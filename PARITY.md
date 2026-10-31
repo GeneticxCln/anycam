@@ -14,7 +14,8 @@ Status legend:
   verification.
 
 Last updated: 2026-10-31 (audit M0, M1 output pipelines, M1 capture source pool,
-network/output failure gates, and media-layer fallback/loop gates). Evidence paths name the private archive
+network/output failure gates, media-layer fallback/loop gates, and the
+vcam/audio/duplicate-capture gates). Evidence paths name the private archive
 `~/anycam-private-evidence/evidence/` after the M0 move.
 
 ## 1. Video sources
@@ -33,6 +34,7 @@ network/output failure gates, and media-layer fallback/loop gates). Evidence pat
 | Missing media fallback | **verified** | A missing image/video/logo/face path builds `overlay.render_media_error_card` in the layer box and records `media_errors`; the rest of the canvas stays live. | `tests/test_pipeline.py::test_missing_media_layers_render_cards_without_stopping_scene` |
 | RTSP/HTTP source | **verified** | `sources.network_chain` (`uridecodebin`); Layers tab Network URL button | Local integration test runs an ffmpeg RTP producer through a minimal RTSP server into `AnyCamEngine` and asserts decoded preview frames (`tests/test_rtsp.py`, `evidence/08_rtsp/`). `tests/test_m1_outputs.py::test_silent_rtsp_source_cannot_stall_the_canvas` covers a server that accepts and never answers; HTTP was exercised earlier. |
 | Capture pipeline isolation / sharing (M1 slice 2) | **verified** | `pool.SourcePool` owns one `intervideosink` pipeline per distinct `CaptureSpec`; layers on the same device share it by refcount and the last release sets it to NULL. The canvas reads it through `intervideosrc` (`sources.layer_tail`), so a dead capture cannot stop the compositor, and one EOS through the compositor's src pad finalises the outputs. | `tests/test_source_pool.py` (shared refcount, real pixels through the pool, dead capture, release on stop); `tests/test_m1_outputs.py` |
+| Duplicate camera sharing (B16) | **verified** | Two layers with the same `CaptureSpec` acquire one `SourcePool` entry; `layer_tail` names each `intervideosrc` with its layer id so a shared channel cannot collide. | `tests/test_gui.py::test_duplicate_camera_shares_one_pooled_capture` (one entry, refs=2) |
 
 ## 2. Scene compositor
 
@@ -67,6 +69,7 @@ network/output failure gates, and media-layer fallback/loop gates). Evidence pat
 | Gain | **verified** | `volume` element, dB→linear in `_build_audio` | −12 dB → −53.1 dB mean, 0 dB → −43.3 dB, +12 dB → −30.2 dB |
 | Mute | **verified** | `volume mute=true` | muted: −91.0 dB (digital silence) |
 | Mic/media mixing | **verified** | `audiomixer` with mic + media file + silent anchor, 48 kHz stereo | `evidence/04_audio/av.mp4`, A/V delta 0.078 s, `verify.json` all true |
+| Simultaneous record + stream audio queues | **verified** | The shared AAC tee feeds a bounded `record_audio_queue` and a leaky `rtmp_audio_queue`, so one muxer cannot block the other. | `tests/test_m1_outputs.py::test_recording_and_streaming_have_separate_audio_queues` |
 
 ## 5. Synchronised MP4 recording
 
@@ -75,6 +78,7 @@ network/output failure gates, and media-layer fallback/loop gates). Evidence pat
 | H.264 MP4, correct resolution/frame rate | **verified** | `x264enc → h264parse → mp4mux`, explicit EOS finalisation, I420 caps | `evidence/01_camera/composite.mp4`: 1920×1080, 60/1, 611 frames, 10.18 s |
 | Continuous MP4 across canvas rebuilds | **verified** | A session-owned `Recorder` keeps `mp4mux`/filesink alive while engines attach and detach encoded taps; encoder PTS resets are remapped onto the session timeline. | `tests/test_recorder.py::test_two_engines_write_one_continuous_file`, `tests/test_gui.py::test_layer_edit_while_recording_keeps_one_continuous_file` |
 | Persistent virtual camera across rebuilds | **verified (offscreen wiring)** | A window-owned `VcamOutput` keeps `v4l2sink` PLAYING while engines attach and detach taps; the input is not stopped by a canvas rebuild. Real loopback consumer verification still needs `/dev/video10`. | `tests/test_vcam_output.py`, `tests/test_gui.py::test_vcam_output_survives_engine_restarts` |
+| Vcam diagnostics and queue bound | **verified** | Inactive output errors reach `report.vcam_error`, `config.vcam_available(device)` checks the configured node, and both the session and legacy appsrc paths cap at 2 buffers with a downstream leak. | `tests/test_vcam_output.py::test_inactive_vcam_output_is_reported`, `::test_legacy_vcam_appsrc_is_bounded`, `::test_missing_vcam_device_fails_without_a_pipeline` |
 | Audio + video synchronised | **verified** | AAC branch built when `--audio` is used; SystemClock; 5 s record buffer | `evidence/04_audio/av.mp4`, `verify.json` (av_sync true, 0.078 s) |
 | 10-min 1080p60 soak | **pass on drops/memory/stalls** (2026-10-31 synthetic re-run; vcam blocked) | `soak.py` + `scripts/soak.sh`. 600.15 s, 36,009 frames at 60.0 fps, 0.0% preview/recorded drops; RSS 188.7 → 189.0 MiB (0.043 MiB/min, settled 0.038), 12 → 12 FDs, no stalls; finalised 600.15 s MP4 with 36,009 packets. `acceptance.overall=blocked` only because `/dev/video10` was absent (v4l2loopback not loaded). | `evidence/soak_10m/report.json` |
 
@@ -131,4 +135,4 @@ sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
 | Wayland portal capture, no niri-only API | **verified** (spike) | `xdg-desktop-portal` ScreenCast + PipeWire |
 | Reversible system changes | **verified** | Only `modprobe v4l2loopback`; `scripts/disable-v4l2loopback.sh`; documented |
 | Reproducible build/run docs | **verified** | `README.md`, `scripts/setup.sh` |
-| Runnable automated tests | **verified** | `./scripts/test.sh` (143 passed, 1 hardware-gated multicam skip; 144 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |
+| Runnable automated tests | **verified** | `./scripts/test.sh` (147 passed, 1 hardware-gated multicam skip; 148 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |

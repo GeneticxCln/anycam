@@ -585,7 +585,11 @@ def layer_tail(layer, source_size: tuple[int, int], width: int, height: int,
     every second frame of a 60 fps capture.
     """
     chain = SourceChain()
-    src = make("intervideosrc", f"src_{channel}", channel=channel)
+    # Two layers can share one capture channel.  The element name must still
+    # be unique inside the canvas pipeline, or the second element is refused
+    # by Gst.Bin.add and the link fails with a misleading "not in a pipeline".
+    tag = re.sub(r"[^A-Za-z0-9_-]", "_", getattr(layer, "id", "") or "layer")
+    src = make("intervideosrc", f"src_{channel}_{tag}", channel=channel)
     rate = caps_filter(f"video/x-raw,framerate={fps}/1")
     chain.add(src, rate, make("videoconvert"))
     effects = _effects_chain(layer)

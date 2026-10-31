@@ -25,7 +25,7 @@ from PySide6.QtCore import QEvent, QPointF, Qt
 from PySide6.QtGui import QColor, QImage, QKeyEvent, QMouseEvent
 from PySide6.QtWidgets import QApplication, QDialog, QInputDialog, QMessageBox
 
-from anycam import config, portal
+from anycam import config, portal, sources
 from anycam.demo import build_demo_project
 from anycam.gui import AnyCamWindow, CameraGridDialog
 from anycam.model import Layer, Project, Scene
@@ -708,6 +708,37 @@ def test_undo_redo_add_remove_and_duplicate_layers(app):
         assert len(window.scene.layers) == before_duplicate
         window.redo()
         assert window.scene.layer(copy_id) is not None
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_duplicate_camera_shares_one_pooled_capture(app, tmp_path, monkeypatch):
+    """B16: a duplicated camera layer must not open the device twice."""
+    device = tmp_path / "fake-camera"
+    device.write_bytes(b"")
+    monkeypatch.setattr(
+        "anycam.pool.camera_modes",
+        lambda _device: [sources.CameraMode("MJPG", 320, 180, 30)],
+    )
+    window = AnyCamWindow(build_demo_project("testsrc", 320, 180, 30))
+    camera = Layer("camera_shared", "camera", "Shared", source=str(device),
+                   box=(0.0, 0.0, 1.0, 1.0), z=5)
+    window.scene.add_layer(camera)
+    window.resize(720, 480)
+    window.show()
+    window.headless = True
+    window._quiet_engine_errors = True
+    try:
+        window.start_engine()
+        assert window.engine is not None, window.statusBar().currentMessage()
+        window.preview.select_layer(camera.id)
+        window.duplicate_layer()
+        assert window.engine is not None, window.statusBar().currentMessage()
+        cameras = [entry for entry in window._source_pool.entries()
+                   if entry.spec.kind == "camera"]
+        assert len(cameras) == 1, [entry.as_dict() for entry in cameras]
+        assert cameras[0].refs == 2
     finally:
         window.close()
         app.processEvents()

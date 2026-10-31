@@ -505,6 +505,33 @@ Verification: `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest tests 
 → 144 collected, 143 passed, 1 hardware-gated multicam skip.
 
 
+## 2026-10-31 — vcam diagnostics, audio queues and shared captures
+
+`VcamOutput.poll()` already surfaced pipeline errors and
+`config.vcam_available(device)` already honoured an explicit node; both paths
+are now covered. The legacy self-contained vcam bridge now caps its `appsrc` at
+2 buffers with `block=false` and a downstream leak, matching the session-owned
+output, so a stalled consumer cannot grow the queue.
+
+The shared AAC tee now feeds `record_audio_queue` as well as the existing
+`rtmp_audio_queue`; a slow MP4 muxer cannot block the streaming muxer (or vice
+versa). The legacy recording path and RTMP are both built in the regression,
+with a real WAV audio bed.
+
+Duplicating a camera exposed a second bug: two layers sharing a capture channel
+both named their `intervideosrc` `src_<channel>`, so the second element was
+refused by `Gst.Bin.add` and the canvas failed to build. The name now includes
+the layer id, and `_add` raises immediately if an element cannot be added. A
+GUI test duplicates a camera and checks one pool entry with `refs == 2`.
+
+B19: the README now states that v4l2loopback must use the default
+`exclusive_caps=0`; `exclusive_caps=1` prevents simultaneous producer/consumer
+use. The Chromium/Zoom/Teams matrix remains an M9 hardware task.
+
+Verification: `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest tests -q`
+→ 148 collected, 147 passed, 1 hardware-gated multicam skip.
+
+
 ## 2026-10-31 — persistent recorder (one MP4 across rebuilds)
 
 Recording moved out of the canvas graph into `anycam.engine.outputs.recorder`.

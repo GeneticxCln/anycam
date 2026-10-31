@@ -2,7 +2,7 @@
 
 Backlog derived from the 2026-10-31 full audit (55 bugs, M0–M9) and the work
 landed since. Snapshot: 2026-10-31, after the camera-replug fix and the
-10-minute soak re-run; suite **144 collected, 143 passed, 1 hardware-gated
+10-minute soak re-run; suite **148 collected, 147 passed, 1 hardware-gated
 multicam skip**.
 
 `PLAN.md` is the older 2026-10-30 plan; this file tracks the newer audit's open
@@ -30,11 +30,11 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - [x] A missing video/image layer renders an error card while the rest of the scene keeps running (B13). Passed 2026-10-31: missing image and video layers each build a card, and the test layer keeps producing frames.
 - [ ] Per-source health model and watchdog; FPS stops being a lifetime average; a stalled pipeline is detected (B41).
 - [ ] Report every camera's negotiated mode, not only the last one (B48).
-- [ ] Vcam: surface runtime errors (B17), check the configured device (B18), and bound the `appsrc` queue (B20).
-- [ ] Audio tee gets queues when recording and streaming together, so one muxer cannot block the other (B21).
+- [x] Vcam: surface runtime errors (B17), check the configured device (B18), and bound the `appsrc` queue (B20). Passed 2026-10-31: inactive outputs report their error, the explicit device is checked, and both vcam appsrc paths use `max-buffers=2`, `block=false`, downstream leak.
+- [x] Audio tee gets queues when recording and streaming together, so one muxer cannot block the other (B21). Passed 2026-10-31: separate bounded queues feed the MP4 and RTMP muxers.
 - [ ] Replace or wrap `rtmpsink` with `rtmp2sink`; keep reconnect/backoff out of the canvas.
-- [ ] Verify a duplicated camera layer shares one capture through the pool (B16) and cover it at the GUI level.
-- [ ] Resolve the `exclusive_caps=1` documentation contradiction; settle the Chromium/Zoom/Teams compatibility list in M9 (B19).
+- [x] Verify a duplicated camera layer shares one capture through the pool (B16) and cover it at the GUI level. Passed 2026-10-31: one pool entry with two references after `duplicate_layer()`; the shared-channel `intervideosrc` name collision is fixed.
+- [x] Resolve the `exclusive_caps=1` documentation contradiction; settle the Chromium/Zoom/Teams compatibility list in M9 (B19). Docs now require the default `exclusive_caps=0`; the browser/meeting matrix remains an M9 hardware task.
 
 ## 2. M2 — GPU canvas, transforms, transitions
 
@@ -151,12 +151,6 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 | B1 | Live portal screen frame size still needs one real check | M0 residual |
 | B12 | Every rebuild splits the MP4 and drops outputs | M1 |
 | B15 | Hidden layers still play and hold sources | M1 |
-| B16 | Duplicate camera must share one capture (verify) | M1 |
-| B17 | Vcam runtime errors are silent | M1 |
-| B18 | Vcam availability checks a different device | M1 |
-| B19 | `exclusive_caps=1` docs/error contradiction | M9 |
-| B20 | Vcam `appsrc` has no queue bound | M1 |
-| B21 | Audio tee has no queues for record + stream | M1 |
 | B32 | Text cannot be edited; no font/colour; no renaming | M3 |
 | B33 | Effects panel edits the wrong layer; Apply rebuilds | M3 |
 | B34 | Reload leaves audio widgets stale | M3 |
@@ -185,6 +179,10 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - B11: a refused RTMP output cannot abort preview/recording/vcam, and a failed rebuild clears Record (`tests/test_m1_outputs.py::test_missing_rtmp_sink_keeps_preview_and_recording`, `tests/test_gui.py::test_failed_start_clears_recording_state`).
 - B13: missing image/video/logo/face assets render an error card without stopping the scene (`tests/test_pipeline.py::test_missing_media_layers_render_cards_without_stopping_scene`).
 - B14: video-file captures seek back to the start after EOS and keep the picture (`tests/test_pipeline.py::test_video_layer_loops_without_a_black_frame`).
+- B16: duplicated camera layers share one pool capture (`tests/test_gui.py::test_duplicate_camera_shares_one_pooled_capture`).
+- B17/B18/B20: vcam failures are reported, the explicit device is checked, and the legacy appsrc is bounded (`tests/test_vcam_output.py`).
+- B19: `exclusive_caps=0` is documented as required; the compatibility matrix remains in M9.
+- B21: record and RTMP have separate audio queues (`tests/test_m1_outputs.py::test_recording_and_streaming_have_separate_audio_queues`).
 - M1 slice 2: ref-counted source pool, dead-capture isolation, output-pad EOS, duplicate-PTS handling (`tests/test_source_pool.py`).
 - Persistent recorder: one MP4 across canvas rebuilds, with PTS remap and AAC audio (`tests/test_recorder.py`).
 - Session-owned virtual camera: one `v4l2sink` across canvas rebuilds (`tests/test_vcam_output.py`).

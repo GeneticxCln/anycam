@@ -198,7 +198,10 @@ class AnyCamEngine:
     def _add(self, *elements: Gst.Element) -> None:
         assert self.pipeline is not None
         for element in elements:
-            self.pipeline.add(element)
+            if not self.pipeline.add(element):
+                raise RuntimeError(
+                    f"could not add {element.get_name()} to the canvas pipeline"
+                )
 
     def _link(self, elements: list[Gst.Element], skip_from=None) -> None:
         for a, b in zip(elements, elements[1:]):
@@ -664,7 +667,8 @@ class AnyCamEngine:
         vcam = Gst.Pipeline.new("anycam-vcam")
         appsrc = make("appsrc", "vcam_appsrc",
                       caps=Gst.Caps.from_string(caps_text),
-                      format=Gst.Format.TIME, is_live=False)
+                      format=Gst.Format.TIME, is_live=False,
+                      max_buffers=2, block=False, leaky_type=2)
         # A converter here absorbs the extended caps fields (colorimetry,
         # interlace-mode...) that v4l2sink refuses to negotiate directly.
         vcam_convert = make("videoconvert")
@@ -796,10 +800,21 @@ class AnyCamEngine:
         self._record_sink = sink
         tee = self._audio_tee()
         if tee is not None:
+            # Keep the muxer behind its own queue.  Without this, a slow
+            # mp4mux waits on the shared audio tee and can stall the separate
+            # RTMP muxer (and the recording) during simultaneous output.
+            audio_queue = make("queue", "record_audio_queue",
+                               max_size_buffers=8, max_size_time=1 * Gst.SECOND)
+            self._add(audio_queue)
             tpad = tee.request_pad_simple("src_%u")
             apad = mux.request_pad_simple("audio_%u")
-            if tpad is None or apad is None or tpad.link(apad) != Gst.PadLinkReturn.OK:
+            if (tpad is None or apad is None
+                    or tpad.link(audio_queue.get_static_pad("sink"))
+                    != Gst.PadLinkReturn.OK
+                    or audio_queue.get_static_pad("src").link(apad)
+                    != Gst.PadLinkReturn.OK):
                 raise RuntimeError("could not link shared audio into mp4mux")
+
 
     @staticmethod
     def _set_leaky(element: Gst.Element) -> None:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import socket
 import threading
 import time
+import wave
 
 import pytest
 
@@ -208,3 +209,32 @@ def test_missing_rtmp_sink_keeps_preview_and_recording(monkeypatch, tmp_path):
     assert out.exists() and out.stat().st_size > 0
     assert engine.report.vcam_active
     assert vcam.samples > 0, "virtual-camera tap stopped with a refused output"
+
+
+@pytest.mark.skipif(not (HAS_RTMP and HAS_MP4MUX),
+                    reason="rtmpsink or mp4mux unavailable")
+def test_recording_and_streaming_have_separate_audio_queues(tmp_path):
+    """B21: one muxer must not block the other through the shared audio tee."""
+    if Gst.ElementFactory.find("avenc_aac") is None:
+        pytest.skip("avenc_aac unavailable")
+    wav = tmp_path / "bed.wav"
+    with wave.open(str(wav), "wb") as handle:
+        handle.setnchannels(2)
+        handle.setsampwidth(2)
+        handle.setframerate(48000)
+        handle.writeframes(b"\0" * 96000)
+    project = make_project()
+    project.audio.media_file = str(wav)
+    project.audio.mic_enabled = False
+    engine = AnyCamEngine(
+        project,
+        record_path=tmp_path / "both.mp4",
+        rtmp="rtmp://127.0.0.1:1/live/both",
+        audio=True,
+    ).build()
+    try:
+        assert engine.pipeline.get_by_name("record_audio_queue") is not None
+        assert engine.pipeline.get_by_name("rtmp_audio_queue") is not None
+        assert engine.report.audio_inputs
+    finally:
+        engine.pipeline.set_state(Gst.State.NULL)
