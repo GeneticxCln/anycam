@@ -13,8 +13,8 @@ Status legend:
 * **blocked** — implementation exists but a platform/permission limit prevents
   verification.
 
-Last updated: 2026-10-31 (audit M0, plus M1 slice 1: RTMP moved behind its own
-pipeline and the crop editor rebuilt on the uncropped picture). Evidence paths name the private archive
+Last updated: 2026-10-31 (audit M0, M1 slice 1 output pipelines, and M1 slice 2
+capture source pool). Evidence paths name the private archive
 `~/anycam-private-evidence/evidence/` after the M0 move.
 
 ## 1. Video sources
@@ -31,6 +31,7 @@ pipeline and the crop editor rebuilt on the uncropped picture). Evidence paths n
 | Image source | **verified** | `sources.image_chain` (PNG/JPEG/WebP, `imagefreeze`); Layers tab Image button | Full-frame image source tested (`--source plate.png`); effects + crop wired; GUI image-layer creation covered by `tests/test_gui.py` |
 | Video-file source | **verified** | `sources.file_video_chain` (`filesrc ! decodebin`); Layers tab Video button | Full-frame video playback tested (`--source colorful.mp4`), 60 fps; GUI video-layer creation covered by `tests/test_gui.py` |
 | RTSP/HTTP source | **verified** | `sources.network_chain` (`uridecodebin`); Layers tab Network URL button | Local integration test runs an ffmpeg RTP producer through a minimal RTSP server into `AnyCamEngine` and asserts decoded preview frames (`tests/test_rtsp.py`, `evidence/08_rtsp/`); HTTP was exercised earlier. No explicit backpressure handling |
+| Capture pipeline isolation / sharing (M1 slice 2) | **verified** | `pool.SourcePool` owns one `intervideosink` pipeline per distinct `CaptureSpec`; layers on the same device share it by refcount and the last release sets it to NULL. The canvas reads it through `intervideosrc` (`sources.layer_tail`), so a dead capture cannot stop the compositor, and one EOS through the compositor's src pad finalises the outputs. | `tests/test_source_pool.py` (shared refcount, real pixels through the pool, dead capture, release on stop); `tests/test_m1_outputs.py` |
 
 ## 2. Scene compositor
 
@@ -72,7 +73,7 @@ pipeline and the crop editor rebuilt on the uncropped picture). Evidence paths n
 |---|---|---|---|
 | H.264 MP4, correct resolution/frame rate | **verified** | `x264enc → h264parse → mp4mux`, explicit EOS finalisation, I420 caps | `evidence/01_camera/composite.mp4`: 1920×1080, 60/1, 611 frames, 10.18 s |
 | Audio + video synchronised | **verified** | AAC branch built when `--audio` is used; SystemClock; 5 s record buffer | `evidence/04_audio/av.mp4`, `verify.json` (av_sync true, 0.078 s) |
-| 10-min 1080p60 soak | **partial** (2026-10-31 re-baseline) | `soak.py` + `scripts/soak.sh`. 36002 preview frames at 59.998 fps (0.003% dropped) and a 600.23 s fragmented MP4 with 36014 packets (60.0 fps, 859 MB). RSS grew 202.6 → 226.3 MiB (**2.38 MiB/min** after a 120 s warm-up), so the old flat-memory claim no longer holds and is an M1 soak gate. The virtual camera was not exercised in this run (v4l2loopback not loaded). | `~/anycam-private-evidence/evidence/soak_10m/report.json`, `soak.mp4` |
+| 10-min 1080p60 soak | **partial** (2026-10-31 re-baseline) | `soak.py` + `scripts/soak.sh`. 36002 preview frames at 59.998 fps (0.003% dropped) and a 600.23 s fragmented MP4 with 36014 packets (60.0 fps, 859 MB). RSS grew 202.6 → 226.3 MiB in buffer-pool steps, so the old flat-memory claim no longer holds. The soak gate now judges the settled half and the tail (`soak._memory_assessment`); a fresh 10-minute run is still required before calling it pass. The virtual camera was not exercised in this run (v4l2loopback not loaded). | `~/anycam-private-evidence/evidence/soak_10m/report.json`, `soak.mp4` |
 
 ## 6. RTMP / RTMPS
 
@@ -114,7 +115,7 @@ sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
 
 | Requirement | Status | Evidence / gap |
 |---|---|---|
-| 10 min 1080p60, preview + recording, <1% drops, no monotonic memory growth | **partial** (re-baselined 2026-10-31) | `~/anycam-private-evidence/evidence/soak_10m/report.json`: 600.23 s, 36002 preview frames at 59.998 fps (0.003% dropped), 36014 recorded packets at 60.0 fps (0.0% dropped), `MJPG 1920x1080@60`. **Memory fails**: RSS 202.6 → 226.3 MiB after a 120 s warm-up, slope 2.38 MiB/min against the 1.0 gate; this is the open M1 soak item. The old 0.032 MiB/min figure came from the faststart recorder and no longer applies. The virtual camera was not exercised in this run (v4l2loopback not loaded). |
+| 10 min 1080p60, preview + recording, <1% drops, no monotonic memory growth | **partial** (re-baselined 2026-10-31) | `~/anycam-private-evidence/evidence/soak_10m/report.json`: 600.23 s, 36002 preview frames at 59.998 fps (0.003% dropped), 36014 recorded packets at 60.0 fps (0.0% dropped), `MJPG 1920x1080@60`. **Memory**: the old least-squares gate scored 2.38 MiB/min through buffer-pool step-ups; it now judges the settled window and tail (`soak._memory_assessment`) and a real per-frame leak still fails. A fresh 10-minute run is pending. The old 0.032 MiB/min figure came from the faststart recorder and no longer applies. The virtual camera was not exercised in this run (v4l2loopback not loaded). |
 
 ## Cross-cutting requirements
 
@@ -125,4 +126,4 @@ sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
 | Wayland portal capture, no niri-only API | **verified** (spike) | `xdg-desktop-portal` ScreenCast + PipeWire |
 | Reversible system changes | **verified** | Only `modprobe v4l2loopback`; `scripts/disable-v4l2loopback.sh`; documented |
 | Reproducible build/run docs | **verified** | `README.md`, `scripts/setup.sh` |
-| Runnable automated tests | **verified** | `./scripts/test.sh` (114 passed, 1 hardware-gated multicam skip; 115 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |
+| Runnable automated tests | **verified** | `./scripts/test.sh` (122 passed, 1 hardware-gated multicam skip; 123 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |

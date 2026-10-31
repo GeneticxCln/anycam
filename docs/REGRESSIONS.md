@@ -390,3 +390,44 @@ Test: `tests/test_m1_outputs.py::test_unresponsive_rtmp_cannot_stall_the_canvas`
 * RSS grew 202.6 → 226.3 MiB after a 120 s warm-up (**2.38 MiB/min**, gate is
   1.0). The previous 0.032 MiB/min figure came from the faststart recorder and is
   no longer valid. This is now the blocking M1 soak item.
+
+## 2026-10-31 — M1 slice 2: capture source pool
+
+Capture pipelines moved out of the canvas graph. `pool.SourcePool` owns one
+`intervideosink` pipeline per distinct `CaptureSpec`; layers on the same device
+share it by refcount and the last release sets it to NULL. The canvas consumes
+each source through `intervideosrc` (`sources.layer_tail`), so a dead capture
+cannot stop the compositor. `AnyCamEngine(..., pool=...)` accepts a pool, and
+the GUI keeps one for the window's lifetime (`AnyCamWindow._source_pool`).
+
+Three bugs were found while finishing the interrupted work:
+
+* `compositor ignore-inactive-pads=true` ignored inter-fed pads from the first
+  frame (measured: 0 preview frames against 49 with false at 320x180), so the
+  canvas never started. The flag is reverted; a dead capture still leaves the
+  other pads rendering.
+* Pushing EOS into each `intervideosrc` tail deadlocked the compositor's
+  streaming thread, and EOS does not cross `intervideosink` from the capture
+  pipeline (measured). `stop()` now sends one EOS through the compositor's src
+  pad, which reaches every branch and finalises mp4mux/flvmux.
+* Two inter sources start at PTS 0, so the compositor emitted two frames with
+  the same PTS and qtmux failed with `Buffer has no PTS`. A canvas `videorate`
+  (`skip-to-first`) keeps the output monotonic, and the preview holds delivery
+  until every compositor pad has produced a buffer so the first shown frame is
+  not the bare background.
+
+The soak gate now judges the settled second half and the tail
+(`soak._memory_assessment`) instead of a least-squares slope through buffer-pool
+step-ups; a real leak of one 1080p frame per minute still fails
+(`tests/test_soak_memory.py`). A fresh 10-minute run is still required.
+
+Verification: `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest tests -q`
+→ 123 collected, 122 passed, 1 hardware-gated multicam skip.
+`tests/test_source_pool.py` covers sharing, real pixels through the pool, a dead
+capture, and release on stop.
+
+Known incomplete: `scripts/verify-av-drift.py` is not a passing gate yet. An 8 s
+synthetic smoke run reported 320 audio "gaps" (its gap heuristic uses the video
+frame interval for audio buffers), the recorded probe file had 0 packets, and
+the gate compares drift against 1.0 s while its note says one frame. Fix or
+retire it before using it as M1 evidence.

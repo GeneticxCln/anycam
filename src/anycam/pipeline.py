@@ -147,6 +147,11 @@ class AnyCamEngine:
         self.bus: Gst.Bus | None = None
         self.chains: list[SourceChain] = []
         self._layer_pads: dict[str, Gst.Pad] = {}
+        # Preview delivery waits until every compositor pad has produced a
+        # buffer, so the first shown frame is not the bare background.
+        self._pads_with_data: set[str] = set()
+        self._preview_gate_open = False
+        self._preview_gate_deadline = 0.0
         self.media_volume: Gst.Element | None = None
         self.audio_tee: Gst.Element | None = None
         self._probe_id = 0
@@ -316,6 +321,12 @@ class AnyCamEngine:
             raise RuntimeError(f"could not link {layer.name} into the compositor")
         self._layer_pads[layer.id] = pad
 
+        def on_first_buffer(_pad, _info, layer_id=layer.id):
+            self._pads_with_data.add(layer_id)
+            return Gst.PadProbeReturn.OK
+
+        pad.add_probe(Gst.PadProbeType.BUFFER, on_first_buffer)
+
     def _watch_source_size(self, chain: SourceChain, layer: Layer) -> None:
         """Report a screen layer whose frames are not the portal's stream.
 
@@ -362,14 +373,23 @@ class AnyCamEngine:
                 f"canvas size must be even for H.264 (got {self.canvas_w}x{self.canvas_h})"
             )
         self.pipeline = Gst.Pipeline.new("anycam")
-        # ignore_inactive_pads: a capture pipeline that dies stops producing
-        # without sending EOS; the compositor must skip that pad and keep
-        # rendering the rest instead of waiting for it forever.
-        self.compositor = make("compositor", "compositor", background="black", ignore_inactive_pads=True)
+        # A pad fed by ``intervideosrc`` is ignored from the first frame when
+        # this is true, even when its capture is already PLAYING (measured:
+        # 0 preview frames with True against 49 with False at 320x180), so the
+        # canvas would never start.  It is not needed for a dead capture
+        # either: the aggregator stops waiting for the silent pad on its own
+        # and the remaining pads keep rendering.
+        self.compositor = make("compositor", "compositor", background="black", ignore_inactive_pads=False)
         self.tee = make("tee", "output")
-        self._add(self.compositor, self.tee)
-        if not self.compositor.link(self.tee):
-            raise RuntimeError("could not link compositor to tee")
+        # A canvas-wide rate element keeps the composited timestamps monotonic
+        # for h264parse/qtmux (two inter sources can start at the same PTS).
+        # ``skip-to-first`` stops it emitting black buffers before the first
+        # composited frame has arrived, which otherwise flash on the preview.
+        rate = make("videorate", "canvas_rate", skip_to_first=True)
+        canvas_caps = caps_filter(
+            caps_string(self.canvas_w, self.canvas_h, self.fps), "canvas_caps")
+        self._add(self.compositor, rate, canvas_caps, self.tee)
+        self._link([self.compositor, rate, canvas_caps, self.tee])
 
         # Build hidden layers too: the playlist toggles their pad alpha live,
         # which is impossible if they were never added to the compositor.
@@ -463,6 +483,19 @@ class AnyCamEngine:
         if sample is None:
             return False
         self._pending_sample = None
+        if not self._preview_gate_open:
+            if (len(self._pads_with_data) < len(self._layer_pads)
+                    and time.monotonic() < self._preview_gate_deadline):
+                # The compositor can emit background frames before every layer
+                # has produced its first buffer; showing one flashes the
+                # preview black.  Hold delivery until all pads are live
+                # (bounded by the deadline so a stalled source cannot freeze
+                # the preview).
+                return False
+            self._preview_gate_open = True
+            # The pending sample was composited while some pads were blank;
+            # drop it so the first shown frame contains every layer.
+            return False
         if self.on_frame is not None:
             try:
                 self.on_frame(sample)
@@ -852,6 +885,9 @@ class AnyCamEngine:
         assert self.pipeline is not None
         self._start_time = time.monotonic()
         self.report.started = self._start_time
+        self._pads_with_data.clear()
+        self._preview_gate_open = False
+        self._preview_gate_deadline = self._start_time + 2.0
         self._frame_count = 0
         self._last_sample = 0.0
         # Prefer the system clock: a USB/PipeWire microphone's clock can start
@@ -973,9 +1009,15 @@ class AnyCamEngine:
             for element in chain.pause_elements:
                 element.set_state(Gst.State.PAUSED)
         time.sleep(0.12)
-        for chain in self.chains:
+        # End the output branch, not the individual source pads.  EOS pushed
+        # into an ``intervideosrc`` tail deadlocks against the compositor's
+        # streaming thread, and EOS never crosses the inter channel from the
+        # capture pipeline.  One event on the compositor's src pad reaches
+        # every branch and finalises mp4mux/flvmux.
+        output_pad = self.compositor.get_static_pad("src") if self.compositor else None
+        if output_pad is not None:
             try:
-                chain.output_pad.push_event(Gst.Event.new_eos())
+                output_pad.push_event(Gst.Event.new_eos())
             except Exception:
                 pass
         # mp4mux/flvmux only finalise after every pad sees EOS.  Video alone is

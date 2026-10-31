@@ -28,6 +28,7 @@ from .geometry import clamp
 from .model import (Effects, Layer, Project, Scene, camera_grid_scene,
                     default_project, new_id, two_camera_scene)
 from .pipeline import AnyCamEngine
+from .pool import SourcePool
 
 STYLE = """
 QMainWindow, QWidget { background: #0b0d10; color: #d7e3ea; font-family: "Noto Sans", "DejaVu Sans"; font-size: 13px; }
@@ -854,6 +855,9 @@ class AnyCamWindow(QMainWindow):
         self._dirty = False
         self.project = project or self._load_saved_project()
         self.engine: AnyCamEngine | None = None
+        # Captures are ref-counted, so one pool lives for the window's
+        # lifetime and engines acquire/release their sources against it.
+        self._source_pool = SourcePool()
         self.recording = False
         self.vcam_on = False
         # Streaming is a separate action: preview must never publish a saved URL.
@@ -2969,6 +2973,7 @@ class AnyCamWindow(QMainWindow):
                 screen_sizes=self._screen_sizes(),
                 preview_crop_layer=crop_preview,
                 skip_layers=set(self._lost_cameras),
+                pool=self._source_pool,
                 on_frame=self._on_frame,
             ).build()
             self.engine.start()
@@ -3033,6 +3038,7 @@ class AnyCamWindow(QMainWindow):
         self.preview.cancel_pending_edits()
         if self.engine is not None:
             self.stop_engine()
+        self._source_pool.stop()
         self._save_if_needed()
         self._close_screen_sessions()
         event.accept()
@@ -3046,6 +3052,7 @@ class AnyCamWindow(QMainWindow):
         self.preview.cancel_pending_edits()
         if self.engine is not None:
             self.stop_engine()
+        self._source_pool.stop()
         self._save_if_needed()
         self._close_screen_sessions()
 
