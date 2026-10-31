@@ -52,9 +52,10 @@ The GUI screenshot that used to be embedded here is in that archive too
 | Duplicate camera sharing (B16) | PASS, one pool entry with two references after GUI duplicate | `tests/test_gui.py::test_duplicate_camera_shares_one_pooled_capture` |
 | Hidden capture release (B15) | PASS, hidden layers acquire no capture; showing acquires, hiding releases | `tests/test_source_pool.py::test_hidden_capture_is_acquired_only_while_visible` |
 | Per-camera mode report (B48) | PASS, two camera layers report both negotiated modes | `tests/test_source_pool.py::test_report_lists_every_camera_mode` |
+| Per-source health/watchdog (B41) | PASS, source-side counters, instant FPS, dead capture flagged after 2 s | `tests/test_source_pool.py::test_health_flags_a_capture_that_stops` |
 | Continuous MP4 across rebuilds | PASS, one persistent recorder spans rebuilds, including five scene switches, and writes one playable file | `tests/test_recorder.py`, `tests/test_gui.py::test_five_scene_switches_keep_one_recording`, `tests/test_gui.py::test_layer_edit_while_recording_keeps_one_continuous_file` |
 | Persistent virtual-camera output | PASS (offscreen wiring), one session-owned `v4l2sink` survives engine rebuilds; real loopback consumer not exercised because `/dev/video10` is absent | `tests/test_vcam_output.py`, `tests/test_gui.py::test_vcam_output_survives_engine_restarts` |
-| Automated tests | PASS, 149 passed + 1 hardware-gated multicam test | `./scripts/test.sh`; `docs/EVIDENCE.md` §2, §4.10 |
+| Automated tests | PASS, 150 passed + 1 hardware-gated multicam test | `./scripts/test.sh`; `docs/EVIDENCE.md` §2, §4.10 |
 | V4L2 virtual camera | PASS — 720 frames in 12 s, and a `v4l2src` consumer read 60/60 buffers at 1920×1080 YUYV | `evidence/02_virtual_camera/report.json`, `consumer.txt`, `format.txt` |
 
 ## Output mode: 1920×1080@60 (MJPG)
@@ -360,7 +361,7 @@ and a new segment starts (the status bar reports the segment count).
 
 ```bash
 ./scripts/test.sh
-# 149 passed, 1 skipped (hardware-gated multicam; 150 collected)
+# 150 passed, 1 skipped (hardware-gated multicam; 151 collected)
 ```
 
 Covers geometry, model/JSON round-trips (including audio mixing fields, editor

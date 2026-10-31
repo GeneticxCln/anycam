@@ -2,7 +2,7 @@
 
 Backlog derived from the 2026-10-31 full audit (55 bugs, M0–M9) and the work
 landed since. Snapshot: 2026-10-31, after the camera-replug fix and the
-10-minute soak re-run; suite **150 collected, 149 passed, 1 hardware-gated
+10-minute soak re-run; suite **151 collected, 150 passed, 1 hardware-gated
 multicam skip**.
 
 `PLAN.md` is the older 2026-10-30 plan; this file tracks the newer audit's open
@@ -28,7 +28,7 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - [x] Hidden playlist layers release their sources; hidden cameras stop holding devices and CPU (B15). Passed 2026-10-31: hidden capture layers acquire no pool entry; showing acquires on the stable channel, hiding releases it again.
 - [ ] Stable camera IDs through `/dev/v4l/by-id`, not `/dev/videoN` (B46). **App side implemented 2026-10-31; needs a physical replug run.**
 - [x] A missing video/image layer renders an error card while the rest of the scene keeps running (B13). Passed 2026-10-31: missing image and video layers each build a card, and the test layer keeps producing frames.
-- [ ] Per-source health model and watchdog; FPS stops being a lifetime average; a stalled pipeline is detected (B41).
+- [x] Per-source health model and watchdog; FPS stops being a lifetime average; a stalled pipeline is detected (B41). Passed 2026-10-31: source-side frame counters, `instant_fps`, and a dead capture flagged after 2 s.
 - [x] Report every camera's negotiated mode, not only the last one (B48). Passed 2026-10-31: two camera layers report both negotiated modes; a hidden camera adds its mode when shown.
 - [x] Vcam: surface runtime errors (B17), check the configured device (B18), and bound the `appsrc` queue (B20). Passed 2026-10-31: inactive outputs report their error, the explicit device is checked, and both vcam appsrc paths use `max-buffers=2`, `block=false`, downstream leak.
 - [x] Audio tee gets queues when recording and streaming together, so one muxer cannot block the other (B21). Passed 2026-10-31: separate bounded queues feed the MP4 and RTMP muxers.
@@ -157,7 +157,6 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 | B36 | Window minimum height 1109 px | M3 |
 | B37 | Portal calls block the UI; no restore token | M3 |
 | B40 | Canvas/FPS edits do nothing while running | M3 |
-| B41 | FPS is a lifetime average; no watchdog | M1 |
 | B42 | `auto` never picks NVENC; fixed bitrate/GOP | M2 |
 | B43 | Face detection runs on the UI thread | M5 |
 | B44 | First playlist item lasts twice as long | M3 |
@@ -180,6 +179,7 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - B15: hidden capture layers acquire no source until shown and release it when hidden (`tests/test_source_pool.py::test_hidden_capture_is_acquired_only_while_visible`).
 - B16: duplicated camera layers share one pool capture (`tests/test_gui.py::test_duplicate_camera_shares_one_pooled_capture`).
 - B48: every camera layer's negotiated mode is kept in the report (`tests/test_source_pool.py::test_report_lists_every_camera_mode`).
+- B41: source-side health counters and `source_health`/`stalled_sources` detect a dead capture (`tests/test_source_pool.py::test_health_flags_a_capture_that_stops`).
 - B17/B18/B20: vcam failures are reported, the explicit device is checked, and the legacy appsrc is bounded (`tests/test_vcam_output.py`).
 - B19: `exclusive_caps=0` is documented as required; the compatibility matrix remains in M9.
 - B21: record and RTMP have separate audio queues (`tests/test_m1_outputs.py::test_recording_and_streaming_have_separate_audio_queues`).

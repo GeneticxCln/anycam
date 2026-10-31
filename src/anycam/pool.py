@@ -16,6 +16,7 @@ canvas rate for exactly this reason.
 from __future__ import annotations
 
 import itertools
+import time
 from dataclasses import dataclass, field
 
 import gi
@@ -68,6 +69,8 @@ class Entry:
     screen_error: str = ""
     error: str = ""
     loops: int = 0
+    frames: int = 0
+    last_frame: float = 0.0
 
     def as_dict(self) -> dict:
         return {
@@ -76,6 +79,7 @@ class Entry:
             "refs": self.refs,
             "source_size": list(self.source_size),
             "loops": self.loops,
+            "frames": self.frames,
             "error": self.error,
         }
 
@@ -247,6 +251,17 @@ class SourcePool:
         entry = Entry(spec=spec, channel=channel, pipeline=pipeline,
                       source_size=built.size, camera_mode=built.camera_mode,
                       probe_error=built.probe_error)
+        sink_pad = sink.get_static_pad("sink")
+        if sink_pad is not None:
+            def on_buffer(_pad, _info, entry=entry):
+                # This is the producer side.  Once the capture stops, the
+                # canvas-side intervideosrc may repeat its last frame, so it
+                # cannot be used to detect a stalled source.
+                entry.frames += 1
+                entry.last_frame = time.monotonic()
+                return Gst.PadProbeReturn.OK
+
+            sink_pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
         if built.check is not None and built.check_size is not None:
             self._watch_size(built.check, built.check_size, entry)
         if self._started:

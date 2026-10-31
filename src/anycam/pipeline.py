@@ -42,6 +42,9 @@ class EngineReport:
     media_errors: list[str] = field(default_factory=list)
     camera_mode: str = ""
     camera_modes: list[str] = field(default_factory=list)
+    instant_fps: float = 0.0
+    source_health: dict[str, dict] = field(default_factory=dict)
+    stalled_sources: list[str] = field(default_factory=list)
     camera_probe_error: str = ""
     camera_placeholders: list[str] = field(default_factory=list)
     source_errors: list[str] = field(default_factory=list)
@@ -72,6 +75,9 @@ class EngineReport:
             "media_errors": self.media_errors,
             "camera_mode": self.camera_mode,
             "camera_modes": self.camera_modes,
+            "instant_fps": round(self.instant_fps, 3),
+            "source_health": self.source_health,
+            "stalled_sources": self.stalled_sources,
             "camera_probe_error": self.camera_probe_error,
             "camera_placeholders": self.camera_placeholders,
             "source_errors": self.source_errors,
@@ -136,6 +142,13 @@ class AnyCamEngine:
         self._layer_specs: dict[str, CaptureSpec] = {}
         self._layer_acquired: set[str] = set()
         self._camera_modes: dict[str, str] = {}
+        # Per-layer pad counters.  A lifetime compositor FPS hides a single
+        # source that stopped while the others keep the canvas alive.
+        self._layer_frames: dict[str, int] = {}
+        self._layer_last: dict[str, float] = {}
+        self._last_sample_frames = 0
+        self._last_sample_time = 0.0
+        self._stall_seconds = 2.0
         # The crop editor shows this layer uncropped while the model keeps its
         # real crop, so the window is drawn over the picture it edits.
         self.preview_crop_layer = preview_crop_layer
@@ -361,6 +374,15 @@ class AnyCamEngine:
         self._add(*chain.elements)
         self._link(chain.elements, skip_from=getattr(chain, "dynamic_from", None))
         self._link_dynamic(chain)
+
+        def on_source_buffer(_pad, _info, layer_id=layer.id):
+            # Count the layer's own tail, not the compositor output: the
+            # compositor can repeat the last frame after a source dies.
+            self._layer_frames[layer_id] = self._layer_frames.get(layer_id, 0) + 1
+            self._layer_last[layer_id] = time.monotonic()
+            return Gst.PadProbeReturn.OK
+
+        chain.output_pad.add_probe(Gst.PadProbeType.BUFFER, on_source_buffer)
         pad = self.compositor.request_pad_simple("sink_%u")
         if pad is None:
             raise RuntimeError("compositor refused a request pad")
@@ -1069,6 +1091,13 @@ class AnyCamEngine:
         self._preview_gate_deadline = self._start_time + 2.0
         self._frame_count = 0
         self._last_sample = 0.0
+        self._last_sample_frames = 0
+        self._last_sample_time = self._start_time
+        self._layer_frames.clear()
+        self._layer_last.clear()
+        self.report.instant_fps = 0.0
+        self.report.source_health = {}
+        self.report.stalled_sources = []
         # Prefer the system clock: a USB/PipeWire microphone's clock can start
         # late and would delay the first composited frame (and the recording).
         self.pipeline.use_clock(Gst.SystemClock.obtain())
@@ -1157,6 +1186,12 @@ class AnyCamEngine:
             return None
         self._last_sample = now
         elapsed = max(1e-6, now - self._start_time)
+        delta_frames = self._frame_count - self._last_sample_frames
+        delta_time = now - self._last_sample_time
+        instant_fps = (delta_frames / delta_time) if delta_time > 0 else 0.0
+        self._update_health(now)
+        self._last_sample_frames = self._frame_count
+        self._last_sample_time = now
         try:
             cpu = self._proc.cpu_percent(None)
             rss = self._proc.memory_info().rss / 2 ** 20
@@ -1166,11 +1201,44 @@ class AnyCamEngine:
             "t": round(elapsed, 2),
             "frames": self._frame_count,
             "fps": round(self._frame_count / elapsed, 2),
+            "instant_fps": round(instant_fps, 2),
+            "stalled_sources": list(self.report.stalled_sources),
             "cpu_pct": cpu,
             "rss_mib": round(rss, 1) if rss else None,
         }
         self.report.samples.append(rec)
         return rec
+
+    def _update_health(self, now: float) -> None:
+        """Snapshot visible sources and flag one that stopped delivering."""
+        health: dict[str, dict] = {}
+        stalled: list[str] = []
+        for layer in self.scene.layers:
+            if not layer.visible or layer.id not in self._layer_pads:
+                continue
+            spec = self._layer_specs.get(layer.id)
+            entry = self.pool.entry(spec) if spec is not None else None
+            if entry is not None:
+                frames = entry.frames
+            else:
+                frames = self._layer_frames.get(layer.id, 0)
+            last = (entry.last_frame or None) if entry is not None else self._layer_last.get(layer.id)
+            age = None if last is None else max(0.0, now - last)
+            health[layer.id] = {
+                "frames": frames,
+                "last_frame_age_s": None if age is None else round(age, 2),
+            }
+            if last is None:
+                if now - self._start_time > self._stall_seconds:
+                    stalled.append(layer.id)
+            elif age is not None and age > self._stall_seconds:
+                stalled.append(layer.id)
+        self.report.instant_fps = (
+            (self._frame_count - self._last_sample_frames)
+            / max(1e-6, now - self._last_sample_time)
+        )
+        self.report.source_health = health
+        self.report.stalled_sources = sorted(stalled)
 
     def set_mic_gain(self, db: float) -> None:
         self.project.audio.mic_gain_db = db

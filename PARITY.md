@@ -15,7 +15,8 @@ Status legend:
 
 Last updated: 2026-10-31 (audit M0, M1 output pipelines, M1 capture source pool,
 network/output failure gates, media-layer fallback/loop gates, the
-vcam/audio/duplicate-capture gates, and hidden-capture/camera-mode gates). Evidence paths name the private archive
+vcam/audio/duplicate-capture gates, hidden-capture/camera-mode gates, and the
+source-health watchdog). Evidence paths name the private archive
 `~/anycam-private-evidence/evidence/` after the M0 move.
 
 ## 1. Video sources
@@ -37,6 +38,7 @@ vcam/audio/duplicate-capture gates, and hidden-capture/camera-mode gates). Evide
 | Duplicate camera sharing (B16) | **verified** | Two layers with the same `CaptureSpec` acquire one `SourcePool` entry; `layer_tail` names each `intervideosrc` with its layer id so a shared channel cannot collide. | `tests/test_gui.py::test_duplicate_camera_shares_one_pooled_capture` (one entry, refs=2) |
 | Hidden capture lifecycle (B15) | **verified** | Hidden capture layers build only their `intervideosrc` tail and hold no pool reference. Showing acquires on the stable channel; hiding releases the entry. | `tests/test_source_pool.py::test_hidden_capture_is_acquired_only_while_visible` |
 | Per-camera mode reporting (B48) | **verified** | `EngineReport.camera_modes` keeps one negotiated mode per camera layer; showing a hidden camera adds its mode. | `tests/test_source_pool.py::test_report_lists_every_camera_mode` |
+| Per-source health/watchdog (B41) | **verified** | `SourcePool` counts buffers at each `intervideosink`; `EngineReport.source_health` keeps per-layer frames and age, `instant_fps` is per interval, and `stalled_sources` flags a visible source with no buffer for 2 s. | `tests/test_source_pool.py::test_health_flags_a_capture_that_stops` |
 
 ## 2. Scene compositor
 
@@ -137,4 +139,4 @@ sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
 | Wayland portal capture, no niri-only API | **verified** (spike) | `xdg-desktop-portal` ScreenCast + PipeWire |
 | Reversible system changes | **verified** | Only `modprobe v4l2loopback`; `scripts/disable-v4l2loopback.sh`; documented |
 | Reproducible build/run docs | **verified** | `README.md`, `scripts/setup.sh` |
-| Runnable automated tests | **verified** | `./scripts/test.sh` (149 passed, 1 hardware-gated multicam skip; 150 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |
+| Runnable automated tests | **verified** | `./scripts/test.sh` (150 passed, 1 hardware-gated multicam skip; 151 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |

@@ -552,6 +552,24 @@ Verification: `tests/test_source_pool.py::test_hidden_capture_is_acquired_only_w
 The run: 150 collected, 149 passed, 1 hardware-gated multicam skip.
 
 
+## 2026-10-31 — per-source health and stalled-capture watchdog
+
+`EngineReport` now keeps `source_health` per visible layer, `instant_fps` for
+the last sampling interval, and `stalled_sources` for a source with no new
+buffer for two seconds. Counters live at each capture's `intervideosink`, not
+at the compositor: the compositor repeats the last frame after a source dies,
+so canvas-side counting reported a healthy graph while one camera was gone.
+
+`sample()` applies the watchdog and exposes `instant_fps` and
+`stalled_sources` in each sample; the lifetime `fps` field remains for
+compatibility with the soak and existing reports.
+
+Verification: `tests/test_source_pool.py::test_health_flags_a_capture_that_stops`
+kills the red capture while the blue layer keeps rendering and asserts that
+`left` is reported stalled; the run is 151 collected, 150 passed, 1
+hardware-gated multicam skip.
+
+
 ## 2026-10-31 — persistent recorder (one MP4 across rebuilds)
 
 Recording moved out of the canvas graph into `anycam.engine.outputs.recorder`.

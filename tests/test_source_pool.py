@@ -104,6 +104,32 @@ def test_stop_releases_every_capture():
     assert engine.pool.entries() == []
 
 
+def test_health_flags_a_capture_that_stops():
+    """B41: one stopped source is visible even while the canvas continues."""
+    engine = AnyCamEngine(two_patterns(), preview=True).build()
+    try:
+        engine.start()
+        deadline = time.monotonic() + 1.2
+        while time.monotonic() < deadline:
+            engine.pump(50)
+        record = engine.sample(force=True)
+        assert record is not None
+        assert record["instant_fps"] > 0
+        assert engine.report.source_health
+        assert engine.report.stalled_sources == []
+
+        red = next(entry for entry in engine.pool.entries()
+                   if entry.spec.source == "red")
+        red.pipeline.set_state(Gst.State.NULL)
+        time.sleep(2.2)
+        engine.sample(force=True)
+        assert "left" in engine.report.stalled_sources, (
+            engine.report.source_health, engine.report.stalled_sources
+        )
+    finally:
+        engine.stop()
+
+
 def test_report_lists_every_camera_mode(monkeypatch, tmp_path):
     """B48: two cameras used to leave only the last mode in the report."""
     from anycam import pool as pool_module
