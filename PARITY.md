@@ -90,8 +90,9 @@ source-health watchdog). Evidence paths name the private archive
 
 | Requirement | Status | Implementation | Evidence / gap |
 |---|---|---|---|
-| Publish to user-supplied RTMP/RTMPS URL | **verified** | `flvmux` + `rtmpsink`, video + AAC audio, I420 H.264 High. Since M1 slice 1 the publish branch lives in its own `anycam-rtmp` pipeline fed by `appsrc` samples, so a stalled server cannot reach the canvas tee; it is reported as `rtmp_error` | `evidence/05_rtmp/received.flv`: 1280×720, H.264 High yuv420p + AAC, 8.23 s. `tests/test_m1_outputs.py::test_unresponsive_rtmp_cannot_stall_the_canvas` keeps preview and recording alive with a black-hole server |
+| Publish to user-supplied RTMP/RTMPS URL | **verified** | `flvmux` + `rtmp2sink` when installed (with `rtmpsink` fallback), video + AAC audio, I420 H.264 High. Since M1 slice 1 the publish branch lives in its own `anycam-rtmp` pipeline fed by `appsrc` samples, so a stalled server cannot reach the canvas tee; it is reported as `rtmp_error` | `evidence/05_rtmp/received.flv`: 1280×720, H.264 High yuv420p + AAC, 8.23 s (captured through `rtmpsink`). `tests/test_m1_outputs.py::test_unresponsive_rtmp_cannot_stall_the_canvas` keeps preview and recording alive with a black-hole server; `::test_stream_prefers_rtmp2sink` covers sink selection, not delivery |
 | Refused or missing output element | **verified** | `build()` confines RTMP setup failures to `rtmp_error`; `_build_rtmp()` checks required elements before attaching a canvas branch. Preview, recording and a virtual-camera tap stay alive, and the GUI disarms Record if a rebuild fails. | `tests/test_m1_outputs.py::test_missing_rtmp_sink_keeps_preview_and_recording`, `tests/test_gui.py::test_failed_start_clears_recording_state` |
+| Live record/vcam toggles | **verified** | A `valve` before each output-tap encoder lets `attach_recorder()` / `detach_recorder()` and `attach_vcam()` / `detach_vcam()` start or stop the feed without rebuilding the canvas. Scene and layer changes still rebuild. | `tests/test_gui.py::test_record_toggle_attaches_without_rebuilding`, `::test_vcam_output_survives_engine_restarts` |
 
 ## 7. Playlists and shortcuts
 

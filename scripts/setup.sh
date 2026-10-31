@@ -43,7 +43,7 @@ echo "== checking GStreamer elements"
 missing=0
 for element in compositor appsrc imagefreeze v4l2sink v4l2src jpegdec \
                videoconvert videoscale videocrop videobalance gaussianblur \
-               tee queue x264enc mp4mux h264parse pulsesrc audiomixer avenc_aac \
+               tee valve queue x264enc mp4mux h264parse pulsesrc audiomixer avenc_aac \
                flvmux rtmpsink textoverlay gdkpixbufoverlay; do
   if ! gst-inspect-1.0 "$element" >/dev/null 2>&1; then
     echo "  MISSING $element"

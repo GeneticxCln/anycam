@@ -53,6 +53,21 @@ def make_project() -> Project:
     return project
 
 
+@pytest.mark.skipif(Gst.ElementFactory.find("rtmp2sink") is None,
+                    reason="rtmp2sink unavailable")
+def test_stream_prefers_rtmp2sink():
+    """M1: prefer the maintained rtmp2 sink, with rtmpsink as a fallback."""
+    engine = AnyCamEngine(make_project(),
+                          rtmp="rtmp://127.0.0.1:1/live/key").build()
+    try:
+        sink = engine._rtmp_pipeline.get_by_name("rtmp_sink")
+        assert sink.get_factory().get_name() == "rtmp2sink"
+    finally:
+        if engine._rtmp_pipeline is not None:
+            engine._rtmp_pipeline.set_state(Gst.State.NULL)
+        engine.pipeline.set_state(Gst.State.NULL)
+
+
 @pytest.mark.skipif(not HAS_RTMP, reason="rtmpsink unavailable")
 def test_unresponsive_rtmp_cannot_stall_the_canvas():
     """The canvas must keep producing while the publish pipeline is stuck."""
@@ -163,8 +178,8 @@ def test_missing_rtmp_sink_keeps_preview_and_recording(monkeypatch, tmp_path):
     real_make = pipeline_module.make
 
     def make_without_rtmp(factory, name=None, **props):
-        if factory == "rtmpsink":
-            raise RuntimeError("rtmpsink is not installed")
+        if factory in ("rtmpsink", "rtmp2sink"):
+            raise RuntimeError(f"{factory} is not installed")
         return real_make(factory, name, **props)
 
     class _FakeVcam:
@@ -203,7 +218,7 @@ def test_missing_rtmp_sink_keeps_preview_and_recording(monkeypatch, tmp_path):
         engine.stop()
 
     assert len(frames) > 30, f"canvas stalled at {len(frames)} frames"
-    assert "rtmpsink" in engine.report.rtmp_error, engine.report.rtmp_error
+    assert "rtmp" in engine.report.rtmp_error, engine.report.rtmp_error
     assert engine.report.error == "", engine.report.error
     assert engine.report.record_ok, engine.report.as_dict()
     assert out.exists() and out.stat().st_size > 0

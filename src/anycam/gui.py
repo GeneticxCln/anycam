@@ -3207,7 +3207,7 @@ class AnyCamWindow(QMainWindow):
             self.recording = False
             self.record_button.setText("Record")
             if self.engine is not None:
-                self.restart_engine()
+                self.engine.detach_recorder()
             self._finish_recorder()
             return
         self.recording = True
@@ -3217,7 +3217,17 @@ class AnyCamWindow(QMainWindow):
         self._recording_path = ""
         self.record_button.setText("Stop recording")
         if self.engine is not None:
-            self.restart_engine()
+            if not self._start_recorder():
+                self.recording = False
+                self.record_button.setText("Record")
+                return
+            if not self.engine.attach_recorder(self._recorder):
+                self.recording = False
+                self.record_button.setText("Record")
+                self._finish_recorder()
+                self._status("Recording could not attach to the running canvas")
+                return
+            self._status(f"Recording to {self._recording_path}")
         elif not self._start_recorder():
             self.recording = False
             self.record_button.setText("Record")
@@ -3234,7 +3244,14 @@ class AnyCamWindow(QMainWindow):
             self.vcam_button.setText("Virtual camera")
             return
         if self.engine is not None:
-            self.restart_engine()
+            if self.vcam_on:
+                if not self.engine.attach_vcam(self._vcam_output):
+                    self.vcam_on = False
+                    self.vcam_button.setText("Virtual camera")
+                    self._finish_vcam_output()
+                    return
+            else:
+                self.engine.detach_vcam()
         if not self.vcam_on:
             self._finish_vcam_output()
 

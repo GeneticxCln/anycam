@@ -371,7 +371,7 @@ crop mode rebuilds the graph, so a recording in progress starts a new segment.
 **M1 slice 1 — RTMP output moved into its own pipeline.** The canvas graph now
 ends the RTMP branch at a `h264parse → appsink` (drop, max 1 buffer) plus an AAC
 `appsink` on the shared audio tee; a separate `anycam-rtmp` pipeline pushes those
-samples into `appsrc → flvmux → rtmpsink`. A server that accepts a connection and
+samples into `appsrc → flvmux → rtmp2sink` (falling back to `rtmpsink`). A server that accepts a connection and
 never speaks RTMP can no longer reach the tee, so preview, recording and the
 virtual camera keep running; the failure is reported as `report.rtmp_error` and
 teardown happens off the caller's thread (`stop()` returned in <0.4 s in the
@@ -617,3 +617,27 @@ file or left a segment behind fails.
 
 The 60-minute soak and the real `v4l2src` consumer still need v4l2loopback and
 `/dev/video10`.
+
+
+## 2026-10-31 — live output taps and rtmp2sink
+
+Record start/stop and virtual-camera toggles used to call `restart_engine()`,
+which tore down and rebuilt the whole canvas. Both output taps now have a
+`valve` before their converters. `attach_recorder()` / `detach_recorder()` and
+`attach_vcam()` / `detach_vcam()` set the valve's `drop` property, so the
+canvas, preview and sources keep running while an output starts or stops.
+The GUI uses those methods instead of a rebuild. Scene switches, adding a
+layer and applying effects still rebuild; that remains the open part of B12.
+
+The publish pipeline now prefers `rtmp2sink` and falls back to `rtmpsink` when
+the newer plugin is absent. The sink is still behind the separate
+`anycam-rtmp` pipeline and the leaky appsink bridge, so the isolation guarantee
+is unchanged. This machine has `rtmp2sink` (GStreamer 1.28.8); no RTMP receiver
+is installed, so the selection regression does not claim a new delivery capture.
+
+Verification: `tests/test_gui.py::test_record_toggle_attaches_without_rebuilding`
+starts and stops Record while asserting the engine object and canvas are
+unchanged and one playable file is produced;
+`::test_vcam_output_survives_engine_restarts` now also asserts that toggling
+the vcam does not replace the engine; `tests/test_m1_outputs.py::test_stream_prefers_rtmp2sink`
+asserts the selected sink factory. Full suite: 152 passed, 1 hardware-gated skip.

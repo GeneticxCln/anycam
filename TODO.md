@@ -14,16 +14,16 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 
 - [x] **10-minute A/V drift gate.** `PYTHONPATH=src python3 scripts/verify-av-drift.py --seconds 600 --warmup 20 --record /tmp/drift.mp4 --json /tmp/drift.json`. Passed 2026-10-31: `drift_s: 0.0`, 36,008 video / 24,405 audio buffers, zero duplicate/gap timestamps, finalised 600.12 s MP4.
 - [~] **60-minute soak** tracking RSS, tmpfs usage, disk and file descriptors; fail the run on a frame stall. Instrumentation landed 2026-10-31 (tmpfs, recording filesystem, FDs, `--stall-seconds`); the 10-minute synthetic re-run passed at 0.043 MiB/min with no stalls. Run 60 minutes with vcam.
-- [~] **Continuous MP4** across five scene switches and record toggles, plus an unbroken `v4l2src` consumer on the virtual camera (B12). A persistent `Recorder` and a session-owned vcam output now span canvas rebuilds, and the five-scene-switch gate passes with synthetic sources (2026-10-31); the 60-minute soak and a real loopback consumer remain.
+- [~] **Continuous MP4** across five scene switches and record toggles, plus an unbroken `v4l2src` consumer on the virtual camera (B12). A persistent `Recorder` and a session-owned vcam output span canvas rebuilds; Record start/stop and vcam toggles are now live valve changes rather than rebuilds (2026-10-31). The five-scene-switch gate passes with synthetic sources; the 60-minute soak and a real loopback consumer remain.
 - [x] **Unresponsive RTSP/network source**: canvas keeps ≥99% of its frames and `stop()` returns in under 1 s (B10/B11). Passed 2026-10-31 with a local RTSP server that accepts and never answers: ≥99% of 30 fps over a 2 s window, `stop()` 0.32 s.
-- [x] **Refused output does not poison the session** (B11): preview, recording and vcam keep running, and the recording flag does not stay on. Passed 2026-10-31 with a missing `rtmpsink` and with a forced rebuild failure.
+- [x] **Refused output does not poison the session** (B11): preview, recording and vcam keep running, and the recording flag does not stay on. Passed 2026-10-31 with a missing RTMP sink and with a forced rebuild failure.
 - [ ] **Physical camera unplug/replug** on real hardware with `scripts/verify-camera-reconnect.py`. Needs the user and a cable; the app now resolves the by-id path.
 - [ ] **UVC wedge recovery**: after repeated open failures, offer a USB reset (pkexec) instead of requiring a reboot.
 
 ## 1. M1 engine split and source/output correctness
 
 - [ ] Split `pipeline.py` into `src/anycam/engine/`: `source_pool.py`, `canvas.py`, `outputs/{vcam,recorder,stream}.py`, `health.py`, `controller.py`; keep `AnyCamEngine` as a thin facade while tests migrate.
-- [ ] Canvas is never rebuilt. Record/stop, vcam toggle, scene switch, add layer and apply-effects attach/detach live (B12).
+- [~] Canvas is never rebuilt. Record/stop and vcam toggles attach/detach live through valves (B12, 2026-10-31); scene switch, add layer and apply-effects still rebuild.
 - [x] Video layers loop with a segment seek and never end on a silent black frame (B14); a video-only scene must not leave the chip saying LIVE. Passed 2026-10-31: a 1 s red clip seeked after EOS, `loops >= 1`, and the centre was still red after 2.6 s.
 - [x] Hidden playlist layers release their sources; hidden cameras stop holding devices and CPU (B15). Passed 2026-10-31: hidden capture layers acquire no pool entry; showing acquires on the stable channel, hiding releases it again.
 - [ ] Stable camera IDs through `/dev/v4l/by-id`, not `/dev/videoN` (B46). **App side implemented 2026-10-31; needs a physical replug run.**
@@ -32,7 +32,7 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - [x] Report every camera's negotiated mode, not only the last one (B48). Passed 2026-10-31: two camera layers report both negotiated modes; a hidden camera adds its mode when shown.
 - [x] Vcam: surface runtime errors (B17), check the configured device (B18), and bound the `appsrc` queue (B20). Passed 2026-10-31: inactive outputs report their error, the explicit device is checked, and both vcam appsrc paths use `max-buffers=2`, `block=false`, downstream leak.
 - [x] Audio tee gets queues when recording and streaming together, so one muxer cannot block the other (B21). Passed 2026-10-31: separate bounded queues feed the MP4 and RTMP muxers.
-- [ ] Replace or wrap `rtmpsink` with `rtmp2sink`; keep reconnect/backoff out of the canvas.
+- [x] Prefer `rtmp2sink` and fall back to `rtmpsink`; the publish leg stays in its own pipeline. Passed 2026-10-31: `rtmp2sink` selected when installed and the black-hole server gate still passes. Actual `rtmp2sink` delivery has not been re-captured because no RTMP receiver is installed here.
 - [x] Verify a duplicated camera layer shares one capture through the pool (B16) and cover it at the GUI level. Passed 2026-10-31: one pool entry with two references after `duplicate_layer()`; the shared-channel `intervideosrc` name collision is fixed.
 - [x] Resolve the `exclusive_caps=1` documentation contradiction; settle the Chromium/Zoom/Teams compatibility list in M9 (B19). Docs now require the default `exclusive_caps=0`; the browser/meeting matrix remains an M9 hardware task.
 
@@ -149,7 +149,7 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 | ID | Open issue | Target |
 |---|---|---|
 | B1 | Live portal screen frame size still needs one real check | M0 residual |
-| B12 | Every rebuild splits the MP4 and drops outputs | M1 |
+| B12 | Live record/vcam toggles done; scene and layer changes still rebuild | M1 |
 | B32 | Text cannot be edited; no font/colour; no renaming | M3 |
 | B33 | Effects panel edits the wrong layer; Apply rebuilds | M3 |
 | B34 | Reload leaves audio widgets stale | M3 |
@@ -183,6 +183,8 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - B17/B18/B20: vcam failures are reported, the explicit device is checked, and the legacy appsrc is bounded (`tests/test_vcam_output.py`).
 - B19: `exclusive_caps=0` is documented as required; the compatibility matrix remains in M9.
 - B21: record and RTMP have separate audio queues (`tests/test_m1_outputs.py::test_recording_and_streaming_have_separate_audio_queues`).
+- B12 (partial): Record start/stop and vcam toggles attach/detach valves without rebuilding (`tests/test_gui.py::test_record_toggle_attaches_without_rebuilding`, `test_vcam_output_survives_engine_restarts`); scene/layer changes still rebuild.
+- `rtmp2sink` is preferred when installed, with `rtmpsink` fallback (`tests/test_m1_outputs.py::test_stream_prefers_rtmp2sink`).
 - M1 slice 2: ref-counted source pool, dead-capture isolation, output-pad EOS, duplicate-PTS handling (`tests/test_source_pool.py`).
 - Persistent recorder: one MP4 across canvas rebuilds, with PTS remap and AAC audio (`tests/test_recorder.py`).
 - Session-owned virtual camera: one `v4l2sink` across canvas rebuilds (`tests/test_vcam_output.py`).

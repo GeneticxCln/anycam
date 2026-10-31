@@ -44,7 +44,7 @@ The GUI screenshot that used to be embedded here is in that archive too
 | 10-min 1080p60 soak (synthetic re-run) | PASS on drops/memory/stalls: 36,009 frames over 600.15 s (0.0% dropped), RSS 188.7→189.0 MiB (0.043 MiB/min), 12→12 FDs; vcam blocked (no `/dev/video10`) | `evidence/soak_10m/report.json` |
 | Output isolation (M1 slice 1) | PASS, an RTMP server that stops reading cannot stall preview, recording or the virtual camera | `tests/test_m1_outputs.py::test_unresponsive_rtmp_cannot_stall_the_canvas` |
 | Unresponsive RTSP source (B10) | PASS, silent RTSP server; canvas keeps ≥99% of 30 fps and `stop()` returns in under 1 s | `tests/test_m1_outputs.py::test_silent_rtsp_source_cannot_stall_the_canvas` |
-| Refused output (B11) | PASS, missing `rtmpsink` leaves preview, recording and the vcam tap running; a failed rebuild clears Record and finalises the recorder | `tests/test_m1_outputs.py::test_missing_rtmp_sink_keeps_preview_and_recording`, `tests/test_gui.py::test_failed_start_clears_recording_state` |
+| Refused output (B11) | PASS, missing RTMP sink leaves preview, recording and the vcam tap running; a failed rebuild clears Record and finalises the recorder | `tests/test_m1_outputs.py::test_missing_rtmp_sink_keeps_preview_and_recording`, `tests/test_gui.py::test_failed_start_clears_recording_state` |
 | Missing media cards (B13) | PASS, missing image/video layers render cards while the test layer keeps producing frames | `tests/test_pipeline.py::test_missing_media_layers_render_cards_without_stopping_scene` |
 | Video-file looping (B14) | PASS, 1 s clip seeked after EOS; centre still red after 2.6 s | `tests/test_pipeline.py::test_video_layer_loops_without_a_black_frame` |
 | Vcam diagnostics and bounded queue (B17/B18/B20) | PASS, inactive output reports its error, explicit device is checked, appsrc is capped at 2 buffers | `tests/test_vcam_output.py` |
@@ -55,7 +55,9 @@ The GUI screenshot that used to be embedded here is in that archive too
 | Per-source health/watchdog (B41) | PASS, source-side counters, instant FPS, dead capture flagged after 2 s | `tests/test_source_pool.py::test_health_flags_a_capture_that_stops` |
 | Continuous MP4 across rebuilds | PASS, one persistent recorder spans rebuilds, including five scene switches, and writes one playable file | `tests/test_recorder.py`, `tests/test_gui.py::test_five_scene_switches_keep_one_recording`, `tests/test_gui.py::test_layer_edit_while_recording_keeps_one_continuous_file` |
 | Persistent virtual-camera output | PASS (offscreen wiring), one session-owned `v4l2sink` survives engine rebuilds; real loopback consumer not exercised because `/dev/video10` is absent | `tests/test_vcam_output.py`, `tests/test_gui.py::test_vcam_output_survives_engine_restarts` |
-| Automated tests | PASS, 150 passed + 1 hardware-gated multicam test | `./scripts/test.sh`; `docs/EVIDENCE.md` §2, §4.10 |
+| Live record/vcam taps | PASS, Record start/stop and vcam toggle attach/detach valves without rebuilding the canvas | `tests/test_gui.py::test_record_toggle_attaches_without_rebuilding`, `tests/test_gui.py::test_vcam_output_survives_engine_restarts` |
+| `rtmp2sink` preference | PASS, `rtmp2sink` selected when installed, `rtmpsink` fallback; actual delivery still uses the existing receiver evidence | `tests/test_m1_outputs.py::test_stream_prefers_rtmp2sink` |
+| Automated tests | PASS, 152 passed + 1 hardware-gated multicam test | `./scripts/test.sh`; `docs/EVIDENCE.md` §2, §4.10 |
 | V4L2 virtual camera | PASS — 720 frames in 12 s, and a `v4l2src` consumer read 60/60 buffers at 1920×1080 YUYV | `evidence/02_virtual_camera/report.json`, `consumer.txt`, `format.txt` |
 
 ## Output mode: 1920×1080@60 (MJPG)
@@ -271,7 +273,7 @@ PYTHONPATH=src python3 -m anycam demo --seconds 30 --source camera   --rtmp rtmp
 PYTHONPATH=src python3 -m anycam demo --seconds 60 --source camera --audio   --audio-file music.wav --mic-gain 3 --record ~/Videos/AnyCam/session.mp4
 ```
 
-`rtmps://` URLs are passed to the same `rtmpsink` (librtmp). Both inputs are
+`rtmps://` URLs use `rtmp2sink` when installed and fall back to `rtmpsink` (librtmp). Both inputs are
 resampled to 48 kHz stereo and mixed by `audiomixer`; the AAC track is muxed
 with the H.264 video so the MP4 stays synchronised.
 
@@ -333,7 +335,7 @@ screen (pipewiresrc) ───────────────────�
                                      ├→ tee → preview appsink → Qt QImage
                                      ├→ tee → v4l2sink /dev/video10
                                      ├→ tee → x264enc → h264parse → mp4mux (I420, H.264 High)
-                                     └→ tee → x264enc → h264parse → flvmux → rtmpsink
+                                     └→ tee → x264enc → h264parse → flvmux → rtmp2sink/rtmpsink
 ```
 
 * `src/anycam/model.py` — plain-data Project/Scene/Layer/Effects, JSON presets.

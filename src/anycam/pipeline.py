@@ -185,6 +185,10 @@ class AnyCamEngine:
         self._preview_gate_deadline = 0.0
         self.media_volume: Gst.Element | None = None
         self.audio_tee: Gst.Element | None = None
+        # Live output taps.  A valve lets the GUI stop feeding the recorder or
+        # vcam without rebuilding (and therefore interrupting) the canvas.
+        self._recorder_valve: Gst.Element | None = None
+        self._vcam_valve: Gst.Element | None = None
         self._probe_id = 0
         self._frame_count = 0
         self._start_time = 0.0
@@ -675,6 +679,10 @@ class AnyCamEngine:
         """
         device = self.project.output.vcam_device or config.loopback_device()
         self.report.vcam = device
+        if self._vcam_valve is not None:
+            self._vcam_valve.set_property("drop", False)
+            self.report.vcam_active = True
+            return
         if self.vcam_output is not None:
             if not self.vcam_output.active:
                 self.report.vcam_error = (self.vcam_output.error or
@@ -684,12 +692,14 @@ class AnyCamEngine:
             caps_text = caps_string(self.canvas_w, self.canvas_h, self.fps, fmt)
             queue = self._branch("vcam")
             queue.set_property("leaky", 2)  # downstream: drop old buffers
+            valve = make("valve", "vcam_valve", drop=False)
+            self._vcam_valve = valve
             convert = make("videoconvert")
             caps = caps_filter(caps_text, "vcam_caps")
             appsink = make("appsink", "vcam_appsink", emit_signals=True,
                            max_buffers=2, drop=True, sync=False)
-            self._add(convert, caps, appsink)
-            self._link([queue, convert, caps, appsink])
+            self._add(valve, convert, caps, appsink)
+            self._link([queue, valve, convert, caps, appsink])
             appsink.connect("new-sample", self._on_vcam_sample)
             self.report.vcam_active = True
             return
@@ -705,12 +715,14 @@ class AnyCamEngine:
 
         queue = self._branch("vcam")
         queue.set_property("leaky", 2)  # downstream: drop old buffers
+        valve = make("valve", "vcam_valve", drop=False)
+        self._vcam_valve = valve
         convert = make("videoconvert")
         caps = caps_filter(caps_text, "vcam_caps")
         appsink = make("appsink", "vcam_appsink", emit_signals=True,
                        max_buffers=2, drop=True, sync=False)
-        self._add(convert, caps, appsink)
-        self._link([queue, convert, caps, appsink])
+        self._add(valve, convert, caps, appsink)
+        self._link([queue, valve, convert, caps, appsink])
         appsink.connect("new-sample", self._on_vcam_sample)
 
         vcam = Gst.Pipeline.new("anycam-vcam")
@@ -732,6 +744,29 @@ class AnyCamEngine:
         self._vcam_bus = vcam.get_bus()
         self._vcam_sink = sink
         self.report.vcam_active = True
+
+    def attach_vcam(self, output: VcamOutput) -> bool:
+        """Resume the vcam tap for ``output`` without rebuilding the canvas."""
+        if not output.active:
+            self.report.vcam_error = output.error or "virtual camera is not running"
+            return False
+        self.vcam_output = output
+        self.want_vcam = True
+        self.report.vcam_error = ""
+        if self._vcam_valve is None:
+            self._build_vcam()
+        else:
+            self._vcam_valve.set_property("drop", False)
+            self.report.vcam_active = True
+        return self._vcam_valve is not None
+
+    def detach_vcam(self) -> None:
+        """Stop feeding the virtual camera without touching the canvas."""
+        if self._vcam_valve is not None:
+            self._vcam_valve.set_property("drop", True)
+        self.vcam_output = None
+        self.want_vcam = False
+        self.report.vcam_active = False
 
     def _on_vcam_sample(self, sink):
         sample = sink.emit("pull-sample")
@@ -772,8 +807,13 @@ class AnyCamEngine:
         """
         if self.recorder is None:
             return
+        if self._recorder_valve is not None:
+            self._recorder_valve.set_property("drop", False)
+            return
         queue = self._branch("record")
         queue.set_property("leaky", 2)
+        valve = make("valve", "record_valve", drop=False)
+        self._recorder_valve = valve
         convert = make("videoconvert")
         i420 = caps_filter("video/x-raw,format=I420", "record_raw")
         encoder = os.environ.get("ANYCAM_ENCODER", "auto").lower()
@@ -788,8 +828,8 @@ class AnyCamEngine:
         parse = make("h264parse")
         sink = make("appsink", "record_tap_sink", emit_signals=True,
                     max_buffers=4, drop=True, sync=False)
-        self._add(convert, i420, enc, parse, sink)
-        self._link([queue, convert, i420, enc, parse, sink])
+        self._add(valve, convert, i420, enc, parse, sink)
+        self._link([queue, valve, convert, i420, enc, parse, sink])
         sink.connect("new-sample", self._on_record_sample)
 
         tee = self._audio_tee()
@@ -806,6 +846,25 @@ class AnyCamEngine:
                     tpad.link(audio_queue.get_static_pad("sink")) != Gst.PadLinkReturn.OK):
                 raise RuntimeError("could not tap shared audio for recording")
             audio_sink.connect("new-sample", self._on_record_audio_sample)
+
+    def attach_recorder(self, recorder: Recorder) -> bool:
+        """Start feeding the existing canvas into ``recorder`` without a rebuild."""
+        self.recorder = recorder
+        self.record_path = str(recorder.path)
+        if self._recorder_valve is None:
+            self._build_recorder_tap()
+        else:
+            self._recorder_valve.set_property("drop", False)
+        if self._recorder_valve is not None:
+            return True
+        self.recorder = None
+        return False
+
+    def detach_recorder(self) -> None:
+        """Stop feeding encoded samples to the recorder, leaving the file open."""
+        if self._recorder_valve is not None:
+            self._recorder_valve.set_property("drop", True)
+        self.recorder = None
 
     def _on_record_sample(self, sink):
         sample = sink.emit("pull-sample")
@@ -876,11 +935,12 @@ class AnyCamEngine:
     def _build_rtmp(self) -> None:
         """Encode in the canvas graph, publish in a separate pipeline.
 
-        ``rtmpsink`` blocks its streaming thread while it talks to the
+        The publish leg blocks its streaming thread while it talks to the
         server.  In the single graph that back-pressure reached the tee and
         froze preview, recording and the virtual camera (audit B9/B11).  The
         appsinks below drop frames instead, so a dead server can only starve
-        its own output pipeline.
+        its own output pipeline.  ``rtmp2sink`` is preferred when available;
+        the older ``rtmpsink`` remains a fallback for minimal installs.
         """
         url = self.rtmp
         if not url:
@@ -888,7 +948,9 @@ class AnyCamEngine:
         # Check before attaching the canvas branch: a missing plugin used to
         # abort the whole build and leave a recording session running with no
         # preview.  Report it and keep the other outputs alive instead.
-        missing = [name for name in ("rtmpsink", "flvmux", "x264enc", "h264parse")
+        sink_factory = ("rtmp2sink" if Gst.ElementFactory.find("rtmp2sink")
+                        else "rtmpsink")
+        missing = [name for name in (sink_factory, "flvmux", "x264enc", "h264parse")
                    if Gst.ElementFactory.find(name) is None]
         if missing:
             self.report.rtmp_error = (
@@ -938,7 +1000,7 @@ class AnyCamEngine:
         video_src.set_property("block", False)
         self._set_leaky(video_src)
         mux = make("flvmux", "rtmp_mux", streamable=True)
-        sink = make("rtmpsink", "rtmp_sink", location=url, sync=False)
+        sink = make(sink_factory, "rtmp_sink", location=url, sync=False)
         output.add(video_src)
         output.add(mux)
         output.add(sink)
@@ -958,7 +1020,7 @@ class AnyCamEngine:
                 raise RuntimeError("could not link RTMP audio into flvmux")
             self._rtmp_audio_appsrc = audio_src
         if not mux.link(sink):
-            raise RuntimeError("could not link flvmux into rtmpsink")
+            raise RuntimeError(f"could not link flvmux into {sink_factory}")
         self._rtmp_pipeline = output
         self._rtmp_bus = output.get_bus()
         self._rtmp_appsrc = video_src

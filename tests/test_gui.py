@@ -437,6 +437,37 @@ def test_layer_edit_while_recording_keeps_one_continuous_file(app, tmp_path, mon
         app.processEvents()
 
 
+def test_record_toggle_attaches_without_rebuilding(app, tmp_path, monkeypatch):
+    """B12: starting/stopping Record is a live tap change, not a graph rebuild."""
+    monkeypatch.setenv("XDG_VIDEOS_DIR", str(tmp_path))
+    window = _window()
+    window.headless = True
+    try:
+        window.start_engine()
+        assert window.engine is not None, window.statusBar().currentMessage()
+        assert _wait_for(app, lambda: window.preview.image is not None)
+        first = window.engine
+        baseline = len(window.recording_segments)
+
+        window.toggle_record()
+        assert window.recording is True
+        assert window.engine is first, "Record rebuilt the canvas"
+        assert first._recorder_valve is not None
+        assert first._recorder_valve.get_property("drop") is False
+        _pump(app, 1.0)
+
+        window.toggle_record()
+        assert window.recording is False
+        assert window.engine is first, "Stop rebuilt the canvas"
+        assert first._recorder_valve.get_property("drop") is True
+        files = [Path(path) for path in window.recording_segments]
+        assert len(files) == baseline + 1, files
+        assert files[-1].exists() and files[-1].stat().st_size > 0
+    finally:
+        window.close()
+        app.processEvents()
+
+
 def test_five_scene_switches_keep_one_recording(app, tmp_path, monkeypatch):
     """B12: each scene switch rebuilds the canvas; the MP4 must stay one file."""
     monkeypatch.setenv("XDG_VIDEOS_DIR", str(tmp_path))
@@ -1136,6 +1167,7 @@ def test_vcam_output_survives_engine_restarts(app, monkeypatch):
         first = window.engine
         window.toggle_vcam()
         assert window.vcam_on is True
+        assert window.engine is first, "toggling vcam rebuilt the canvas"
         assert len(created) == 1
         output = created[0]
         window.restart_engine()
