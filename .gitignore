@@ -1,0 +1,21 @@
+# AnyCam runtime and tooling
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Local recordings, snapshots, caches
+recordings/
+*.mp4
+!assets/sample/*.mp4
+*.log
+core
+core.*
+
+# Private captures (webcam frames, microphone audio, desktop screenshots)
+# never belong in the tree; they are kept outside the checkout.
+evidence/
+/tmp/

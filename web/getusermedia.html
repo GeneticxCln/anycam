@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AnyCam · getUserMedia check</title>
+<style>
+  :root { color-scheme: dark; --bg:#0b0d10; --panel:#101418; --line:#1e2830;
+          --text:#d7e3ea; --muted:#7d8b96; --accent:#5eead0; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:14px/1.45 "Noto Sans","DejaVu Sans",system-ui,sans-serif; }
+  header { display:flex; align-items:center; gap:12px; padding:14px 20px;
+           border-bottom:1px solid var(--line); background:var(--panel); }
+  header img { width:30px; height:30px; }
+  h1 { font-size:17px; margin:0; letter-spacing:.2px; }
+  .tag { color:var(--accent); font-weight:700; font-size:12px; letter-spacing:.12em; }
+  main { max-width:1020px; margin:0 auto; padding:20px; }
+  .bar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:14px; }
+  button, select { background:#172026; color:var(--text); border:1px solid #26343d;
+                   border-radius:8px; padding:8px 12px; font:inherit; }
+  button.primary { background:var(--accent); color:#07120f; border:0; font-weight:700; }
+  button:hover { border-color:var(--accent); }
+  .stage { background:#07090b; border:1px solid var(--line); border-radius:12px;
+           overflow:hidden; aspect-ratio:16/9; display:grid; place-items:center; }
+  video { width:100%; height:100%; object-fit:contain; background:#07090b; }
+  .meta { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr));
+          gap:10px; margin-top:14px; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
+  .card b { display:block; color:var(--muted); font-weight:500; font-size:12px;
+            text-transform:uppercase; letter-spacing:.08em; margin-bottom:3px; }
+  .ok { color:var(--accent); } .bad { color:#ff8a9a; }
+  pre { background:#0e1216; border:1px solid var(--line); border-radius:8px;
+        padding:10px; overflow:auto; max-height:220px; font-size:12px; }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <img src="../assets/anycam-logo.png" alt="">
+  <h1>AnyCam</h1><span class="tag">GETUSERMEDIA CHECK</span>
+</header>
+<main>
+  <div class="bar">
+    <button class="primary" id="start">Start camera</button>
+    <button id="stop">Stop</button>
+    <button id="grab">Save frame</button>
+    <select id="device" aria-label="Camera"></select>
+    <label><input type="checkbox" id="prefer"> prefer “AnyCam” by label</label>
+  </div>
+
+  <div class="stage"><video id="video" autoplay playsinline muted></video></div>
+
+  <div class="meta">
+    <div class="card"><b>Selected device</b><span id="label">—</span></div>
+    <div class="card"><b>Resolution</b><span id="size">—</span></div>
+    <div class="card"><b>Frame rate</b><span id="fps">—</span></div>
+    <div class="card"><b>AnyCam found</b><span id="found" class="bad">no</span></div>
+  </div>
+
+  <p style="color:var(--muted);margin-top:16px">
+    The preview above is the composited AnyCam output when the AnyCam virtual
+    camera is selected: it must show the scene overlays and effects, not the raw
+    StreamCam image. Labelling requires camera permission once; press
+    <em>Start camera</em> and allow access.
+  </p>
+  <pre id="log"></pre>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const log = (msg) => { $("log").textContent += msg + "\n"; };
+let stream = null;
+
+function isAnyCam(device) {
+  return /anycam/i.test(device.label || "");
+}
+
+async function listDevices() {
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const cameras = devices.filter(d => d.kind === "videoinput");
+  const select = $("device");
+  select.innerHTML = "";
+  for (const cam of cameras) {
+    const option = document.createElement("option");
+    option.value = cam.deviceId;
+    option.textContent = cam.label || `Camera ${select.length + 1}`;
+    option.dataset.anycam = isAnyCam(cam) ? "1" : "";
+    select.appendChild(option);
+  }
+  const anycam = cameras.find(isAnyCam);
+  $("found").textContent = anycam ? "yes" : "no";
+  $("found").className = anycam ? "ok" : "bad";
+  if (anycam) {
+    select.value = anycam.deviceId;
+    log(`AnyCam device: ${anycam.label}`);
+  } else {
+    log(cameras.length ? "AnyCam not found. Run scripts/enable-v4l2loopback.sh and start AnyCam." :
+                         "No video inputs visible.");
+  }
+  return cameras;
+}
+
+async function start() {
+  stop();
+  const deviceId = $("device").value;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: deviceId ? { deviceId: { exact: deviceId }, width: 1920, height: 1080, frameRate: 30 }
+                      : { width: 1920, height: 1080, frameRate: 30 },
+      audio: false,
+    });
+    const video = $("video");
+    video.srcObject = stream;
+    await video.play();
+    await listDevices();
+    const track = stream.getVideoTracks()[0];
+    const settings = track.getSettings();
+    $("label").textContent = track.label || "(unlabelled)";
+    $("size").textContent = `${settings.width || "?"} × ${settings.height || "?"}`;
+    $("fps").textContent = settings.frameRate ? settings.frameRate.toFixed(1) + " fps" : "—";
+    log(`Playing ${track.label} ${settings.width}x${settings.height}@${settings.frameRate}`);
+  } catch (err) {
+    log("getUserMedia failed: " + err.name + " " + err.message);
+  }
+}
+
+function stop() {
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+}
+
+function grab() {
+  const video = $("video");
+  if (!video.videoWidth) { log("Nothing to save yet"); return; }
+  const canvas = document.createElement("canvas");
+  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+  canvas.getContext("2d").drawImage(video, 0, 0);
+  const a = document.createElement("a");
+  a.download = `anycam-getusermedia-${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
+  a.href = canvas.toDataURL("image/png");
+  a.click();
+  log("Saved " + a.download);
+}
+
+$("start").addEventListener("click", start);
+$("stop").addEventListener("click", stop);
+$("grab").addEventListener("click", grab);
+$("device").addEventListener("change", start);
+navigator.mediaDevices.addEventListener("devicechange", listDevices);
+listDevices().catch(err => log("enumerateDevices failed: " + err));
+</script>
+</body>
+</html>

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AnyCam · virtual camera check</title>
+<style>
+  :root { color-scheme: dark; --bg:#101418; --panel:#0b0d10; --text:#d7e3ea;
+          --muted:#7d8b96; --accent:#5eead0; --bad:#ff8a9a; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:20px; background:#311516; color:var(--text);
+         font:15px/1.45 "Noto Sans","DejaVu Sans",system-ui,sans-serif; }
+  h1 { margin:0 0 4px; font-size:22px; }
+  .muted { color:var(--muted); }
+  #state { font-size:28px; font-weight:700; margin:8px 0 4px; }
+  #detail { margin-bottom:14px; }
+  canvas { display:block; width:100%; max-width:1000px; border:1px solid var(--accent);
+           border-radius:6px; background:#000; }
+  pre { background:var(--panel); border:1px solid #26343d; border-radius:8px;
+        padding:10px; max-height:220px; overflow:auto; font-size:12px; }
+</style>
+</head>
+<body>
+<h1>AnyCam <span class="muted">virtual camera check</span></h1>
+<div id="state">starting…</div>
+<div id="detail" class="muted">Waiting for camera permission.</div>
+<canvas id="frame" width="640" height="360"></canvas>
+<pre id="log"></pre>
+<script>
+/* Automated verification contract: window.__result is polled by
+   scripts/verify-firefox.py, and window.__frame is the captured composited
+   frame as a PNG data URL.  The page is also usable manually. */
+window.__result = {state: "start"};
+const out = window.__result;
+const log = (msg) => { document.getElementById("log").textContent += msg + "\n"; };
+const set = (patch) => Object.assign(out, patch);
+const state = (text) => { document.getElementById("state").textContent = text; };
+const detail = (text) => { document.getElementById("detail").textContent = text; };
+const fail = (err) => {
+  set({state: "error", error: err});
+  state("FAILED");
+  detail(err);
+  document.body.style.background = "#441111";
+  log(err);
+};
+
+(async () => {
+  try {
+    state("permission…");
+    // A first getUserMedia call grants camera permission so enumerateDevices
+    // returns labels.  Some devices can be busy; the enumeration below still
+    // runs if this probe fails.
+    try {
+      const warm = await navigator.mediaDevices.getUserMedia({video: true, audio: false});
+      warm.getTracks().forEach(t => t.stop());
+    } catch (err) {
+      log("warm permission probe: " + err.name + " " + err.message);
+    }
+
+    state("enumerating…");
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cameras = devices.filter(d => d.kind === "videoinput");
+    set({devices: cameras.map(d => d.label || "(unlabelled)"), count: cameras.length});
+    log("video inputs: " + out.devices.join(", "));
+    const cam = cameras.find(d => /anycam/i.test(d.label || ""));
+    if (!cam) {
+      fail("AnyCam is not enumerated among " + cameras.length + " video inputs");
+      return;
+    }
+
+    set({found: true, label: cam.label});
+    state("opening " + cam.label + "…");
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {deviceId: {exact: cam.deviceId},
+              width: {ideal: 1280}, height: {ideal: 720}, frameRate: {ideal: 30}},
+      audio: false,
+    });
+    const video = document.createElement("video");
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = true;
+    video.srcObject = stream;
+    await video.play();
+    await new Promise(resolve => setTimeout(resolve, 800));
+
+    const track = stream.getVideoTracks()[0];
+    const settings = track.getSettings();
+    const canvas = document.getElementById("frame");
+    canvas.width = video.videoWidth || 640;
+    canvas.height = video.videoHeight || 360;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    let sum = 0, sum2 = 0, n = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const value = (data[i] + data[i + 1] + data[i + 2]) / 3;
+      sum += value;
+      sum2 += value * value;
+      n += 1;
+    }
+    const mean = sum / n;
+    const std = Math.sqrt(Math.max(0, sum2 / n - mean * mean));
+    window.__frame = canvas.toDataURL("image/png");
+    set({
+      state: "done", width: settings.width, height: settings.height,
+      fps: settings.frameRate, canvas: [canvas.width, canvas.height],
+      mean: Math.round(mean * 10) / 10, std: Math.round(std * 10) / 10,
+      track: track.label,
+    });
+    state("ANYCAM " + settings.width + "×" + settings.height + " @" + settings.frameRate);
+    detail(cam.label + " · mean=" + mean.toFixed(1) + " std=" + std.toFixed(1));
+    document.body.style.background = "#113322";
+    log("selected: " + cam.label + " " + settings.width + "x" + settings.height +
+        "@" + settings.frameRate);
+    stream.getTracks().forEach(t => t.stop());
+  } catch (err) {
+    fail(err.name + ": " + err.message);
+  }
+})();
+</script>
+</body>
+</html>

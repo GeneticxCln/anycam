@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anycam"
+version = "0.1.0"
+description = "AnyCam - Linux-native virtual camera studio"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "AnyCam" }]
+dependencies = [
+  "numpy>=1.26",
+  "Pillow>=10",
+  "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-timeout>=2"]
+# Powers the bundled YuNet face overlay; install with `pip install -e '.[face]'`.
+face = ["onnxruntime>=1.16"]
+
+[project.scripts]
+anycam = "anycam.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.setuptools.package-data]
+anycam = ["ui/*.qss", "assets/*.png", "assets/models/*.onnx"]

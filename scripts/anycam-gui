@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Launch the AnyCam GUI. Uses the project venv when present.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+if [ -x .venv/bin/anycam ]; then
+  exec .venv/bin/anycam gui "$@"
+fi
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m anycam gui "$@"

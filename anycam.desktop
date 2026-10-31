@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=AnyCam
+GenericName=Virtual Camera Studio
+Comment=Linux-native camera, screen and scene compositor with a virtual camera output
+Exec=anycam gui
+TryExec=anycam
+Icon=anycam
+Terminal=false
+Categories=AudioVideo;Video;Recorder;Player;
+Keywords=camera;webcam;virtual;stream;record;compositor;
+StartupWMClass=AnyCam
+StartupNotify=true
