@@ -72,6 +72,7 @@ capture source pool). Evidence paths name the private archive
 | Requirement | Status | Implementation | Evidence / gap |
 |---|---|---|---|
 | H.264 MP4, correct resolution/frame rate | **verified** | `x264enc → h264parse → mp4mux`, explicit EOS finalisation, I420 caps | `evidence/01_camera/composite.mp4`: 1920×1080, 60/1, 611 frames, 10.18 s |
+| Continuous MP4 across canvas rebuilds | **verified** | A session-owned `Recorder` keeps `mp4mux`/filesink alive while engines attach and detach encoded taps; encoder PTS resets are remapped onto the session timeline. | `tests/test_recorder.py::test_two_engines_write_one_continuous_file`, `tests/test_gui.py::test_layer_edit_while_recording_keeps_one_continuous_file` |
 | Audio + video synchronised | **verified** | AAC branch built when `--audio` is used; SystemClock; 5 s record buffer | `evidence/04_audio/av.mp4`, `verify.json` (av_sync true, 0.078 s) |
 | 10-min 1080p60 soak | **pass on drops/memory/stalls** (2026-10-31 synthetic re-run; vcam blocked) | `soak.py` + `scripts/soak.sh`. 600.15 s, 36,009 frames at 60.0 fps, 0.0% preview/recorded drops; RSS 188.7 → 189.0 MiB (0.043 MiB/min, settled 0.038), 12 → 12 FDs, no stalls; finalised 600.15 s MP4 with 36,009 packets. `acceptance.overall=blocked` only because `/dev/video10` was absent (v4l2loopback not loaded). | `evidence/soak_10m/report.json` |
 
@@ -127,4 +128,4 @@ sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
 | Wayland portal capture, no niri-only API | **verified** (spike) | `xdg-desktop-portal` ScreenCast + PipeWire |
 | Reversible system changes | **verified** | Only `modprobe v4l2loopback`; `scripts/disable-v4l2loopback.sh`; documented |
 | Reproducible build/run docs | **verified** | `README.md`, `scripts/setup.sh` |
-| Runnable automated tests | **verified** | `./scripts/test.sh` (132 passed, 1 hardware-gated multicam skip; 133 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |
+| Runnable automated tests | **verified** | `./scripts/test.sh` (134 passed, 1 hardware-gated multicam skip; 135 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |

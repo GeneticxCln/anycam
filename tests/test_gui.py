@@ -354,7 +354,7 @@ def test_opacity_and_layer_order_controls(app):
         app.processEvents()
 
 
-def test_layer_edit_while_recording_finalises_both_segments(app, tmp_path, monkeypatch):
+def test_layer_edit_while_recording_keeps_one_continuous_file(app, tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_VIDEOS_DIR", str(tmp_path))
     from PIL import Image
 
@@ -394,22 +394,20 @@ def test_layer_edit_while_recording_finalises_both_segments(app, tmp_path, monke
         _pump(app, 1.2)
         window.close()
         app.processEvents()
-        segments = [Path(path) for path in window.recording_segments]
-        # Two rebuilds split the recording: opening the crop editor (which
-        # builds the layer uncropped so its window matches the picture) and
-        # committing the crop edit.  Live edits above must not add segments.
-        assert len(segments) == 3, segments
-        for path in segments:
-            assert path.exists() and path.stat().st_size > 0
-            if shutil.which("ffprobe"):
-                probe = subprocess.run(
-                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                     "-of", "csv=p=0", str(path)],
-                    capture_output=True, text=True,
-                )
-                assert probe.returncode == 0, probe.stderr
-                # The middle segment is as short as the edit that caused it.
-                assert float(probe.stdout.strip()) > 0.05
+        files = [Path(path) for path in window.recording_segments]
+        # The crop editor and the crop commit both rebuild the canvas.  The
+        # recorder must keep the same file across both rebuilds.
+        assert len(files) == 1, files
+        path = files[0]
+        assert path.exists() and path.stat().st_size > 0
+        if shutil.which("ffprobe"):
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True,
+            )
+            assert probe.returncode == 0, probe.stderr
+            assert float(probe.stdout.strip()) > 1.5, probe.stdout
     finally:
         window.close()
         app.processEvents()

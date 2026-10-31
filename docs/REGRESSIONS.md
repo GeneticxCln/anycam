@@ -432,7 +432,7 @@ step-ups; a real leak of one 1080p frame per minute still fails
 (`tests/test_soak_memory.py`). A fresh 10-minute run is still required.
 
 Verification: `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest tests -q`
-→ 133 collected, 132 passed, 1 hardware-gated multicam skip.
+→ 135 collected, 134 passed, 1 hardware-gated multicam skip.
 `tests/test_source_pool.py` covers sharing, real pixels through the pool, a dead
 capture, and release on stop.
 
@@ -468,3 +468,24 @@ that is already stuck still needs a USB reset or a reboot; physical
 cable-pull verification is still pending. `tests/test_camera_identity.py`
 covers by-id resolution, and `test_camera_reconnect_retries_with_backoff_when_restart_fails`
 covers the retry behaviour.
+
+## 2026-10-31 — persistent recorder (one MP4 across rebuilds)
+
+Recording moved out of the canvas graph into `anycam.engine.outputs.recorder`.
+One `Recorder` owns `mp4mux` and the file sink for the whole recording session;
+`AnyCamEngine` attaches an encoded H.264/AAC appsink tap, and a canvas rebuild
+destroys only that tap, not the MP4. The GUI no longer mints `-segN.mp4` files:
+`_start_recorder()` opens one path, `_finish_recorder()` finalises it, and every
+`restart_engine()` reuses the same recorder.
+
+The new engine's encoder restarts PTS at zero. The recorder detects the
+backward jump and offsets each stream onto the session timeline, so mp4mux sees
+one monotonic stream. The audio pad is requested at session start (requesting it
+after video data was rejected by mp4mux) and the video/audio samples carry their
+own caps.
+
+Verification: `tests/test_recorder.py::test_two_engines_write_one_continuous_file`
+(one playable file over two engines), `test_recorder_muxes_audio_and_video`
+(real H.264 + AAC), and the GUI crop-edit test (two rebuilds, exactly one MP4).
+The virtual-camera consumer is still restarted with the canvas, and the
+five-scene-switch soak remains.

@@ -18,6 +18,7 @@ from gi.repository import Gst  # noqa: E402
 from . import config, overlay
 from .geometry import box_pixels, clamp
 from .model import Layer, Project, Scene
+from .engine.outputs.recorder import Recorder
 from .pool import CAPTURE_KINDS, CaptureSpec, SourcePool, capture_spec
 from .sources import (SourceChain, build_chain, caps_filter, caps_string,
                       image_chain, layer_tail, make)
@@ -98,6 +99,7 @@ class AnyCamEngine:
         *,
         scene: Scene | None = None,
         record_path: str | os.PathLike | None = None,
+        recorder: Recorder | None = None,
         vcam: bool = False,
         preview: bool = False,
         audio: bool = False,
@@ -129,7 +131,11 @@ class AnyCamEngine:
         self.canvas_w = int(project.output.canvas_w)
         self.canvas_h = int(project.output.canvas_h)
         self.fps = int(project.output.fps)
-        self.record_path = str(record_path) if record_path else ""
+        self.recorder = recorder
+        if recorder is not None:
+            self.record_path = str(recorder.path)
+        else:
+            self.record_path = str(record_path) if record_path else ""
         self.want_vcam = vcam
         self.preview = preview
         self.audio = audio
@@ -421,7 +427,9 @@ class AnyCamEngine:
             self._build_audio()
         if self.want_vcam:
             self._build_vcam()
-        if self.record_path:
+        if self.recorder is not None:
+            self._build_recorder_tap()
+        elif self.record_path:
             self._build_recording()
         # Publishing is explicit: a URL saved in the project must never start
         # streaming just because preview was opened.
@@ -651,6 +659,62 @@ class AnyCamEngine:
         self._link([self.audio_mixer, aconv, aenc, aparse, tee])
         self.audio_tee = tee
         return tee
+
+    def _build_recorder_tap(self) -> None:
+        """Feed encoded samples to the persistent recorder.
+
+        The recorder owns mp4mux and the file for the whole session, so this
+        branch can be destroyed and recreated with the canvas without
+        finalising the MP4.
+        """
+        if self.recorder is None:
+            return
+        queue = self._branch("record")
+        queue.set_property("leaky", 2)
+        convert = make("videoconvert")
+        i420 = caps_filter("video/x-raw,format=I420", "record_raw")
+        encoder = os.environ.get("ANYCAM_ENCODER", "auto").lower()
+        if encoder in ("nv", "nvh264", "nvenc") and Gst.ElementFactory.find("nvh264enc"):
+            enc = make("nvh264enc", "record_encoder", bitrate=12000,
+                       zerolatency=True, preset="p4")
+            self.report.encoder = "nvh264enc"
+        else:
+            enc = make("x264enc", "record_encoder", speed_preset="veryfast",
+                       tune="zerolatency", bitrate=12000, key_int_max=60)
+            self.report.encoder = "x264enc"
+        parse = make("h264parse")
+        sink = make("appsink", "record_tap_sink", emit_signals=True,
+                    max_buffers=4, drop=True, sync=False)
+        self._add(convert, i420, enc, parse, sink)
+        self._link([queue, convert, i420, enc, parse, sink])
+        sink.connect("new-sample", self._on_record_sample)
+
+        tee = self._audio_tee()
+        if tee is not None:
+            audio_queue = make("queue", "record_audio_queue",
+                               max_size_buffers=8, max_size_time=1 * Gst.SECOND)
+            audio_queue.set_property("leaky", 2)
+            audio_sink = make("appsink", "record_audio_sink", emit_signals=True,
+                              max_buffers=4, drop=True, sync=False)
+            self._add(audio_queue, audio_sink)
+            self._link([audio_queue, audio_sink])
+            tpad = tee.request_pad_simple("src_%u")
+            if (tpad is None or
+                    tpad.link(audio_queue.get_static_pad("sink")) != Gst.PadLinkReturn.OK):
+                raise RuntimeError("could not tap shared audio for recording")
+            audio_sink.connect("new-sample", self._on_record_audio_sample)
+
+    def _on_record_sample(self, sink):
+        sample = sink.emit("pull-sample")
+        if sample is not None and self.recorder is not None:
+            self.recorder.push_video(sample)
+        return Gst.FlowReturn.OK
+
+    def _on_record_audio_sample(self, sink):
+        sample = sink.emit("pull-sample")
+        if sample is not None and self.recorder is not None:
+            self.recorder.push_audio(sample)
+        return Gst.FlowReturn.OK
 
     def _build_recording(self) -> None:
         queue = self._branch("record")
@@ -1047,7 +1111,7 @@ class AnyCamEngine:
         self.report.dropped_frames = max(0.0, self.report.expected_frames - stop_frames)
         self.report.dropped_pct = 100.0 * self.report.dropped_frames / max(self.report.expected_frames, 1.0)
         finalised = self._eos_seen and not self._error_seen
-        if self.record_path:
+        if self.recorder is None and self.record_path:
             path = Path(self.record_path)
             if path.exists():
                 self.report.record_path = self.record_path

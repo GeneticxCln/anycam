@@ -27,6 +27,7 @@ from . import config, overlay, portal
 from .geometry import clamp
 from .model import (Effects, Layer, Project, Scene, camera_grid_scene,
                     default_project, new_id, two_camera_scene)
+from .engine.outputs.recorder import Recorder
 from .pipeline import AnyCamEngine
 from .pool import SourcePool
 
@@ -865,6 +866,8 @@ class AnyCamWindow(QMainWindow):
         # lifetime and engines acquire/release their sources against it.
         self._source_pool = SourcePool()
         self.recording = False
+        self._recorder: Recorder | None = None
+        self._recording_path = ""
         self.vcam_on = False
         # Streaming is a separate action: preview must never publish a saved URL.
         self.live = False
@@ -2980,17 +2983,45 @@ class AnyCamWindow(QMainWindow):
 
     # --------------------------------------------------------------- engine
     def _record_path(self) -> Path:
-        """Name the next recording segment.
-
-        A graph rebuild (scene switch, effects apply) cannot continue an MP4
-        that mp4mux has already finalised, so each rebuild gets its own segment
-        with millisecond precision and a shared session prefix.
-        """
+        """Path for the current recording session (one file, no segments)."""
+        if self._recording_path:
+            return Path(self._recording_path)
         stamp = self._session_stamp or overlay.timestamped_name("anycam", "")
-        self._segment_index += 1
-        suffix = "" if self._segment_index == 1 else f"-seg{self._segment_index}"
-        # record_dir was saved but never read; the project setting now applies.
-        return config.recordings_dir(self.project.output.record_dir) / f"{stamp}{suffix}.mp4"
+        self._session_stamp = stamp
+        path = config.recordings_dir(self.project.output.record_dir) / f"{stamp}.mp4"
+        self._recording_path = str(path)
+        return path
+
+    def _start_recorder(self) -> bool:
+        if self._recorder is not None:
+            return True
+        path = self._record_path()
+        recorder = Recorder()
+        audio = self.audio_on or bool(self.project.audio.media_file)
+        if not recorder.start(str(path), self.project.output.canvas_w,
+                              self.project.output.canvas_h, self.project.output.fps,
+                              audio=audio):
+            self._status(f"Recording could not start: {recorder.error}")
+            return False
+        self._recorder = recorder
+        self._recording_path = str(path)
+        return True
+
+    def _finish_recorder(self) -> None:
+        recorder = self._recorder
+        if recorder is None:
+            return
+        self._recorder = None
+        report = recorder.stop()
+        self._recording_path = ""
+        path = str(report.get("path") or "")
+        if report.get("ok") and path:
+            if path not in self.recording_segments:
+                self.recording_segments.append(path)
+            self._status(f"Saved {path}")
+        else:
+            self._status(
+                f"Recording failed: {report.get('error') or 'no frames'}")
 
     def start_engine(self) -> None:
         if self.engine is not None:
@@ -3017,7 +3048,11 @@ class AnyCamWindow(QMainWindow):
                 layer = self.scene.layer(layer_id)
                 if layer is not None:
                     layer.visible = position == self.playlist_index
-        record = self._record_path() if self.recording else None
+        if self.recording and not self._start_recorder():
+            self.recording = False
+            self.record_button.setText("Record")
+            return
+        recorder = self._recorder
         # In crop mode the selected layer is built uncropped, so the editor's
         # window is drawn over the picture it is actually trimming.
         crop_preview = self.preview.selected_id if self.preview.edit_mode == "crop" else ""
@@ -3025,7 +3060,7 @@ class AnyCamWindow(QMainWindow):
         try:
             self.engine = AnyCamEngine(
                 self.project,
-                record_path=record,
+                recorder=recorder,
                 vcam=self.vcam_on,
                 preview=True,
                 audio=self.audio_on or bool(self.project.audio.media_file),
@@ -3100,6 +3135,7 @@ class AnyCamWindow(QMainWindow):
         self.preview.cancel_pending_edits()
         if self.engine is not None:
             self.stop_engine()
+        self._finish_recorder()
         self._source_pool.stop()
         self._save_if_needed()
         self._close_screen_sessions()
@@ -3114,6 +3150,7 @@ class AnyCamWindow(QMainWindow):
         self.preview.cancel_pending_edits()
         if self.engine is not None:
             self.stop_engine()
+        self._finish_recorder()
         self._source_pool.stop()
         self._save_if_needed()
         self._close_screen_sessions()
@@ -3131,22 +3168,21 @@ class AnyCamWindow(QMainWindow):
             self.record_button.setText("Record")
             if self.engine is not None:
                 self.restart_engine()
-            count = len(self.recording_segments)
-            self._segment_index = 0
-            self.recording_segments = []
-            if count > 1:
-                self._status(f"Recording stopped: {count} playable segments saved")
+            self._finish_recorder()
             return
         self.recording = True
         self._segment_index = 0
         self.recording_segments = []
         self._session_stamp = overlay.timestamped_name("anycam", "")
+        self._recording_path = ""
         self.record_button.setText("Stop recording")
         if self.engine is not None:
             self.restart_engine()
+        elif not self._start_recorder():
+            self.recording = False
+            self.record_button.setText("Record")
         else:
-            self._status("Recording will start in "
-                         f"{config.recordings_dir(self.project.output.record_dir)}")
+            self._status(f"Recording to {self._recording_path}")
 
     def toggle_vcam(self) -> None:
         self.vcam_on = not self.vcam_on
