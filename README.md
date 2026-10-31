@@ -41,8 +41,9 @@ The GUI screenshot that used to be embedded here is in that archive too
 | Local RTSP network source | PASS, ffmpeg RTP → local RTSP server → `uridecodebin` → compositor | `evidence/08_rtsp/pytest.txt`, `junit.xml` |
 | Two-camera composite (real + synthetic v4l2loopback) | PASS, 119 composited frames; both camera chains delivered 119 buffers | `evidence/10_multicam/report.json`, `junit.xml` |
 | Camera modes, grid preset, placeholders and reconnect | PASS (offscreen; placeholder graph and reconnect timer exercised) | `evidence/11_camera_controls/`, `docs/EVIDENCE.md` §4.10 |
-| 10-min 1080p60 soak (preview + recording) | PASS, 0.0% recorded drops, 0.032 MiB/min RSS | `evidence/soak_10m/report.json` |
-| Automated tests | PASS, 111 passed + 1 hardware-gated multicam test | `./scripts/test.sh`; `docs/EVIDENCE.md` §2, §4.10 |
+| 10-min 1080p60 soak (preview + recording) | PASS on drops (0.003% preview, 0.0% recorded over 600.23 s), FAIL on memory (2.38 MiB/min RSS) | `~/anycam-private-evidence/evidence/soak_10m/report.json` |
+| Output isolation (M1 slice 1) | PASS, an RTMP server that stops reading cannot stall preview, recording or the virtual camera | `tests/test_m1_outputs.py::test_unresponsive_rtmp_cannot_stall_the_canvas` |
+| Automated tests | PASS, 114 passed + 1 hardware-gated multicam test | `./scripts/test.sh`; `docs/EVIDENCE.md` §2, §4.10 |
 | V4L2 virtual camera | PASS — 720 frames in 12 s, and a `v4l2src` consumer read 60/60 buffers at 1920×1080 YUYV | `evidence/02_virtual_camera/report.json`, `consumer.txt`, `format.txt` |
 
 ## Output mode: 1920×1080@60 (MJPG)
@@ -345,7 +346,7 @@ and a new segment starts (the status bar reports the segment count).
 
 ```bash
 ./scripts/test.sh
-# 111 passed, 1 skipped (hardware-gated multicam)
+# 114 passed, 1 skipped (hardware-gated multicam)
 ```
 
 Covers geometry, model/JSON round-trips (including audio mixing fields, editor

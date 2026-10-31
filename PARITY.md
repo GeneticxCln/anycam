@@ -13,7 +13,8 @@ Status legend:
 * **blocked** — implementation exists but a platform/permission limit prevents
   verification.
 
-Last updated: 2026-10-31 (audit M0). Evidence paths name the private archive
+Last updated: 2026-10-31 (audit M0, plus M1 slice 1: RTMP moved behind its own
+pipeline and the crop editor rebuilt on the uncropped picture). Evidence paths name the private archive
 `~/anycam-private-evidence/evidence/` after the M0 move.
 
 ## 1. Video sources
@@ -36,7 +37,7 @@ Last updated: 2026-10-31 (audit M0). Evidence paths name the private archive
 | Requirement | Status | Implementation | Evidence / gap |
 |---|---|---|---|
 | Layered position/scale | **verified** | GStreamer `compositor`, normalised `Layer.box`, per-pad xpos/ypos/width/height/zorder | Three independently positioned overlay layers in `evidence/00_skeleton/composite.png` |
-| Crop | **verified** (M0) | `geometry.crop_pixels` + `videocrop`; the crop is a fraction of the **source** (camera mode size, image pixels, probed video size, portal stream size) rather than of the layer box | `tests/test_audit_regressions.py::test_crop_is_a_fraction_of_the_source_image` (real pixels). Network streams use the canvas size as a proxy until the stream is probed |
+| Crop | **verified** (M0) | `geometry.crop_pixels` + `videocrop`; the crop is a fraction of the **source** (camera mode size, image pixels, probed video size, portal stream size) rather than of the layer box. Crop mode builds the selected layer with its crop suppressed (`preview_crop_layer`), so the editor draws its window over the source picture it edits and drags track the pointer | `tests/test_audit_regressions.py::test_crop_is_a_fraction_of_the_source_image`, `::test_preview_crop_layer_shows_the_uncropped_picture` and `::test_crop_editor_window_follows_the_picture` (real pixels). Network streams use the canvas size as a proxy until the stream is probed |
 | Picture-in-picture | **verified** | Layer boxes + playlist PiP (0.34×0.30, bottom-right) | `evidence/03_playlist/rotate_01.png` |
 | Interactive layer transform | **verified** (offscreen) | Preview drag maps to normalised `Layer.box`; corner/edge handles resize; Crop mode pans and trims `Layer.crop`; arrow-key nudging; numeric X/Y/W/H and L/T/R/B fields; Ctrl/Shift-click multi-select and group X/Y moves; configurable alignment snapping to canvas/layer edges with spacing labels; Ctrl+Alt+arrows align selections to canvas edges/centres; move/resize updates the live compositor pad (`pipeline.set_layer_box`) | `tests/test_gui.py` drives real mouse/key events offscreen (move, resize, crop trim/pan/reset, nudge, numeric fields, multi-select group move, snap toggle/tolerance, snap/spacing guides, alignment shortcuts); `tests/test_pipeline.py` checks pad xpos/ypos/width/height |
 | Per-layer opacity and stacking | **verified** (offscreen) | Opacity slider writes `Layer.alpha` through `pipeline.set_layer_alpha` (all selected layers); Raise/Lower/Top/Bottom normalise `Layer.z` and call `pipeline.refresh_layer_order`; neither rebuilds the graph | `tests/test_gui.py` slider and order buttons; `tests/test_pipeline.py` checks live pad alpha and zorder |
@@ -71,13 +72,13 @@ Last updated: 2026-10-31 (audit M0). Evidence paths name the private archive
 |---|---|---|---|
 | H.264 MP4, correct resolution/frame rate | **verified** | `x264enc → h264parse → mp4mux`, explicit EOS finalisation, I420 caps | `evidence/01_camera/composite.mp4`: 1920×1080, 60/1, 611 frames, 10.18 s |
 | Audio + video synchronised | **verified** | AAC branch built when `--audio` is used; SystemClock; 5 s record buffer | `evidence/04_audio/av.mp4`, `verify.json` (av_sync true, 0.078 s) |
-| 10-min 1080p60 soak | **verified** (2026-10-30 run; not re-run in M0) | `soak.py` + `scripts/soak.sh`. M0 changed the recorder to fragmented MP4, so the next soak must be re-baselined before this row is quoted again | `evidence/soak_10m/report.json` (archived): 36011 frames, 60.0 fps, 0.0% recorded drops, 0.032 MiB/min RSS |
+| 10-min 1080p60 soak | **partial** (2026-10-31 re-baseline) | `soak.py` + `scripts/soak.sh`. 36002 preview frames at 59.998 fps (0.003% dropped) and a 600.23 s fragmented MP4 with 36014 packets (60.0 fps, 859 MB). RSS grew 202.6 → 226.3 MiB (**2.38 MiB/min** after a 120 s warm-up), so the old flat-memory claim no longer holds and is an M1 soak gate. The virtual camera was not exercised in this run (v4l2loopback not loaded). | `~/anycam-private-evidence/evidence/soak_10m/report.json`, `soak.mp4` |
 
 ## 6. RTMP / RTMPS
 
 | Requirement | Status | Implementation | Evidence / gap |
 |---|---|---|---|
-| Publish to user-supplied RTMP/RTMPS URL | **verified** | `flvmux` + `rtmpsink`, video + AAC audio, I420 H.264 High | `evidence/05_rtmp/received.flv`: 1280×720, H.264 High yuv420p + AAC, 8.23 s |
+| Publish to user-supplied RTMP/RTMPS URL | **verified** | `flvmux` + `rtmpsink`, video + AAC audio, I420 H.264 High. Since M1 slice 1 the publish branch lives in its own `anycam-rtmp` pipeline fed by `appsrc` samples, so a stalled server cannot reach the canvas tee; it is reported as `rtmp_error` | `evidence/05_rtmp/received.flv`: 1280×720, H.264 High yuv420p + AAC, 8.23 s. `tests/test_m1_outputs.py::test_unresponsive_rtmp_cannot_stall_the_canvas` keeps preview and recording alive with a black-hole server |
 
 ## 7. Playlists and shortcuts
 
@@ -113,7 +114,7 @@ sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
 
 | Requirement | Status | Evidence / gap |
 |---|---|---|
-| 10 min 1080p60, preview + recording, <1% drops, no monotonic memory growth | **verified** | `evidence/soak_10m/report.json`: 600.18 s, 36011 frames, 60.0 fps, 0.0% recorded drops, preview 0.007%, RSS slope 0.032 MiB/min (307.4 → 307.6 MiB). The virtual-camera branch was re-verified after the 2026-10-30 fix (`evidence/02_virtual_camera/report.json`). |
+| 10 min 1080p60, preview + recording, <1% drops, no monotonic memory growth | **partial** (re-baselined 2026-10-31) | `~/anycam-private-evidence/evidence/soak_10m/report.json`: 600.23 s, 36002 preview frames at 59.998 fps (0.003% dropped), 36014 recorded packets at 60.0 fps (0.0% dropped), `MJPG 1920x1080@60`. **Memory fails**: RSS 202.6 → 226.3 MiB after a 120 s warm-up, slope 2.38 MiB/min against the 1.0 gate; this is the open M1 soak item. The old 0.032 MiB/min figure came from the faststart recorder and no longer applies. The virtual camera was not exercised in this run (v4l2loopback not loaded). |
 
 ## Cross-cutting requirements
 
@@ -124,4 +125,4 @@ sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
 | Wayland portal capture, no niri-only API | **verified** (spike) | `xdg-desktop-portal` ScreenCast + PipeWire |
 | Reversible system changes | **verified** | Only `modprobe v4l2loopback`; `scripts/disable-v4l2loopback.sh`; documented |
 | Reproducible build/run docs | **verified** | `README.md`, `scripts/setup.sh` |
-| Runnable automated tests | **verified** | `docs/EVIDENCE.md` §2 and §4.10 (87 passed, 1 hardware-gated multicam skip; 88 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |
+| Runnable automated tests | **verified** | `./scripts/test.sh` (114 passed, 1 hardware-gated multicam skip; 115 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |

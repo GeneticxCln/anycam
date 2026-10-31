@@ -224,6 +224,9 @@ class SourceChain:
     tail: Gst.Element | None = None
     pause_elements: list[Gst.Element] = field(default_factory=list)
     dynamic_from: Gst.Element | None = None
+    # Negotiated source size before the box fit: the crop editor and the
+    # normalised crop both need to know what "100%" means for this layer.
+    source_size: tuple[int, int] | None = None
 
     def add(self, *elements: Gst.Element) -> None:
         self.elements.extend(elements)
@@ -373,6 +376,7 @@ def camera_chain(device: str, width: int, height: int, fps: int, layer=None,
     chain.camera_mode = mode
     chain.capture_request = (cap_w, cap_h, cap_fps)
     chain.camera_probe_error = camera_probe_error(device)
+    chain.source_size = (mode.width, mode.height)
     return chain
 
 
@@ -458,6 +462,7 @@ def image_chain(path: str, width: int, height: int, fps: int, layer=None,
     if effects:
         chain.add(*effects, make("videoconvert"))
     _finish_chain(chain, width, height, fps)
+    chain.source_size = (width, height)
     return chain
 
 
@@ -477,6 +482,7 @@ def file_video_chain(path: str, width: int, height: int, fps: int, layer=None) -
     _fit_letterbox(chain, cropped_w, cropped_h, width, height)
     _finish_chain(chain, width, height, fps)
     chain.dynamic_from = decode
+    chain.source_size = (source_w, source_h)
     return chain
 
 
@@ -498,6 +504,7 @@ def network_chain(uri: str, width: int, height: int, fps: int, layer=None,
     _finish_chain(chain, width, height, fps)
     chain.dynamic_from = decode
     chain.pause_elements.append(decode)
+    chain.source_size = (source_w, source_h)
     return chain
 
 
@@ -532,6 +539,7 @@ def screen_chain(node_id: int, width: int, height: int, fps: int, layer=None,
     _fit_letterbox(chain, cropped_w, cropped_h, width, height)
     _finish_chain(chain, width, height, fps)
     chain.pause_elements.append(src)
+    chain.source_size = (source_w, source_h)
     return chain
 
 
@@ -563,6 +571,7 @@ def test_chain(width: int, height: int, fps: int, layer=None) -> SourceChain:
     _fit_letterbox(chain, cropped_w, cropped_h, width, height)
     _finish_chain(chain, width, height, fps)
     chain.pause_elements.append(src)
+    chain.source_size = (width, height)
     return chain
 
 

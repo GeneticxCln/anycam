@@ -280,6 +280,25 @@ def prepare_rgba(source: Path, width: int, height: int,
     return out
 
 
+def image_size(layer) -> tuple[int, int] | None:
+    """Natural, EXIF-corrected pixel size of an image/logo layer's source.
+
+    The crop editor needs this to draw its window over the visible picture
+    rather than over the layer box (which may include letterbox bands).
+    """
+    if getattr(layer, "kind", "") not in ("logo", "image"):
+        return None
+    source = Path(getattr(layer, "source", "") or "").expanduser()
+    if not source.exists():
+        return None
+    try:
+        with Image.open(source) as opened:
+            width, height = ImageOps.exif_transpose(opened).size
+        return (int(width), int(height))
+    except (OSError, ValueError):
+        return None
+
+
 def layer_pixels(layer, canvas_w: int, canvas_h: int) -> tuple[int, int, int, int]:
     from .geometry import clamp
 
@@ -292,8 +311,13 @@ def layer_pixels(layer, canvas_w: int, canvas_h: int) -> tuple[int, int, int, in
     )
 
 
-def render_layer(layer, canvas_w: int, canvas_h: int) -> Path:
-    """Return an RGBA PNG for a text or logo layer."""
+def render_layer(layer, canvas_w: int, canvas_h: int,
+                 crop: tuple[float, float, float, float] | None = None) -> Path:
+    """Return an RGBA PNG for a text or logo layer.
+
+    ``crop`` overrides the layer's own insets; the crop editor passes zeros so
+    the preview can show the uncropped picture while the model keeps the crop.
+    """
     x, y, w, h = layer_pixels(layer, canvas_w, canvas_h)
     if layer.kind == "text":
         return render_text_png(
@@ -308,7 +332,8 @@ def render_layer(layer, canvas_w: int, canvas_h: int) -> Path:
         source = Path(layer.source).expanduser()
         if not source.exists():
             raise FileNotFoundError(f"overlay asset not found: {source}")
-        return prepare_rgba(source, w, h, getattr(layer, "crop", (0.0, 0.0, 0.0, 0.0)))
+        source_crop = getattr(layer, "crop", (0.0, 0.0, 0.0, 0.0)) if crop is None else crop
+        return prepare_rgba(source, w, h, source_crop)
     raise ValueError(f"layer {layer.kind} is not an overlay")
 
 

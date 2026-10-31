@@ -348,7 +348,45 @@ Fixed:
 
 Still open from M0:
 
-* **B31** The crop editor still draws over the already-cropped preview; a
-  proper fix needs an uncropped preview path.
 * B1's live verification on a real portal session (needs the desktop's
   chooser; the code path and size check are covered by tests).
+
+B31 was closed on 2026-10-31; see the section below.
+
+## 2026-10-31 — B31 (crop editor) and M1 slice 1 (output pipelines)
+
+**B31 — the crop window is drawn over the picture it edits.** Crop mode now
+builds the selected layer with its crop suppressed (`AnyCamEngine(
+preview_crop_layer=…)`), so the composite shows the whole source while the
+model keeps the real crop. The window is drawn over the layer's *picture*
+(source fitted into the box, from `AnyCamEngine.source_sizes()` /
+`PreviewWidget.picture_rect`), not over the box, and drags track the pointer.
+Overlays (image/logo/text) are pre-rendered, so opening the editor rebuilds the
+graph once; camera/video/network/screen/test layers get the same treatment.
+Tests: `tests/test_audit_regressions.py::test_preview_crop_layer_shows_the_uncropped_picture`
+(pixels, both halves visible while the model crop stays `(0.5,0,0,0)`) and
+`::test_crop_editor_window_follows_the_picture`. Known cost: opening or closing
+crop mode rebuilds the graph, so a recording in progress starts a new segment.
+
+**M1 slice 1 — RTMP output moved into its own pipeline.** The canvas graph now
+ends the RTMP branch at a `h264parse → appsink` (drop, max 1 buffer) plus an AAC
+`appsink` on the shared audio tee; a separate `anycam-rtmp` pipeline pushes those
+samples into `appsrc → flvmux → rtmpsink`. A server that accepts a connection and
+never speaks RTMP can no longer reach the tee, so preview, recording and the
+virtual camera keep running; the failure is reported as `report.rtmp_error` and
+teardown happens off the caller's thread (`stop()` returned in <0.4 s in the
+test). This is the first slice of the M1 split: sources are still built into the
+canvas graph and the controller/health model is not written yet.
+Test: `tests/test_m1_outputs.py::test_unresponsive_rtmp_cannot_stall_the_canvas`.
+
+**Soak re-baseline (2026-10-31, 1920×1080@60, 10 min, fragmented recorder).**
+36002 preview frames at 59.998 fps (0.003% dropped), camera mode
+`MJPG 1920x1080@60`, 859 MB fragmented MP4 with 36014 packets over 600.23 s
+(60.0 fps). Two findings:
+
+* `verify_mp4` reported **100% dropped frames** for the fragmented file because
+  `nb_frames` is absent from a fragmented moov atom; it now falls back to
+  `ffprobe -count_packets`. The recording was healthy all along.
+* RSS grew 202.6 → 226.3 MiB after a 120 s warm-up (**2.38 MiB/min**, gate is
+  1.0). The previous 0.032 MiB/min figure came from the faststart recorder and is
+  no longer valid. This is now the blocking M1 soak item.

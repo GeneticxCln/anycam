@@ -135,6 +135,9 @@ class PreviewWidget(QWidget):
         self.selected_id = ""
         self.selected_ids: list[str] = []
         self.edit_mode = "move"          # move | crop
+        # Source size per layer, so the crop window can follow the picture
+        # inside the box instead of the box (which may contain bars).
+        self.layer_sizes: dict[str, tuple[int, int]] = {}
         self._drag: dict | None = None
         self._guides: list[tuple[str, float]] = []
         self._spacing: list[tuple[str, float, float, float, int]] = []
@@ -258,8 +261,20 @@ class PreviewWidget(QWidget):
                       canvas.y() + y * canvas.height(),
                       w * canvas.width(), h * canvas.height())
 
+    def picture_rect(self, layer: Layer) -> QRectF:
+        """The visible source inside the layer box, excluding letterbox bars."""
+        box = self.box_rect(layer)
+        size = self.layer_sizes.get(layer.id)
+        if box.isEmpty() or not size or size[0] <= 0 or size[1] <= 0:
+            return box
+        scale = min(box.width() / size[0], box.height() / size[1])
+        width, height = size[0] * scale, size[1] * scale
+        return QRectF(box.x() + (box.width() - width) / 2.0,
+                      box.y() + (box.height() - height) / 2.0,
+                      width, height)
+
     def crop_rect(self, layer: Layer) -> QRectF:
-        rect = self.box_rect(layer)
+        rect = self.picture_rect(layer)
         if rect.isEmpty():
             return rect
         left, top, right, bottom = layer.crop
@@ -457,6 +472,13 @@ class PreviewWidget(QWidget):
         dx = x - self._drag["origin"][0]
         dy = y - self._drag["origin"][1]
         mode = self._drag["mode"]
+        if mode in ("crop-move", "crop-resize"):
+            # Crop insets are fractions of the picture, not of the layer box.
+            canvas = self.canvas_rect()
+            picture = self.picture_rect(layer)
+            if not canvas.isEmpty() and picture.width() > 0 and picture.height() > 0:
+                dx *= canvas.width() / picture.width()
+                dy *= canvas.height() / picture.height()
         if mode == "move":
             dx, dy, guides, spacing = self._snap_move(self._drag["group"], dx, dy)
             for layer_id, start in self._drag["group"]:
@@ -688,12 +710,13 @@ class PreviewWidget(QWidget):
                 continue
             active = self.crop_rect(layer) if self.edit_mode == "crop" else box
             if self.edit_mode == "crop" and not active.isEmpty():
+                picture = self.picture_rect(layer)
                 dim = QColor(0, 0, 0, 120)
                 for leftover in (
-                    QRectF(box.left(), box.top(), box.width(), active.top() - box.top()),
-                    QRectF(box.left(), active.bottom(), box.width(), box.bottom() - active.bottom()),
-                    QRectF(box.left(), active.top(), active.left() - box.left(), active.height()),
-                    QRectF(active.right(), active.top(), box.right() - active.right(), active.height()),
+                    QRectF(picture.left(), picture.top(), picture.width(), active.top() - picture.top()),
+                    QRectF(picture.left(), active.bottom(), picture.width(), picture.bottom() - active.bottom()),
+                    QRectF(picture.left(), active.top(), active.left() - picture.left(), active.height()),
+                    QRectF(active.right(), active.top(), picture.right() - active.right(), active.height()),
                 ):
                     if leftover.isValid():
                         painter.fillRect(leftover, dim)
@@ -837,6 +860,8 @@ class AnyCamWindow(QMainWindow):
         self.live = False
         self.audio_on = bool(getattr(self.project.audio, "mic_enabled", False))
         self._screen_error_shown = ""
+        # Layer currently built without its crop because the editor is open.
+        self._crop_preview_layer_id = ""
         self._screen_sessions: dict[str, portal.ScreenSession] = {}
         self._camera_choices: list[tuple[str, str]] = []
         self._face_detector = None
@@ -2345,6 +2370,11 @@ class AnyCamWindow(QMainWindow):
                     item.setSelected(True)
             self.layer_list.blockSignals(False)
             self._syncing_selection = False
+        wanted = layer_id if self.preview.edit_mode == "crop" else ""
+        if wanted != self._crop_preview_layer_id:
+            self._crop_preview_layer_id = wanted
+            if self.engine is not None:
+                self.restart_engine()
         self._sync_transform_fields()
         layer = self.scene.layer(layer_id) if layer_id else None
         if layer is not None:
@@ -2675,6 +2705,11 @@ class AnyCamWindow(QMainWindow):
         self.preview.set_edit_mode(mode)
         self.move_button.setChecked(mode == "move")
         self.crop_button.setChecked(mode == "crop")
+        wanted = self.preview.selected_id if mode == "crop" else ""
+        if wanted != self._crop_preview_layer_id:
+            self._crop_preview_layer_id = wanted
+            if self.engine is not None:
+                self.restart_engine()
         if mode == "crop":
             self.transform_hint.setText(
                 "Drag inside the crop window to pan it; drag an edge or corner "
@@ -2917,6 +2952,10 @@ class AnyCamWindow(QMainWindow):
                 if layer is not None:
                     layer.visible = position == self.playlist_index
         record = self._record_path() if self.recording else None
+        # In crop mode the selected layer is built uncropped, so the editor's
+        # window is drawn over the picture it is actually trimming.
+        crop_preview = self.preview.selected_id if self.preview.edit_mode == "crop" else ""
+        self._crop_preview_layer_id = crop_preview
         try:
             self.engine = AnyCamEngine(
                 self.project,
@@ -2928,10 +2967,12 @@ class AnyCamWindow(QMainWindow):
                 rtmp=self.project.output.rtmp_url if self.live else None,
                 screen_fds=self._screen_fds(),
                 screen_sizes=self._screen_sizes(),
+                preview_crop_layer=crop_preview,
                 skip_layers=set(self._lost_cameras),
                 on_frame=self._on_frame,
             ).build()
             self.engine.start()
+            self.preview.layer_sizes = self.engine.source_sizes()
         except Exception as exc:  # noqa: BLE001
             self.engine = None
             message = f"Could not start the pipeline:\n{exc}"
@@ -2974,6 +3015,7 @@ class AnyCamWindow(QMainWindow):
         self.status_chip.setText("STOPPED")
         self.start_button.setText("Start preview")
         self.preview.image = None
+        self.preview.layer_sizes = {}
         self.preview.update()
 
     def restart_engine(self) -> None:

@@ -242,21 +242,27 @@ def test_preview_crop_handles_trim_and_pan_the_source(app):
         window._set_edit_mode("crop")
         _pump(app, 0.05)
         canvas = window.preview.canvas_rect()
+        # Crop insets are fractions of the picture, so a pointer move in canvas
+        # pixels is scaled by how much of the canvas the picture covers: the
+        # window now tracks the pointer instead of lagging behind it (B31).
+        picture = window.preview.picture_rect(layer)
+        factor = canvas.width() / picture.width()
         crop = window.preview.crop_rect(layer)
         left_edge = QPointF(crop.left(), crop.center().y())
         _drag(window.preview, left_edge,
               QPointF(left_edge.x() + canvas.width() * 0.04, left_edge.y()))
-        assert layer.crop[0] == pytest.approx(0.14, abs=0.015)
+        assert layer.crop[0] == pytest.approx(0.1 + 0.04 * factor, abs=0.02)
         assert layer.crop[2] == pytest.approx(0.1, abs=0.005)
+        inset_sum = layer.crop[0] + layer.crop[2]
 
         # Panning the crop window keeps its size and moves both insets.
         crop = window.preview.crop_rect(layer)
         middle = crop.center()
         _drag(window.preview, middle,
               QPointF(middle.x() + canvas.width() * 0.03, middle.y()))
-        assert layer.crop[0] > 0.14
+        assert layer.crop[0] > 0.1 + 0.04 * factor
         assert layer.crop[2] < 0.1
-        assert layer.crop[0] + layer.crop[2] == pytest.approx(0.24, abs=0.01)
+        assert layer.crop[0] + layer.crop[2] == pytest.approx(inset_sum, abs=0.01)
 
         # Dragging past the canvas edge clamps instead of producing a
         # negative far inset.
@@ -264,7 +270,7 @@ def test_preview_crop_handles_trim_and_pan_the_source(app):
         _drag(window.preview, crop.center(),
               QPointF(canvas.right(), crop.center().y()))
         assert layer.crop[2] >= 0.0
-        assert layer.crop[0] + layer.crop[2] == pytest.approx(0.24, abs=0.01)
+        assert layer.crop[0] + layer.crop[2] == pytest.approx(inset_sum, abs=0.01)
 
         window._reset_crop()
         assert layer.crop == (0.0, 0.0, 0.0, 0.0)
@@ -389,7 +395,10 @@ def test_layer_edit_while_recording_finalises_both_segments(app, tmp_path, monke
         window.close()
         app.processEvents()
         segments = [Path(path) for path in window.recording_segments]
-        assert len(segments) == 2, segments
+        # Two rebuilds split the recording: opening the crop editor (which
+        # builds the layer uncropped so its window matches the picture) and
+        # committing the crop edit.  Live edits above must not add segments.
+        assert len(segments) == 3, segments
         for path in segments:
             assert path.exists() and path.stat().st_size > 0
             if shutil.which("ffprobe"):
@@ -399,7 +408,8 @@ def test_layer_edit_while_recording_finalises_both_segments(app, tmp_path, monke
                     capture_output=True, text=True,
                 )
                 assert probe.returncode == 0, probe.stderr
-                assert float(probe.stdout.strip()) > 0.2
+                # The middle segment is as short as the edit that caused it.
+                assert float(probe.stdout.strip()) > 0.05
     finally:
         window.close()
         app.processEvents()

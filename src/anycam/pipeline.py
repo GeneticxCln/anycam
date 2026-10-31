@@ -1,7 +1,9 @@
 """The AnyCam GStreamer engine: sources -> compositor -> preview/vcam/record."""
 from __future__ import annotations
 
+import copy
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +43,7 @@ class EngineReport:
     vcam: str = ""
     vcam_active: bool = False
     screen_error: str = ""
+    rtmp_error: str = ""
     record_path: str = ""
     record_bytes: int = 0
     record_ok: bool = False
@@ -67,6 +70,7 @@ class EngineReport:
             "vcam": self.vcam,
             "vcam_active": self.vcam_active,
             "screen_error": self.screen_error,
+            "rtmp_error": self.rtmp_error,
             "record_path": self.record_path,
             "record_bytes": self.record_bytes,
             "record_ok": self.record_ok,
@@ -97,6 +101,7 @@ class AnyCamEngine:
         screen_node: int | None = None,
         screen_fds: dict[str, int] | None = None,
         screen_sizes: dict[str, tuple[int, int]] | None = None,
+        preview_crop_layer: str = "",
         skip_layers: set[str] | None = None,
         on_frame: Callable | None = None,
     ) -> None:
@@ -107,6 +112,9 @@ class AnyCamEngine:
         # its box and z-order survive; other skipped kinds are left out.  The
         # GUI rebuilds with the real source when the device returns.
         self.skip_layers = set(skip_layers or ())
+        # The crop editor shows this layer uncropped while the model keeps its
+        # real crop, so the window is drawn over the picture it edits.
+        self.preview_crop_layer = preview_crop_layer
         self.canvas_w = int(project.output.canvas_w)
         self.canvas_h = int(project.output.canvas_h)
         self.fps = int(project.output.fps)
@@ -138,6 +146,14 @@ class AnyCamEngine:
         self._vcam_pipeline: Gst.Pipeline | None = None
         self._vcam_appsrc: Gst.Element | None = None
         self._vcam_bus: Gst.Bus | None = None
+        # Streaming lives in its own pipeline (audit M1, slice 1).
+        self._rtmp_pipeline: Gst.Pipeline | None = None
+        self._rtmp_bus: Gst.Bus | None = None
+        self._rtmp_appsrc: Gst.Element | None = None
+        self._rtmp_audio_appsrc: Gst.Element | None = None
+        self._rtmp_failed = False
+        # Source size per layer, for the crop editor's picture rectangle.
+        self.layer_sources: dict[str, tuple[int, int]] = {}
         self._record_sink = None
         self._appsink = None
         self._pending_sample = None
@@ -189,6 +205,8 @@ class AnyCamEngine:
     def _add_layer(self, layer: Layer, zorder: int) -> None:
         assert self.compositor is not None
         box = self._box_pixels(layer)
+        crop = ((0.0, 0.0, 0.0, 0.0) if layer.id == self.preview_crop_layer
+                else layer.crop)
         source_layer = layer
         if layer.kind == "camera" and not layer.source:
             layer.source = config.camera_device()
@@ -211,7 +229,8 @@ class AnyCamEngine:
                 if not png.exists():
                     raise FileNotFoundError(f"face overlay asset not found: {png}")
             else:
-                png = overlay.render_layer(layer, self.canvas_w, self.canvas_h)
+                png = overlay.render_layer(layer, self.canvas_w, self.canvas_h,
+                                           crop=crop)
             # render_layer already applied the layer's crop while rendering,
             # so the chain must not crop the box-sized PNG again.  Effects are
             # carried over: they used to be dropped on image/logo/text layers.
@@ -225,6 +244,9 @@ class AnyCamEngine:
             chain = image_chain(str(png), box[2], box[3], self.fps, source_layer,
                                 fit=False)
         else:
+            if crop != layer.crop:
+                source_layer = copy.copy(layer)
+                source_layer.crop = crop
             chain = build_chain(
                 source_layer, box[2], box[3], self.fps, self.screen_node,
                 screen_fd=self.screen_fds.get(layer.id),
@@ -241,6 +263,11 @@ class AnyCamEngine:
             probe_error = getattr(chain, "camera_probe_error", "")
             if probe_error:
                 self.report.camera_probe_error = probe_error
+        source_size = getattr(chain, "source_size", None)
+        if layer.kind in ("image", "logo"):
+            source_size = overlay.image_size(layer) or source_size
+        self.layer_sources[layer.id] = (tuple(source_size) if source_size
+                                        else (box[2], box[3]))
         self.chains.append(chain)
         self._add(*chain.elements)
         self._link(chain.elements, skip_from=getattr(chain, "dynamic_from", None))
@@ -587,31 +614,150 @@ class AnyCamEngine:
             if tpad is None or apad is None or tpad.link(apad) != Gst.PadLinkReturn.OK:
                 raise RuntimeError("could not link shared audio into mp4mux")
 
+    @staticmethod
+    def _set_leaky(element: Gst.Element) -> None:
+        """Drop old buffers instead of blocking (GstAppLeakyType.DOWNSTREAM=2)."""
+        try:
+            element.set_property("leaky-type", 2)
+        except (TypeError, ValueError):
+            pass
+
     def _build_rtmp(self) -> None:
+        """Encode in the canvas graph, publish in a separate pipeline.
+
+        ``rtmpsink`` blocks its streaming thread while it talks to the
+        server.  In the single graph that back-pressure reached the tee and
+        froze preview, recording and the virtual camera (audit B9/B11).  The
+        appsinks below drop frames instead, so a dead server can only starve
+        its own output pipeline.
+        """
         url = self.rtmp
         if not url:
             return
         queue = self._branch("rtmp")
+        # Downstream leak: the encoder can never push back into the compositor.
+        queue.set_property("leaky", 2)
         convert = make("videoconvert")
         i420 = caps_filter("video/x-raw,format=I420", "rtmp_raw")
-        enc = make("x264enc", "rtmp_encoder", speed_preset="veryfast", tune="zerolatency",
-                   bitrate=6000, key_int_max=60)
-        parse = make("h264parse")
-        mux = make("flvmux", "rtmp_mux", streamable=True)
-        sink = make("rtmpsink", "rtmp_sink", location=url)
-        self._add(convert, i420, enc, parse, mux, sink)
-        self._link([queue, convert, i420, enc, parse])
-        vpad = mux.request_pad_simple("video")
-        if vpad is None or parse.get_static_pad("src").link(vpad) != Gst.PadLinkReturn.OK:
-            raise RuntimeError("could not link video into flvmux")
+        enc = make("x264enc", "rtmp_encoder", speed_preset="veryfast",
+                   tune="zerolatency", bitrate=6000, key_int_max=60)
+        parse = make("h264parse", "rtmp_parse", config_interval=-1)
+        h264 = caps_filter("video/x-h264,stream-format=avc,alignment=au",
+                           "rtmp_h264")
+        video_sink = make("appsink", "rtmp_video_sink", emit_signals=True,
+                          max_buffers=1, drop=True, sync=False)
+        self._add(convert, i420, enc, parse, h264, video_sink)
+        self._link([queue, convert, i420, enc, parse, h264, video_sink])
+        video_sink.connect("new-sample", self._on_rtmp_video_sample)
+
+        audio_sink = None
         tee = self._audio_tee()
         if tee is not None:
+            audio_queue = make("queue", "rtmp_audio_queue",
+                               max_size_buffers=2, max_size_time=100_000_000)
+            audio_queue.set_property("leaky", 2)
+            aac = caps_filter("audio/mpeg,mpegversion=4,stream-format=raw",
+                              "rtmp_aac")
+            audio_sink = make("appsink", "rtmp_audio_sink", emit_signals=True,
+                              max_buffers=2, drop=True, sync=False)
+            self._add(audio_queue, aac, audio_sink)
+            self._link([audio_queue, aac, audio_sink])
             tpad = tee.request_pad_simple("src_%u")
-            apad = mux.request_pad_simple("audio")
-            if tpad is None or apad is None or tpad.link(apad) != Gst.PadLinkReturn.OK:
-                raise RuntimeError("could not link shared audio into flvmux")
-        mux.link(sink)
+            if tpad is None or tpad.link(audio_queue.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+                raise RuntimeError("could not tap shared audio for RTMP")
+            audio_sink.connect("new-sample", self._on_rtmp_audio_sample)
+
+        output = Gst.Pipeline.new("anycam-rtmp")
+        video_src = make("appsrc", "rtmp_video_src", format=Gst.Format.TIME,
+                         is_live=True)
+        video_src.set_property(
+            "caps", Gst.Caps.from_string("video/x-h264,stream-format=avc,alignment=au"))
+        video_src.set_property("max-buffers", 2)
+        video_src.set_property("block", False)
+        self._set_leaky(video_src)
+        mux = make("flvmux", "rtmp_mux", streamable=True)
+        sink = make("rtmpsink", "rtmp_sink", location=url, sync=False)
+        output.add(video_src)
+        output.add(mux)
+        output.add(sink)
+        if not video_src.link(mux):
+            raise RuntimeError("could not link RTMP video into flvmux")
+        self._rtmp_audio_appsrc = None
+        if audio_sink is not None:
+            audio_src = make("appsrc", "rtmp_audio_src", format=Gst.Format.TIME,
+                             is_live=True)
+            audio_src.set_property(
+                "caps", Gst.Caps.from_string("audio/mpeg,mpegversion=4,stream-format=raw"))
+            audio_src.set_property("max-buffers", 2)
+            audio_src.set_property("block", False)
+            self._set_leaky(audio_src)
+            output.add(audio_src)
+            if not audio_src.link(mux):
+                raise RuntimeError("could not link RTMP audio into flvmux")
+            self._rtmp_audio_appsrc = audio_src
+        if not mux.link(sink):
+            raise RuntimeError("could not link flvmux into rtmpsink")
+        self._rtmp_pipeline = output
+        self._rtmp_bus = output.get_bus()
+        self._rtmp_appsrc = video_src
         self.report.rtmp_url = url
+
+    def _on_rtmp_video_sample(self, sink):
+        sample = sink.emit("pull-sample")
+        if sample is not None and self._rtmp_appsrc is not None and not self._rtmp_failed:
+            self._rtmp_appsrc.emit("push-sample", sample)
+        return Gst.FlowReturn.OK
+
+    def _on_rtmp_audio_sample(self, sink):
+        sample = sink.emit("pull-sample")
+        if (sample is not None and self._rtmp_audio_appsrc is not None
+                and not self._rtmp_failed):
+            self._rtmp_audio_appsrc.emit("push-sample", sample)
+        return Gst.FlowReturn.OK
+
+    def _poll_rtmp_bus(self) -> None:
+        if self._rtmp_bus is None:
+            return
+        failed = False
+        while True:
+            msg = self._rtmp_bus.pop_filtered(Gst.MessageType.ERROR)
+            if msg is None:
+                break
+            err, debug = msg.parse_error()
+            self.report.rtmp_error = f"{err.message} ({debug})"
+            failed = True
+        if failed:
+            self._rtmp_failed = True
+            self._teardown_rtmp()
+
+    def _teardown_rtmp(self) -> None:
+        """Stop publishing without letting a stuck socket block the caller."""
+        pipeline = self._rtmp_pipeline
+        if pipeline is None:
+            return
+        self._rtmp_pipeline = None
+        self._rtmp_bus = None
+        self._rtmp_appsrc = None
+        self._rtmp_audio_appsrc = None
+
+        def shutdown() -> None:
+            try:
+                pipeline.send_event(Gst.Event.new_eos())
+            except Exception:
+                pass
+            try:
+                # Can block while rtmpsink is inside a socket call; keep it
+                # off the UI thread until the M1 controller owns outputs.
+                pipeline.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+
+        threading.Thread(target=shutdown, daemon=True,
+                         name="anycam-rtmp-teardown").start()
+
+    def source_sizes(self) -> dict[str, tuple[int, int]]:
+        """Source size per layer id (crop editor picture geometry)."""
+        return dict(self.layer_sources)
 
     def set_layer_visible(self, layer_id: str, visible: bool) -> None:
         """Show/hide an already-built layer without rebuilding the graph."""
@@ -673,6 +819,8 @@ class AnyCamEngine:
         self.pipeline.use_clock(Gst.SystemClock.obtain())
         if self._vcam_pipeline is not None:
             self._vcam_pipeline.set_state(Gst.State.PLAYING)
+        if self._rtmp_pipeline is not None:
+            self._rtmp_pipeline.set_state(Gst.State.PLAYING)
         result = self.pipeline.set_state(Gst.State.PLAYING)
         if result == Gst.StateChangeReturn.FAILURE:
             self.report.error = "pipeline failed to start"
@@ -720,6 +868,7 @@ class AnyCamEngine:
             if time.monotonic() >= deadline:
                 break
         self._poll_vcam_bus()
+        self._poll_rtmp_bus()
         self.deliver_frame()
         return messages
 
@@ -796,6 +945,7 @@ class AnyCamEngine:
             self._vcam_pipeline.send_event(Gst.Event.new_eos())
             self._vcam_pipeline.set_state(Gst.State.NULL)
             self._vcam_bus = None
+        self._teardown_rtmp()
         self.report.frames = stop_frames
         self.report.fps = stop_frames / elapsed if elapsed > 0 else 0.0
         self.report.expected_frames = elapsed * self.fps
@@ -862,6 +1012,32 @@ def ffprobe(path: str) -> dict:
     return {"format": data.get("format", {}), "streams": streams}
 
 
+def _count_packets(path: str) -> int:
+    """Count encoded video packets in a file.
+
+    Fragmented MP4 has no ``nb_frames`` in the moov atom (sample tables live in
+    each fragment), so ffprobe reports 0 and a healthy 10-minute recording was
+    scored as 100% dropped frames.  Packet counting is accurate for both
+    fragmented and faststart files.
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-count_packets", "-show_entries", "stream=nb_read_packets",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=300,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip().rstrip(",")
+        if line.isdigit():
+            return int(line)
+    return 0
+
+
 def verify_mp4(path: str, *, width: int = 1920, height: int = 1080, fps: int = 60,
                min_seconds: float = 1.0) -> tuple[bool, dict]:
     info = ffprobe(path)
@@ -874,12 +1050,15 @@ def verify_mp4(path: str, *, width: int = 1920, height: int = 1080, fps: int = 6
     num, den = (video.get("r_frame_rate") or "0/1").split("/")
     rate = float(num) / float(den or 1)
     frames = int(video.get("nb_frames") or 0)
+    if frames <= 0:
+        frames = _count_packets(path)
     recorded_fps = frames / duration if duration > 0 else 0.0
     ok = (
         video.get("width") == width
         and video.get("height") == height
         and abs(rate - fps) < 0.5
         and duration >= min_seconds
+        and frames > 0
     )
     return ok, {**info, "duration": duration, "rate": rate,
                 "frames": frames, "recorded_fps": round(recorded_fps, 3), "ok": ok}

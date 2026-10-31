@@ -54,7 +54,7 @@ class Frame:
         return max(self.average(*box)) < 24
 
 
-def grab_frame(project, timeout: float = 6.0) -> Frame:
+def grab_frame(project, timeout: float = 6.0, **engine_options) -> Frame:
     """Run ``project`` for at most ``timeout`` seconds and return one frame."""
     frames: list[Frame] = []
 
@@ -72,7 +72,8 @@ def grab_frame(project, timeout: float = 6.0) -> Frame:
             buffer.unmap(info)
         frames.append(Frame(width, height, raw))
 
-    engine = AnyCamEngine(project, preview=True, on_frame=on_frame).build()
+    engine = AnyCamEngine(project, preview=True, on_frame=on_frame,
+                          **engine_options).build()
     engine.start()
     end = time.monotonic() + timeout
     frame = None

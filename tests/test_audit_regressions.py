@@ -457,3 +457,80 @@ def test_fit_contain_is_the_shared_geometry():
     """The compositor and the tests must agree on the fit rule."""
     rect = fit_contain(1920, 1080, 960, 1080)
     assert (rect.x, rect.y, rect.w, rect.h) == (0, 270, 960, 540)
+
+
+# --------------------------------------------------------------------- B31
+def _split_plate(tmp_path):
+    """A 2:1 red|blue plate in a square canvas, cropped to its blue half."""
+    from PIL import Image
+
+    plate = tmp_path / "split.png"
+    image = Image.new("RGB", (200, 100), (255, 0, 0))
+    image.paste((0, 0, 255), (100, 0, 200, 100))
+    image.save(plate)
+    project = make_project(320, 320, 30)
+    layer = Layer("l_split", "image", "Split", source=str(plate),
+                  box=(0.0, 0.0, 1.0, 1.0), crop=(0.5, 0.0, 0.0, 0.0), z=1)
+    _add(project, layer)
+    return project, layer
+
+
+def test_preview_crop_layer_shows_the_uncropped_picture(tmp_path):
+    """B31: crop mode builds the layer uncropped, without touching the model."""
+    from helpers.frames import grab_frame
+
+    project, layer = _split_plate(tmp_path)
+    cropped = grab_frame(project)
+    assert cropped.average(120, 140, 200, 180)[2] > 200
+    assert cropped.average(120, 140, 200, 180)[0] < 30
+
+    edited = grab_frame(project, preview_crop_layer=layer.id)
+    assert edited.average(60, 140, 120, 180)[0] > 200, "red half must be visible"
+    assert edited.average(220, 140, 280, 180)[2] > 200, "blue half must be visible"
+    # The editor preview is a build detail, not a model edit.
+    assert layer.crop == (0.5, 0.0, 0.0, 0.0)
+
+
+def test_crop_editor_window_follows_the_picture(tmp_path, monkeypatch):
+    """B31: the window is drawn over the visible picture, not the box."""
+    pytest.importorskip("PySide6")
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_VIDEOS_DIR", str(tmp_path / "videos"))
+
+    from PySide6.QtWidgets import QApplication
+
+    from anycam.gui import AnyCamWindow
+
+    project, layer = _split_plate(tmp_path)
+    app = QApplication.instance() or QApplication([])
+    window = AnyCamWindow(project)
+    window.resize(640, 480)
+    window.show()
+    try:
+        window.preview.select_layer(layer.id)
+        window._set_edit_mode("crop")
+        window.start_engine()
+        assert window.engine is not None, window.statusBar().currentMessage()
+        deadline = time.monotonic() + 8.0
+        while time.monotonic() < deadline and window.preview.image is None:
+            app.processEvents()
+            time.sleep(0.02)
+        assert window.preview.image is not None
+        assert window.engine.preview_crop_layer == layer.id
+
+        image = window.preview.image
+        red = image.pixelColor(60, 160)
+        blue = image.pixelColor(260, 160)
+        assert red.red() > 200 and red.blue() < 30, (red.red(), red.blue())
+        assert blue.blue() > 200, blue.blue()
+
+        picture = window.preview.picture_rect(layer)
+        crop = window.preview.crop_rect(layer)
+        # 2:1 source in a square box; the left half is cropped away.
+        assert picture.height() / picture.width() == pytest.approx(0.5, abs=0.03)
+        assert crop.width() / picture.width() == pytest.approx(0.5, abs=0.03)
+        assert crop.height() / picture.height() == pytest.approx(1.0, abs=0.03)
+    finally:
+        window.close()
+        app.processEvents()
