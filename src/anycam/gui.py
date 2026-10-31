@@ -854,6 +854,12 @@ class AnyCamWindow(QMainWindow):
         self._persist = project is None
         self._dirty = False
         self.project = project or self._load_saved_project()
+        # Prefer the serial-based by-id path.  A replugged USB camera often
+        # returns as a different /dev/videoN; the by-id symlink follows it.
+        for scene in self.project.scenes:
+            for layer in scene.layers:
+                if layer.kind == "camera" and layer.source:
+                    layer.source = config.camera_identity(layer.source)
         self.engine: AnyCamEngine | None = None
         # Captures are ref-counted, so one pool lives for the window's
         # lifetime and engines acquire/release their sources against it.
@@ -878,8 +884,10 @@ class AnyCamWindow(QMainWindow):
         # A camera unplugged mid-stream is dropped from the graph instead of
         # killing the whole scene; this timer rebuilds once the node returns.
         self._lost_cameras: dict[str, str] = {}
+        self._camera_retry_ms = 2000
+        self._quiet_engine_errors = False
         self._camera_watch = QTimer(self)
-        self._camera_watch.setInterval(1200)
+        self._camera_watch.setInterval(self._camera_retry_ms)
         self._camera_watch.timeout.connect(self._reconnect_cameras)
         self.playlist_ids = list(self.scene.playlist.layer_ids)
         self.playlist_index = self.scene.playlist.index
@@ -1894,14 +1902,17 @@ class AnyCamWindow(QMainWindow):
         # would feed the compositor output back into itself.
         vcam = self.project.output.vcam_device or config.loopback_device()
         for camera in config.list_video_devices():
-            if not camera.formats or camera.device in seen:
+            stable = config.camera_identity(camera.device)
+            if not camera.formats or stable in seen:
                 continue
             name = camera.name or "Camera"
-            if camera.device == vcam or "anycam" in name.lower():
+            if camera.device == vcam or stable == vcam or "anycam" in name.lower():
                 continue
-            choices.append((f"{name} · {camera.device}", camera.device))
-            seen.add(camera.device)
-        default = config.camera_device()
+            # The label stays human-readable; the stored value is the stable
+            # path so the combo still matches after a replug.
+            choices.append((f"{name} · {camera.device}", stable))
+            seen.add(stable)
+        default = config.camera_identity(config.camera_device())
         if (default and default not in seen and default != vcam
                 and Path(default).exists()):
             choices.insert(0, (f"Default · {default}", default))
@@ -1936,7 +1947,7 @@ class AnyCamWindow(QMainWindow):
         if (layer is None or layer.kind != "camera" or not source
                 or layer.source == source):
             return
-        layer.source = str(source)
+        layer.source = config.camera_identity(str(source))
         self._lost_cameras.pop(layer.id, None)
         self._mark_dirty()
         if self.engine is not None:
@@ -1969,15 +1980,44 @@ class AnyCamWindow(QMainWindow):
             and not Path(layer.source).exists()
         }
 
+    def _camera_error_layers(self, message: str) -> dict[str, str]:
+        """Map a pipeline error to camera layers even when the node still exists.
+
+        UVC/Logitech devices can stay present but refuse a new stream after too
+        many opens.  Quarantining them like an unplugged camera puts a
+        placeholder in the graph and lets the reconnect watch retry with
+        backoff instead of stopping the preview until a reboot.
+        """
+        cameras = {layer.id: layer.source for layer in self.scene.layers
+                   if layer.kind == "camera" and layer.source}
+        if not cameras:
+            return {}
+        text = message.lower()
+        explicit = {layer_id: device for layer_id, device in cameras.items()
+                    if device.lower() in text}
+        if explicit:
+            return explicit
+        markers = (
+            "v4l2", "video4linux", "resource busy", "no space left",
+            "could not open device", "failed to allocate", "input/output error",
+            "not a capture device",
+        )
+        return cameras if any(marker in text for marker in markers) else {}
+
     def _handle_pipeline_error(self, message: str) -> None:
-        """Treat an unplugged camera as a temporary loss, not a dead preview."""
+        """Treat an unplugged or wedged camera as a temporary loss."""
         missing = self._missing_camera_layers()
+        if not missing:
+            missing = self._camera_error_layers(message)
         if not missing:
             self._status(message)
             self.stop_engine()
             self._status(message)  # keep the failure visible after finalisation
             return
         self._lost_cameras.update(missing)
+        # A camera that fails again after a reconnect must not be reopened in
+        # a tight loop; repeated opens are what wedges some UVC devices.
+        self._camera_retry_ms = min(10000, int(self._camera_retry_ms * 1.5))
         self._rebuild_without_lost_cameras(message)
 
     def _rebuild_without_lost_cameras(self, message: str = "") -> None:
@@ -1988,15 +2028,19 @@ class AnyCamWindow(QMainWindow):
         live = [layer for layer in self.scene.layers
                 if layer.id not in self._lost_cameras]
         prefix = f"{message} · " if message else ""
-        self.start_engine()
+        self._quiet_engine_errors = True
+        try:
+            self.start_engine()
+        finally:
+            self._quiet_engine_errors = False
         if self.engine is None:
             self._status(f"{prefix}{devices} disconnected · preview could not restart")
-            self._camera_watch.start()
+            self._camera_watch.start(self._camera_retry_ms)
             return
         summary = ("placeholder shown; other layers live" if live
                    else "showing placeholders")
         self._status(f"{prefix}{devices} disconnected · {summary}")
-        self._camera_watch.start()
+        self._camera_watch.start(self._camera_retry_ms)
 
     def _reconnect_cameras(self) -> None:
         """Rebuild the preview when a lost camera device reappears."""
@@ -2010,24 +2054,41 @@ class AnyCamWindow(QMainWindow):
             return
         for layer_id in restored:
             del self._lost_cameras[layer_id]
-        if self.engine is not None:
-            self.restart_engine()
-        else:
-            self.start_engine()
+        self._quiet_engine_errors = True
+        try:
+            if self.engine is not None:
+                self.restart_engine()
+            else:
+                self.start_engine()
+        finally:
+            self._quiet_engine_errors = False
         if self.engine is None:
-            # Put the layers back so the next tick retries instead of losing
-            # track of the camera that just came back.
+            # The node exists but the capture did not come back (UVC needs a
+            # moment after a replug, or the device is still busy).  Keep the
+            # placeholder and retry with backoff instead of giving up; giving up
+            # here is what used to force a reboot.
             self._lost_cameras.update(restored)
-            self._camera_watch.stop()
-            self._status("Camera returned but the preview could not restart")
+            self._camera_retry_ms = min(10000, int(self._camera_retry_ms * 1.7))
+            self._camera_watch.start(self._camera_retry_ms)
+            self._status(
+                "Camera returned but the preview could not restart; "
+                f"retrying in {self._camera_retry_ms / 1000:.1f}s"
+            )
             return
-        self._refresh_cameras()
+        # Do not rescan V4L2 here: ``v4l2-ctl`` opens every node, exactly while
+        # the camera we just reopened is negotiating its stream.  The combo
+        # already holds the stable by-id path.
+        if self._lost_cameras:
+            self._camera_watch.start(self._camera_retry_ms)
+        else:
+            self._camera_watch.stop()
         devices = ", ".join(sorted(set(restored.values())))
         self._status(f"Camera reconnected: {devices}")
 
     def _forget_lost_cameras(self) -> None:
         """Drop reconnect state when the scene or the preview changes."""
         self._lost_cameras.clear()
+        self._camera_retry_ms = 2000
         self._camera_watch.stop()
 
     def _choose_camera_device(self) -> str:
@@ -2092,7 +2153,7 @@ class AnyCamWindow(QMainWindow):
     def add_scene(self) -> None:
         scene = Scene(new_id("scene"), f"Scene {len(self.project.scenes) + 1}")
         scene.add_layer(Layer(new_id("layer"), "camera", "StreamCam",
-                              source=config.camera_device(), z=1))
+                              source=config.camera_identity(config.camera_device()), z=1))
         self._append_scene(scene)
 
     def add_two_camera_scene(self) -> None:
@@ -2170,6 +2231,7 @@ class AnyCamWindow(QMainWindow):
                           else self._choose_camera_device())
             if not source:
                 return None
+            source = config.camera_identity(source)
             layer = Layer(new_id("layer"), "camera", self._camera_layer_name(source),
                           source=source, box=(0.62, 0.60, 0.34, 0.34), z=30)
         elif kind == "test":
@@ -2984,7 +3046,7 @@ class AnyCamWindow(QMainWindow):
             self._status(message.replace("\n", " "))
             if self.headless:
                 print(message, file=sys.stderr, flush=True)
-            else:
+            elif not self._quiet_engine_errors:
                 QMessageBox.critical(self, "AnyCam", message)
             return
         self._started_at = time.monotonic()
@@ -3156,6 +3218,12 @@ class AnyCamWindow(QMainWindow):
         if screen_error and screen_error != self._screen_error_shown:
             self._screen_error_shown = screen_error
             self._status(screen_error)
+        source_errors = getattr(self.engine.report, "source_errors", ())
+        camera_error = next(
+            (error for error in source_errors if self._camera_error_layers(error)), "")
+        if camera_error:
+            self._handle_pipeline_error(f"Camera source error: {camera_error}")
+            return
         if self.engine.report.error:
             self._handle_pipeline_error(
                 f"Pipeline error: {self.engine.report.error}")

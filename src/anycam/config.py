@@ -138,6 +138,36 @@ def list_video_devices() -> list[CameraInfo]:
     return devices
 
 
+def camera_identity(device: str, *, by_id_dir: Path | None = None) -> str:
+    """Return the stable ``/dev/v4l/by-id`` name for a V4L2 node.
+
+    A USB camera usually comes back as a different ``/dev/videoN`` after a
+    replug.  The by-id symlink carries the serial number and udev points it at
+    the new node, so storing that path is what lets a project reconnect without
+    the user picking the camera again (audit B46).
+    """
+    if not device:
+        return device
+    candidates = Path(by_id_dir) if by_id_dir is not None else Path("/dev/v4l/by-id")
+    if not candidates.is_dir():
+        return device
+    try:
+        target = Path(device).resolve(strict=True)
+        links = sorted(
+            candidates.iterdir(),
+            key=lambda link: ("video-index0" not in link.name, link.name),
+        )
+    except OSError:
+        return device
+    for link in links:
+        try:
+            if link.resolve() == target:
+                return str(link)
+        except OSError:
+            continue
+    return device
+
+
 def camera_device(preferred: str | None = None) -> str:
     """Pick a usable camera: env override, then preferred, then first capture node."""
     for candidate in (preferred, os.environ.get("ANYCAM_CAMERA")):

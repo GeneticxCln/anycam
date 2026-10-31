@@ -1,8 +1,8 @@
 # AnyCam open work
 
 Backlog derived from the 2026-10-31 full audit (55 bugs, M0–M9) and the work
-landed since. Snapshot: `master` at `9718a3a`; suite **123 collected, 122 passed,
-1 hardware-gated multicam skip**.
+landed since. Snapshot: 2026-10-31, after the camera-replug fix; suite **128
+collected, 127 passed, 1 hardware-gated multicam skip**.
 
 `PLAN.md` is the older 2026-10-30 plan; this file tracks the newer audit's open
 side. Closed items live in `docs/REGRESSIONS.md` and are not repeated here.
@@ -16,7 +16,8 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - [ ] **Continuous MP4** across five scene switches and record toggles, plus an unbroken `v4l2src` consumer on the virtual camera (B12). Today each graph rebuild finalises a new `-segN.mp4`.
 - [ ] **Unresponsive RTSP/network source**: canvas keeps ≥99% of its frames and `stop()` returns in under 1 s (B10/B11). Add a failure-injection test next to `tests/test_m1_outputs.py`; `tests/test_rtsp.py` only exercises a healthy feed.
 - [ ] **Refused output does not poison the session** (B11): preview, recording and vcam keep running, and the recording flag does not stay on.
-- [ ] **Physical camera unplug/replug** on real hardware with `scripts/verify-camera-reconnect.py`. Needs the user and a cable.
+- [ ] **Physical camera unplug/replug** on real hardware with `scripts/verify-camera-reconnect.py`. Needs the user and a cable; the app now resolves the by-id path.
+- [ ] **UVC wedge recovery**: after repeated open failures, offer a USB reset (pkexec) instead of requiring a reboot.
 
 ## 1. M1 engine split and source/output correctness
 
@@ -24,7 +25,7 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - [ ] Canvas is never rebuilt. Record/stop, vcam toggle, scene switch, add layer and apply-effects attach/detach live (B12).
 - [ ] Video layers loop with a segment seek and never end on a silent black frame (B14); a video-only scene must not leave the chip saying LIVE.
 - [ ] Hidden playlist layers release their sources; hidden cameras stop holding devices and CPU (B15).
-- [ ] Stable camera IDs through `/dev/v4l/by-id`, not `/dev/videoN` (B46).
+- [ ] Stable camera IDs through `/dev/v4l/by-id`, not `/dev/videoN` (B46). **App side implemented 2026-10-31; needs a physical replug run.**
 - [ ] A missing video/image layer renders an error card while the rest of the scene keeps running (B13).
 - [ ] Per-source health model and watchdog; FPS stops being a lifetime average; a stalled pipeline is detected (B41).
 - [ ] Report every camera's negotiated mode, not only the last one (B48).

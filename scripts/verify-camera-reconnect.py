@@ -27,6 +27,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+from anycam import config  # noqa: E402
 from anycam.gui import AnyCamWindow  # noqa: E402
 from anycam.model import Layer, Project, Scene  # noqa: E402
 
@@ -55,7 +56,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="max wait for the preview after each transition")
     args = parser.parse_args(argv)
 
-    device = Path(args.device)
+    # Resolve the serial-based path before the pull.  If the device returns as
+    # a different /dev/videoN, the same by-id symlink points at the new node.
+    device = Path(config.camera_identity(args.device))
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()

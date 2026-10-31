@@ -422,7 +422,7 @@ step-ups; a real leak of one 1080p frame per minute still fails
 (`tests/test_soak_memory.py`). A fresh 10-minute run is still required.
 
 Verification: `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest tests -q`
-→ 123 collected, 122 passed, 1 hardware-gated multicam skip.
+→ 128 collected, 127 passed, 1 hardware-gated multicam skip.
 `tests/test_source_pool.py` covers sharing, real pixels through the pool, a dead
 capture, and release on stop.
 
@@ -433,3 +433,24 @@ and waits for the recorder sink's EOS before teardown. A 20 s synthetic run
 reports `drift_s: 0.0`, zero duplicate/backward/gap timestamps (1202 video and
 1201 audio tap buffers) and a finalised 20.03 s MP4 with 1202 packets. The
 10-minute gate is still pending.
+
+## 2026-10-31 — camera replug identity and UVC retry
+
+Camera layers now store the stable `/dev/v4l/by-id/...` path instead of
+`/dev/videoN`, and existing projects are migrated when they load. A USB camera
+that returns as a different node after a replug therefore keeps its layer and
+reconnects without manual re-selection (audit B46).
+
+A camera source error is now quarantined even when the node still exists.
+`v4l2src` errors such as `Device or resource busy`, `No space left on device`
+or an I/O error put a placeholder in the graph, and the reconnect watch keeps
+retrying with persistent backoff (2 s, growing to 10 s) instead of stopping
+after one failed restart. The reconnect path also no longer rescans every V4L2
+node with `v4l2-ctl` immediately after reopening the camera, which added extra
+opens at the worst moment.
+
+This is the app-side mitigation for the Logitech/UVC kernel wedge. A driver
+that is already stuck still needs a USB reset or a reboot; physical
+cable-pull verification is still pending. `tests/test_camera_identity.py`
+covers by-id resolution, and `test_camera_reconnect_retries_with_backoff_when_restart_fails`
+covers the retry behaviour.

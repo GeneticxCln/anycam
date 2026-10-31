@@ -954,6 +954,50 @@ def test_camera_reconnects_when_its_device_returns(app, monkeypatch):
         app.processEvents()
 
 
+def test_camera_reconnect_retries_with_backoff_when_restart_fails(app, monkeypatch):
+    """A present-but-wedged UVC device must not stop the reconnect watch."""
+    window = _window()
+    camera = Layer("layer_retry", "camera", "Retry", source="/dev/anycam-retry")
+    window.scene.add_layer(camera)
+    window._lost_cameras = {camera.id: camera.source}
+    window.engine = object()
+    calls = []
+
+    def failing_restart():
+        calls.append(1)
+        window.engine = None
+
+    monkeypatch.setattr(window, "restart_engine", failing_restart)
+    monkeypatch.setattr("anycam.gui.Path.exists", lambda self: True)
+    try:
+        window._reconnect_cameras()
+        assert calls == [1]
+        assert window._lost_cameras == {camera.id: camera.source}
+        assert window._camera_watch.isActive()
+        assert window._camera_watch.interval() > 1200
+        assert "retrying" in window.statusBar().currentMessage().lower()
+    finally:
+        window.engine = None
+        window.close()
+        app.processEvents()
+
+
+def test_camera_source_error_quarantines_an_existing_device(app):
+    """v4l2 errors after too many opens are treated as temporary loss."""
+    window = _window()
+    camera = Layer("layer_wedged", "camera", "Wedged", source="/dev/anycam-wedged")
+    window.scene.add_layer(camera)
+    try:
+        assert window._camera_error_layers(
+            "v4l2src: Device or resource busy") == {
+                camera.id: "/dev/anycam-wedged"}
+        assert window._camera_error_layers("compositor: not-linked") == {}
+    finally:
+        window.engine = None
+        window.close()
+        app.processEvents()
+
+
 def test_add_screen_layer_keeps_portal_session(app, monkeypatch):
     class FakeSession:
         def __init__(self):
