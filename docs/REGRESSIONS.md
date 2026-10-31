@@ -532,6 +532,26 @@ Verification: `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest tests 
 → 148 collected, 147 passed, 1 hardware-gated multicam skip.
 
 
+## 2026-10-31 — hidden capture lifecycle and camera modes
+
+`AnyCamEngine` now separates a layer's compositor tail from its capture
+reference. A hidden capture layer builds only its `intervideosrc`; it does not
+acquire a `SourcePool` entry, so a hidden camera opens no device and a hidden
+video/network layer starts no pipeline. `set_layer_visible()` acquires the
+spec when shown and releases it when hidden again. `SourcePool.channel_for()`
+keeps the channel assignment after release, so the existing `intervideosrc`
+reconnects to the restarted capture without a graph rebuild.
+
+`EngineReport.camera_modes` now keeps one negotiated mode per camera layer,
+including cameras that were hidden at build time and shown later. The legacy
+`camera_mode` field remains the last mode for compatibility.
+
+Verification: `tests/test_source_pool.py::test_hidden_capture_is_acquired_only_while_visible`
+(one entry while hidden, two when shown, one again when hidden) and
+`::test_report_lists_every_camera_mode` (640x480 and 1280x480 both retained).
+The run: 150 collected, 149 passed, 1 hardware-gated multicam skip.
+
+
 ## 2026-10-31 — persistent recorder (one MP4 across rebuilds)
 
 Recording moved out of the canvas graph into `anycam.engine.outputs.recorder`.

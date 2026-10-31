@@ -2,7 +2,7 @@
 
 Backlog derived from the 2026-10-31 full audit (55 bugs, M0–M9) and the work
 landed since. Snapshot: 2026-10-31, after the camera-replug fix and the
-10-minute soak re-run; suite **148 collected, 147 passed, 1 hardware-gated
+10-minute soak re-run; suite **150 collected, 149 passed, 1 hardware-gated
 multicam skip**.
 
 `PLAN.md` is the older 2026-10-30 plan; this file tracks the newer audit's open
@@ -25,11 +25,11 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - [ ] Split `pipeline.py` into `src/anycam/engine/`: `source_pool.py`, `canvas.py`, `outputs/{vcam,recorder,stream}.py`, `health.py`, `controller.py`; keep `AnyCamEngine` as a thin facade while tests migrate.
 - [ ] Canvas is never rebuilt. Record/stop, vcam toggle, scene switch, add layer and apply-effects attach/detach live (B12).
 - [x] Video layers loop with a segment seek and never end on a silent black frame (B14); a video-only scene must not leave the chip saying LIVE. Passed 2026-10-31: a 1 s red clip seeked after EOS, `loops >= 1`, and the centre was still red after 2.6 s.
-- [ ] Hidden playlist layers release their sources; hidden cameras stop holding devices and CPU (B15).
+- [x] Hidden playlist layers release their sources; hidden cameras stop holding devices and CPU (B15). Passed 2026-10-31: hidden capture layers acquire no pool entry; showing acquires on the stable channel, hiding releases it again.
 - [ ] Stable camera IDs through `/dev/v4l/by-id`, not `/dev/videoN` (B46). **App side implemented 2026-10-31; needs a physical replug run.**
 - [x] A missing video/image layer renders an error card while the rest of the scene keeps running (B13). Passed 2026-10-31: missing image and video layers each build a card, and the test layer keeps producing frames.
 - [ ] Per-source health model and watchdog; FPS stops being a lifetime average; a stalled pipeline is detected (B41).
-- [ ] Report every camera's negotiated mode, not only the last one (B48).
+- [x] Report every camera's negotiated mode, not only the last one (B48). Passed 2026-10-31: two camera layers report both negotiated modes; a hidden camera adds its mode when shown.
 - [x] Vcam: surface runtime errors (B17), check the configured device (B18), and bound the `appsrc` queue (B20). Passed 2026-10-31: inactive outputs report their error, the explicit device is checked, and both vcam appsrc paths use `max-buffers=2`, `block=false`, downstream leak.
 - [x] Audio tee gets queues when recording and streaming together, so one muxer cannot block the other (B21). Passed 2026-10-31: separate bounded queues feed the MP4 and RTMP muxers.
 - [ ] Replace or wrap `rtmpsink` with `rtmp2sink`; keep reconnect/backoff out of the canvas.
@@ -150,7 +150,6 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 |---|---|---|
 | B1 | Live portal screen frame size still needs one real check | M0 residual |
 | B12 | Every rebuild splits the MP4 and drops outputs | M1 |
-| B15 | Hidden layers still play and hold sources | M1 |
 | B32 | Text cannot be edited; no font/colour; no renaming | M3 |
 | B33 | Effects panel edits the wrong layer; Apply rebuilds | M3 |
 | B34 | Reload leaves audio widgets stale | M3 |
@@ -165,7 +164,6 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 | B45 | Three scene-switch implementations; shortcuts skip | M3 |
 | B46 | Reconnect only handles a missing node | M1 |
 | B47 | No single-instance guard | M9 |
-| B48 | Report keeps only the last camera mode | M1 |
 | B52 | Doctor/setup do not require every plugin | M9 |
 | B53 | PySide6/PyGObject undeclared; empty `ui/` package data | M9 |
 | B55 | Remaining docs/evidence overclaims | Cross-cutting |
@@ -179,7 +177,9 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - B11: a refused RTMP output cannot abort preview/recording/vcam, and a failed rebuild clears Record (`tests/test_m1_outputs.py::test_missing_rtmp_sink_keeps_preview_and_recording`, `tests/test_gui.py::test_failed_start_clears_recording_state`).
 - B13: missing image/video/logo/face assets render an error card without stopping the scene (`tests/test_pipeline.py::test_missing_media_layers_render_cards_without_stopping_scene`).
 - B14: video-file captures seek back to the start after EOS and keep the picture (`tests/test_pipeline.py::test_video_layer_loops_without_a_black_frame`).
+- B15: hidden capture layers acquire no source until shown and release it when hidden (`tests/test_source_pool.py::test_hidden_capture_is_acquired_only_while_visible`).
 - B16: duplicated camera layers share one pool capture (`tests/test_gui.py::test_duplicate_camera_shares_one_pooled_capture`).
+- B48: every camera layer's negotiated mode is kept in the report (`tests/test_source_pool.py::test_report_lists_every_camera_mode`).
 - B17/B18/B20: vcam failures are reported, the explicit device is checked, and the legacy appsrc is bounded (`tests/test_vcam_output.py`).
 - B19: `exclusive_caps=0` is documented as required; the compatibility matrix remains in M9.
 - B21: record and RTMP have separate audio queues (`tests/test_m1_outputs.py::test_recording_and_streaming_have_separate_audio_queues`).

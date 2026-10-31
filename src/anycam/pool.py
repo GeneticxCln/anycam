@@ -149,6 +149,10 @@ class SourcePool:
     def __init__(self) -> None:
         self._entries: dict[CaptureSpec, Entry] = {}
         self._counter = itertools.count(1)
+        # Keep the channel assignment after an entry is released.  A hidden
+        # layer keeps its intervideosrc alive and reconnects to the same
+        # channel when it is shown again.
+        self._channels: dict[CaptureSpec, str] = {}
         self._started = False
 
     # ------------------------------------------------------------------ public
@@ -170,6 +174,14 @@ class SourcePool:
         if entry.refs <= 0:
             entry.pipeline.set_state(Gst.State.NULL)
             del self._entries[spec]
+
+    def channel_for(self, spec: CaptureSpec) -> str:
+        """Stable channel for a spec, even while its capture is released."""
+        channel = self._channels.get(spec)
+        if channel is None:
+            channel = f"anycam-src-{next(self._counter)}"
+            self._channels[spec] = channel
+        return channel
 
     def start(self) -> None:
         self._started = True
@@ -220,7 +232,7 @@ class SourcePool:
 
     # ------------------------------------------------------------------ build
     def _build(self, spec: CaptureSpec) -> Entry:
-        channel = f"anycam-src-{next(self._counter)}"
+        channel = self.channel_for(spec)
         built = self._elements(spec)
         sink = make("intervideosink", f"{channel}-sink", channel=channel)
         built.elements.append(sink)

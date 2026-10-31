@@ -102,3 +102,58 @@ def test_stop_releases_every_capture():
     assert len(engine.pool.entries()) == 2
     engine.stop()
     assert engine.pool.entries() == []
+
+
+def test_report_lists_every_camera_mode(monkeypatch, tmp_path):
+    """B48: two cameras used to leave only the last mode in the report."""
+    from anycam import pool as pool_module
+    from anycam.sources import CameraMode
+
+    def modes(device):
+        width = 640 if device.endswith("a") else 1280
+        return [CameraMode("MJPG", width, 480, 30)]
+
+    monkeypatch.setattr(pool_module, "camera_modes", modes)
+    project = Project(name="modes")
+    project.output = OutputConfig(canvas_w=320, canvas_h=180, fps=30)
+    scene = Scene("scene_modes", "Modes")
+    scene.add_layer(Layer("cam_a", "camera", "A", source=str(tmp_path / "cam-a"),
+                          box=(0.0, 0.0, 0.5, 1.0), z=1))
+    scene.add_layer(Layer("cam_b", "camera", "B", source=str(tmp_path / "cam-b"),
+                          box=(0.5, 0.0, 0.5, 1.0), z=2))
+    project.scenes = [scene]
+    project.active_scene = scene.id
+    engine = AnyCamEngine(project, preview=True).build()
+    try:
+        assert len(engine.report.camera_modes) == 2, engine.report.camera_modes
+        assert any("640x480" in mode for mode in engine.report.camera_modes)
+        assert any("1280x480" in mode for mode in engine.report.camera_modes)
+    finally:
+        engine.stop()
+
+
+def test_hidden_capture_is_acquired_only_while_visible():
+    """B15: a hidden layer must not hold a device or run a capture."""
+    project = two_patterns()
+    project.scene.layer("right").visible = False
+    engine = AnyCamEngine(project, preview=True).build()
+    try:
+        assert len(engine.pool.entries()) == 1
+        engine.start()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            engine.pump(50)
+        before = engine._frame_count
+
+        engine.set_layer_visible("right", True)
+        assert len(engine.pool.entries()) == 2
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            engine.pump(50)
+        assert engine._frame_count > before
+
+        engine.set_layer_visible("right", False)
+        assert len(engine.pool.entries()) == 1
+        assert engine._layer_acquired == {"left"}
+    finally:
+        engine.stop()

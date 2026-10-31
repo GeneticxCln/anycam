@@ -14,8 +14,8 @@ Status legend:
   verification.
 
 Last updated: 2026-10-31 (audit M0, M1 output pipelines, M1 capture source pool,
-network/output failure gates, media-layer fallback/loop gates, and the
-vcam/audio/duplicate-capture gates). Evidence paths name the private archive
+network/output failure gates, media-layer fallback/loop gates, the
+vcam/audio/duplicate-capture gates, and hidden-capture/camera-mode gates). Evidence paths name the private archive
 `~/anycam-private-evidence/evidence/` after the M0 move.
 
 ## 1. Video sources
@@ -35,6 +35,8 @@ vcam/audio/duplicate-capture gates). Evidence paths name the private archive
 | RTSP/HTTP source | **verified** | `sources.network_chain` (`uridecodebin`); Layers tab Network URL button | Local integration test runs an ffmpeg RTP producer through a minimal RTSP server into `AnyCamEngine` and asserts decoded preview frames (`tests/test_rtsp.py`, `evidence/08_rtsp/`). `tests/test_m1_outputs.py::test_silent_rtsp_source_cannot_stall_the_canvas` covers a server that accepts and never answers; HTTP was exercised earlier. |
 | Capture pipeline isolation / sharing (M1 slice 2) | **verified** | `pool.SourcePool` owns one `intervideosink` pipeline per distinct `CaptureSpec`; layers on the same device share it by refcount and the last release sets it to NULL. The canvas reads it through `intervideosrc` (`sources.layer_tail`), so a dead capture cannot stop the compositor, and one EOS through the compositor's src pad finalises the outputs. | `tests/test_source_pool.py` (shared refcount, real pixels through the pool, dead capture, release on stop); `tests/test_m1_outputs.py` |
 | Duplicate camera sharing (B16) | **verified** | Two layers with the same `CaptureSpec` acquire one `SourcePool` entry; `layer_tail` names each `intervideosrc` with its layer id so a shared channel cannot collide. | `tests/test_gui.py::test_duplicate_camera_shares_one_pooled_capture` (one entry, refs=2) |
+| Hidden capture lifecycle (B15) | **verified** | Hidden capture layers build only their `intervideosrc` tail and hold no pool reference. Showing acquires on the stable channel; hiding releases the entry. | `tests/test_source_pool.py::test_hidden_capture_is_acquired_only_while_visible` |
+| Per-camera mode reporting (B48) | **verified** | `EngineReport.camera_modes` keeps one negotiated mode per camera layer; showing a hidden camera adds its mode. | `tests/test_source_pool.py::test_report_lists_every_camera_mode` |
 
 ## 2. Scene compositor
 
@@ -135,4 +137,4 @@ sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
 | Wayland portal capture, no niri-only API | **verified** (spike) | `xdg-desktop-portal` ScreenCast + PipeWire |
 | Reversible system changes | **verified** | Only `modprobe v4l2loopback`; `scripts/disable-v4l2loopback.sh`; documented |
 | Reproducible build/run docs | **verified** | `README.md`, `scripts/setup.sh` |
-| Runnable automated tests | **verified** | `./scripts/test.sh` (147 passed, 1 hardware-gated multicam skip; 148 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |
+| Runnable automated tests | **verified** | `./scripts/test.sh` (149 passed, 1 hardware-gated multicam skip; 150 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |

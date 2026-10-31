@@ -41,6 +41,7 @@ class EngineReport:
     media_error: str = ""
     media_errors: list[str] = field(default_factory=list)
     camera_mode: str = ""
+    camera_modes: list[str] = field(default_factory=list)
     camera_probe_error: str = ""
     camera_placeholders: list[str] = field(default_factory=list)
     source_errors: list[str] = field(default_factory=list)
@@ -70,6 +71,7 @@ class EngineReport:
             "media_error": self.media_error,
             "media_errors": self.media_errors,
             "camera_mode": self.camera_mode,
+            "camera_modes": self.camera_modes,
             "camera_probe_error": self.camera_probe_error,
             "camera_placeholders": self.camera_placeholders,
             "source_errors": self.source_errors,
@@ -129,6 +131,11 @@ class AnyCamEngine:
         self.pool = pool or SourcePool()
         self._owns_pool = pool is None
         self._specs: list[CaptureSpec] = []
+        # Capture specs by layer id and the subset currently holding a pool
+        # reference.  Hidden layers keep their tail but release the source.
+        self._layer_specs: dict[str, CaptureSpec] = {}
+        self._layer_acquired: set[str] = set()
+        self._camera_modes: dict[str, str] = {}
         # The crop editor shows this layer uncropped while the model keeps its
         # real crop, so the window is drawn over the picture it edits.
         self.preview_crop_layer = preview_crop_layer
@@ -281,17 +288,30 @@ class AnyCamEngine:
             spec = capture_spec(layer, self.canvas_w, self.canvas_h, self.fps,
                                 screen_fd=self.screen_fds.get(layer.id, -1),
                                 screen_size=self.screen_sizes.get(layer.id))
-            entry = self.pool.acquire(spec)
-            self._specs.append(spec)
-            chain = layer_tail(layer, entry.source_size, box[2], box[3],
-                               self.fps, entry.channel)
-            self.layer_sources[layer.id] = entry.source_size
-            if entry.camera_mode:
-                self.report.camera_mode = entry.camera_mode
-            if entry.probe_error:
-                self.report.camera_probe_error = entry.probe_error
-            if entry.screen_error:
-                self.report.screen_error = entry.screen_error
+            self._layer_specs[layer.id] = spec
+            entry = None
+            if layer.visible:
+                entry = self.pool.acquire(spec)
+                self._specs.append(spec)
+                self._layer_acquired.add(layer.id)
+                source_size = entry.source_size
+                channel = entry.channel
+            else:
+                # A hidden layer must not open its device or run a capture
+                # pipeline.  Its intervideosrc waits on a stable channel and
+                # set_layer_visible() acquires the source when it is shown.
+                source_size = (spec.expected or
+                               (max(2, spec.width), max(2, spec.height)))
+                channel = self.pool.channel_for(spec)
+            chain = layer_tail(layer, source_size, box[2], box[3],
+                               self.fps, channel)
+            self.layer_sources[layer.id] = source_size
+            if entry is not None:
+                self._record_camera_mode(layer.id, entry)
+                if entry.probe_error:
+                    self.report.camera_probe_error = entry.probe_error
+                if entry.screen_error:
+                    self.report.screen_error = entry.screen_error
         elif layer.kind in ("text", "logo", "image", "face"):
             if layer.kind == "face":
                 png = Path(layer.source).expanduser()
@@ -359,6 +379,13 @@ class AnyCamEngine:
             return Gst.PadProbeReturn.OK
 
         pad.add_probe(Gst.PadProbeType.BUFFER, on_first_buffer)
+
+    def _record_camera_mode(self, layer_id: str, entry) -> None:
+        """Keep one negotiated mode per camera layer, not just the last one."""
+        if entry.camera_mode:
+            self._camera_modes[layer_id] = entry.camera_mode
+            self.report.camera_mode = entry.camera_mode
+            self.report.camera_modes = list(self._camera_modes.values())
 
     def _watch_source_size(self, chain: SourceChain, layer: Layer) -> None:
         """Report a screen layer whose frames are not the portal's stream.
@@ -980,6 +1007,18 @@ class AnyCamEngine:
             return
         layer.visible = bool(visible)
         pad.set_property("alpha", float(clamp(layer.alpha)) if visible else 0.0)
+        spec = self._layer_specs.get(layer_id)
+        if spec is not None:
+            if visible and layer_id not in self._layer_acquired:
+                entry = self.pool.acquire(spec)
+                self._record_camera_mode(layer_id, entry)
+                self._specs.append(spec)
+                self._layer_acquired.add(layer_id)
+            elif not visible and layer_id in self._layer_acquired:
+                self.pool.release(spec)
+                if spec in self._specs:
+                    self._specs.remove(spec)
+                self._layer_acquired.discard(layer_id)
 
     def set_layer_alpha(self, layer_id: str, alpha: float) -> None:
         """Change a layer's opacity without rebuilding the compositor."""
