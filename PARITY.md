@@ -115,6 +115,7 @@ sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
 
 | Requirement | Status | Evidence / gap |
 |---|---|---|
+| A/V sync across the split source pipelines | **partial** (20 s synthetic) | `scripts/verify-av-drift.py` drives synthetic video + audio producers through `intervideosink`/`intervideosrc` into a compositor and measures the canvas offsets and a recorded file. A 20 s run reports `drift_s: 0.0` with no duplicate or gap timestamps and a finalised 20.03 s MP4; the 10-minute gate is pending. | `scripts/verify-av-drift.py --seconds 20 --warmup 5` |
 | 10 min 1080p60, preview + recording, <1% drops, no monotonic memory growth | **partial** (re-baselined 2026-10-31) | `~/anycam-private-evidence/evidence/soak_10m/report.json`: 600.23 s, 36002 preview frames at 59.998 fps (0.003% dropped), 36014 recorded packets at 60.0 fps (0.0% dropped), `MJPG 1920x1080@60`. **Memory**: the old least-squares gate scored 2.38 MiB/min through buffer-pool step-ups; it now judges the settled window and tail (`soak._memory_assessment`) and a real per-frame leak still fails. A fresh 10-minute run is pending. The old 0.032 MiB/min figure came from the faststart recorder and no longer applies. The virtual camera was not exercised in this run (v4l2loopback not loaded). |
 
 ## Cross-cutting requirements

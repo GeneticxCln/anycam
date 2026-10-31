@@ -426,8 +426,10 @@ Verification: `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest tests 
 `tests/test_source_pool.py` covers sharing, real pixels through the pool, a dead
 capture, and release on stop.
 
-Known incomplete: `scripts/verify-av-drift.py` is not a passing gate yet. An 8 s
-synthetic smoke run reported 320 audio "gaps" (its gap heuristic uses the video
-frame interval for audio buffers), the recorded probe file had 0 packets, and
-the gate compares drift against 1.0 s while its note says one frame. Fix or
-retire it before using it as M1 evidence.
+**A/V drift gate (fixed 2026-10-31).** `scripts/verify-av-drift.py` now rates the
+composited output (the same duplicate-PTS fix as the engine), measures each
+stream against its own median buffer interval, compares drift with one frame,
+and waits for the recorder sink's EOS before teardown. A 20 s synthetic run
+reports `drift_s: 0.0`, zero duplicate/backward/gap timestamps (1202 video and
+1201 audio tap buffers) and a finalised 20.03 s MP4 with 1202 packets. The
+10-minute gate is still pending.

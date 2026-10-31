@@ -83,9 +83,17 @@ class Canvas:
         rate = caps_filter(f"video/x-raw,framerate={FPS}/1", "canvas_rate")
         convert = make("videoconvert")
         self.compositor = make("compositor", "canvas_compositor", background="black")
-        for element in (self.vsrc, rate, convert, self.compositor):
+        # The compositor can emit two frames with the same PTS at startup;
+        # qtmux rejects the second and the record queue blocks the tee, so the
+        # tap sees only a handful of frames.  Rate the composited output, not
+        # the input, so the dedupe sees those frames (same fix as the engine).
+        vrate = make("videorate", "canvas_videorate", skip_to_first=True)
+        out_caps = caps_filter(f"video/x-raw,framerate={FPS}/1", "canvas_out_rate")
+        for element in (self.vsrc, rate, convert, self.compositor, vrate, out_caps):
             self.pipeline.add(element)
-        if not self.vsrc.link(rate) or not rate.link(convert) or not convert.link(self.compositor):
+        if (not self.vsrc.link(rate) or not rate.link(convert)
+                or not convert.link(self.compositor)
+                or not self.compositor.link(vrate) or not vrate.link(out_caps)):
             raise RuntimeError("could not link the canvas video input")
 
         # Timestamp tap on the composited stream.
@@ -97,7 +105,7 @@ class Canvas:
         self.pipeline.add(self.video_sink)
         tee = make("tee", "canvas_tee")
         self.pipeline.add(tee)
-        self.compositor.link(tee)
+        out_caps.link(tee)
         tee_pad = tee.request_pad_simple("src_%u")
         tee_pad.link(tap.get_static_pad("sink"))
         tap.link(self.video_sink)
@@ -111,7 +119,11 @@ class Canvas:
         enc = make("x264enc", "record_encoder", speed_preset="veryfast",
                    tune="zerolatency", bitrate=6000, key_int_max=60)
         parse = make("h264parse")
-        mux = make("mp4mux", "record_mux", fragment_duration=500)
+        # The harness file is a measurement artifact, not a crash-safety
+        # recording.  A plain mp4mux finalises its sample table on EOS; the
+        # fragmented variant wrote a moov and then raw H.264 in this standalone
+        # pipeline, so ffprobe saw zero packets.
+        mux = make("mp4mux", "record_mux")
         sink = make("filesink", "record_sink", location=record)
         for element in (queue, vconv, i420, enc, parse):
             self.pipeline.add(element)
@@ -199,22 +211,37 @@ class Canvas:
                 print(f"canvas warning: {warning.message}", flush=True)
 
     def stop(self) -> None:
-        self.pipeline.send_event(Gst.Event.new_eos())
+        # EOS pushed at the pipeline level does not reliably reach the mux;
+        # one event on the compositor's output pad finalises the fragment.
+        output_pad = self.compositor.get_static_pad("src")
+        if output_pad is not None:
+            output_pad.push_event(Gst.Event.new_eos())
+        # The video tap posts EOS long before the filesink; stopping on the
+        # first bus EOS truncated the MP4 (2.5 MB, zero packets).  Wait for
+        # the recorder sink, or the deadline.
         deadline = time.monotonic() + 10.0
         while time.monotonic() < deadline:
             msg = self.bus.timed_pop_filtered(200 * Gst.MSECOND,
                                               Gst.MessageType.EOS | Gst.MessageType.ERROR)
             if msg is None:
                 continue
+            name = msg.src.get_name() if msg.src is not None else ""
             if msg.type == Gst.MessageType.ERROR:
                 err, debug = msg.parse_error()
                 print(f"canvas error: {err.message} ({debug})", flush=True)
-            break
+                break
+            if name == "record_sink":
+                break
         self.pipeline.set_state(Gst.State.NULL)
 
 
 def _count_trouble(pts: list[int]) -> dict:
-    interval = Gst.SECOND // FPS
+    # Audio and video arrive at different cadences (about 21 ms vs 16.7 ms),
+    # so a single video-frame interval scored every audio buffer as a gap and
+    # an 8 s run reported 320 of them.  Use the stream's own median interval.
+    deltas = [current - previous for previous, current in zip(pts, pts[1:])
+              if current > previous]
+    interval = sorted(deltas)[len(deltas) // 2] if deltas else Gst.SECOND // FPS
     duplicates = 0
     backwards = 0
     gaps = 0
@@ -226,7 +253,8 @@ def _count_trouble(pts: list[int]) -> dict:
         elif current - previous > interval * 1.5:
             gaps += 1
     return {"samples": len(pts), "duplicates": duplicates,
-            "backwards": backwards, "gaps": gaps}
+            "backwards": backwards, "gaps": gaps,
+            "interval_ms": round(interval / 1e6, 2)}
 
 
 def _packet_offset(path: str) -> dict:
@@ -252,6 +280,8 @@ def _packet_offset(path: str) -> dict:
             result["first_offset_s"] = round(v["first"] - a["first"], 4)
             result["last_offset_s"] = round(v["last"] - a["last"], 4)
             result["drift_s"] = round(result["last_offset_s"] - result["first_offset_s"], 4)
+    if not out.get("audio", {}).get("packets"):
+        result["note"] = "harness records video only; A/V is gated live"
     return result
 
 
@@ -312,11 +342,11 @@ def main(argv: list[str] | None = None) -> int:
         "audio_timestamps": _count_trouble(canvas.audio_pts),
         "recorded": _packet_offset(args.record) if Path(args.record).exists() else {},
     }
-    frame = FPS * 1.0
+    limit = 1.0 / FPS
     drift = report["live"].get("drift_s")
     report["gate"] = {
-        "limit_s": round(1.0 / frame, 5) if frame else None,
-        "passed": bool(drift is not None and abs(drift) < 1.0),
+        "limit_s": round(limit, 5),
+        "passed": bool(drift is not None and abs(drift) < limit),
         "note": "one frame of A/V drift over the whole run",
     }
     print(json.dumps(report, indent=2), flush=True)
