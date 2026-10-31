@@ -157,6 +157,30 @@ def test_screenshot_success_marks_the_frame(app, tmp_path):
         app.processEvents()
 
 
+def test_failed_start_clears_recording_state(app, tmp_path, monkeypatch):
+    """B11: a refused output must not leave Record stuck on."""
+    monkeypatch.setenv("XDG_VIDEOS_DIR", str(tmp_path))
+    window = _window()
+    window.headless = True
+    window._quiet_engine_errors = True
+    window.recording = True
+    window.record_button.setText("Stop recording")
+
+    def refuse(_self):
+        raise RuntimeError("output refused")
+
+    monkeypatch.setattr("anycam.pipeline.AnyCamEngine.build", refuse)
+    try:
+        window.start_engine()
+        assert window.recording is False
+        assert window.record_button.text() == "Record"
+        assert window._recorder is None
+        assert "output refused" in window.statusBar().currentMessage()
+    finally:
+        window.close()
+        app.processEvents()
+
+
 def _live_canvas_image() -> QImage:
     image = QImage(640, 360, QImage.Format.Format_RGBA8888)
     image.fill(QColor("#203040"))

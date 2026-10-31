@@ -435,9 +435,14 @@ class AnyCamEngine:
         elif self.record_path:
             self._build_recording()
         # Publishing is explicit: a URL saved in the project must never start
-        # streaming just because preview was opened.
+        # streaming just because preview was opened.  A missing/broken stream
+        # element must not abort the preview or the recording; the failure is
+        # reported on the output instead.
         if self.rtmp:
-            self._build_rtmp()
+            try:
+                self._build_rtmp()
+            except Exception as exc:  # noqa: BLE001
+                self.report.rtmp_error = f"stream output could not start: {exc}"
 
         if self._branch_count == 0:
             # Without a tee branch the compositor's output pad stays unlinked
@@ -445,6 +450,7 @@ class AnyCamEngine:
             # reporting the real mistake (nothing was asked to consume frames).
             raise RuntimeError(
                 self.report.vcam_error
+                or self.report.rtmp_error
                 or "no output branch requested: enable preview, recording, vcam or RTMP"
             )
 
@@ -793,6 +799,17 @@ class AnyCamEngine:
         """
         url = self.rtmp
         if not url:
+            return
+        # Check before attaching the canvas branch: a missing plugin used to
+        # abort the whole build and leave a recording session running with no
+        # preview.  Report it and keep the other outputs alive instead.
+        missing = [name for name in ("rtmpsink", "flvmux", "x264enc", "h264parse")
+                   if Gst.ElementFactory.find(name) is None]
+        if missing:
+            self.report.rtmp_error = (
+                "stream output unavailable: missing GStreamer element(s): "
+                + ", ".join(missing)
+            )
             return
         queue = self._branch("rtmp")
         # Downstream leak: the encoder can never push back into the compositor.

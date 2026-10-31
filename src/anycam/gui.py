@@ -3105,6 +3105,12 @@ class AnyCamWindow(QMainWindow):
             self.preview.layer_sizes = self.engine.source_sizes()
         except Exception as exc:  # noqa: BLE001
             self.engine = None
+            # A failed rebuild must not leave the Record button armed with a
+            # recorder writing in the background.
+            if self.recording or self._recorder is not None:
+                self.recording = False
+                self.record_button.setText("Record")
+                self._finish_recorder()
             message = f"Could not start the pipeline:\n{exc}"
             self._status(message.replace("\n", " "))
             if self.headless:

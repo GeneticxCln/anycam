@@ -432,7 +432,7 @@ step-ups; a real leak of one 1080p frame per minute still fails
 (`tests/test_soak_memory.py`). A fresh 10-minute run is still required.
 
 Verification: `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest tests -q`
-→ 139 collected, 138 passed, 1 hardware-gated multicam skip.
+→ 142 collected, 141 passed, 1 hardware-gated multicam skip.
 `tests/test_source_pool.py` covers sharing, real pixels through the pool, a dead
 capture, and release on stop.
 
@@ -448,7 +448,25 @@ audio tap buffers, `drift_s: 0.0` against a 0.01667 s limit, zero duplicate,
 backward or gap timestamps, and a finalised 600.12 s MP4 with 36,008 video
 packets. The harness records video only; A/V sync is gated live.
 
-## 2026-10-31 — camera replug identity and UVC retry
+## 2026-10-31 — network stalls and refused outputs
+
+`tests/test_m1_outputs.py::test_silent_rtsp_source_cannot_stall_the_canvas`
+points a network layer at a local RTSP server that accepts the TCP connection
+and never answers. Network capture already lived in the per-source
+`SourcePool`, so this slice adds the regression rather than moving the source.
+The test layer keeps producing: the canvas completed at least 99% of 30 fps
+over a two-second window and `stop()` returned in under one second (0.32 s on
+this machine).
+
+A missing `rtmpsink` used to raise out of `_build_rtmp()` and abort the whole
+canvas. `build()` now confines setup failures to `report.rtmp_error`, and
+`_build_rtmp()` checks the required elements before attaching a canvas branch.
+The regression keeps preview, the recorder and a virtual-camera tap alive. A
+GUI test makes `AnyCamEngine.build()` fail during a recording and checks that
+`Record` is disarmed and the recorder finalised, so the flag cannot stay on.
+
+Verification: `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest tests -q`
+→ 142 collected, 141 passed, 1 hardware-gated multicam skip.
 
 Camera layers now store the stable `/dev/v4l/by-id/...` path instead of
 `/dev/videoN`, and existing projects are migrated when they load. A USB camera

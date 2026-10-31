@@ -13,8 +13,8 @@ Status legend:
 * **blocked** — implementation exists but a platform/permission limit prevents
   verification.
 
-Last updated: 2026-10-31 (audit M0, M1 slice 1 output pipelines, and M1 slice 2
-capture source pool). Evidence paths name the private archive
+Last updated: 2026-10-31 (audit M0, M1 output pipelines, M1 capture source pool,
+and the network/output failure gates). Evidence paths name the private archive
 `~/anycam-private-evidence/evidence/` after the M0 move.
 
 ## 1. Video sources
@@ -30,7 +30,7 @@ capture source pool). Evidence paths name the private archive
 | Screen/window capture via xdg-desktop-portal + PipeWire | **partial** | `portal.request_screen_cast` drives CreateSession → SelectSources → Start → OpenPipeWireRemote; `sources.screen_chain` uses the node id and fd, and the Layers tab has a Screen button | The portal flow is implemented and unit-tested, but no live screen-capture artifact is checked in; a saved screen layer re-requests access on the next engine start |
 | Image source | **verified** | `sources.image_chain` (PNG/JPEG/WebP, `imagefreeze`); Layers tab Image button | Full-frame image source tested (`--source plate.png`); effects + crop wired; GUI image-layer creation covered by `tests/test_gui.py` |
 | Video-file source | **verified** | `sources.file_video_chain` (`filesrc ! decodebin`); Layers tab Video button | Full-frame video playback tested (`--source colorful.mp4`), 60 fps; GUI video-layer creation covered by `tests/test_gui.py` |
-| RTSP/HTTP source | **verified** | `sources.network_chain` (`uridecodebin`); Layers tab Network URL button | Local integration test runs an ffmpeg RTP producer through a minimal RTSP server into `AnyCamEngine` and asserts decoded preview frames (`tests/test_rtsp.py`, `evidence/08_rtsp/`); HTTP was exercised earlier. No explicit backpressure handling |
+| RTSP/HTTP source | **verified** | `sources.network_chain` (`uridecodebin`); Layers tab Network URL button | Local integration test runs an ffmpeg RTP producer through a minimal RTSP server into `AnyCamEngine` and asserts decoded preview frames (`tests/test_rtsp.py`, `evidence/08_rtsp/`). `tests/test_m1_outputs.py::test_silent_rtsp_source_cannot_stall_the_canvas` covers a server that accepts and never answers; HTTP was exercised earlier. |
 | Capture pipeline isolation / sharing (M1 slice 2) | **verified** | `pool.SourcePool` owns one `intervideosink` pipeline per distinct `CaptureSpec`; layers on the same device share it by refcount and the last release sets it to NULL. The canvas reads it through `intervideosrc` (`sources.layer_tail`), so a dead capture cannot stop the compositor, and one EOS through the compositor's src pad finalises the outputs. | `tests/test_source_pool.py` (shared refcount, real pixels through the pool, dead capture, release on stop); `tests/test_m1_outputs.py` |
 
 ## 2. Scene compositor
@@ -82,6 +82,7 @@ capture source pool). Evidence paths name the private archive
 | Requirement | Status | Implementation | Evidence / gap |
 |---|---|---|---|
 | Publish to user-supplied RTMP/RTMPS URL | **verified** | `flvmux` + `rtmpsink`, video + AAC audio, I420 H.264 High. Since M1 slice 1 the publish branch lives in its own `anycam-rtmp` pipeline fed by `appsrc` samples, so a stalled server cannot reach the canvas tee; it is reported as `rtmp_error` | `evidence/05_rtmp/received.flv`: 1280×720, H.264 High yuv420p + AAC, 8.23 s. `tests/test_m1_outputs.py::test_unresponsive_rtmp_cannot_stall_the_canvas` keeps preview and recording alive with a black-hole server |
+| Refused or missing output element | **verified** | `build()` confines RTMP setup failures to `rtmp_error`; `_build_rtmp()` checks required elements before attaching a canvas branch. Preview, recording and a virtual-camera tap stay alive, and the GUI disarms Record if a rebuild fails. | `tests/test_m1_outputs.py::test_missing_rtmp_sink_keeps_preview_and_recording`, `tests/test_gui.py::test_failed_start_clears_recording_state` |
 
 ## 7. Playlists and shortcuts
 
@@ -129,4 +130,4 @@ sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
 | Wayland portal capture, no niri-only API | **verified** (spike) | `xdg-desktop-portal` ScreenCast + PipeWire |
 | Reversible system changes | **verified** | Only `modprobe v4l2loopback`; `scripts/disable-v4l2loopback.sh`; documented |
 | Reproducible build/run docs | **verified** | `README.md`, `scripts/setup.sh` |
-| Runnable automated tests | **verified** | `./scripts/test.sh` (138 passed, 1 hardware-gated multicam skip; 139 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |
+| Runnable automated tests | **verified** | `./scripts/test.sh` (141 passed, 1 hardware-gated multicam skip; 142 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |
