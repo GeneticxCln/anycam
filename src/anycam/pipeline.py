@@ -39,6 +39,7 @@ class EngineReport:
     error: str = ""
     vcam_error: str = ""
     media_error: str = ""
+    media_errors: list[str] = field(default_factory=list)
     camera_mode: str = ""
     camera_probe_error: str = ""
     camera_placeholders: list[str] = field(default_factory=list)
@@ -67,6 +68,7 @@ class EngineReport:
             "error": self.error,
             "vcam_error": self.vcam_error,
             "media_error": self.media_error,
+            "media_errors": self.media_errors,
             "camera_mode": self.camera_mode,
             "camera_probe_error": self.camera_probe_error,
             "camera_placeholders": self.camera_placeholders,
@@ -235,7 +237,26 @@ class AnyCamEngine:
         source_layer = layer
         if layer.kind == "camera" and not layer.source:
             layer.source = config.camera_device()
-        if layer.kind == "camera" and layer.id in self.skip_layers:
+        missing_media = ""
+        if layer.kind in ("image", "logo", "face", "video") and layer.source:
+            source_path = Path(layer.source).expanduser()
+            if not source_path.exists():
+                missing_media = str(source_path)
+        if missing_media:
+            # One unplugged/moved file must not refuse the whole scene.  Keep
+            # the layer's box as an opaque card and let the other layers run.
+            png = overlay.render_media_error_card(
+                layer.name, missing_media, box[2], box[3])
+            self.report.media_errors.append(
+                f"{layer.name}: missing {missing_media}")
+            source_layer = Layer(
+                id=layer.id, kind="image", name=layer.name, source=str(png),
+                box=layer.box, alpha=layer.alpha, z=layer.z,
+                visible=layer.visible,
+            )
+            chain = image_chain(str(png), box[2], box[3], self.fps, source_layer,
+                                fit=False)
+        elif layer.kind == "camera" and layer.id in self.skip_layers:
             # The device is temporarily gone.  Keep the layer's box and z-order
             # in the graph as a placeholder card instead of collapsing the
             # slot; the GUI rebuilds with the real camera on reconnect.
@@ -309,7 +330,7 @@ class AnyCamEngine:
             if probe_error:
                 self.report.camera_probe_error = probe_error
         source_size = getattr(chain, "source_size", None)
-        if layer.kind in ("image", "logo"):
+        if layer.kind in ("image", "logo") and not missing_media:
             source_size = overlay.image_size(layer) or source_size
         self.layer_sources[layer.id] = (tuple(source_size) if source_size
                                         else (box[2], box[3]))

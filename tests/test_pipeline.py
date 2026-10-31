@@ -1,4 +1,6 @@
 import shutil
+import subprocess
+import time
 
 import pytest
 
@@ -159,3 +161,93 @@ def test_engine_reports_dropped_frame_ratio(tmp_path):
     report = engine.run(1.5)
     assert report["dropped_pct"] < 10.0
     assert report["fps"] > 15.0
+
+
+def test_missing_media_layers_render_cards_without_stopping_scene(tmp_path):
+    """B13: one moved image/video must not refuse the rest of the scene."""
+    project = make_project(320, 180, 30)
+    project.scene.add_layer(Layer(
+        "missing_image", "image", "Gone image",
+        source=str(tmp_path / "gone.png"),
+        box=(0.0, 0.0, 0.5, 0.5), z=20,
+    ))
+    project.scene.add_layer(Layer(
+        "missing_video", "video", "Gone clip",
+        source=str(tmp_path / "gone.mp4"),
+        box=(0.5, 0.0, 0.5, 0.5), z=21,
+    ))
+    frames: list[int] = []
+    engine = AnyCamEngine(
+        project, preview=True, on_frame=lambda _sample: frames.append(1)
+    ).build()
+    try:
+        engine.start()
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            engine.pump(50)
+        assert len(engine.report.media_errors) == 2, engine.report.media_errors
+        assert engine.report.error == "", engine.report.error
+        assert frames, "missing media left the preview without a frame"
+        assert {"missing_image", "missing_video"}.issubset(engine._layer_pads)
+    finally:
+        engine.stop()
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg missing")
+def test_video_layer_loops_without_a_black_frame(tmp_path):
+    """B14: a clip ending used to freeze or blank the layer."""
+    clip = tmp_path / "loop.mp4"
+    subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-f", "lavfi",
+         "-i", "color=c=red:s=320x180:d=1:r=25", "-pix_fmt", "yuv420p",
+         "-c:v", "libx264", "-preset", "ultrafast", str(clip)],
+        check=True, timeout=30,
+    )
+    project = Project(name="loop")
+    project.output.canvas_w = 320
+    project.output.canvas_h = 180
+    project.output.fps = 25
+    scene = Scene("scene_loop", "Loop")
+    scene.add_layer(Layer("clip", "video", "Clip", source=str(clip),
+                          box=(0.0, 0.0, 1.0, 1.0), z=1))
+    project.scenes = [scene]
+    project.active_scene = scene.id
+
+    latest = {}
+
+    def on_frame(sample) -> None:
+        buffer = sample.get_buffer()
+        caps = sample.get_caps().get_structure(0)
+        width = int(caps.get_value("width"))
+        height = int(caps.get_value("height"))
+        ok, info = buffer.map(Gst.MapFlags.READ)
+        if not ok:
+            return
+        try:
+            latest["pixels"] = (width, height, bytes(info.data)[:width * height * 4])
+        finally:
+            buffer.unmap(info)
+
+    frames: list[int] = []
+    engine = AnyCamEngine(
+        project, preview=True, on_frame=on_frame
+    ).build()
+    try:
+        engine.start()
+        deadline = time.monotonic() + 2.6
+        while time.monotonic() < deadline:
+            engine.pump(50)
+            frames.append(1)
+        video_sources = [entry for entry in engine.pool.entries()
+                         if entry.spec.kind == "video"]
+        assert video_sources and video_sources[0].loops >= 1, [
+            entry.as_dict() for entry in engine.pool.entries()
+        ]
+        assert len(frames) > 40
+        width, height, pixels = latest["pixels"]
+        offset = ((height // 2) * width + width // 2) * 4
+        red, green, blue = pixels[offset:offset + 3]
+        assert red > 150 and green < 80 and blue < 80, (red, green, blue)
+        assert engine.report.error == "", engine.report.error
+    finally:
+        engine.stop()

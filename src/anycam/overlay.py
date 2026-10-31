@@ -148,6 +148,7 @@ def render_camera_placeholder(
     width: int,
     height: int,
     out: Path | None = None,
+    title: str = "Camera disconnected",
 ) -> Path:
     """Render the opaque card shown while a camera layer is disconnected.
 
@@ -184,7 +185,6 @@ def render_camera_placeholder(
     draw.rectangle([cx - bump_w // 2, body[1] - bump_h,
                     cx + bump_w // 2, body[1] + 1], fill=(26, 33, 39, 255))
 
-    title = "Camera disconnected"
     detail = (name or "Camera").strip()
     if device:
         detail = f"{detail} · {device}" if detail else device
@@ -207,13 +207,26 @@ def render_camera_placeholder(
 
     if out is None:
         digest = hashlib.sha1(
-            f"camera|{name}|{device}|{width}x{height}".encode()
+            f"camera|{title}|{name}|{device}|{width}x{height}".encode()
         ).hexdigest()[:16]
         out = config.cache_dir() / "overlays" / f"camera-placeholder-{digest}.png"
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     image.save(out)
     return out
+
+
+def render_media_error_card(
+    name: str,
+    source: str,
+    width: int,
+    height: int,
+    out: Path | None = None,
+) -> Path:
+    """Opaque card for an image/video/logo/face asset that is missing."""
+    return render_camera_placeholder(
+        name, source, width, height, out=out, title="Media unavailable"
+    )
 
 
 def _fingerprint(source: Path) -> str:

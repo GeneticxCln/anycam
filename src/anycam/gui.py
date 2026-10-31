@@ -3130,6 +3130,10 @@ class AnyCamWindow(QMainWindow):
         self.timer.start(33)
         if self.engine.report.vcam_error:
             self._status(self.engine.report.vcam_error)
+        elif self.engine.report.media_errors:
+            self._status(
+                "Preview running · missing media: "
+                + ", ".join(self.engine.report.media_errors))
         elif self.engine.report.media_error:
             self._status(f"Preview running · {self.engine.report.media_error}")
         elif self.engine.report.camera_probe_error:

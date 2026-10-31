@@ -2,7 +2,7 @@
 
 Backlog derived from the 2026-10-31 full audit (55 bugs, M0–M9) and the work
 landed since. Snapshot: 2026-10-31, after the camera-replug fix and the
-10-minute soak re-run; suite **142 collected, 141 passed, 1 hardware-gated
+10-minute soak re-run; suite **144 collected, 143 passed, 1 hardware-gated
 multicam skip**.
 
 `PLAN.md` is the older 2026-10-30 plan; this file tracks the newer audit's open
@@ -150,8 +150,6 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 |---|---|---|
 | B1 | Live portal screen frame size still needs one real check | M0 residual |
 | B12 | Every rebuild splits the MP4 and drops outputs | M1 |
-| B13 | One missing media file refuses the whole scene | M1 |
-| B14 | Video layers do not loop | M1 |
 | B15 | Hidden layers still play and hold sources | M1 |
 | B16 | Duplicate camera must share one capture (verify) | M1 |
 | B17 | Vcam runtime errors are silent | M1 |
@@ -185,6 +183,8 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - M1 slice 1: RTMP output isolation, B9 (`tests/test_m1_outputs.py`).
 - B10: a silent RTSP source cannot hold the canvas (`tests/test_m1_outputs.py::test_silent_rtsp_source_cannot_stall_the_canvas`).
 - B11: a refused RTMP output cannot abort preview/recording/vcam, and a failed rebuild clears Record (`tests/test_m1_outputs.py::test_missing_rtmp_sink_keeps_preview_and_recording`, `tests/test_gui.py::test_failed_start_clears_recording_state`).
+- B13: missing image/video/logo/face assets render an error card without stopping the scene (`tests/test_pipeline.py::test_missing_media_layers_render_cards_without_stopping_scene`).
+- B14: video-file captures seek back to the start after EOS and keep the picture (`tests/test_pipeline.py::test_video_layer_loops_without_a_black_frame`).
 - M1 slice 2: ref-counted source pool, dead-capture isolation, output-pad EOS, duplicate-PTS handling (`tests/test_source_pool.py`).
 - Persistent recorder: one MP4 across canvas rebuilds, with PTS remap and AAC audio (`tests/test_recorder.py`).
 - Session-owned virtual camera: one `v4l2sink` across canvas rebuilds (`tests/test_vcam_output.py`).

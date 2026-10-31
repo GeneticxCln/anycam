@@ -45,9 +45,11 @@ The GUI screenshot that used to be embedded here is in that archive too
 | Output isolation (M1 slice 1) | PASS, an RTMP server that stops reading cannot stall preview, recording or the virtual camera | `tests/test_m1_outputs.py::test_unresponsive_rtmp_cannot_stall_the_canvas` |
 | Unresponsive RTSP source (B10) | PASS, silent RTSP server; canvas keeps ≥99% of 30 fps and `stop()` returns in under 1 s | `tests/test_m1_outputs.py::test_silent_rtsp_source_cannot_stall_the_canvas` |
 | Refused output (B11) | PASS, missing `rtmpsink` leaves preview, recording and the vcam tap running; a failed rebuild clears Record and finalises the recorder | `tests/test_m1_outputs.py::test_missing_rtmp_sink_keeps_preview_and_recording`, `tests/test_gui.py::test_failed_start_clears_recording_state` |
+| Missing media cards (B13) | PASS, missing image/video layers render cards while the test layer keeps producing frames | `tests/test_pipeline.py::test_missing_media_layers_render_cards_without_stopping_scene` |
+| Video-file looping (B14) | PASS, 1 s clip seeked after EOS; centre still red after 2.6 s | `tests/test_pipeline.py::test_video_layer_loops_without_a_black_frame` |
 | Continuous MP4 across rebuilds | PASS, one persistent recorder spans rebuilds, including five scene switches, and writes one playable file | `tests/test_recorder.py`, `tests/test_gui.py::test_five_scene_switches_keep_one_recording`, `tests/test_gui.py::test_layer_edit_while_recording_keeps_one_continuous_file` |
 | Persistent virtual-camera output | PASS (offscreen wiring), one session-owned `v4l2sink` survives engine rebuilds; real loopback consumer not exercised because `/dev/video10` is absent | `tests/test_vcam_output.py`, `tests/test_gui.py::test_vcam_output_survives_engine_restarts` |
-| Automated tests | PASS, 141 passed + 1 hardware-gated multicam test | `./scripts/test.sh`; `docs/EVIDENCE.md` §2, §4.10 |
+| Automated tests | PASS, 143 passed + 1 hardware-gated multicam test | `./scripts/test.sh`; `docs/EVIDENCE.md` §2, §4.10 |
 | V4L2 virtual camera | PASS — 720 frames in 12 s, and a `v4l2src` consumer read 60/60 buffers at 1920×1080 YUYV | `evidence/02_virtual_camera/report.json`, `consumer.txt`, `format.txt` |
 
 ## Output mode: 1920×1080@60 (MJPG)
@@ -350,7 +352,7 @@ and a new segment starts (the status bar reports the segment count).
 
 ```bash
 ./scripts/test.sh
-# 141 passed, 1 skipped (hardware-gated multicam; 142 collected)
+# 143 passed, 1 skipped (hardware-gated multicam; 144 collected)
 ```
 
 Covers geometry, model/JSON round-trips (including audio mixing fields, editor

@@ -67,6 +67,7 @@ class Entry:
     probe_error: str = ""
     screen_error: str = ""
     error: str = ""
+    loops: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -74,6 +75,7 @@ class Entry:
             "channel": self.channel,
             "refs": self.refs,
             "source_size": list(self.source_size),
+            "loops": self.loops,
             "error": self.error,
         }
 
@@ -192,11 +194,25 @@ class SourcePool:
             if bus is None:
                 continue
             while True:
-                msg = bus.pop_filtered(Gst.MessageType.ERROR)
+                msg = bus.pop_filtered(
+                    Gst.MessageType.ERROR | Gst.MessageType.EOS)
                 if msg is None:
                     break
-                err, debug = msg.parse_error()
-                entry.error = f"{err.message} ({debug})"
+                if msg.type == Gst.MessageType.ERROR:
+                    err, debug = msg.parse_error()
+                    entry.error = f"{err.message} ({debug})"
+                elif entry.spec.kind == "video" and not entry.error:
+                    # File video is the only repeatable capture.  Seek the
+                    # capture pipeline itself, so the canvas keeps the last
+                    # frame and never sees the end of the clip as black.
+                    if entry.pipeline.seek_simple(
+                        Gst.Format.TIME,
+                        Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                        0,
+                    ):
+                        entry.loops += 1
+                    else:
+                        entry.error = "video loop could not seek to the start"
 
     def errors(self) -> dict[str, str]:
         return {entry.channel: entry.error

@@ -14,7 +14,7 @@ Status legend:
   verification.
 
 Last updated: 2026-10-31 (audit M0, M1 output pipelines, M1 capture source pool,
-and the network/output failure gates). Evidence paths name the private archive
+network/output failure gates, and media-layer fallback/loop gates). Evidence paths name the private archive
 `~/anycam-private-evidence/evidence/` after the M0 move.
 
 ## 1. Video sources
@@ -29,7 +29,8 @@ and the network/output failure gates). Evidence paths name the private archive
 | Camera hot-plug reconnect | **verified** (offscreen); physical pull still blocked | A missing camera node keeps its box in the graph as an opaque generated placeholder card (`AnyCamEngine(skip_layers=…)` + `overlay.render_camera_placeholder`), so the rest of the scene stays live and the slot keeps its position. The same placeholder appears when preview starts with a camera absent. A 1.2 s watcher rebuilds with the real camera when the node returns. A deliberately stopped preview is not restarted. | `tests/test_overlay.py::test_camera_placeholder_is_an_opaque_labeled_card`; `tests/test_pipeline.py::test_skipped_camera_builds_a_placeholder_pad` and `test_all_skipped_cameras_still_build_placeholders`; `tests/test_gui.py::test_camera_loss_drops_layer_but_keeps_preview_alive`, `test_all_lost_cameras_still_show_placeholder_frames` and `test_camera_reconnects_when_its_device_returns` |
 | Screen/window capture via xdg-desktop-portal + PipeWire | **partial** | `portal.request_screen_cast` drives CreateSession → SelectSources → Start → OpenPipeWireRemote; `sources.screen_chain` uses the node id and fd, and the Layers tab has a Screen button | The portal flow is implemented and unit-tested, but no live screen-capture artifact is checked in; a saved screen layer re-requests access on the next engine start |
 | Image source | **verified** | `sources.image_chain` (PNG/JPEG/WebP, `imagefreeze`); Layers tab Image button | Full-frame image source tested (`--source plate.png`); effects + crop wired; GUI image-layer creation covered by `tests/test_gui.py` |
-| Video-file source | **verified** | `sources.file_video_chain` (`filesrc ! decodebin`); Layers tab Video button | Full-frame video playback tested (`--source colorful.mp4`), 60 fps; GUI video-layer creation covered by `tests/test_gui.py` |
+| Video-file source | **verified** | `pool.SourcePool` captures `filesrc ! decodebin`; Layers tab Video button. After EOS, `poll_errors` seeks the video capture pipeline to 0, so the layer loops instead of ending black. | Full-frame video playback tested (`--source colorful.mp4`), 60 fps; `tests/test_pipeline.py::test_video_layer_loops_without_a_black_frame` confirms a second pass and red centre; GUI video-layer creation covered by `tests/test_gui.py` |
+| Missing media fallback | **verified** | A missing image/video/logo/face path builds `overlay.render_media_error_card` in the layer box and records `media_errors`; the rest of the canvas stays live. | `tests/test_pipeline.py::test_missing_media_layers_render_cards_without_stopping_scene` |
 | RTSP/HTTP source | **verified** | `sources.network_chain` (`uridecodebin`); Layers tab Network URL button | Local integration test runs an ffmpeg RTP producer through a minimal RTSP server into `AnyCamEngine` and asserts decoded preview frames (`tests/test_rtsp.py`, `evidence/08_rtsp/`). `tests/test_m1_outputs.py::test_silent_rtsp_source_cannot_stall_the_canvas` covers a server that accepts and never answers; HTTP was exercised earlier. |
 | Capture pipeline isolation / sharing (M1 slice 2) | **verified** | `pool.SourcePool` owns one `intervideosink` pipeline per distinct `CaptureSpec`; layers on the same device share it by refcount and the last release sets it to NULL. The canvas reads it through `intervideosrc` (`sources.layer_tail`), so a dead capture cannot stop the compositor, and one EOS through the compositor's src pad finalises the outputs. | `tests/test_source_pool.py` (shared refcount, real pixels through the pool, dead capture, release on stop); `tests/test_m1_outputs.py` |
 
@@ -130,4 +131,4 @@ sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
 | Wayland portal capture, no niri-only API | **verified** (spike) | `xdg-desktop-portal` ScreenCast + PipeWire |
 | Reversible system changes | **verified** | Only `modprobe v4l2loopback`; `scripts/disable-v4l2loopback.sh`; documented |
 | Reproducible build/run docs | **verified** | `README.md`, `scripts/setup.sh` |
-| Runnable automated tests | **verified** | `./scripts/test.sh` (141 passed, 1 hardware-gated multicam skip; 142 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |
+| Runnable automated tests | **verified** | `./scripts/test.sh` (143 passed, 1 hardware-gated multicam skip; 144 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |
