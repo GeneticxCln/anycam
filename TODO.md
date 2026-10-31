@@ -24,10 +24,10 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 
 - [ ] Split `pipeline.py` into `src/anycam/engine/`: `source_pool.py`, `canvas.py`, `outputs/{vcam,recorder,stream}.py`, `health.py`, `controller.py`; keep `AnyCamEngine` as a thin facade while tests migrate.
 - [ ] Canvas is never rebuilt. Record/stop, vcam toggle, scene switch, add layer and apply-effects attach/detach live (B12).
-- [ ] Video layers loop with a segment seek and never end on a silent black frame (B14); a video-only scene must not leave the chip saying LIVE.
+- [x] Video layers loop with a segment seek and never end on a silent black frame (B14); a video-only scene must not leave the chip saying LIVE. Passed 2026-10-31: a 1 s red clip seeked after EOS, `loops >= 1`, and the centre was still red after 2.6 s.
 - [ ] Hidden playlist layers release their sources; hidden cameras stop holding devices and CPU (B15).
 - [ ] Stable camera IDs through `/dev/v4l/by-id`, not `/dev/videoN` (B46). **App side implemented 2026-10-31; needs a physical replug run.**
-- [ ] A missing video/image layer renders an error card while the rest of the scene keeps running (B13).
+- [x] A missing video/image layer renders an error card while the rest of the scene keeps running (B13). Passed 2026-10-31: missing image and video layers each build a card, and the test layer keeps producing frames.
 - [ ] Per-source health model and watchdog; FPS stops being a lifetime average; a stalled pipeline is detected (B41).
 - [ ] Report every camera's negotiated mode, not only the last one (B48).
 - [ ] Vcam: surface runtime errors (B17), check the configured device (B18), and bound the `appsrc` queue (B20).

@@ -487,6 +487,24 @@ cable-pull verification is still pending. `tests/test_camera_identity.py`
 covers by-id resolution, and `test_camera_reconnect_retries_with_backoff_when_restart_fails`
 covers the retry behaviour.
 
+## 2026-10-31 — media cards and video looping
+
+`AnyCamEngine._add_layer` now checks local image, logo, face and video sources
+before building their chains. A missing path becomes an opaque
+`overlay.render_media_error_card` in the layer's box and is recorded in
+`EngineReport.media_errors`; the rest of the scene keeps running. This also
+covers a missing face asset, which used to raise during build.
+
+Video-file capture runs in `SourcePool`. The pool now consumes EOS as well as
+ERROR messages, and for a `video` entry seeks the capture pipeline back to zero
+with `FLUSH | KEY_UNIT`. The canvas therefore gets a continuous stream rather
+than a frozen last frame or a black gap. The test runs a 1 s red clip for 2.6 s,
+checks `loops >= 1`, and samples the centre pixel after the first loop.
+
+Verification: `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest tests -q`
+→ 144 collected, 143 passed, 1 hardware-gated multicam skip.
+
+
 ## 2026-10-31 — persistent recorder (one MP4 across rebuilds)
 
 Recording moved out of the canvas graph into `anycam.engine.outputs.recorder`.
