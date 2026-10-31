@@ -28,6 +28,7 @@ from .geometry import clamp
 from .model import (Effects, Layer, Project, Scene, camera_grid_scene,
                     default_project, new_id, two_camera_scene)
 from .engine.outputs.recorder import Recorder
+from .engine.outputs.vcam import VcamOutput
 from .pipeline import AnyCamEngine
 from .pool import SourcePool
 
@@ -868,6 +869,7 @@ class AnyCamWindow(QMainWindow):
         self.recording = False
         self._recorder: Recorder | None = None
         self._recording_path = ""
+        self._vcam_output: VcamOutput | None = None
         self.vcam_on = False
         # Streaming is a separate action: preview must never publish a saved URL.
         self.live = False
@@ -3023,6 +3025,27 @@ class AnyCamWindow(QMainWindow):
             self._status(
                 f"Recording failed: {report.get('error') or 'no frames'}")
 
+    def _start_vcam_output(self) -> bool:
+        if self._vcam_output is not None and self._vcam_output.active:
+            return True
+        device = self.project.output.vcam_device or config.loopback_device()
+        output = VcamOutput()
+        if not output.start(device, self.project.output.canvas_w,
+                            self.project.output.canvas_h, self.project.output.fps):
+            self._status(output.error or "Virtual camera could not start")
+            return False
+        self._vcam_output = output
+        return True
+
+    def _finish_vcam_output(self) -> None:
+        output = self._vcam_output
+        self._vcam_output = None
+        if output is None:
+            return
+        report = output.stop()
+        if report.get("error"):
+            self._status(str(report["error"]))
+
     def start_engine(self) -> None:
         if self.engine is not None:
             return
@@ -3053,6 +3076,10 @@ class AnyCamWindow(QMainWindow):
             self.record_button.setText("Record")
             return
         recorder = self._recorder
+        if self.vcam_on and not self._start_vcam_output():
+            self.vcam_on = False
+            self.vcam_button.setText("Virtual camera")
+        vcam_output = self._vcam_output if self.vcam_on else None
         # In crop mode the selected layer is built uncropped, so the editor's
         # window is drawn over the picture it is actually trimming.
         crop_preview = self.preview.selected_id if self.preview.edit_mode == "crop" else ""
@@ -3062,6 +3089,7 @@ class AnyCamWindow(QMainWindow):
                 self.project,
                 recorder=recorder,
                 vcam=self.vcam_on,
+                vcam_output=vcam_output,
                 preview=True,
                 audio=self.audio_on or bool(self.project.audio.media_file),
                 # Only an explicit Go Live publishes; a saved URL is inert.
@@ -3136,6 +3164,7 @@ class AnyCamWindow(QMainWindow):
         if self.engine is not None:
             self.stop_engine()
         self._finish_recorder()
+        self._finish_vcam_output()
         self._source_pool.stop()
         self._save_if_needed()
         self._close_screen_sessions()
@@ -3151,6 +3180,7 @@ class AnyCamWindow(QMainWindow):
         if self.engine is not None:
             self.stop_engine()
         self._finish_recorder()
+        self._finish_vcam_output()
         self._source_pool.stop()
         self._save_if_needed()
         self._close_screen_sessions()
@@ -3187,10 +3217,16 @@ class AnyCamWindow(QMainWindow):
     def toggle_vcam(self) -> None:
         self.vcam_on = not self.vcam_on
         self.vcam_button.setText("Virtual camera: on" if self.vcam_on else "Virtual camera")
+        self.project.output.vcam_device = (self.vcam_edit.text().strip()
+                                           or config.loopback_device())
+        if self.vcam_on and not self._start_vcam_output():
+            self.vcam_on = False
+            self.vcam_button.setText("Virtual camera")
+            return
         if self.engine is not None:
             self.restart_engine()
-        if self.vcam_on and not config.vcam_available():
-            self._status("Virtual camera device is not available. Run scripts/enable-v4l2loopback.sh.")
+        if not self.vcam_on:
+            self._finish_vcam_output()
 
     def snapshot(self) -> None:
         image = self.preview.image

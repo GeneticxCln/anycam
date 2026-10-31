@@ -432,7 +432,7 @@ step-ups; a real leak of one 1080p frame per minute still fails
 (`tests/test_soak_memory.py`). A fresh 10-minute run is still required.
 
 Verification: `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest tests -q`
-→ 135 collected, 134 passed, 1 hardware-gated multicam skip.
+→ 138 collected, 137 passed, 1 hardware-gated multicam skip.
 `tests/test_source_pool.py` covers sharing, real pixels through the pool, a dead
 capture, and release on stop.
 
@@ -487,5 +487,21 @@ own caps.
 Verification: `tests/test_recorder.py::test_two_engines_write_one_continuous_file`
 (one playable file over two engines), `test_recorder_muxes_audio_and_video`
 (real H.264 + AAC), and the GUI crop-edit test (two rebuilds, exactly one MP4).
-The virtual-camera consumer is still restarted with the canvas, and the
-five-scene-switch soak remains.
+The five-scene-switch soak remains.
+
+## 2026-10-31 — session-owned virtual camera
+
+The virtual camera moved to `anycam.engine.outputs.vcam.VcamOutput`. The GUI
+now owns one `VcamOutput` for the window lifetime; `AnyCamEngine` builds only
+the `vcam_appsink` tap, so a canvas rebuild destroys the tap but leaves
+`v4l2sink` PLAYING. Toggling the virtual camera off stops the output
+independently, and `config.vcam_available(device)` now accepts an explicit node.
+
+The tap uses the same appsink/appsrc bridge as before (direct `v4l2sink` into
+the tee recursed in GStreamer 1.28). A real `v4l2src` consumer could not be
+exercised because `/dev/video10` is absent; the tests use a fake output object
+for the GUI persistence path and verify that a missing device fails cleanly.
+
+Verification: `tests/test_vcam_output.py` (missing device, engine tap) and
+`tests/test_gui.py::test_vcam_output_survives_engine_restarts` (one output
+across a rebuild, stopped on toggle off).

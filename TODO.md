@@ -2,7 +2,7 @@
 
 Backlog derived from the 2026-10-31 full audit (55 bugs, M0–M9) and the work
 landed since. Snapshot: 2026-10-31, after the camera-replug fix and the
-10-minute soak re-run; suite **135 collected, 134 passed, 1 hardware-gated
+10-minute soak re-run; suite **138 collected, 137 passed, 1 hardware-gated
 multicam skip**.
 
 `PLAN.md` is the older 2026-10-30 plan; this file tracks the newer audit's open
@@ -14,7 +14,7 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 
 - [x] **10-minute A/V drift gate.** `PYTHONPATH=src python3 scripts/verify-av-drift.py --seconds 600 --warmup 20 --record /tmp/drift.mp4 --json /tmp/drift.json`. Passed 2026-10-31: `drift_s: 0.0`, 36,008 video / 24,405 audio buffers, zero duplicate/gap timestamps, finalised 600.12 s MP4.
 - [~] **60-minute soak** tracking RSS, tmpfs usage, disk and file descriptors; fail the run on a frame stall. Instrumentation landed 2026-10-31 (tmpfs, recording filesystem, FDs, `--stall-seconds`); the 10-minute synthetic re-run passed at 0.043 MiB/min with no stalls. Run 60 minutes with vcam.
-- [~] **Continuous MP4** across five scene switches and record toggles, plus an unbroken `v4l2src` consumer on the virtual camera (B12). A persistent `Recorder` now spans canvas rebuilds (2026-10-31); the vcam consumer still restarts with the canvas, and the five-switch soak remains.
+- [~] **Continuous MP4** across five scene switches and record toggles, plus an unbroken `v4l2src` consumer on the virtual camera (B12). A persistent `Recorder` and a session-owned vcam output now span canvas rebuilds (2026-10-31); the five-switch/60-minute soak and a real loopback consumer remain.
 - [ ] **Unresponsive RTSP/network source**: canvas keeps ≥99% of its frames and `stop()` returns in under 1 s (B10/B11). Add a failure-injection test next to `tests/test_m1_outputs.py`; `tests/test_rtsp.py` only exercises a healthy feed.
 - [ ] **Refused output does not poison the session** (B11): preview, recording and vcam keep running, and the recording flag does not stay on.
 - [ ] **Physical camera unplug/replug** on real hardware with `scripts/verify-camera-reconnect.py`. Needs the user and a cable; the app now resolves the by-id path.
@@ -187,5 +187,6 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - M1 slice 1: RTMP output isolation, B9 (`tests/test_m1_outputs.py`).
 - M1 slice 2: ref-counted source pool, dead-capture isolation, output-pad EOS, duplicate-PTS handling (`tests/test_source_pool.py`).
 - Persistent recorder: one MP4 across canvas rebuilds, with PTS remap and AAC audio (`tests/test_recorder.py`).
+- Session-owned virtual camera: one `v4l2sink` across canvas rebuilds (`tests/test_vcam_output.py`).
 - A/V drift harness: 20 s synthetic run with 0.0 s drift and a finalised MP4 (`scripts/verify-av-drift.py`).
 - Repo hygiene B54: git history, evidence moved out, launcher/desktop fixed, 123-test suite.

@@ -996,6 +996,56 @@ def test_camera_source_error_quarantines_an_existing_device(app):
         app.processEvents()
 
 
+def test_vcam_output_survives_engine_restarts(app, monkeypatch):
+    created = []
+
+    class FakeVcam:
+        def __init__(self):
+            self.active = False
+            self.error = ""
+            self.pixel_format = "YUY2"
+            self.stopped = False
+            created.append(self)
+
+        def start(self, device, width, height, fps):
+            self.device = device
+            self.active = True
+            return True
+
+        def push_sample(self, _sample):
+            return None
+
+        def poll(self):
+            return None
+
+        def stop(self):
+            self.active = False
+            self.stopped = True
+            return {"device": self.device, "ok": True, "error": ""}
+
+    monkeypatch.setattr("anycam.gui.VcamOutput", FakeVcam)
+    window = _window()
+    try:
+        window.start_engine()
+        assert window.engine is not None, window.statusBar().currentMessage()
+        first = window.engine
+        window.toggle_vcam()
+        assert window.vcam_on is True
+        assert len(created) == 1
+        output = created[0]
+        window.restart_engine()
+        assert len(created) == 1, "a rebuild created a second v4l2sink"
+        assert window._vcam_output is output
+        assert window.engine is not first
+        window.toggle_vcam()
+        assert window.vcam_on is False
+        assert output.stopped is True
+        assert window._vcam_output is None
+    finally:
+        window.close()
+        app.processEvents()
+
+
 def test_add_screen_layer_keeps_portal_session(app, monkeypatch):
     class FakeSession:
         def __init__(self):

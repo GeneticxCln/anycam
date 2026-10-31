@@ -19,6 +19,7 @@ from . import config, overlay
 from .geometry import box_pixels, clamp
 from .model import Layer, Project, Scene
 from .engine.outputs.recorder import Recorder
+from .engine.outputs.vcam import VcamOutput
 from .pool import CAPTURE_KINDS, CaptureSpec, SourcePool, capture_spec
 from .sources import (SourceChain, build_chain, caps_filter, caps_string,
                       image_chain, layer_tail, make)
@@ -101,6 +102,7 @@ class AnyCamEngine:
         record_path: str | os.PathLike | None = None,
         recorder: Recorder | None = None,
         vcam: bool = False,
+        vcam_output: VcamOutput | None = None,
         preview: bool = False,
         audio: bool = False,
         rtmp: str | None = None,
@@ -137,6 +139,7 @@ class AnyCamEngine:
         else:
             self.record_path = str(record_path) if record_path else ""
         self.want_vcam = vcam
+        self.vcam_output = vcam_output
         self.preview = preview
         self.audio = audio
         self.rtmp = rtmp or ""
@@ -585,20 +588,37 @@ class AnyCamEngine:
             decode.connect("pad-added", on_pad, conv)
 
     def _build_vcam(self) -> None:
-        """Feed /dev/video10 through an appsink -> appsrc bridge.
+        """Feed the virtual camera through an appsink tap.
 
-        v4l2sink links directly into the compositor's tee on paper, but on
-        GStreamer 1.28 its caps query proxies back through the tee and the
-        compositor, recursing until the stack overflows (SIGSEGV inside
-        libgstvideo4linux2).  Keeping v4l2sink in its own pipeline makes every
-        caps query terminate at the appsink/appsrc pair.
+        A session-owned ``VcamOutput`` keeps ``v4l2sink`` alive across canvas
+        rebuilds.  The engine only builds the tap; CLI users without a shared
+        output still get the legacy self-contained bridge.
         """
         device = self.project.output.vcam_device or config.loopback_device()
         self.report.vcam = device
-        if not config.vcam_available():
+        if self.vcam_output is not None:
+            if not self.vcam_output.active:
+                self.report.vcam_error = (self.vcam_output.error or
+                                          f"virtual camera {device} is not running")
+                return
+            fmt = self.vcam_output.pixel_format
+            caps_text = caps_string(self.canvas_w, self.canvas_h, self.fps, fmt)
+            queue = self._branch("vcam")
+            queue.set_property("leaky", 2)  # downstream: drop old buffers
+            convert = make("videoconvert")
+            caps = caps_filter(caps_text, "vcam_caps")
+            appsink = make("appsink", "vcam_appsink", emit_signals=True,
+                           max_buffers=2, drop=True, sync=False)
+            self._add(convert, caps, appsink)
+            self._link([queue, convert, caps, appsink])
+            appsink.connect("new-sample", self._on_vcam_sample)
+            self.report.vcam_active = True
+            return
+
+        if not config.vcam_available(device):
             self.report.vcam_error = (
                 f"virtual camera {device} is not available; load v4l2loopback with "
-                f"'sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam exclusive_caps=1'"
+                f"'sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam'"
             )
             return
         fmt = config.vcam_pixel_format(device)
@@ -635,9 +655,12 @@ class AnyCamEngine:
 
     def _on_vcam_sample(self, sink):
         sample = sink.emit("pull-sample")
-        if sample is not None and self._vcam_appsrc is not None:
-            # Buffers are refcounted; handing the sample to appsrc is zero-copy.
-            self._vcam_appsrc.emit("push-sample", sample)
+        if sample is not None:
+            if self.vcam_output is not None:
+                self.vcam_output.push_sample(sample)
+            elif self._vcam_appsrc is not None:
+                # Buffers are refcounted; handing the sample to appsrc is zero-copy.
+                self._vcam_appsrc.emit("push-sample", sample)
         return Gst.FlowReturn.OK
 
     def _audio_tee(self) -> Gst.Element | None:
@@ -1011,6 +1034,11 @@ class AnyCamEngine:
             if time.monotonic() >= deadline:
                 break
         self._poll_vcam_bus()
+        if self.vcam_output is not None:
+            self.vcam_output.poll()
+            if self.vcam_output.error:
+                self.report.vcam_error = self.vcam_output.error
+                self.report.vcam_active = False
         self._poll_rtmp_bus()
         self.pool.poll_errors()
         errors = self.pool.errors()

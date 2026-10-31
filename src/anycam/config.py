@@ -241,8 +241,8 @@ def loopback_device() -> str:
     return "/dev/video10"
 
 
-def vcam_available() -> bool:
-    dev = loopback_device()
+def vcam_available(device: str | None = None) -> bool:
+    dev = device or loopback_device()
     if not Path(dev).exists():
         return False
     code, out = run(["v4l2-ctl", "-d", dev, "--info"])
