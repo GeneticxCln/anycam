@@ -43,9 +43,9 @@ The GUI screenshot that used to be embedded here is in that archive too
 | Camera modes, grid preset, placeholders and reconnect | PASS (offscreen; placeholder graph and reconnect timer exercised) | `evidence/11_camera_controls/`, `docs/EVIDENCE.md` §4.10 |
 | 10-min 1080p60 soak (synthetic re-run) | PASS on drops/memory/stalls: 36,009 frames over 600.15 s (0.0% dropped), RSS 188.7→189.0 MiB (0.043 MiB/min), 12→12 FDs; vcam blocked (no `/dev/video10`) | `evidence/soak_10m/report.json` |
 | Output isolation (M1 slice 1) | PASS, an RTMP server that stops reading cannot stall preview, recording or the virtual camera | `tests/test_m1_outputs.py::test_unresponsive_rtmp_cannot_stall_the_canvas` |
-| Continuous MP4 across rebuilds | PASS, one persistent recorder spans two engine rebuilds and writes one playable file | `tests/test_recorder.py`, `tests/test_gui.py::test_layer_edit_while_recording_keeps_one_continuous_file` |
+| Continuous MP4 across rebuilds | PASS, one persistent recorder spans rebuilds, including five scene switches, and writes one playable file | `tests/test_recorder.py`, `tests/test_gui.py::test_five_scene_switches_keep_one_recording`, `tests/test_gui.py::test_layer_edit_while_recording_keeps_one_continuous_file` |
 | Persistent virtual-camera output | PASS (offscreen wiring), one session-owned `v4l2sink` survives engine rebuilds; real loopback consumer not exercised because `/dev/video10` is absent | `tests/test_vcam_output.py`, `tests/test_gui.py::test_vcam_output_survives_engine_restarts` |
-| Automated tests | PASS, 137 passed + 1 hardware-gated multicam test | `./scripts/test.sh`; `docs/EVIDENCE.md` §2, §4.10 |
+| Automated tests | PASS, 138 passed + 1 hardware-gated multicam test | `./scripts/test.sh`; `docs/EVIDENCE.md` §2, §4.10 |
 | V4L2 virtual camera | PASS — 720 frames in 12 s, and a `v4l2src` consumer read 60/60 buffers at 1920×1080 YUYV | `evidence/02_virtual_camera/report.json`, `consumer.txt`, `format.txt` |
 
 ## Output mode: 1920×1080@60 (MJPG)
@@ -348,7 +348,7 @@ and a new segment starts (the status bar reports the segment count).
 
 ```bash
 ./scripts/test.sh
-# 137 passed, 1 skipped (hardware-gated multicam; 138 collected)
+# 138 passed, 1 skipped (hardware-gated multicam; 139 collected)
 ```
 
 Covers geometry, model/JSON round-trips (including audio mixing fields, editor

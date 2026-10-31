@@ -28,7 +28,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QInputDialog, QMessageBox
 from anycam import config, portal
 from anycam.demo import build_demo_project
 from anycam.gui import AnyCamWindow, CameraGridDialog
-from anycam.model import Layer, Project
+from anycam.model import Layer, Project, Scene
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -408,6 +408,56 @@ def test_layer_edit_while_recording_keeps_one_continuous_file(app, tmp_path, mon
             )
             assert probe.returncode == 0, probe.stderr
             assert float(probe.stdout.strip()) > 1.5, probe.stdout
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_five_scene_switches_keep_one_recording(app, tmp_path, monkeypatch):
+    """B12: each scene switch rebuilds the canvas; the MP4 must stay one file."""
+    monkeypatch.setenv("XDG_VIDEOS_DIR", str(tmp_path))
+    project = build_demo_project("testsrc", 320, 180, 30)
+    first = project.scene
+    for index in range(1, 5):
+        scene = Scene(f"scene_{index}", f"Scene {index}")
+        for layer in first.layers:
+            clone = Layer.from_dict(layer.to_dict())
+            clone.id = f"{layer.id}_{index}"
+            scene.add_layer(clone)
+        project.scenes.append(scene)
+    window = AnyCamWindow(project)
+    window.resize(720, 480)
+    window.show()
+    window.headless = True
+    window.recording = True
+    window.record_button.setText("Stop recording")
+    try:
+        window.start_engine()
+        assert window.engine is not None, window.statusBar().currentMessage()
+        assert _wait_for(app, lambda: window.preview.image is not None, timeout=8)
+        _pump(app, 1.0)
+        previous = window.engine
+        # Five rebuilds, including the return to the first scene.
+        for index in (1, 2, 3, 4, 0):
+            window.switch_scene(index)
+            assert window.engine is not None, window.statusBar().currentMessage()
+            assert window.engine is not previous
+            previous = window.engine
+            _pump(app, 0.45)
+        window.close()
+        app.processEvents()
+        files = [Path(path) for path in window.recording_segments]
+        assert len(files) == 1, files
+        path = files[0]
+        assert path.exists() and path.stat().st_size > 0
+        if shutil.which("ffprobe"):
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(path)],
+                capture_output=True, text=True,
+            )
+            assert probe.returncode == 0, probe.stderr
+            assert float(probe.stdout.strip()) > 2.0, probe.stdout
     finally:
         window.close()
         app.processEvents()

@@ -432,7 +432,7 @@ step-ups; a real leak of one 1080p frame per minute still fails
 (`tests/test_soak_memory.py`). A fresh 10-minute run is still required.
 
 Verification: `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest tests -q`
-→ 138 collected, 137 passed, 1 hardware-gated multicam skip.
+→ 139 collected, 138 passed, 1 hardware-gated multicam skip.
 `tests/test_source_pool.py` covers sharing, real pixels through the pool, a dead
 capture, and release on stop.
 
@@ -505,3 +505,14 @@ for the GUI persistence path and verify that a missing device fails cleanly.
 Verification: `tests/test_vcam_output.py` (missing device, engine tap) and
 `tests/test_gui.py::test_vcam_output_survives_engine_restarts` (one output
 across a rebuild, stopped on toggle off).
+
+## 2026-10-31 — five-scene-switch recording gate
+
+`tests/test_gui.py::test_five_scene_switches_keep_one_recording` drives the
+offscreen window through five canvas rebuilds (scene indices 1, 2, 3, 4, 0)
+while one recording session is active. It asserts that exactly one finalised
+MP4 exists and that it is longer than two seconds, so a rebuild that split the
+file or left a segment behind fails.
+
+The 60-minute soak and the real `v4l2src` consumer still need v4l2loopback and
+`/dev/video10`.
