@@ -575,6 +575,31 @@ def test_chain(width: int, height: int, fps: int, layer=None) -> SourceChain:
     return chain
 
 
+def layer_tail(layer, source_size: tuple[int, int], width: int, height: int,
+               fps: int, channel: str) -> SourceChain:
+    """The canvas half of a captured layer, fed by ``intervideosrc``.
+
+    The capture pipeline (`anycam.pool`) emits the source's native frame; crop,
+    effects and the letterbox fit are per layer and stay here.  The rate is
+    pinned: ``intervideosrc`` negotiates 30/1 by default and silently drops
+    every second frame of a 60 fps capture.
+    """
+    chain = SourceChain()
+    src = make("intervideosrc", f"src_{channel}", channel=channel)
+    rate = caps_filter(f"video/x-raw,framerate={fps}/1")
+    chain.add(src, rate, make("videoconvert"))
+    effects = _effects_chain(layer)
+    if effects:
+        chain.add(*effects, make("videoconvert"))
+    src_w, src_h = source_size
+    chain.add(*_crop_chain(layer, src_w, src_h))
+    cropped_w, cropped_h = cropped_size(layer, src_w, src_h)
+    _fit_letterbox(chain, cropped_w, cropped_h, width, height)
+    _finish_chain(chain, width, height, fps)
+    chain.source_size = (src_w, src_h)
+    return chain
+
+
 def build_chain(layer, width: int, height: int, fps: int, screen_node: int | None = None,
                 screen_fd: int | None = None, canvas: tuple[int, int] | None = None,
                 screen_size: tuple[int, int] | None = None) -> SourceChain:

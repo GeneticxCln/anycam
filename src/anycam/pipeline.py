@@ -18,7 +18,9 @@ from gi.repository import Gst  # noqa: E402
 from . import config, overlay
 from .geometry import box_pixels, clamp
 from .model import Layer, Project, Scene
-from .sources import SourceChain, build_chain, caps_filter, caps_string, image_chain, make
+from .pool import CAPTURE_KINDS, CaptureSpec, SourcePool, capture_spec
+from .sources import (SourceChain, build_chain, caps_filter, caps_string,
+                      image_chain, layer_tail, make)
 
 Gst.init(None)
 
@@ -38,6 +40,7 @@ class EngineReport:
     camera_mode: str = ""
     camera_probe_error: str = ""
     camera_placeholders: list[str] = field(default_factory=list)
+    source_errors: list[str] = field(default_factory=list)
     mic_level_db: float | None = None
     encoder: str = ""
     vcam: str = ""
@@ -65,6 +68,7 @@ class EngineReport:
             "camera_mode": self.camera_mode,
             "camera_probe_error": self.camera_probe_error,
             "camera_placeholders": self.camera_placeholders,
+            "source_errors": self.source_errors,
             "mic_level_db": self.mic_level_db,
             "encoder": self.encoder,
             "vcam": self.vcam,
@@ -103,6 +107,7 @@ class AnyCamEngine:
         screen_sizes: dict[str, tuple[int, int]] | None = None,
         preview_crop_layer: str = "",
         skip_layers: set[str] | None = None,
+        pool: SourcePool | None = None,
         on_frame: Callable | None = None,
     ) -> None:
         self.project = project
@@ -112,6 +117,12 @@ class AnyCamEngine:
         # its box and z-order survive; other skipped kinds are left out.  The
         # GUI rebuilds with the real source when the device returns.
         self.skip_layers = set(skip_layers or ())
+        # Capture lives in its own pipeline per source (audit M1 slice 2).
+        # The GUI may pass a pool it keeps across rebuilds; otherwise the
+        # engine owns one and releases every capture on stop().
+        self.pool = pool or SourcePool()
+        self._owns_pool = pool is None
+        self._specs: list[CaptureSpec] = []
         # The crop editor shows this layer uncropped while the model keeps its
         # real crop, so the window is drawn over the picture it edits.
         self.preview_crop_layer = preview_crop_layer
@@ -223,6 +234,26 @@ class AnyCamEngine:
                 visible=layer.visible,
             )
             chain = image_chain(str(png), box[2], box[3], self.fps, source_layer)
+        elif layer.kind in CAPTURE_KINDS and layer.id not in self.skip_layers:
+            # Capture runs in its own pipeline, so a dead device cannot stop
+            # the compositor and two layers on one camera share one capture.
+            if crop != layer.crop:
+                layer = copy.copy(layer)
+                layer.crop = crop
+            spec = capture_spec(layer, self.canvas_w, self.canvas_h, self.fps,
+                                screen_fd=self.screen_fds.get(layer.id, -1),
+                                screen_size=self.screen_sizes.get(layer.id))
+            entry = self.pool.acquire(spec)
+            self._specs.append(spec)
+            chain = layer_tail(layer, entry.source_size, box[2], box[3],
+                               self.fps, entry.channel)
+            self.layer_sources[layer.id] = entry.source_size
+            if entry.camera_mode:
+                self.report.camera_mode = entry.camera_mode
+            if entry.probe_error:
+                self.report.camera_probe_error = entry.probe_error
+            if entry.screen_error:
+                self.report.screen_error = entry.screen_error
         elif layer.kind in ("text", "logo", "image", "face"):
             if layer.kind == "face":
                 png = Path(layer.source).expanduser()
@@ -331,7 +362,10 @@ class AnyCamEngine:
                 f"canvas size must be even for H.264 (got {self.canvas_w}x{self.canvas_h})"
             )
         self.pipeline = Gst.Pipeline.new("anycam")
-        self.compositor = make("compositor", "compositor", background="black", ignore_inactive_pads=False)
+        # ignore_inactive_pads: a capture pipeline that dies stops producing
+        # without sending EOS; the compositor must skip that pad and keep
+        # rendering the rest instead of waiting for it forever.
+        self.compositor = make("compositor", "compositor", background="black", ignore_inactive_pads=True)
         self.tee = make("tee", "output")
         self._add(self.compositor, self.tee)
         if not self.compositor.link(self.tee):
@@ -347,8 +381,14 @@ class AnyCamEngine:
             # non-camera layers are left out of the graph.
             layers = [layer for layer in layers
                       if layer.kind == "camera" or layer.id not in self.skip_layers]
-        for zorder, layer in enumerate(layers):
-            self._add_layer(layer, zorder)
+        try:
+            for zorder, layer in enumerate(layers):
+                self._add_layer(layer, zorder)
+        except Exception:
+            # A half-built graph must not leave capture pipelines running.
+            self.pool.stop()
+            self._specs.clear()
+            raise
 
         if self.preview:
             self._build_preview()
@@ -817,6 +857,9 @@ class AnyCamEngine:
         # Prefer the system clock: a USB/PipeWire microphone's clock can start
         # late and would delay the first composited frame (and the recording).
         self.pipeline.use_clock(Gst.SystemClock.obtain())
+        # Captures must be live before the canvas prerolls, or the compositor
+        # sees no active pad and the first preview frame is late.
+        self.pool.start()
         if self._vcam_pipeline is not None:
             self._vcam_pipeline.set_state(Gst.State.PLAYING)
         if self._rtmp_pipeline is not None:
@@ -869,6 +912,11 @@ class AnyCamEngine:
                 break
         self._poll_vcam_bus()
         self._poll_rtmp_bus()
+        self.pool.poll_errors()
+        errors = self.pool.errors()
+        if errors:
+            self.report.source_errors = [f"{channel}: {message}"
+                                         for channel, message in errors.items()]
         self.deliver_frame()
         return messages
 
@@ -941,6 +989,11 @@ class AnyCamEngine:
         while time.monotonic() < deadline and not self._eos_seen:
             self.pump(100)
         self.pipeline.set_state(Gst.State.NULL)
+        for spec in self._specs:
+            self.pool.release(spec)
+        self._specs.clear()
+        if self._owns_pool:
+            self.pool.stop()
         if self._vcam_pipeline is not None:
             self._vcam_pipeline.send_event(Gst.Event.new_eos())
             self._vcam_pipeline.set_state(Gst.State.NULL)
