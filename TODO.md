@@ -1,8 +1,9 @@
 # AnyCam open work
 
 Backlog derived from the 2026-10-31 full audit (55 bugs, M0–M9) and the work
-landed since. Snapshot: 2026-10-31, after the camera-replug fix; suite **128
-collected, 127 passed, 1 hardware-gated multicam skip**.
+landed since. Snapshot: 2026-10-31, after the camera-replug fix and the
+10-minute soak re-run; suite **133 collected, 132 passed, 1 hardware-gated
+multicam skip**.
 
 `PLAN.md` is the older 2026-10-30 plan; this file tracks the newer audit's open
 side. Closed items live in `docs/REGRESSIONS.md` and are not repeated here.
@@ -11,8 +12,8 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 
 ## 0. M1 acceptance gates — do these first
 
-- [ ] **10-minute A/V drift gate.** `PYTHONPATH=src python3 scripts/verify-av-drift.py --seconds 600 --warmup 20 --record /tmp/drift.mp4 --json /tmp/drift.json`. The 20 s run currently passes with `drift_s: 0.0`, zero duplicate/gap timestamps and a finalised 20.03 s MP4; the 10-minute result must be recorded in `evidence/` (or the private archive).
-- [ ] **60-minute soak** tracking RSS, tmpfs usage, disk and file descriptors; fail the run on a frame stall. `soak.py` currently samples CPU/RSS only and has no stall watchdog.
+- [x] **10-minute A/V drift gate.** `PYTHONPATH=src python3 scripts/verify-av-drift.py --seconds 600 --warmup 20 --record /tmp/drift.mp4 --json /tmp/drift.json`. Passed 2026-10-31: `drift_s: 0.0`, 36,008 video / 24,405 audio buffers, zero duplicate/gap timestamps, finalised 600.12 s MP4.
+- [~] **60-minute soak** tracking RSS, tmpfs usage, disk and file descriptors; fail the run on a frame stall. Instrumentation landed 2026-10-31 (tmpfs, recording filesystem, FDs, `--stall-seconds`); the 10-minute synthetic re-run passed at 0.043 MiB/min with no stalls. Run 60 minutes with vcam.
 - [ ] **Continuous MP4** across five scene switches and record toggles, plus an unbroken `v4l2src` consumer on the virtual camera (B12). Today each graph rebuild finalises a new `-segN.mp4`.
 - [ ] **Unresponsive RTSP/network source**: canvas keeps ≥99% of its frames and `stop()` returns in under 1 s (B10/B11). Add a failure-injection test next to `tests/test_m1_outputs.py`; `tests/test_rtsp.py` only exercises a healthy feed.
 - [ ] **Refused output does not poison the session** (B11): preview, recording and vcam keep running, and the recording flag does not stay on.
@@ -137,6 +138,7 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 ## 11. Needs the user / hardware
 
 - [ ] Physical camera unplug and replug on the real StreamCam.
+- [ ] Load v4l2loopback (`sudo scripts/enable-v4l2loopback.sh`) and re-run the soak with `--vcam`; without `/dev/video10` the run is blocked on that one gate.
 - [ ] Live xdg-desktop-portal screen-layer frame-size check (B1).
 - [ ] Compatibility matrix on Firefox, Chromium, Zoom, Teams, Meet and OBS.
 - [ ] Android and iPhone source/remote tests.

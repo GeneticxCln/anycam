@@ -12,6 +12,8 @@ import sys
 import time
 from pathlib import Path
 
+import psutil
+
 from . import config
 from .demo import build_demo_project
 from .pipeline import AnyCamEngine, verify_mp4
@@ -25,6 +27,107 @@ def _slope_per_min(points: list[tuple[float, float]]) -> float | None:
     mean_y = sum(p[1] for p in points) / n
     denom = sum((p[0] - mean_x) ** 2 for p in points) or 1.0
     return sum((p[0] - mean_x) * (p[1] - mean_y) for p in points) / denom * 60.0
+
+
+def _disk_usage(path: str | Path) -> dict:
+    """Usage of the filesystem holding ``path``, including its mount type."""
+    target = Path(path).expanduser()
+    while not target.exists() and target != target.parent:
+        target = target.parent
+    try:
+        usage = psutil.disk_usage(str(target))
+    except OSError:
+        return {}
+    fstype = ""
+    try:
+        for part in psutil.disk_partitions(all=True):
+            mount = part.mountpoint.rstrip("/") or "/"
+            if str(target) == mount or str(target).startswith(mount + "/"):
+                fstype = part.fstype
+                break
+    except (psutil.Error, OSError):
+        pass
+    return {
+        "used_mib": round(usage.used / 2 ** 20, 1),
+        "free_mib": round(usage.free / 2 ** 20, 1),
+        "fstype": fstype,
+    }
+
+
+def _resource_snapshot(record_path: str = "") -> dict:
+    """Process and filesystem numbers the RSS-based gate cannot see.
+
+    The old soak only watched RSS, so a faststart recorder filling tmpfs (and a
+    leak of file descriptors) was invisible.  Sample the temp filesystem and
+    the recording filesystem every second; ``/tmp`` is often tmpfs.
+    """
+    try:
+        fds = psutil.Process().num_fds()
+    except (psutil.Error, AttributeError):
+        fds = None
+    tmp = _disk_usage("/tmp")
+    record = _disk_usage(Path(record_path).expanduser().parent) if record_path else {}
+    return {
+        "fds": fds,
+        "tmp_used_mib": tmp.get("used_mib"),
+        "tmp_free_mib": tmp.get("free_mib"),
+        "tmp_fstype": tmp.get("fstype", ""),
+        "record_free_mib": record.get("free_mib"),
+    }
+
+
+def _resource_summary(samples: list[dict]) -> dict:
+    def span(key: str) -> dict | None:
+        values = [s[key] for s in samples if s.get(key) is not None]
+        if not values:
+            return None
+        return {"start": values[0], "end": values[-1],
+                "min": min(values), "max": max(values)}
+
+    fstype = next((s.get("tmp_fstype") for s in samples if s.get("tmp_fstype")), "")
+    return {
+        "tmp_fstype": fstype,
+        "fds": span("fds"),
+        "tmp_used_mib": span("tmp_used_mib"),
+        "tmp_free_mib": span("tmp_free_mib"),
+        "record_free_mib": span("record_free_mib"),
+    }
+
+
+def _stall_assessment(samples: list[dict], *, warmup: float = 5.0,
+                      stall_seconds: float = 2.0) -> dict:
+    """Fail a run when the compositor stops advancing frames.
+
+    The engine samples once a second; two samples can legitimately show the
+    same count.  Only a plateau longer than ``stall_seconds`` is a stall, and
+    the first ``warmup`` seconds are ignored while the sources start.
+    """
+    points = [(float(s["t"]), s.get("frames")) for s in samples
+              if s.get("t") is not None and s.get("frames") is not None
+              and float(s["t"]) >= warmup]
+    stalls: list[dict] = []
+    if len(points) >= 2:
+        last_frames = points[0][1]
+        stall_start = points[0][0]
+        for t, frames in points[1:]:
+            if frames == last_frames:
+                continue
+            if t - stall_start >= stall_seconds:
+                stalls.append({"from_s": round(stall_start, 1),
+                               "to_s": round(t, 1),
+                               "seconds": round(t - stall_start, 1),
+                               "frames": last_frames})
+            last_frames = frames
+            stall_start = t
+        end_t, end_frames = points[-1]
+        if end_t - stall_start >= stall_seconds:
+            stalls.append({"from_s": round(stall_start, 1),
+                           "to_s": round(end_t, 1),
+                           "seconds": round(end_t - stall_start, 1),
+                           "frames": end_frames})
+    longest = max((s["seconds"] for s in stalls), default=0.0)
+    return {"ok": len(points) >= 2 and not stalls,
+            "stalls": stalls, "longest_s": longest}
 
 
 def _memory_assessment(samples: list[dict], warmup: float) -> dict:
@@ -80,6 +183,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source", default="camera")
     parser.add_argument("--record", default="")
     parser.add_argument("--vcam", action="store_true")
+    parser.add_argument("--stall-seconds", type=float, default=2.0,
+                        help="fail when the frame counter is unchanged this long")
     parser.add_argument("--json", default="")
     parser.add_argument("--width", type=int, default=config.CANVAS_W)
     parser.add_argument("--height", type=int, default=config.CANVAS_H)
@@ -98,11 +203,23 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     print(f"soak: {args.seconds:.0f}s at {args.width}x{args.height}@{args.fps} "
           f"(warm-up {args.warmup:.0f}s)", flush=True)
-    report = engine.run(args.seconds, sample_cb=lambda r: print(
-        f"t={r['t']:7.1f}s fps={r['fps']:6.2f} cpu={r['cpu_pct']} "
-        f"rss={r['rss_mib']}MiB", flush=True))
+
+    def sample_cb(rec: dict) -> None:
+        rec.update(_resource_snapshot(args.record))
+        print(f"t={rec['t']:7.1f}s fps={rec['fps']:6.2f} cpu={rec['cpu_pct']} "
+              f"rss={rec['rss_mib']}MiB fds={rec['fds']} "
+              f"tmp={rec['tmp_used_mib']}MiB disk_free={rec['record_free_mib']}MiB",
+              flush=True)
+
+    report = engine.run(args.seconds, sample_cb=sample_cb)
     elapsed = time.monotonic() - started
     memory = _memory_assessment(report["samples"], args.warmup)
+    stalls = _stall_assessment(
+        report["samples"],
+        warmup=min(5.0, max(1.0, args.seconds / 60.0)),
+        stall_seconds=args.stall_seconds,
+    )
+    resources = _resource_summary(report["samples"])
 
     mp4_ok = True
     mp4 = {}
@@ -123,10 +240,12 @@ def main(argv: list[str] | None = None) -> int:
     preview_drops_ok = report["dropped_pct"] < 1.0
     drops_ok = preview_drops_ok and (recorded_drops is None or recorded_drops < 1.0)
     memory_ok = bool(memory["ok"])
+    stalls_ok = bool(stalls["ok"])
     vcam_ok = bool(report["vcam_active"])
-    overall = "pass" if (drops_ok and memory_ok and mp4_ok and vcam_ok
-                         and not report["error"]) else (
-        "blocked" if (drops_ok and memory_ok and mp4_ok and not report["error"]) else "fail")
+    overall = "pass" if (drops_ok and memory_ok and mp4_ok and stalls_ok
+                         and vcam_ok and not report["error"]) else (
+        "blocked" if (drops_ok and memory_ok and mp4_ok and stalls_ok
+                      and not report["error"]) else "fail")
 
     result = {
         "soak": {
@@ -139,17 +258,21 @@ def main(argv: list[str] | None = None) -> int:
             "vcam": report.get("vcam"),
             "vcam_active": report.get("vcam_active"),
             "vcam_error": report.get("vcam_error"),
+            "stall_seconds": args.stall_seconds,
         },
         "acceptance": {
             "overall": overall,
             "drops_ok": drops_ok,
             "memory_ok": memory_ok,
             "mp4_ok": mp4_ok,
+            "stalls_ok": stalls_ok,
             "vcam_ok": vcam_ok,
             "error": report["error"],
         },
         "report": report,
         "memory": memory,
+        "stalls": stalls,
+        "resources": resources,
         "recorded": recorded,
         "mp4": mp4,
     }

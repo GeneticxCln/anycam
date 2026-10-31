@@ -73,7 +73,7 @@ capture source pool). Evidence paths name the private archive
 |---|---|---|---|
 | H.264 MP4, correct resolution/frame rate | **verified** | `x264enc → h264parse → mp4mux`, explicit EOS finalisation, I420 caps | `evidence/01_camera/composite.mp4`: 1920×1080, 60/1, 611 frames, 10.18 s |
 | Audio + video synchronised | **verified** | AAC branch built when `--audio` is used; SystemClock; 5 s record buffer | `evidence/04_audio/av.mp4`, `verify.json` (av_sync true, 0.078 s) |
-| 10-min 1080p60 soak | **partial** (2026-10-31 re-baseline) | `soak.py` + `scripts/soak.sh`. 36002 preview frames at 59.998 fps (0.003% dropped) and a 600.23 s fragmented MP4 with 36014 packets (60.0 fps, 859 MB). RSS grew 202.6 → 226.3 MiB in buffer-pool steps, so the old flat-memory claim no longer holds. The soak gate now judges the settled half and the tail (`soak._memory_assessment`); a fresh 10-minute run is still required before calling it pass. The virtual camera was not exercised in this run (v4l2loopback not loaded). | `~/anycam-private-evidence/evidence/soak_10m/report.json`, `soak.mp4` |
+| 10-min 1080p60 soak | **pass on drops/memory/stalls** (2026-10-31 synthetic re-run; vcam blocked) | `soak.py` + `scripts/soak.sh`. 600.15 s, 36,009 frames at 60.0 fps, 0.0% preview/recorded drops; RSS 188.7 → 189.0 MiB (0.043 MiB/min, settled 0.038), 12 → 12 FDs, no stalls; finalised 600.15 s MP4 with 36,009 packets. `acceptance.overall=blocked` only because `/dev/video10` was absent (v4l2loopback not loaded). | `evidence/soak_10m/report.json` |
 
 ## 6. RTMP / RTMPS
 
@@ -116,7 +116,7 @@ sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
 | Requirement | Status | Evidence / gap |
 |---|---|---|
 | A/V sync across the split source pipelines | **partial** (20 s synthetic) | `scripts/verify-av-drift.py` drives synthetic video + audio producers through `intervideosink`/`intervideosrc` into a compositor and measures the canvas offsets and a recorded file. A 20 s run reports `drift_s: 0.0` with no duplicate or gap timestamps and a finalised 20.03 s MP4; the 10-minute gate is pending. | `scripts/verify-av-drift.py --seconds 20 --warmup 5` |
-| 10 min 1080p60, preview + recording, <1% drops, no monotonic memory growth | **partial** (re-baselined 2026-10-31) | `~/anycam-private-evidence/evidence/soak_10m/report.json`: 600.23 s, 36002 preview frames at 59.998 fps (0.003% dropped), 36014 recorded packets at 60.0 fps (0.0% dropped), `MJPG 1920x1080@60`. **Memory**: the old least-squares gate scored 2.38 MiB/min through buffer-pool step-ups; it now judges the settled window and tail (`soak._memory_assessment`) and a real per-frame leak still fails. A fresh 10-minute run is pending. The old 0.032 MiB/min figure came from the faststart recorder and no longer applies. The virtual camera was not exercised in this run (v4l2loopback not loaded). |
+| 10 min 1080p60, preview + recording, <1% drops, no monotonic memory growth | **partial — vcam not exercised** (2026-10-31 synthetic re-run) | 600.15 s, 36,009 frames at 60.0 fps (0.0% preview/recorded drops), RSS 188.7 → 189.0 MiB (0.043 MiB/min; settled 0.038), 12 → 12 FDs, no frame stalls, finalised 600.15 s MP4 with 36,009 packets. The remaining soak gate is the 60-minute run with `/dev/video10`; v4l2loopback was not loaded. |
 
 ## Cross-cutting requirements
 
@@ -127,4 +127,4 @@ sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
 | Wayland portal capture, no niri-only API | **verified** (spike) | `xdg-desktop-portal` ScreenCast + PipeWire |
 | Reversible system changes | **verified** | Only `modprobe v4l2loopback`; `scripts/disable-v4l2loopback.sh`; documented |
 | Reproducible build/run docs | **verified** | `README.md`, `scripts/setup.sh` |
-| Runnable automated tests | **verified** | `./scripts/test.sh` (127 passed, 1 hardware-gated multicam skip; 128 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |
+| Runnable automated tests | **verified** | `./scripts/test.sh` (132 passed, 1 hardware-gated multicam skip; 133 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |

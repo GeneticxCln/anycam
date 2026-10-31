@@ -389,7 +389,17 @@ Test: `tests/test_m1_outputs.py::test_unresponsive_rtmp_cannot_stall_the_canvas`
   `ffprobe -count_packets`. The recording was healthy all along.
 * RSS grew 202.6 → 226.3 MiB after a 120 s warm-up (**2.38 MiB/min**, gate is
   1.0). The previous 0.032 MiB/min figure came from the faststart recorder and is
-  no longer valid. This is now the blocking M1 soak item.
+  no longer valid. This was the blocking M1 soak item.
+
+**Soak re-run (2026-10-31, synthetic testsrc, 1920×1080@60, 600 s).**
+`soak.py` now samples tmpfs used/free (with the mount type), recording-filesystem
+free space and process FDs every second, and fails on a frame-counter plateau
+longer than `--stall-seconds` (default 2 s). The re-run produced 36,009 frames
+at 60.0 fps over 600.15 s with 0.0% preview/recorded drops, RSS 188.7 → 189.0
+MiB (0.043 MiB/min, settled 0.038, no steps), 12 → 12 FDs, no stalls, and a
+finalised 600.15 s MP4 with 36,009 packets. `acceptance.overall` is `blocked`
+only because `/dev/video10` was absent; v4l2loopback was not loaded. The
+60-minute run with vcam remains open.
 
 ## 2026-10-31 — M1 slice 2: capture source pool
 
@@ -422,7 +432,7 @@ step-ups; a real leak of one 1080p frame per minute still fails
 (`tests/test_soak_memory.py`). A fresh 10-minute run is still required.
 
 Verification: `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest tests -q`
-→ 128 collected, 127 passed, 1 hardware-gated multicam skip.
+→ 133 collected, 132 passed, 1 hardware-gated multicam skip.
 `tests/test_source_pool.py` covers sharing, real pixels through the pool, a dead
 capture, and release on stop.
 
@@ -431,8 +441,12 @@ composited output (the same duplicate-PTS fix as the engine), measures each
 stream against its own median buffer interval, compares drift with one frame,
 and waits for the recorder sink's EOS before teardown. A 20 s synthetic run
 reports `drift_s: 0.0`, zero duplicate/backward/gap timestamps (1202 video and
-1201 audio tap buffers) and a finalised 20.03 s MP4 with 1202 packets. The
-10-minute gate is still pending.
+1201 audio tap buffers) and a finalised 20.03 s MP4 with 1202 packets.
+
+The 10-minute gate now passes (2026-10-31): 600 s, 36,008 video and 24,405
+audio tap buffers, `drift_s: 0.0` against a 0.01667 s limit, zero duplicate,
+backward or gap timestamps, and a finalised 600.12 s MP4 with 36,008 video
+packets. The harness records video only; A/V sync is gated live.
 
 ## 2026-10-31 — camera replug identity and UVC retry
 
