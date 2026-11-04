@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -176,7 +177,8 @@ def camera_device(preferred: str | None = None) -> str:
     for cam in list_video_devices():
         # Never pick AnyCam's own v4l2loopback output as the default camera;
         # doing so would feed the compositor back into itself.
-        if cam.formats and "anycam" not in (cam.name or "").lower():
+        if cam.formats and "anycam" not in (cam.name or "").lower() \
+                and cam.device != loopback_device():
             return cam.device
     return "/dev/video0"
 
@@ -239,6 +241,46 @@ def loopback_device() -> str:
     if Path("/dev/video10").exists():
         return "/dev/video10"
     return "/dev/video10"
+
+
+def ensure_vcam_device(device: str | None = None, *, prompt: bool = True) -> str:
+    """Make the v4l2loopback device exist, creating it when necessary.
+
+    A virtual-camera app should not ask the user to run modprobe by hand.  The
+    module needs root, so the first time we ask through ``pkexec`` (the normal
+    polkit prompt) and only fall back to an explicit instruction when that is
+    impossible or declined.  Returns "" on success, a reason otherwise.
+    """
+    dev = device or loopback_device()
+    if Path(dev).exists():
+        return ""
+    match = re.search(r"video(\d+)$", dev)
+    if match is None:
+        return f"virtual camera device {dev} does not exist"
+    number = match.group(1)
+    manual = (f"sudo modprobe v4l2loopback video_nr={number} "
+              f"card_label=AnyCam exclusive_caps=0")
+    if (not prompt or shutil.which("pkexec") is None
+            or shutil.which("modprobe") is None):
+        return f"{dev} is missing; load v4l2loopback first: {manual}"
+    try:
+        result = subprocess.run(
+            ["pkexec", "modprobe", "v4l2loopback", f"video_nr={number}",
+             "card_label=AnyCam", "exclusive_caps=0"],
+            capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:  # noqa: BLE001
+        return f"could not set up the virtual camera: {exc}"
+    # The device node can take a moment to appear after the module loads.
+    for _ in range(40):
+        if Path(dev).exists():
+            return ""
+        time.sleep(0.05)
+    detail = (result.stderr or result.stdout or "").strip()
+    if result.returncode in (126, 127):
+        return f"setting up the virtual camera was cancelled. Run: {manual}"
+    return (f"virtual camera {dev} is still missing"
+            + (f": {detail}" if detail else "") + f". Run: {manual}")
 
 
 def vcam_available(device: str | None = None) -> bool:

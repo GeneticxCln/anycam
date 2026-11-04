@@ -334,8 +334,11 @@ def _fit_letterbox(chain: SourceChain, src_w: int, src_h: int,
         chain.add(make("videorate"))
 
 
-def _finish_chain(chain: SourceChain, width: int, height: int, fps: int) -> None:
-    tail = caps_filter(caps_string(width, height, fps))
+def _finish_chain(chain: SourceChain, width: int, height: int, fps: int, *,
+                  pin_rate: bool = True) -> None:
+    caps = caps_string(width, height, fps) if pin_rate else (
+        f"video/x-raw,format=RGBA,width={width},height={height}")
+    tail = caps_filter(caps)
     chain.add(tail)
     chain.tail = tail
 
@@ -522,24 +525,109 @@ def screen_chain(node_id: int, width: int, height: int, fps: int, layer=None,
     webcam) while reporting success.
     """
     chain = SourceChain()
-    props = {"do_timestamp": True, "path": str(int(node_id))}
+    # Screen nodes are DMA-BUF on niri/Wayland.  pipewiresrc cannot hand those
+    # to videoconvert directly ("no more input formats"); upload to GL and
+    # download to system memory first.  Compositors that expose only system
+    # memory take the old always-copy path.
+    props = {"do_timestamp": True, "path": str(int(node_id)),
+             # PipeWire defaults to a 16-buffer pool.  A screencast can run at
+             # the monitor refresh (up to 120 Hz), so 16 queued frames mean the
+             # preview is up to a second behind the desktop.  A small pool
+             # keeps the picture live and lets the producer drop stale damage.
+             "max_buffers": 3, "min_buffers": 1}
     if fd is not None and fd >= 0:
         props["fd"] = int(fd)
     src = make("pipewiresrc", **props)
-    chain.add(src, make("videoconvert"))
+    chain.add(src)
+    # A live screencast must never back-pressure the PipeWire stream: the
+    # compositor only consumes ``fps`` frames of a stream that can run at the
+    # monitor's refresh, and once the producer's buffer pool is empty the
+    # capture stops for good (the preview then keeps the last frame).  One
+    # slot, leaking downstream, drops stale frames and always returns the rest
+    # to PipeWire, so a stalled consumer (window focus) cannot lock capture up.
+    chain.add(make("queue", leaky=2, max_size_buffers=1,
+                   max_size_bytes=0, max_size_time=0, silent=True))
+    gl_ready = all(Gst.ElementFactory.find(name) is not None
+                   for name in ("glupload", "glcolorconvert", "gldownload"))
+    gl_scale = gl_ready and Gst.ElementFactory.find("glcolorscale") is not None
+    # Some portal/compositor combinations report a 1x1 stream or the logical
+    # size instead of the buffer size.  Building the letterbox from that
+    # stretches the picture, which is how a window share ends up filling only
+    # part of the box; fall back to the box itself when the size is unusable.
+    if expected_size and expected_size[0] > 1 and expected_size[1] > 1:
+        source_w, source_h = int(expected_size[0]), int(expected_size[1])
+    else:
+        source_w, source_h = int(width), int(height)
+    fit = fit_contain(source_w, source_h, width, height)
+    if gl_ready:
+        chain.add(make("glupload"))
+        if gl_scale:
+            # Scale the 4K screencast on the GPU.  Downloading full 3840x2160
+            # frames up to 120 times a second and scaling them on the CPU is
+            # what made the shared screen lag.
+            chain.add(make("glcolorscale"))
+        chain.add(make("glcolorconvert"), make("gldownload"))
+        if gl_scale:
+            chain.add(caps_filter(
+                f"video/x-raw,format=RGBA,width={max(2, fit.w)},height={max(2, fit.h)}"))
+    else:
+        src.set_property("always-copy", True)
+    chain.add(make("videoconvert"))
+    chain.add(caps_filter("video/x-raw,format=RGBA"))
     chain.check_element = src
-    chain.expected_size = tuple(expected_size) if expected_size else None
+    chain.expected_size = (source_w, source_h)
     effects = _effects_chain(layer)
     if effects:
         chain.add(*effects, make("videoconvert"))
-    # Crop against the stream size the portal reported, not the layer box.
-    source_w, source_h = expected_size or (width, height)
-    chain.add(*_crop_chain(layer, source_w, source_h))
-    cropped_w, cropped_h = cropped_size(layer, source_w, source_h)
-    _fit_letterbox(chain, cropped_w, cropped_h, width, height)
+    # Crop against the frame the crop was computed on: the fitted size when the
+    # GPU already scaled it, the native size otherwise.
+    crop_base = (fit.w, fit.h) if gl_scale else (source_w, source_h)
+    chain.add(*_crop_chain(layer, crop_base[0], crop_base[1]))
+    cropped_w, cropped_h = cropped_size(layer, crop_base[0], crop_base[1])
+    _fit_letterbox(chain, cropped_w, cropped_h, width, height, rate=False)
+    # The canvas layer_tail owns the output rate.  A forced framerate here
+    # makes niri's DMA-BUF stream emit one frame and then stall.  The same
+    # applies to videorate: a screencast advertises framerate=0/1 (variable),
+    # and a video-rate element fed with that can stop passing frames entirely.
+    _finish_chain(chain, width, height, fps, pin_rate=False)
+    chain.pause_elements.append(src)
+    chain.source_size = crop_base
+    return chain
+
+
+def template_chain(width: int, height: int, fps: int) -> SourceChain:
+    """The branded slate shown when a layout has no sources.
+
+    This replaces the old bare test pattern: an empty canvas now reads as an
+    AnyCam surface with a hint, rather than looking like a broken feed.
+    """
+    width = max(2, int(width))
+    height = max(2, int(height))
+    chain = SourceChain()
+    src = make("videotestsrc", is_live=True, pattern="black")
+    # textoverlay sizes are Pango points and read much larger than the
+    # pixel count suggests; keep them modest so the slate never overlaps.
+    title_size = max(24, min(90, height // 24))
+    hint_size = max(10, min(26, height // 90))
+    chain.add(
+        src,
+        make("videoconvert"),
+        make("videoscale"),
+        caps_filter(f"video/x-raw,width={width},height={height}"),
+        make("textoverlay", text="AnyCam", halignment="center",
+             valignment="center",
+             font_desc=f"DejaVu Sans Bold {title_size}",
+             color=0xFFFFFFFF),
+        make("videoconvert"),
+        make("textoverlay", text="Empty layout  ·  click + to add a source",
+             halignment="center", valignment="bottom",
+             font_desc=f"DejaVu Sans {hint_size}", color=0xFF7D8B96),
+        make("videoconvert"),
+        make("videorate"),
+    )
     _finish_chain(chain, width, height, fps)
     chain.pause_elements.append(src)
-    chain.source_size = (source_w, source_h)
+    chain.source_size = (width, height)
     return chain
 
 
@@ -637,4 +725,6 @@ def build_chain(layer, width: int, height: int, fps: int, screen_node: int | Non
                              source_size=(canvas_w, canvas_h))
     if kind == "test":
         return test_chain(width, height, fps, layer)
+    if kind == "template":
+        return template_chain(width, height, fps)
     raise ValueError(f"unsupported layer kind: {kind}")

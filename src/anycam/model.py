@@ -132,7 +132,10 @@ class Layer:
             data["effects"] = Effects.from_dict(data["effects"])
         data["box"] = tuple(data.get("box", (0, 0, 1, 1)))
         data["crop"] = tuple(data.get("crop", (0, 0, 0, 0)))
-        data["playlist"] = [PlaylistItem(**p) if isinstance(p, dict) else p
+        known_pi = {f.name for f in fields(PlaylistItem)}
+        data["playlist"] = [PlaylistItem(**{k: v for k, v in p.items()
+                                            if k in known_pi})
+                            if isinstance(p, dict) else p
                             for p in data.get("playlist", [])]
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in data.items() if k in known})
@@ -151,6 +154,9 @@ class Scene:
     layers: list[Layer] = field(default_factory=list)
     transition: str = "cut"      # reserved: scene changes are hard cuts today
     playlist: PlaylistConfig = field(default_factory=PlaylistConfig)
+    # Layout template that last arranged this preset; "" means the boxes
+    # were placed by hand.  Stored so switching presets restores the picker.
+    layout: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Scene":
@@ -160,13 +166,15 @@ class Scene:
             layers=[Layer.from_dict(x) for x in data.get("layers", [])],
             transition=data.get("transition", "cut"),
             playlist=PlaylistConfig.from_dict(data.get("playlist")),
+            layout=str(data.get("layout") or ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
         return {"id": self.id, "name": self.name,
                 "layers": [l.to_dict() for l in self.layers],
                 "transition": self.transition,
-                "playlist": asdict(self.playlist)}
+                "playlist": asdict(self.playlist),
+                "layout": self.layout}
 
     def add_layer(self, layer: Layer) -> Layer:
         # An explicit positive z wins; 0 means "put it on top".
@@ -197,6 +205,10 @@ class AudioConfig:
     media_loop: bool = True      # reserved: the media bed plays once today
     media_gain_db: float = 0.0
     media_muted: bool = False
+    # Desktop audio: a PipeWire/PulseAudio monitor source ("what you hear").
+    desktop_device: str = ""
+    desktop_gain_db: float = 0.0
+    desktop_muted: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AudioConfig":
@@ -237,7 +249,7 @@ class Project:
                 return s
         if not self.scenes:
             self.scenes.append(Scene(new_id("scene"), "Scene 1"))
-            self.active_scene = self.scenes[0].id
+        self.active_scene = self.scenes[0].id
         return self.scenes[0]
 
     def to_dict(self) -> dict[str, Any]:
@@ -344,6 +356,19 @@ def camera_grid_scene(slots: list[str], name: str = "Camera grid",
             box=(column * cell_w, row * cell_h, cell_w, cell_h), z=index + 1,
         ))
     return scene
+
+
+def empty_project(name: str = "AnyCam") -> Project:
+    """First-run project: one empty single-camera preset.
+
+    The canvas shows a single slot with a ``+`` until the user picks a source;
+    no camera is opened just because the app started.
+    """
+    project = Project(name=name)
+    scene = Scene(new_id("scene"), "Camera", layout="full")
+    project.scenes = [scene]
+    project.active_scene = scene.id
+    return project
 
 
 def default_project(name: str = "AnyCam") -> Project:

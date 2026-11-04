@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import copy
+from collections import deque
 import os
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -146,6 +148,7 @@ class AnyCamEngine:
         # source that stopped while the others keep the canvas alive.
         self._layer_frames: dict[str, int] = {}
         self._layer_last: dict[str, float] = {}
+        self._source_rate_history: dict[str, deque] = {}
         self._last_sample_frames = 0
         self._last_sample_time = 0.0
         self._stall_seconds = 2.0
@@ -208,6 +211,9 @@ class AnyCamEngine:
         self._record_sink = None
         self._appsink = None
         self._pending_sample = None
+        # Rate limit for preview frames that cannot be handed to the GUI.
+        self._preview_problem_at = 0.0
+        self._preview_problem_count = 0
         self._branch_count = 0
         self._last_sample = 0.0
         self._eos_seen = False
@@ -226,6 +232,10 @@ class AnyCamEngine:
                 raise RuntimeError(
                     f"could not add {element.get_name()} to the canvas pipeline"
                 )
+            try:
+                element.sync_state_with_parent()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _link(self, elements: list[Gst.Element], skip_from=None) -> None:
         for a, b in zip(elements, elements[1:]):
@@ -263,7 +273,8 @@ class AnyCamEngine:
                 else layer.crop)
         source_layer = layer
         if layer.kind == "camera" and not layer.source:
-            layer.source = config.camera_device()
+            source_layer = copy.copy(layer)
+            source_layer.source = config.camera_device()
         missing_media = ""
         if layer.kind in ("image", "logo", "face", "video") and layer.source:
             source_path = Path(layer.source).expanduser()
@@ -296,9 +307,14 @@ class AnyCamEngine:
                 visible=layer.visible,
             )
             chain = image_chain(str(png), box[2], box[3], self.fps, source_layer)
-        elif layer.kind in CAPTURE_KINDS and layer.id not in self.skip_layers:
+        elif (layer.kind in CAPTURE_KINDS and layer.kind != "screen"
+              and layer.id not in self.skip_layers):
             # Capture runs in its own pipeline, so a dead device cannot stop
             # the compositor and two layers on one camera share one capture.
+            # Screen layers are the exception: their PipeWire consumer cannot
+            # be handed to a second pipeline through intervideosrc (the canvas
+            # then only ever sees the black fallback frames), so they are
+            # built directly into the canvas by the else branch below.
             if crop != layer.crop:
                 layer = copy.copy(layer)
                 layer.crop = crop
@@ -379,14 +395,46 @@ class AnyCamEngine:
         self._link(chain.elements, skip_from=getattr(chain, "dynamic_from", None))
         self._link_dynamic(chain)
 
+        screen_identity = [None]
+
         def on_source_buffer(_pad, _info, layer_id=layer.id):
-            # Count the layer's own tail, not the compositor output: the
-            # compositor can repeat the last frame after a source dies.
+            # PipeWire's SPA header sequence is carried in buffer.offset.
+            # Some producers send PTS=0 for every frame, so timestamps alone
+            # incorrectly label a changing stream as stale. Prefer sequence
+            # numbers, falling back to PTS when the source has no sequence.
+            if layer.kind == "screen":
+                buffer = _info.get_buffer()
+                if buffer is not None:
+                    identity = None
+                    if buffer.offset != Gst.BUFFER_OFFSET_NONE:
+                        identity = ("sequence", buffer.offset)
+                    elif buffer.pts != Gst.CLOCK_TIME_NONE:
+                        identity = ("pts", buffer.pts)
+                    # A portal stream is live, but its producer's PTS need
+                    # not advance (niri supplies zero). do-timestamp on
+                    # pipewiresrc does not replace an existing PTS. With two
+                    # such streams the compositor can keep presenting the
+                    # first frame even as their sequence numbers advance.
+                    # Put each arrival on the canvas timeline, before any
+                    # queue/GL processing. Preserve the original identity
+                    # above so retiming a cached frame cannot fake freshness.
+                    clock = self.pipeline.get_clock()
+                    if clock is not None:
+                        buffer.pts = max(0, clock.get_time() - self.pipeline.get_base_time())
+                        buffer.dts = Gst.CLOCK_TIME_NONE
+                    if identity is not None:
+                        if identity == screen_identity[0]:
+                            return Gst.PadProbeReturn.OK
+                        screen_identity[0] = identity
             self._layer_frames[layer_id] = self._layer_frames.get(layer_id, 0) + 1
             self._layer_last[layer_id] = time.monotonic()
             return Gst.PadProbeReturn.OK
 
-        chain.output_pad.add_probe(Gst.PadProbeType.BUFFER, on_source_buffer)
+        # Screen health follows PipeWire arrivals, not a downstream element
+        # that may repeat cached frames at the canvas rate.
+        health_pad = (chain.check_element.get_static_pad("src")
+                      if layer.kind == "screen" else chain.output_pad)
+        health_pad.add_probe(Gst.PadProbeType.BUFFER, on_source_buffer)
         pad = self.compositor.request_pad_simple("sink_%u")
         if pad is None:
             raise RuntimeError("compositor refused a request pad")
@@ -438,7 +486,13 @@ class AnyCamEngine:
             seen.append(True)
             struct = caps.get_structure(0)
             got = (int(struct.get_value("width")), int(struct.get_value("height")))
-            if got != tuple(expected):
+            # The portal reports the logical size while the buffer is in
+            # physical pixels (a 1.5x scale turns 2560x1440 into 3840x2160),
+            # so compare the shape, not the exact size: an exact check warned
+            # about a perfectly good HiDPI share.
+            got_ratio = got[0] / got[1] if got[1] else 0.0
+            want_ratio = expected[0] / expected[1] if expected[1] else 0.0
+            if want_ratio and abs(got_ratio - want_ratio) > 0.02 * want_ratio:
                 self.report.screen_error = (
                     f"screen layer '{layer.name}' captured {got[0]}x{got[1]} "
                     f"but the portal stream is {expected[0]}x{expected[1]}"
@@ -481,7 +535,10 @@ class AnyCamEngine:
         # which is impossible if they were never added to the compositor.
         layers = sorted(self.scene.layers, key=lambda l: l.z)
         if not layers:
-            layers = [Layer("layer_test", "test", "Test pattern", box=(0, 0, 1, 1))]
+            # An empty layout is a deliberate state, not a broken feed: show
+            # the branded AnyCam template instead of a test pattern.
+            layers = [Layer("layer_template", "template", "AnyCam",
+                            box=(0, 0, 1, 1))]
         else:
             # Skipped camera layers still build a placeholder card; skipped
             # non-camera layers are left out of the graph.
@@ -501,9 +558,10 @@ class AnyCamEngine:
         media = self.project.audio.media_file
         if media and not Path(media).exists():
             self.report.media_error = f"media audio file not found: {media}"
-        if self.audio and (self.record_path or self.rtmp or self.project.output.rtmp_url):
-            # Audio is only consumed by the recorder/RTMP muxers.  Building the
-            # mixer without one leaves its src pad unlinked (not-linked error).
+        if self.audio:
+            # Build audio whenever it is requested, even in preview-only mode.
+            # The mixer's src is given a fakesink consumer inside _build_audio
+            # so it never stays unlinked.
             self._build_audio()
         if self.want_vcam:
             self._build_vcam()
@@ -541,23 +599,55 @@ class AnyCamEngine:
         self._frame_count += 1
         return Gst.PadProbeReturn.OK
 
-    def _branch(self, name: str) -> Gst.Element:
+    def _branch(self, name: str, max_buffers: int = 4,
+                max_time_ns: int = 200_000_000) -> Gst.Element:
         assert self.tee is not None
-        queue = make("queue", f"queue_{name}", max_size_buffers=4, max_size_time=200_000_000)
+        queue = make("queue", f"queue_{name}", max_size_buffers=max_buffers,
+                     max_size_time=max_time_ns)
         self._add(queue)
         tee_pad = self.tee.request_pad_simple("src_%u")
         if tee_pad is None or tee_pad.link(queue.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
             raise RuntimeError(f"could not create {name} branch")
+        try:
+            tee_pad.set_active(True)
+        except Exception:  # noqa: BLE001
+            pass
         self._branch_count += 1
         return queue
 
+    def _preview_size(self) -> tuple[int, int]:
+        """A size the GUI can paint without copying the whole canvas.
+
+        The preview widget is far smaller than the canvas, and every frame is
+        copied into a QImage on the GUI thread.  At 2560x1440 that copy alone
+        is ~14 MB per frame at 60 fps, which is what made the preview trail
+        the desktop.
+        """
+        limit_w, limit_h = 1280, 720
+        scale = min(1.0, limit_w / max(1, self.canvas_w),
+                    limit_h / max(1, self.canvas_h))
+        width = max(2, int(self.canvas_w * scale) // 2 * 2)
+        height = max(2, int(self.canvas_h * scale) // 2 * 2)
+        return width, height
+
     def _build_preview(self) -> None:
-        queue = self._branch("preview")
+        # One buffered frame, leaking downstream instead of blocking: when the
+        # window gains focus or is resized the GUI thread can stall for a
+        # moment, and a blocking queue would then lock the compositor up.
+        # ``leaky=2`` drops the oldest queued frame, so the preview always
+        # shows the newest one instead of replaying stale frames.
+        queue = self._branch("preview", max_buffers=1, max_time_ns=0)
+        queue.set_property("leaky", 2)
+
         convert = make("videoconvert")
-        caps = caps_filter(caps_string(self.canvas_w, self.canvas_h, self.fps), "preview_caps")
-        sink = make("appsink", "preview_sink", emit_signals=True, max_buffers=2, drop=True, sync=True)
-        self._add(convert, caps, sink)
-        self._link([queue, convert, caps, sink])
+        format_caps = caps_filter("video/x-raw,format=RGBA", "preview_format")
+        scale = make("videoscale")
+        preview_w, preview_h = self._preview_size()
+        caps = caps_filter(caps_string(preview_w, preview_h, self.fps), "preview_caps")
+        sink = make("appsink", "preview_sink", emit_signals=True,
+                    max_buffers=2, drop=True, sync=False)
+        self._add(convert, format_caps, scale, caps, sink)
+        self._link([queue, convert, format_caps, scale, caps, sink])
         # The streaming thread only stores the newest sample.  Delivery to
         # ``on_frame`` happens from pump() on the caller's thread, which keeps
         # Qt calls on the main thread and works for the headless demo too.
@@ -565,10 +655,51 @@ class AnyCamEngine:
         self._appsink = sink
         self._pending_sample = None
 
+    def _log_preview_problem(self, message: str) -> None:
+        """Report a frame the preview cannot paint instead of showing black.
+
+        The streaming thread can hit one bad buffer per frame, so keep the log
+        readable by printing at most one message a second.
+        """
+        self._preview_problem_count += 1
+        now = time.monotonic()
+        if now - self._preview_problem_at < 1.0:
+            return
+        self._preview_problem_at = now
+        print(f"[preview] dropped frame: {message}", file=sys.stderr, flush=True)
+
     def _on_preview_sample(self, sink):
+        """Keep the newest sample, rejecting the obviously malformed ones.
+
+        Deliberately no ``map()`` here: mapping the composited buffer in the
+        appsink callback (and again in the GUI to actually read it) doubles the
+        per-frame work on the streaming thread and adds seconds of lag.  The
+        GUI maps once in ``_on_frame`` and reports mapping/short-frame errors.
+        """
         sample = sink.emit("pull-sample")
-        if sample is not None:
-            self._pending_sample = sample  # newest frame wins
+        if sample is None:
+            self._log_preview_problem("appsink returned no sample")
+            return Gst.FlowReturn.OK
+        buf = sample.get_buffer()
+        caps = sample.get_caps()
+        if buf is None or caps is None or caps.get_size() == 0:
+            self._log_preview_problem("sample without buffer or caps")
+            return Gst.FlowReturn.OK
+        structure = caps.get_structure(0)
+        if not (structure.has_field("width") and structure.has_field("height")):
+            self._log_preview_problem(
+                f"caps without dimensions: {structure.to_string()}")
+            return Gst.FlowReturn.OK
+        width = int(structure.get_value("width"))
+        height = int(structure.get_value("height"))
+        if width <= 0 or height <= 0:
+            self._log_preview_problem(f"invalid preview size {width}x{height}")
+            return Gst.FlowReturn.OK
+        if str(structure.get_value("format")) not in ("RGBA", "RGB"):
+            self._log_preview_problem(
+                f"unexpected preview format {structure.get_value('format')!r}")
+            return Gst.FlowReturn.OK
+        self._pending_sample = sample  # newest frame wins
         return Gst.FlowReturn.OK
 
     def deliver_frame(self) -> bool:
@@ -631,6 +762,7 @@ class AnyCamEngine:
         conv, _, _ = self._mixer_input("silence", 0.0, False)
         self._add(silence)
         self._link([silence, conv])
+        self.report.audio_inputs.append("silence")
         self._audio_eos_pads.append(silence.get_static_pad("src"))
         mic_name = self.project.audio.mic_device or config.microphone()
         if mic_name and self.project.audio.mic_enabled:
@@ -644,6 +776,20 @@ class AnyCamEngine:
             self.mic_volume = vol
             self._audio_eos_pads.append(src.get_static_pad("src"))
             self.report.audio_inputs.append(f"mic:{mic_name}")
+
+        desktop = self.project.audio.desktop_device
+        if desktop:
+            # Desktop audio is a monitor source: a separate mixer input so
+            # sharing what you hear does not replace the microphone.
+            src = make("pulsesrc", "desktop_audio", device=desktop)
+            conv, vol, _level = self._mixer_input(
+                "desktop", self.project.audio.desktop_gain_db,
+                self.project.audio.desktop_muted, meter=False)
+            self._add(src)
+            self._link([src, conv])
+            self.desktop_volume = vol
+            self._audio_eos_pads.append(src.get_static_pad("src"))
+            self.report.audio_inputs.append(f"desktop:{desktop}")
 
         media = self.project.audio.media_file
         if media and not Path(media).exists():
@@ -669,6 +815,21 @@ class AnyCamEngine:
                     self._audio_eos_pads.append(pad)
 
             decode.connect("pad-added", on_pad, conv)
+
+        # Give the shared mixer a consumer even in preview-only mode, so its
+        # src pad is never unlinked and the audio tee can be tapped later by
+        # the recorder/RTMP branches without rebuilding the graph.
+        tee = self._audio_tee()
+        if tee is not None:
+            fs = make("fakesink", "audio_preview_sink", sync=False)
+            fs.set_property("async", False)
+            self._add(fs)
+            tpad = tee.request_pad_simple("src_%u")
+            if tpad is not None and tpad.link(fs.get_static_pad("sink")) == Gst.PadLinkReturn.OK:
+                try:
+                    tpad.set_active(True)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _build_vcam(self) -> None:
         """Feed the virtual camera through an appsink tap.
@@ -798,6 +959,19 @@ class AnyCamEngine:
         self.audio_tee = tee
         return tee
 
+    def _make_record_encoder(self) -> Gst.Element:
+        """Shared H.264 encoder selection for the recording branches."""
+        encoder = os.environ.get("ANYCAM_ENCODER", "auto").lower()
+        if encoder in ("nv", "nvh264", "nvenc") and Gst.ElementFactory.find("nvh264enc"):
+            enc = make("nvh264enc", "record_encoder", bitrate=12000,
+                       zerolatency=True, preset="p4")
+            self.report.encoder = "nvh264enc"
+        else:
+            enc = make("x264enc", "record_encoder", speed_preset="veryfast",
+                       tune="zerolatency", bitrate=12000, key_int_max=60)
+            self.report.encoder = "x264enc"
+        return enc
+
     def _build_recorder_tap(self) -> None:
         """Feed encoded samples to the persistent recorder.
 
@@ -816,15 +990,7 @@ class AnyCamEngine:
         self._recorder_valve = valve
         convert = make("videoconvert")
         i420 = caps_filter("video/x-raw,format=I420", "record_raw")
-        encoder = os.environ.get("ANYCAM_ENCODER", "auto").lower()
-        if encoder in ("nv", "nvh264", "nvenc") and Gst.ElementFactory.find("nvh264enc"):
-            enc = make("nvh264enc", "record_encoder", bitrate=12000,
-                       zerolatency=True, preset="p4")
-            self.report.encoder = "nvh264enc"
-        else:
-            enc = make("x264enc", "record_encoder", speed_preset="veryfast",
-                       tune="zerolatency", bitrate=12000, key_int_max=60)
-            self.report.encoder = "x264enc"
+        enc = self._make_record_encoder()
         parse = make("h264parse")
         sink = make("appsink", "record_tap_sink", emit_signals=True,
                     max_buffers=4, drop=True, sync=False)
@@ -839,12 +1005,19 @@ class AnyCamEngine:
             audio_queue.set_property("leaky", 2)
             audio_sink = make("appsink", "record_audio_sink", emit_signals=True,
                               max_buffers=4, drop=True, sync=False)
+            audio_sink.set_property("async", False)
             self._add(audio_queue, audio_sink)
             self._link([audio_queue, audio_sink])
             tpad = tee.request_pad_simple("src_%u")
             if (tpad is None or
                     tpad.link(audio_queue.get_static_pad("sink")) != Gst.PadLinkReturn.OK):
                 raise RuntimeError("could not tap shared audio for recording")
+            try:
+                tpad.set_active(True)
+            except Exception:  # noqa: BLE001
+                pass
+            audio_queue.set_state(Gst.State.PLAYING)
+            audio_sink.set_state(Gst.State.PLAYING)
             audio_sink.connect("new-sample", self._on_record_audio_sample)
 
     def attach_recorder(self, recorder: Recorder) -> bool:
@@ -882,13 +1055,7 @@ class AnyCamEngine:
         queue = self._branch("record")
         convert = make("videoconvert")
         i420 = caps_filter("video/x-raw,format=I420", "record_raw")
-        encoder = os.environ.get("ANYCAM_ENCODER", "auto").lower()
-        if encoder in ("nv", "nvh264", "nvenc") and Gst.ElementFactory.find("nvh264enc"):
-            enc = make("nvh264enc", "record_encoder", bitrate=12000, zerolatency=True, preset="p4")
-            self.report.encoder = "nvh264enc"
-        else:
-            enc = make("x264enc", "record_encoder", speed_preset="veryfast", tune="zerolatency", bitrate=12000, key_int_max=60)
-            self.report.encoder = "x264enc"
+        enc = self._make_record_encoder()
         parse = make("h264parse")
         # Buffer encoded video while mux waits for the first audio buffer, so a
         # slow microphone wake-up cannot block the tee and starve the preview.
@@ -1157,6 +1324,7 @@ class AnyCamEngine:
         self._last_sample_time = self._start_time
         self._layer_frames.clear()
         self._layer_last.clear()
+        self._source_rate_history.clear()
         self.report.instant_fps = 0.0
         self.report.source_health = {}
         self.report.stalled_sources = []
@@ -1286,9 +1454,29 @@ class AnyCamEngine:
                 frames = self._layer_frames.get(layer.id, 0)
             last = (entry.last_frame or None) if entry is not None else self._layer_last.get(layer.id)
             age = None if last is None else max(0.0, now - last)
+            # Measure the input, not the compositor's repeated output. Keep
+            # a bounded three-second window so bursty ~1 Hz screen updates
+            # cannot alternate between LIVE and SLOW on every short burst.
+            history = self._source_rate_history.setdefault(
+                layer.id, deque([(self._start_time, 0)], maxlen=16))
+            if now < history[-1][0] or frames < history[-1][1]:
+                history.clear()
+                history.append((now, frames))
+            if now - history[-1][0] >= 0.25:
+                history.append((now, frames))
+            while len(history) > 2 and history[1][0] <= now - 3.0:
+                history.popleft()
+            interval = now - history[0][0]
+            source_fps = ((frames - history[0][1]) / interval
+                          if interval >= 2.0 else None)
             health[layer.id] = {
                 "frames": frames,
                 "last_frame_age_s": None if age is None else round(age, 2),
+                "fps": None if source_fps is None else round(source_fps, 2),
+                # Static damage-driven shares may also be low-rate: report
+                # what is measured without claiming the source is broken.
+                "slow": (layer.kind == "screen" and source_fps is not None
+                         and source_fps < min(10.0, self.fps / 2)),
             }
             if last is None:
                 if now - self._start_time > self._stall_seconds:

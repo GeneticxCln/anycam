@@ -45,7 +45,10 @@ def cmd_demo(args) -> int:
 def cmd_gui(args) -> int:
     if args.screenshot:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    from .gui import run_gui, run_screenshot
+    if getattr(args, "ui", "manycam") == "classic":
+        from .gui import run_gui, run_screenshot
+    else:
+        from .gui_many import run_gui, run_screenshot
 
     if args.screenshot:
         return run_screenshot(args.screenshot, args.seconds, source=args.source)
@@ -80,6 +83,8 @@ def main(argv: list[str] | None = None) -> int:
     gui.add_argument("--screenshot", default="", help="render headless (Qt offscreen) and save a PNG")
     gui.add_argument("--seconds", type=float, default=3.0)
     gui.add_argument("--source", default="", help="use the headless demo scene (camera, testsrc, or a media path)")
+    gui.add_argument("--ui", choices=("manycam", "classic"), default="manycam",
+                     help="UI layout: manycam (default) or classic")
     gui.set_defaults(func=cmd_gui)
 
     args = parser.parse_args(argv)

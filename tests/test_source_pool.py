@@ -14,7 +14,7 @@ pytest.importorskip("gi")
 
 from anycam.model import Layer, OutputConfig, Project, Scene  # noqa: E402
 from anycam.pipeline import AnyCamEngine  # noqa: E402
-from anycam.pool import CaptureSpec, SourcePool  # noqa: E402
+from anycam.pool import CaptureSpec, SourcePool, capture_spec  # noqa: E402
 from helpers.frames import grab_frame  # noqa: E402
 
 HAS_INTER = False
@@ -47,6 +47,49 @@ def two_patterns() -> Project:
     project.scenes = [scene]
     project.active_scene = scene.id
     return project
+
+
+def test_screen_capture_uploads_dmabuf_frames():
+    """niri's DMA-BUF-only stream needs GL upload; videoconvert alone fails."""
+    if Gst.ElementFactory.find("pipewiresrc") is None:
+        pytest.skip("pipewiresrc unavailable")
+    spec = CaptureSpec("screen", "86", 320, 180, 30, expected=(320, 180))
+    built = SourcePool._screen(spec)
+    source = built.elements[0]
+    names = [element.get_factory().get_name() for element in built.elements]
+    assert names[0] == "pipewiresrc"
+    # One slot, leaking downstream: the newest frame always wins and stale
+    # frames are dropped instead of back-pressuring the screencast (which would
+    # empty the producer's pool after a focus stall and stop the capture).
+    assert names[1] == "queue"
+    queue = built.elements[1]
+    assert queue.get_property("leaky") == 2
+    assert queue.get_property("max-size-buffers") == 1
+    if all(Gst.ElementFactory.find(name) is not None
+           for name in ("glupload", "glcolorconvert", "gldownload")):
+        assert names[2:5] == ["glupload", "glcolorconvert", "gldownload"]
+        assert source.get_property("always-copy") is False
+    else:
+        assert source.get_property("always-copy") is True
+    assert "videoscale" in names
+    assert "videorate" not in names
+    # The format is pinned right after videoconvert, before any consumer can
+    # read the buffer with the wrong stride and paint it black.
+    assert names.index("capsfilter") == names.index("videoconvert") + 1
+    caps = next(element for element in built.elements
+                if element.get_factory().get_name() == "capsfilter")
+    assert caps.get_property("caps").get_structure(0).get_value("format") == "RGBA"
+    all_caps = [element.get_property("caps").to_string()
+                for element in built.elements
+                if element.get_factory().get_name() == "capsfilter"]
+    assert all("framerate" not in text for text in all_caps)
+
+
+def test_invalid_portal_size_is_scaled_to_the_canvas():
+    """A 1x1 portal size used to become a not-negotiated pipewiresrc."""
+    layer = Layer("screen_layer", "screen", "Screen 1x1", source="86")
+    spec = capture_spec(layer, 1920, 1080, 60, screen_size=(1, 1))
+    assert spec.expected == (1920, 1080)
 
 
 def test_layers_on_the_same_source_share_one_capture():

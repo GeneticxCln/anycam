@@ -280,7 +280,7 @@ def test_microphone_is_absent_unless_enabled(monkeypatch, tmp_path):
                           record_path=tmp_path / "audio.mp4").build()
     try:
         assert engine.pipeline.get_by_name("mic") is None
-        assert engine.report.audio_inputs == []
+        assert not any(x.startswith("mic:") for x in engine.report.audio_inputs)
     finally:
         engine.pipeline.set_state(Gst.State.NULL)
 

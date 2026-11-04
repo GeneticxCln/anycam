@@ -41,15 +41,25 @@ class VcamOutput:
     def active(self) -> bool:
         return self._pipeline is not None
 
-    def start(self, device: str, width: int, height: int, fps: int) -> bool:
+    def start(self, device: str, width: int, height: int, fps: int,
+              setup: bool = False) -> bool:
         if self.active:
             self.stop()
         self.device = device
         self.error = ""
+        if setup:
+            # The user just asked for the virtual camera: bring the loopback
+            # device up (pkexec/polkit prompt) instead of telling them to run
+            # modprobe in a terminal.
+            problem = config.ensure_vcam_device(device)
+            if problem:
+                self.error = problem
+                return False
         if not config.vcam_available(device):
             self.error = (
-                f"virtual camera {device} is not available; load v4l2loopback with "
-                f"'sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam'"
+                f"virtual camera {device} is not available; "
+                f"load v4l2loopback with 'sudo modprobe v4l2loopback "
+                f"video_nr=10 card_label=AnyCam'"
             )
             return False
         self.pixel_format = config.vcam_pixel_format(device)

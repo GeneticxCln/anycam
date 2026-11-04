@@ -218,7 +218,8 @@ class Recorder:
         pipeline.set_state(Gst.State.NULL)
         file = Path(self.path)
         size = file.stat().st_size if file.exists() else 0
-        ok = bool(size > 0 and not self.error)
+        ok = bool(size > 0 and not self.error
+                  and self._last_in.get("video") is not None)
         result = {"path": self.path, "bytes": size, "ok": ok,
                   "error": self.error}
         self._clear_runtime()

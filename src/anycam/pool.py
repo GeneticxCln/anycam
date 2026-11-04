@@ -16,8 +16,9 @@ canvas rate for exactly this reason.
 from __future__ import annotations
 
 import itertools
+import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import gi
 
@@ -117,6 +118,14 @@ def _on_pad_added(_bin, pad, target) -> None:
         pad.link(sink)
 
 
+def _gl_screen_available() -> bool:
+    """Whether the screen path can upload DMA-BUF frames through OpenGL."""
+    return all(
+        Gst.ElementFactory.find(name) is not None
+        for name in ("glupload", "glcolorconvert", "gldownload")
+    )
+
+
 def capture_spec(layer, canvas_w: int, canvas_h: int, fps: int, *,
                  screen_fd: int = -1,
                  screen_size: tuple[int, int] | None = None) -> CaptureSpec:
@@ -135,8 +144,13 @@ def capture_spec(layer, canvas_w: int, canvas_h: int, fps: int, *,
                 node = None
         if node is None:
             raise RuntimeError("screen layer requires a PipeWire node id from the portal")
+        # Some portal/compositor combinations report 1x1 for a valid stream.
+        # Asking pipewiresrc for that size makes it fail with not-negotiated.
+        expected = screen_size
+        if not expected or expected[0] <= 1 or expected[1] <= 1:
+            expected = (max(2, canvas_w), max(2, canvas_h))
         return CaptureSpec("screen", str(node), canvas_w, canvas_h, fps,
-                           fd=screen_fd, expected=screen_size)
+                           fd=screen_fd, expected=expected)
     if kind == "video":
         return CaptureSpec("video", layer.source, canvas_w, canvas_h, fps)
     if kind == "network":
@@ -217,6 +231,8 @@ class SourcePool:
                 if msg.type == Gst.MessageType.ERROR:
                     err, debug = msg.parse_error()
                     entry.error = f"{err.message} ({debug})"
+                    print(f"[capture-error] {entry.channel} {entry.error}",
+                          file=sys.stderr, flush=True)
                 elif entry.spec.kind == "video" and not entry.error:
                     # File video is the only repeatable capture.  Seek the
                     # capture pipeline itself, so the canvas keeps the last
@@ -239,6 +255,13 @@ class SourcePool:
         channel = self.channel_for(spec)
         built = self._elements(spec)
         sink = make("intervideosink", f"{channel}-sink", channel=channel)
+        if spec.kind == "screen":
+            # A capture pipeline is a producer for the canvas, not a renderer.
+            # With the default sync=true the sink waits for the PipeWire clock
+            # that pipewiresrc provides; when the screencast has no damage that
+            # clock stands still, the sink holds its buffer, PipeWire runs out
+            # of buffers and the screen layer goes black.
+            sink.set_property("sync", False)
         built.elements.append(sink)
         pipeline = Gst.Pipeline.new(channel)
         for element in built.elements:
@@ -284,7 +307,11 @@ class SourcePool:
             seen.append(True)
             struct = caps.get_structure(0)
             got = (int(struct.get_value("width")), int(struct.get_value("height")))
-            if got != tuple(expected):
+            # Compare the shape, not the exact size: the portal reports logical
+            # pixels while the buffer is physical (HiDPI scale).
+            got_ratio = got[0] / got[1] if got[1] else 0.0
+            want_ratio = expected[0] / expected[1] if expected[1] else 0.0
+            if want_ratio and abs(got_ratio - want_ratio) > 0.02 * want_ratio:
                 entry.screen_error = (
                     f"screen layer captured {got[0]}x{got[1]} but the portal "
                     f"stream is {expected[0]}x{expected[1]}"
@@ -360,6 +387,7 @@ class SourcePool:
             decode,
             make("videoconvert"),
             make("videoscale"),
+            make("videorate"),
             caps_filter(f"video/x-raw,format=RGBA,width={width},height={height},"
                         f"framerate={spec.fps}/1"),
         ]
@@ -374,6 +402,7 @@ class SourcePool:
             decode,
             make("videoconvert"),
             make("videoscale"),
+            make("videorate"),
             caps_filter(f"video/x-raw,format=RGBA,width={width},height={height},"
                         f"framerate={spec.fps}/1"),
         ]
@@ -382,15 +411,46 @@ class SourcePool:
     @staticmethod
     def _screen(spec: CaptureSpec) -> _Built:
         node = int(spec.source)
-        props = {"do_timestamp": True, "path": str(node)}
+        # niri 26.04 exports the screencast as DMA-BUF only.  Asking
+        # pipewiresrc for the system-memory caps that videoconvert requires
+        # fails with "no more input formats" (a black or dead screen layer).
+        # Upload the DMA-BUF to GL and download it before videoconvert.
+        # Do not let pipewiresrc impose its PipeWire clock on the capture
+        # pipeline: the canvas owns presentation timing, and a clock that only
+        # advances on screencast damage stalls the sink and starves the stream.
+        props = {"do_timestamp": True, "path": str(node),
+                 "provide_clock": False, "max_buffers": 3, "min_buffers": 1}
         if spec.fd >= 0:
             props["fd"] = int(spec.fd)
+        print(f"[screen-chain] node={node} fd={spec.fd} expected={spec.expected}",
+              file=sys.stderr, flush=True)
         src = make("pipewiresrc", **props)
         expected = spec.expected or (max(2, spec.width), max(2, spec.height))
-        elements: list[Gst.Element] = [
-            src,
+        elements: list[Gst.Element] = [src]
+        # Same reason as sources.screen_chain: keep the newest frame and always
+        # return the rest to PipeWire, so a slow consumer cannot empty the
+        # producer's pool and stall the capture.  ``leaky=2`` (downstream)
+        # drops the oldest queued frame, which is what keeps the picture live
+        # after the window gains focus and the consumer briefly stalls.
+        elements.append(make("queue", "screen_queue", leaky=2,
+                             max_size_buffers=1, max_size_bytes=0,
+                             max_size_time=0, silent=True))
+        if _gl_screen_available():
+            elements.extend([make("glupload"), make("glcolorconvert"),
+                             make("gldownload")])
+        else:
+            # Compositors that only expose system-memory buffers still need
+            # the deprecated copy path.
+            src.set_property("always-copy", True)
+        elements.extend([
             make("videoconvert"),
-            caps_filter(f"video/x-raw,format=RGBA,width={expected[0]},height={expected[1]},"
-                        f"framerate={spec.fps}/1"),
-        ]
+            caps_filter("video/x-raw,format=RGBA"),
+            # The portal can report a size that does not match the negotiated
+            # PipeWire stream (or 1x1).  Scale instead of failing negotiation.
+            make("videoscale"),
+            # Do not pin a framerate here.  On niri's DMA-BUF stream a final
+            # framerate cap makes the capture emit one frame and then stall;
+            # the canvas layer_tail already owns the output rate.
+            caps_filter(f"video/x-raw,format=RGBA,width={expected[0]},height={expected[1]}"),
+        ])
         return _Built(elements, tuple(expected), check=src, check_size=tuple(expected))

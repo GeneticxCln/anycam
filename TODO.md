@@ -109,10 +109,12 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 
 ## 8. M8 — phone camera and remote
 
+Design and build order: `docs/PHONE_CAMERA.md`.
+
 - [ ] Local HTTPS + WebRTC page with QR pairing; several phones as sources.
 - [ ] Phone remote / stream deck for switching presets.
 - [ ] Local-network only, authenticated per device, no cloud.
-- [ ] Acceptance: Android and iPhone both work as source and remote; an unpaired device receives nothing. Needs the user's phones.
+- [ ] Acceptance: two Android phones work as source and remote; an unpaired device receives nothing. Needs the user's phones.
 
 ## 9. M9 — ship 1.0
 
@@ -141,7 +143,7 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - [ ] Load v4l2loopback (`sudo scripts/enable-v4l2loopback.sh`) and re-run the soak with `--vcam`; without `/dev/video10` the run is blocked on that one gate.
 - [ ] Live xdg-desktop-portal screen-layer frame-size check (B1).
 - [ ] Compatibility matrix on Firefox, Chromium, Zoom, Teams, Meet and OBS.
-- [ ] Android and iPhone source/remote tests.
+- [ ] Two Android phones as source and remote.
 - [ ] Decision to publish the repository.
 
 ## 12. Remaining audit bug index

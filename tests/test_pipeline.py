@@ -36,6 +36,256 @@ def make_project(width=640, height=360, fps=30):
     return project
 
 
+def test_screen_capture_uploads_pipewire_dmabuf_frames():
+    if Gst.ElementFactory.find("pipewiresrc") is None:
+        pytest.skip("pipewiresrc unavailable")
+    from anycam.sources import screen_chain
+
+    chain = screen_chain(1, 320, 180, 30)
+    names = [element.get_factory().get_name() for element in chain.elements
+             if element.get_factory() is not None]
+    sources = [element for element in chain.elements
+               if element.get_factory() is not None
+               and element.get_factory().get_name() == "pipewiresrc"]
+    assert sources
+    if all(Gst.ElementFactory.find(name) is not None
+           for name in ("glupload", "glcolorconvert", "gldownload")):
+        assert "glupload" in names
+        assert sources[0].get_property("always-copy") is False
+    else:
+        assert sources[0].get_property("always-copy") is True
+    # One-slot queue leaking downstream: stale frames are dropped rather than
+    # back-pressuring the screencast when the window gains focus.
+    queues = [element for element in chain.elements
+              if element.get_factory().get_name() == "queue"]
+    assert len(queues) == 1
+    assert queues[0].get_property("leaky") == 2
+    assert queues[0].get_property("max-size-buffers") == 1
+    elements = [element for element in chain.elements
+                if element.get_factory() is not None]
+    convert = next(index for index, element in enumerate(elements)
+                   if element.get_factory().get_name() == "videoconvert")
+    assert elements[convert + 1].get_factory().get_name() == "capsfilter"
+    format_caps = elements[convert + 1].get_property("caps").get_structure(0)
+    assert format_caps.get_value("format") == "RGBA"
+    caps = [element for element in chain.elements
+            if element.get_factory().get_name() == "capsfilter"]
+    assert caps
+    assert all("framerate" not in element.get_property("caps").to_string()
+               for element in caps)
+
+
+@pytest.mark.parametrize("sequences, expected_frames", [
+    ([None, None, None, None], 2),
+    ([1, 2, 3, 4], 4),
+    ([1, 1, 1, 1], 1),
+])
+def test_screen_health_uses_sequence_then_timestamp(monkeypatch, sequences, expected_frames):
+    from anycam import pipeline as pipeline_module
+    from anycam.sources import SourceChain, make, caps_filter
+
+    src = make("appsrc", is_live=True, format=Gst.Format.TIME)
+    caps = Gst.Caps.from_string("video/x-raw,format=RGBA,width=32,height=18,framerate=0/1")
+    src.set_property("caps", caps)
+    tail = caps_filter(caps.to_string())
+    chain = SourceChain(elements=[src, tail], tail=tail, source_size=(32, 18))
+    chain.check_element = src
+    monkeypatch.setattr(pipeline_module, "build_chain", lambda *args, **kwargs: chain)
+    project = make_project(32, 18, 30)
+    project.scene.layers = [Layer("screen", "screen", "Screen", source="123")]
+    engine = AnyCamEngine(project, preview=True).build()
+    engine.start()
+    try:
+        for pts, sequence in zip((0, 0, 0, Gst.SECOND), sequences):
+            buf = Gst.Buffer.new_allocate(None, 32 * 18 * 4, None)
+            buf.pts = pts
+            if sequence is not None:
+                buf.offset = sequence
+            src.emit("push-buffer", buf)
+            time.sleep(0.05)
+        deadline = time.monotonic() + 2
+        while engine._layer_frames.get("screen", 0) < expected_frames and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert engine._layer_frames["screen"] == expected_frames
+        engine._update_health(engine._layer_last["screen"] + 3)
+        assert engine.report.stalled_sources == ["screen"]
+    finally:
+        engine.stop()
+
+
+@pytest.mark.parametrize("has_sequence", [False, True])
+def test_two_screens_with_repeated_pts_keep_changing_pixels(monkeypatch, has_sequence):
+    """Fresh source counters must not hide a frozen compositor picture."""
+    from anycam import pipeline as pipeline_module
+    from anycam.sources import SourceChain, make, caps_filter
+    from helpers.frames import Frame
+
+    sources = []
+    timestamps = [[], []]
+
+    def build_screen(_layer, width, height, *_args, **_kwargs):
+        src = make("appsrc", is_live=True, format=Gst.Format.TIME)
+        caps = f"video/x-raw,format=RGBA,width={width},height={height},framerate=0/1"
+        src.set_property("caps", Gst.Caps.from_string(caps))
+        tail = caps_filter(caps)
+        chain = SourceChain(elements=[src, tail], tail=tail,
+                            source_size=(width, height))
+        chain.check_element = src
+        index = len(sources)
+        sources.append(src)
+
+        def inspect_timestamp(_pad, info):
+            timestamps[index].append(info.get_buffer().pts)
+            return Gst.PadProbeReturn.OK
+
+        tail.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, inspect_timestamp)
+        return chain
+
+    monkeypatch.setattr(pipeline_module, "build_chain", build_screen)
+    project = make_project(64, 36, 30)
+    project.scene.layers = [
+        Layer("left", "screen", "Left", source="123", box=(0, 0, 0.5, 1)),
+        Layer("right", "screen", "Right", source="124", box=(0.5, 0, 0.5, 1)),
+    ]
+    seen = [[], []]
+
+    def on_frame(sample):
+        buf = sample.get_buffer()
+        ok, mapped = buf.map(Gst.MapFlags.READ)
+        assert ok
+        try:
+            frame = Frame(64, 36, bytes(mapped.data))
+        finally:
+            buf.unmap(mapped)
+        for i, x in enumerate((16, 48)):
+            pixel = frame.pixel(x, 18)
+            if not seen[i] or seen[i][-1] != pixel:
+                seen[i].append(pixel)
+
+    engine = AnyCamEngine(project, preview=True, on_frame=on_frame).build().start()
+    palettes = [((255, 0, 0, 255), (0, 0, 255, 255)),
+                ((0, 255, 0, 255), (255, 255, 0, 255))]
+    try:
+        start = time.monotonic()
+        sequence = 0
+        while time.monotonic() - start < 2.5:
+            elapsed = time.monotonic() - start
+            sequence += 1
+            for i, src in enumerate(sources):
+                color = palettes[i][int(elapsed * 5) % 2]
+                buf = Gst.Buffer.new_allocate(None, 32 * 36 * 4, None)
+                buf.fill(0, bytes(color) * (32 * 36))
+                buf.pts = 0  # niri's producer timestamp does not advance.
+                if has_sequence:
+                    buf.offset = sequence
+                assert src.emit("push-buffer", buf) == Gst.FlowReturn.OK
+            engine.pump(20)
+            time.sleep(0.01)
+        engine.pump(50)
+        assert not engine.report.error, engine.report.error
+        for i in range(2):
+            assert set(palettes[i]).issubset(seen[i]), seen
+            assert len(seen[i]) >= 6, seen
+            assert len(set(timestamps[i])) > 10, timestamps
+            assert timestamps[i] == sorted(timestamps[i])
+        # Retiming must not make repeated identities look fresh.
+        engine._update_health(time.monotonic())
+        if has_sequence:
+            assert engine.report.stalled_sources == []
+        else:
+            assert engine.report.stalled_sources == ["left", "right"]
+    finally:
+        engine.stop()
+
+
+def test_screen_health_measures_bursty_input_and_recovers():
+    project = make_project()
+    project.scene.layers = [Layer("screen", "screen", "Screen", source="123")]
+    engine = AnyCamEngine(project, preview=True)
+    engine._layer_pads["screen"] = object()
+    engine._start_time = 100.0
+    # Three frames in a short burst once per second must stay SLOW between
+    # bursts even though the canvas keeps rendering at its configured rate.
+    for step in range(1, 17):
+        now = 100 + step * 0.25
+        engine._layer_frames["screen"] = (step // 4) * 3
+        engine._layer_last["screen"] = 100 + step // 4
+        engine._update_health(now)
+        health = engine.report.source_health["screen"]
+        if step < 8:
+            assert health["fps"] is None
+            assert not health["slow"]
+        else:
+            assert health["fps"] < 4
+            assert health["slow"]
+        assert not engine.report.stalled_sources
+    # A resumed 30 fps input clears the rolling low-rate state.
+    for step in range(1, 17):
+        now = 104 + step * 0.25
+        engine._layer_frames["screen"] = 12 + round(step * 7.5)
+        engine._layer_last["screen"] = now
+        engine._update_health(now)
+    assert engine.report.source_health["screen"]["fps"] == 30
+    assert not engine.report.source_health["screen"]["slow"]
+    engine._update_health(now + 3)
+    assert engine.report.stalled_sources == ["screen"]
+    assert len(engine._source_rate_history["screen"]) <= 16
+
+
+def test_screen_health_uses_elapsed_time_and_resets_on_restart():
+    project = make_project(fps=5)
+    project.scene.layers = [Layer("screen", "screen", "Screen", source="123")]
+    engine = AnyCamEngine(project, preview=True)
+    engine._layer_pads["screen"] = object()
+    engine._start_time = 10
+    engine._layer_frames["screen"] = 30
+    engine._layer_last["screen"] = 13
+    engine._update_health(13)
+    assert engine.report.source_health["screen"]["fps"] == 10
+    assert not engine.report.source_health["screen"]["slow"]
+    engine._layer_frames["screen"] = 0
+    engine._layer_last["screen"] = 14
+    engine._update_health(14)
+    assert engine.report.source_health["screen"]["fps"] is None
+    assert not engine.report.source_health["screen"]["slow"]
+
+
+def test_two_screen_layers_have_unique_elements():
+    if Gst.ElementFactory.find("pipewiresrc") is None:
+        pytest.skip("pipewiresrc unavailable")
+    project = make_project(320, 180, 30)
+    project.scene.layers = [
+        Layer("screen_a", "screen", "A", source="123", box=(0, 0, 0.5, 1)),
+        Layer("screen_b", "screen", "B", source="124", box=(0.5, 0, 0.5, 1)),
+    ]
+    engine = AnyCamEngine(project, preview=True).build()
+    try:
+        assert set(engine._layer_pads) == {"screen_a", "screen_b"}
+        names = [element.get_name() for chain in engine.chains for element in chain.elements]
+        assert len(names) == len(set(names))
+    finally:
+        engine.pipeline.set_state(Gst.State.NULL)
+
+
+def test_empty_layout_builds_the_anycam_template_not_a_test_pattern():
+    project = make_project(320, 180, 30)
+    project.scenes[0].layers = []
+    engine = AnyCamEngine(project, preview=True).build()
+    try:
+        assert "layer_template" in engine._layer_pads
+        assert engine.scene.layers == []
+        from anycam.sources import template_chain
+
+        chain = template_chain(320, 180, 30)
+        titles = [element.get_property("text") for element in chain.elements
+                  if element.get_factory() is not None
+                  and element.get_factory().get_name() == "textoverlay"]
+        assert "AnyCam" in titles
+        assert not any("Test pattern" in str(title) for title in titles)
+    finally:
+        engine.pipeline.set_state(Gst.State.NULL)
+
+
 def test_engine_composites_and_records(tmp_path):
     output = tmp_path / "composite.mp4"
     engine = AnyCamEngine(make_project(), record_path=output).build()
@@ -57,6 +307,75 @@ def test_engine_delivers_preview_frames():
     report = engine.run(1.0)
     assert report["error"] == "", report["error"]
     assert frames, "preview appsink never produced a sample"
+
+
+class _PreviewSample:
+    """The slice of ``Gst.Sample`` the appsink callback uses."""
+
+    def __init__(self, buffer, caps):
+        self._buffer = buffer
+        self._caps = caps
+
+    def get_buffer(self):
+        return self._buffer
+
+    def get_caps(self):
+        return self._caps
+
+
+class _PreviewSink:
+    def __init__(self, sample):
+        self._sample = sample
+
+    def emit(self, _name):
+        return self._sample
+
+
+def test_preview_drops_a_frame_without_dimensions_and_logs(capsys):
+    """Caps without width/height are rejected instead of painting black."""
+    engine = AnyCamEngine(make_project(320, 180, 30))
+    caps = Gst.Caps.from_string("video/x-raw,format=RGBA")
+    buffer = Gst.Buffer.new_wrapped(b"\x00" * 8)
+    result = engine._on_preview_sample(
+        _PreviewSink(_PreviewSample(buffer, caps)))
+
+    assert result == Gst.FlowReturn.OK
+    assert engine._pending_sample is None
+    assert engine._preview_problem_count == 1
+    err = capsys.readouterr().err
+    assert "[preview] dropped frame:" in err
+    assert "caps without dimensions" in err
+
+
+def test_preview_drops_a_frame_with_the_wrong_format_and_logs(capsys):
+    """A non-RGBA frame would be read with the wrong stride, so it is dropped."""
+    engine = AnyCamEngine(make_project(320, 180, 30))
+    caps = Gst.Caps.from_string("video/x-raw,format=RGBx,width=4,height=4")
+    buffer = Gst.Buffer.new_wrapped(b"\x00" * 64)
+    result = engine._on_preview_sample(
+        _PreviewSink(_PreviewSample(buffer, caps)))
+
+    assert result == Gst.FlowReturn.OK
+    assert engine._pending_sample is None
+    assert engine._preview_problem_count == 1
+    err = capsys.readouterr().err
+    assert "unexpected preview format" in err
+
+
+def test_preview_branch_keeps_only_the_newest_frame():
+    """A stalled GUI must drop stale frames instead of blocking the compositor."""
+    engine = AnyCamEngine(make_project(320, 180, 30), preview=True).build()
+    try:
+        queue = engine.pipeline.get_by_name("queue_preview")
+        assert queue is not None
+        assert queue.get_property("max-size-buffers") == 1
+        assert queue.get_property("max-size-time") == 0
+        assert queue.get_property("leaky") == 2  # downstream: drop stale
+        format_caps = engine.pipeline.get_by_name("preview_format")
+        assert format_caps is not None
+        assert format_caps.get_property("caps").get_structure(0).get_value("format") == "RGBA"
+    finally:
+        engine.pipeline.set_state(Gst.State.NULL)
 
 
 def test_set_layer_box_moves_the_compositor_pad():

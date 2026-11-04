@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from . import config, overlay, portal
 from .geometry import clamp
+from .layouts import GRID_KINDS, LAYOUT_PRESETS, arrange, layout_preset
 from .model import (Effects, Layer, Project, Scene, camera_grid_scene,
                     default_project, new_id, two_camera_scene)
 from .engine.outputs.recorder import Recorder
@@ -42,6 +43,10 @@ QPushButton { background: #172026; border: 1px solid #26343d; border-radius: 7px
 QPushButton:hover { border-color: #5eead0; }
 QPushButton:pressed { background: #1d2b31; }
 QPushButton#primary { background: #5eead0; color: #07120f; font-weight: 700; border: none; }
+QPushButton#preset { text-align: left; padding: 7px 10px; font-weight: 600; }
+QPushButton#preset:checked { border-color: #5eead0; color: #5eead0; background: #12211f; }
+QPushButton#slotAdd { background: transparent; border: 2px solid transparent; border-radius: 10px; color: #5eead0; font-size: 30px; font-weight: 300; }
+QPushButton#slotAdd:hover { border: 2px dashed #5eead0; background: rgba(18, 33, 31, 180); }
 QPushButton#danger { background: #3a1d22; border-color: #7a2f3a; }
 QListWidget { background: #0e1216; border: 1px solid #1e2830; border-radius: 7px; }
 QListWidget::item { padding: 6px; }
@@ -125,6 +130,7 @@ class PreviewWidget(QWidget):
     geometry_changed = Signal(str)
     edit_started = Signal(str)
     edit_finished = Signal(str, bool)
+    context_menu_requested = Signal(str, QPoint)
 
     HANDLE = 9.0
     MIN_BOX = 0.02
@@ -152,6 +158,15 @@ class PreviewWidget(QWidget):
         self._nudge_timer.setSingleShot(True)
         self._nudge_timer.setInterval(350)
         self._nudge_timer.timeout.connect(self._finish_nudge)
+        # The selection outline is a transient hint: it shows when a layer is
+        # picked and fades out again, so a full-frame source does not leave a
+        # green border around the whole program.  Off by default (classic UI).
+        self.selection_auto_hide = False
+        self._selection_visible = True
+        self._selection_timer = QTimer(self)
+        self._selection_timer.setSingleShot(True)
+        self._selection_timer.setInterval(1600)
+        self._selection_timer.timeout.connect(self._hide_selection)
         self.setMinimumSize(QSize(640, 360))
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
@@ -197,6 +212,31 @@ class PreviewWidget(QWidget):
         self.snap_px = max(0.0, float(pixels))
         self.update()
 
+    def set_selection_auto_hide(self, enabled: bool) -> None:
+        """Show the selection outline on demand and hide it when idle."""
+        self.selection_auto_hide = bool(enabled)
+        if not enabled:
+            self._selection_timer.stop()
+            self._selection_visible = True
+            self.update()
+        elif self.selected_ids:
+            self._show_selection()
+        else:
+            self._hide_selection()
+
+    def _show_selection(self) -> None:
+        self._selection_visible = True
+        self.update()
+        if self.selection_auto_hide and self.selected_ids:
+            self._selection_timer.start()
+
+    def _hide_selection(self) -> None:
+        self._selection_timer.stop()
+        if not self._selection_visible:
+            return
+        self._selection_visible = False
+        self.update()
+
     def set_selection(self, layer_ids, primary: str = "") -> None:
         ids: list[str] = []
         for layer_id in layer_ids:
@@ -207,6 +247,10 @@ class PreviewWidget(QWidget):
         changed = ids != self.selected_ids or primary != self.selected_id
         self.selected_ids = ids
         self.selected_id = primary
+        if ids:
+            self._show_selection()
+        else:
+            self._hide_selection()
         self.update()
         if changed:
             self.selection_changed.emit(primary)
@@ -231,7 +275,7 @@ class PreviewWidget(QWidget):
     def set_primary(self, layer_id: str) -> None:
         if layer_id in self.selected_ids and layer_id != self.selected_id:
             self.selected_id = layer_id
-            self.update()
+            self._show_selection()
             self.selection_changed.emit(layer_id)
 
     def selected_layer(self) -> Layer | None:
@@ -348,6 +392,7 @@ class PreviewWidget(QWidget):
             super().mousePressEvent(event)
             return
         self.setFocus()
+        self._show_selection()
         pos = event.position()
         layer = self.selected_layer()
         if layer is not None and layer.visible:
@@ -398,6 +443,15 @@ class PreviewWidget(QWidget):
             self._end_drag()
             return
         super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event) -> None:
+        """Right-click a layer: pick it, then let the window offer actions."""
+        target = self.layer_at(QPointF(event.pos()))
+        if target is not None:
+            self.select_layer(target.id)
+        self.context_menu_requested.emit(target.id if target else "",
+                                         event.globalPos())
+        event.accept()
 
     def keyPressEvent(self, event) -> None:
         layer = self.selected_layer()
@@ -656,6 +710,7 @@ class PreviewWidget(QWidget):
         self._guides = []
         self._spacing = []
         self.unsetCursor()
+        self._show_selection()
         self.update()
         if not drag:
             return
@@ -694,7 +749,7 @@ class PreviewWidget(QWidget):
         self._paint_guides(painter)
 
     def _paint_selection(self, painter: QPainter) -> None:
-        if self.scene is None:
+        if self.scene is None or not self._selection_visible:
             return
         primary = self.selected_layer()
         for layer_id in self.selected_ids:
@@ -875,6 +930,8 @@ class AnyCamWindow(QMainWindow):
         self.live = False
         self.audio_on = bool(getattr(self.project.audio, "mic_enabled", False))
         self._screen_error_shown = ""
+        # Previous (frames, time) for the captured-frames readout.
+        self._screen_fps_prev: tuple[float, float] | None = None
         # Layer currently built without its crop because the editor is open.
         self._crop_preview_layer_id = ""
         self._screen_sessions: dict[str, portal.ScreenSession] = {}
@@ -1040,8 +1097,20 @@ class AnyCamWindow(QMainWindow):
         self.vcam_button.clicked.connect(self.toggle_vcam)
         self.snapshot_button = QPushButton("Snapshot")
         self.snapshot_button.clicked.connect(self.snapshot)
-        for button in (self.start_button, self.record_button, self.vcam_button, self.snapshot_button):
+        self.multiview_button = QPushButton("Multi-view")
+        self.multiview_button.clicked.connect(self.toggle_multiview)
+        for button in (self.start_button, self.record_button, self.vcam_button,
+                       self.snapshot_button, self.multiview_button):
             controls.addWidget(button)
+        controls.addSpacing(10)
+        controls.addWidget(QLabel("Layout"))
+        self.layout_combo = QComboBox()
+        for preset in LAYOUT_PRESETS:
+            self.layout_combo.addItem(preset.label, preset.key)
+        controls.addWidget(self.layout_combo)
+        apply_layout = QPushButton("Apply layout")
+        apply_layout.clicked.connect(lambda: self.apply_layout())
+        controls.addWidget(apply_layout)
         controls.addStretch(1)
         self.stats_label = QLabel("idle")
         self.stats_label.setObjectName("muted")
@@ -1058,6 +1127,7 @@ class AnyCamWindow(QMainWindow):
         side.addTab(self._audio_tab(), "Audio")
         side.addTab(self._playlist_tab(), "Playlist")
         side.addTab(self._output_tab(), "Output")
+        side.addTab(self._stream_tab(), "Stream")
         splitter.addWidget(side)
         splitter.setStretchFactor(0, 1)
 
@@ -1098,12 +1168,6 @@ class AnyCamWindow(QMainWindow):
         row.addWidget(add)
         row.addWidget(remove)
         layout.addLayout(row)
-        two_camera = QPushButton("Add two-camera scene")
-        two_camera.clicked.connect(self.add_two_camera_scene)
-        layout.addWidget(two_camera)
-        grid = QPushButton("Add camera grid...")
-        grid.clicked.connect(self.add_camera_grid_scene)
-        layout.addWidget(grid)
         self._refresh_scene_list()
         return page
 
@@ -1112,6 +1176,9 @@ class AnyCamWindow(QMainWindow):
         layout = QVBoxLayout(page)
         self.layer_list = QListWidget()
         self.layer_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.layer_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        self.layer_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.layer_list.model().rowsMoved.connect(self._layers_reordered)
         self.layer_list.itemChanged.connect(self._layer_visibility)
         self.layer_list.itemSelectionChanged.connect(self._layers_selection_changed)
         layout.addWidget(self.layer_list, 1)
@@ -1427,32 +1494,6 @@ class AnyCamWindow(QMainWindow):
         grid.addWidget(self.mic_level_label, 4, 1)
         layout.addWidget(box)
 
-        box2 = QGroupBox("Media audio (mixed with the mic)")
-        grid2 = QGridLayout(box2)
-        self.media_edit = QLineEdit(self.project.audio.media_file)
-        self.media_edit.textChanged.connect(lambda *_: self._mark_dirty())
-        browse = QPushButton("Browse")
-        browse.clicked.connect(self._pick_media)
-        grid2.addWidget(QLabel("File"), 0, 0)
-        grid2.addWidget(self.media_edit, 0, 1)
-        grid2.addWidget(browse, 0, 2)
-        self.media_gain_slider = QSlider(Qt.Orientation.Horizontal)
-        self.media_gain_slider.setRange(-30, 20)
-        self.media_gain_slider.setValue(int(self.project.audio.media_gain_db))
-        self.media_gain_slider.valueChanged.connect(self._media_gain_changed)
-        self.media_gain_label = QLabel(f"{self.project.audio.media_gain_db:+.0f} dB")
-        self.media_gain_label.setObjectName("accent")
-        media_row = QHBoxLayout()
-        media_row.addWidget(self.media_gain_slider, 1)
-        media_row.addWidget(self.media_gain_label)
-        grid2.addWidget(QLabel("Gain"), 1, 0)
-        grid2.addLayout(media_row, 1, 1, 1, 2)
-        note = QLabel("Media audio is decoded and mixed with the microphone through "
-                      "an audiomixer; both inputs are resampled to 48 kHz stereo.")
-        note.setObjectName("muted")
-        note.setWordWrap(True)
-        grid2.addWidget(note, 2, 0, 1, 3)
-        layout.addWidget(box2)
         layout.addStretch(1)
         return page
 
@@ -1467,6 +1508,16 @@ class AnyCamWindow(QMainWindow):
             self.mic_combo.setCurrentIndex(index)
         self.mic_combo.blockSignals(False)
         self._status(f"{self.mic_combo.count()} microphone(s) found")
+
+    def _desktop_audio_changed(self, _index: int) -> None:
+        device = self.desktop_combo.currentData() or ""
+        self.project.audio.desktop_device = device
+        self.project.audio.desktop_muted = False
+        self._mark_dirty()
+        if self.engine is not None:
+            self.restart_engine()
+        self._status("Desktop audio off" if not device
+                     else f"Desktop audio: {device}")
 
     def _toggle_audio(self, enabled: bool) -> None:
         self.audio_on = enabled
@@ -1543,6 +1594,57 @@ class AnyCamWindow(QMainWindow):
         self.playlist_enabled.toggled.connect(self._playlist_settings_changed)
         grid.addWidget(self.playlist_enabled, 1, 0, 1, 2)
         layout.addLayout(grid)
+
+        music = QGroupBox("Music (audio file)")
+        music_grid = QGridLayout(music)
+        self.media_edit = QLineEdit(self.project.audio.media_file)
+        self.media_edit.textChanged.connect(lambda *_: self._mark_dirty())
+        browse = QPushButton("Browse")
+        browse.clicked.connect(self._pick_media)
+        music_grid.addWidget(QLabel("File"), 0, 0)
+        music_grid.addWidget(self.media_edit, 0, 1)
+        music_grid.addWidget(browse, 0, 2)
+        self.media_gain_slider = QSlider(Qt.Orientation.Horizontal)
+        self.media_gain_slider.setRange(-30, 20)
+        self.media_gain_slider.setValue(int(self.project.audio.media_gain_db))
+        self.media_gain_slider.valueChanged.connect(self._media_gain_changed)
+        self.media_gain_label = QLabel(f"{self.project.audio.media_gain_db:+.0f} dB")
+        self.media_gain_label.setObjectName("accent")
+        music_row = QHBoxLayout()
+        music_row.addWidget(self.media_gain_slider, 1)
+        music_row.addWidget(self.media_gain_label)
+        music_grid.addWidget(QLabel("Gain"), 1, 0)
+        music_grid.addLayout(music_row, 1, 1, 1, 2)
+        music_note = QLabel("Music is mixed with the microphone through an "
+                            "audiomixer at 48 kHz stereo.")
+        music_note.setObjectName("muted")
+        music_note.setWordWrap(True)
+        music_grid.addWidget(music_note, 2, 0, 1, 3)
+        layout.addWidget(music)
+
+        desktop = QGroupBox("Desktop audio (optional)")
+        desktop_grid = QGridLayout(desktop)
+        self.desktop_combo = QComboBox()
+        self.desktop_combo.addItem("Off", "")
+        for source in config.list_audio_sources():
+            if source.is_monitor:
+                self.desktop_combo.addItem(source.description or source.name,
+                                           source.name)
+        index = self.desktop_combo.findData(self.project.audio.desktop_device)
+        if index >= 0:
+            self.desktop_combo.setCurrentIndex(index)
+        self.desktop_combo.currentIndexChanged.connect(
+            self._desktop_audio_changed)
+        desktop_grid.addWidget(QLabel("Source"), 0, 0)
+        desktop_grid.addWidget(self.desktop_combo, 0, 1)
+        desktop_note = QLabel(
+            "Monitor sources are the 'what you hear' streams from "
+            "PipeWire/PulseAudio. They are mixed with the mic.")
+        desktop_note.setObjectName("muted")
+        desktop_note.setWordWrap(True)
+        desktop_grid.addWidget(desktop_note, 1, 0, 1, 2)
+        layout.addWidget(desktop)
+
         layout.addStretch(1)
         self._load_playlist_state()
         return page
@@ -1633,6 +1735,29 @@ class AnyCamWindow(QMainWindow):
             self.engine.set_layer_visible(layer_id, position == self.playlist_index)
         self.playlist_list.setCurrentRow(self.playlist_index)
 
+    def _stream_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        box = QGroupBox("Live stream")
+        grid = QGridLayout(box)
+        self.rtmp_edit = QLineEdit(self.project.output.rtmp_url)
+        self.rtmp_edit.setPlaceholderText("rtmp://host/live/stream-key")
+        self.rtmp_edit.textChanged.connect(lambda *_: self._mark_dirty())
+        grid.addWidget(QLabel("RTMP URL"), 0, 0)
+        grid.addWidget(self.rtmp_edit, 0, 1)
+        self.live_button = QPushButton("Go Live")
+        self.live_button.setObjectName("primary")
+        self.live_button.clicked.connect(self.toggle_live)
+        grid.addWidget(self.live_button, 1, 0, 1, 2)
+        live_note = QLabel("The saved URL is used only while Go Live is on; "
+                           "starting preview never publishes.")
+        live_note.setObjectName("muted")
+        live_note.setWordWrap(True)
+        grid.addWidget(live_note, 2, 0, 1, 2)
+        layout.addWidget(box)
+        layout.addStretch(1)
+        return page
+
     def _output_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1654,35 +1779,19 @@ class AnyCamWindow(QMainWindow):
         grid.addWidget(QLabel("FPS"), 2, 0); grid.addWidget(self.fps_spin, 2, 1)
         layout.addWidget(box)
 
-        box2 = QGroupBox("Virtual camera")
+        box2 = QGroupBox("Video output (virtual camera)")
         grid2 = QGridLayout(box2)
         self.vcam_edit = QLineEdit(self.project.output.vcam_device)
         self.vcam_edit.textChanged.connect(lambda *_: self._mark_dirty())
         grid2.addWidget(QLabel("Device"), 0, 0)
         grid2.addWidget(self.vcam_edit, 0, 1)
-        self.vcam_note = QLabel("Run scripts/enable-v4l2loopback.sh once (needs sudo).")
+        self.vcam_note = QLabel(
+            "Run scripts/enable-v4l2loopback.sh once (needs sudo). "
+            "The camera source itself is chosen in Sources or the + menu.")
         self.vcam_note.setObjectName("muted")
         self.vcam_note.setWordWrap(True)
         grid2.addWidget(self.vcam_note, 1, 0, 1, 2)
         layout.addWidget(box2)
-
-        box3 = QGroupBox("Stream")
-        grid3 = QGridLayout(box3)
-        self.rtmp_edit = QLineEdit(self.project.output.rtmp_url)
-        self.rtmp_edit.setPlaceholderText("rtmp://host/live/stream-key")
-        self.rtmp_edit.textChanged.connect(lambda *_: self._mark_dirty())
-        grid3.addWidget(QLabel("RTMP URL"), 0, 0)
-        grid3.addWidget(self.rtmp_edit, 0, 1)
-        self.live_button = QPushButton("Go Live")
-        self.live_button.setObjectName("primary")
-        self.live_button.clicked.connect(self.toggle_live)
-        grid3.addWidget(self.live_button, 1, 0, 1, 2)
-        live_note = QLabel("The saved URL is used only while Go Live is on; "
-                           "starting preview never publishes.")
-        live_note.setObjectName("muted")
-        live_note.setWordWrap(True)
-        grid3.addWidget(live_note, 2, 0, 1, 2)
-        layout.addWidget(box3)
 
         box4 = QGroupBox("Shortcuts")
         grid4 = QGridLayout(box4)
@@ -1898,6 +2007,20 @@ class AnyCamWindow(QMainWindow):
         if hasattr(self, "preview"):
             self.preview.set_scene(self.scene)
             self._sync_transform_fields()
+
+    def _layers_reordered(self, *_args) -> None:
+        # Map the new list order back to scene.layers by z-order.
+        ids = [self.layer_list.item(i).data(Qt.ItemDataRole.UserRole)
+               for i in range(self.layer_list.count())]
+        by_id = {layer.id: layer for layer in self.scene.layers}
+        ordered = [by_id[lid] for lid in ids if lid in by_id]
+        # Reassign z so the list order is the stacking order.
+        for i, layer in enumerate(ordered):
+            layer.z = (i + 1) * 10
+        self.scene.layers = ordered
+        self._mark_dirty()
+        if self.engine is not None:
+            self.restart_engine()
 
     def _scan_camera_choices(self) -> list[tuple[str, str]]:
         """Return (label, device) for usable V4L2 capture nodes."""
@@ -2118,6 +2241,18 @@ class AnyCamWindow(QMainWindow):
                 return label.split(" · ", 1)[0]
         return "Camera"
 
+    def _sync_layout_combo(self) -> None:
+        """Show the preset's saved layout in the classic layout combo."""
+        combo = getattr(self, "layout_combo", None)
+        if combo is None:
+            return
+        index = combo.findData(self.scene.layout)
+        if index < 0:
+            return
+        combo.blockSignals(True)
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+
     def _scene_changed(self, _index: int) -> None:
         scene_id = self.scene_combo.currentData()
         if not scene_id or scene_id == self.project.active_scene:
@@ -2125,6 +2260,7 @@ class AnyCamWindow(QMainWindow):
         self._store_playlist_state()
         self._forget_lost_cameras()
         self.project.active_scene = scene_id
+        self._sync_layout_combo()
         self._clear_history()
         self._refresh_scene_list()
         self._refresh_layers()
@@ -2146,6 +2282,7 @@ class AnyCamWindow(QMainWindow):
         self._store_playlist_state()
         self._forget_lost_cameras()
         self.project.active_scene = scene_id
+        self._sync_layout_combo()
         self._clear_history()
         self._refresh_scenes()
         self._refresh_layers()
@@ -2191,6 +2328,34 @@ class AnyCamWindow(QMainWindow):
         used = ", ".join(device for device in slots if device)
         self._status(f"{count}-camera grid: {used}")
 
+    def apply_layout(self, key: str = "") -> list[Layer]:
+        """Tile the scene's visible capture layers into the chosen layout.
+
+        Text and logo overlays keep their position.  Sources beyond the
+        layout's cell count are left exactly as the user positioned them.
+        """
+        combo = getattr(self, "layout_combo", None)
+        preset = layout_preset(key or (combo.currentData() if combo is not None else ""))
+        if preset is None:
+            return []
+        sources = [layer for layer in self.scene.layers
+                   if layer.visible and layer.kind in GRID_KINDS]
+        before = self._layout_snapshot()
+        arranged = arrange(self.scene, preset)
+        self.scene.layout = preset.key
+        self._refresh_layers()
+        if arranged:
+            self._record_history(before)
+        if self.engine is not None and arranged:
+            self.restart_engine()
+        if not arranged:
+            self._status(f"Layout: {preset.label} · choose a source for each +")
+            return arranged
+        extra = len(sources) - len(arranged)
+        note = f" · {extra} left unchanged" if extra else ""
+        self._status(f"Layout: {preset.label} · {len(arranged)} sources{note}")
+        return arranged
+
     def _append_scene(self, scene: Scene) -> None:
         self._store_playlist_state()
         self._forget_lost_cameras()
@@ -2206,15 +2371,33 @@ class AnyCamWindow(QMainWindow):
         if self.engine is not None:
             self.restart_engine()
 
-    def remove_scene(self) -> None:
+    def rename_scene(self, scene_id: str = "") -> None:
+        """Rename a preset from its context menu or the Scene list."""
+        scene = next((s for s in self.project.scenes
+                      if s.id == (scene_id or self.project.active_scene)), None)
+        if scene is None:
+            return
+        name, accepted = QInputDialog.getText(
+            self, "Rename scene", "Scene name:", text=scene.name)
+        if not accepted or not name.strip():
+            return
+        scene.name = name.strip()
+        self._refresh_scenes()
+        self._refresh_scene_list()
+        self._mark_dirty()
+
+    def remove_scene(self, scene_id: str = "") -> None:
         if len(self.project.scenes) <= 1:
             return
-        scene_id = self.project.active_scene
+        scene_id = scene_id or self.project.active_scene
         removed = next((s for s in self.project.scenes if s.id == scene_id), None)
-        screen_ids = ([layer.id for layer in removed.layers
-                       if layer.id in self._screen_sessions] if removed else [])
+        if removed is None:
+            return
+        screen_ids = [layer.id for layer in removed.layers
+                      if layer.id in self._screen_sessions]
         self.project.scenes = [s for s in self.project.scenes if s.id != scene_id]
-        self.project.active_scene = self.project.scenes[0].id
+        if self.project.active_scene not in [s.id for s in self.project.scenes]:
+            self.project.active_scene = self.project.scenes[0].id
         self._forget_lost_cameras()
         self._clear_history()
         self._refresh_scenes()
@@ -2228,8 +2411,13 @@ class AnyCamWindow(QMainWindow):
         for layer_id in screen_ids:
             self._close_screen_session(layer_id)
 
-    def add_layer(self, kind: str, source: str = "") -> Layer | None:
-        """Add a source layer, using a picker only when no source is supplied."""
+    def add_layer(self, kind: str, source: str = "",
+                  box: tuple[float, float, float, float] | None = None) -> Layer | None:
+        """Add a source layer, using a picker only when no source is supplied.
+
+        ``box`` overrides the default drop position; the source grid uses it
+        to put a new layer straight into the cell the user clicked.
+        """
         if kind == "camera":
             if not source:
                 source = (config.camera_device() if self.headless
@@ -2238,12 +2426,12 @@ class AnyCamWindow(QMainWindow):
                 return None
             source = config.camera_identity(source)
             layer = Layer(new_id("layer"), "camera", self._camera_layer_name(source),
-                          source=source, box=(0.62, 0.60, 0.34, 0.34), z=30)
+                          source=source, box=(0.62, 0.60, 0.34, 0.34), z=0)
         elif kind == "test":
-            layer = Layer(new_id("layer"), "test", "Test pattern", box=(0.62, 0.60, 0.34, 0.34), z=30)
+            layer = Layer(new_id("layer"), "test", "Test pattern", box=(0.62, 0.60, 0.34, 0.34), z=0)
         elif kind == "text":
             layer = Layer(new_id("layer"), "text", "Caption", source="Your text here",
-                          box=(0.05, 0.75, 0.30, 0.08), z=30, font_size=0.04)
+                          box=(0.05, 0.75, 0.30, 0.08), z=0, font_size=0.04)
         elif kind in ("logo", "image", "video"):
             if not source:
                 if kind == "video":
@@ -2264,11 +2452,13 @@ class AnyCamWindow(QMainWindow):
             else:
                 box = (0.04, 0.04, 0.18, 0.18)
             layer = Layer(new_id("layer"), kind, path.stem, source=str(path),
-                          box=box, z=30)
+                          box=box, z=0)
         elif kind == "network":
             if not source:
                 source, ok = QInputDialog.getText(
-                    self, "Network source", "RTSP or HTTP URL:")
+                    self, "Network source",
+                    "RTSP or HTTP URL (phone cameras: IP Webcam, DroidCam, "
+                    "iVCam — e.g. http://phone-ip:8080/video):")
                 if not ok:
                     return None
             uri = source.strip()
@@ -2278,11 +2468,13 @@ class AnyCamWindow(QMainWindow):
                 self._status("Network source must be an rtsp://, rtsps://, http:// or https:// URL")
                 return None
             layer = Layer(new_id("layer"), "network", parsed.netloc or "Network",
-                          source=uri, box=(0.0, 0.0, 1.0, 1.0), z=30)
+                          source=uri, box=(0.0, 0.0, 1.0, 1.0), z=0)
         elif kind == "screen":
-            return self._add_screen_layer()
+            return self._add_screen_layer(box=box)
         else:
             return None
+        if box is not None:
+            layer.box = tuple(float(value) for value in box)
         return self._insert_layer(layer)
 
     def _insert_layer(self, layer: Layer) -> Layer:
@@ -2295,19 +2487,24 @@ class AnyCamWindow(QMainWindow):
             self.restart_engine()
         return layer
 
-    def _add_screen_layer(self) -> Layer | None:
+    def _add_screen_layer(
+            self, box: tuple[float, float, float, float] | None = None) -> Layer | None:
         """Ask the portal for a screen stream and add it as a layer."""
         try:
             session = portal.request_screen_cast()
         except Exception as exc:  # noqa: BLE001 - the portal reports user cancellation too
             self._status(f"Screen capture unavailable: {exc}")
+            print(f"AnyCam screen capture failed: {exc}", file=sys.stderr,
+                  flush=True)
             if not self.headless:
                 QMessageBox.warning(self, "Screen capture", str(exc))
             return None
         stream = session.streams[0]
-        size = f"{stream.width}×{stream.height}" if stream.width and stream.height else "Screen"
+        size = (f"{stream.width}×{stream.height}"
+                if stream.width > 1 and stream.height > 1 else "Screen")
         layer = Layer(new_id("layer"), "screen", f"Screen {size}",
-                      source=str(session.node_id), box=(0.0, 0.0, 1.0, 1.0), z=30)
+                      source=str(session.node_id),
+                      box=box or (0.0, 0.0, 1.0, 1.0), z=0)
         self._screen_sessions[layer.id] = session
         return self._insert_layer(layer)
 
@@ -2321,6 +2518,11 @@ class AnyCamWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001
                 self._status(f"Screen capture unavailable: {exc}")
                 return False
+            print(
+                f"[screen-session] layer={layer.id} node={session.node_id} "
+                f"fd={session.fd} streams="
+                f"{[(s.width, s.height, s.source_type) for s in session.streams]}",
+                file=sys.stderr, flush=True)
             layer.source = str(session.node_id)
             self._screen_sessions[layer.id] = session
         return True
@@ -2382,7 +2584,14 @@ class AnyCamWindow(QMainWindow):
         items = self.layer_list.selectedItems()
         if not items:
             return
-        removed = [item.data(Qt.ItemDataRole.UserRole) for item in items]
+        self.remove_layers([item.data(Qt.ItemDataRole.UserRole) for item in items])
+
+    def remove_layers(self, removed) -> None:
+        """Remove layers by id from whatever selected them (list or canvas)."""
+        removed = [layer_id for layer_id in removed
+                   if layer_id and self.scene.layer(layer_id) is not None]
+        if not removed:
+            return
         screen_ids = [layer_id for layer_id in removed
                       if layer_id in self._screen_sessions]
         before = self._layout_snapshot()
@@ -2851,6 +3060,31 @@ class AnyCamWindow(QMainWindow):
         """Round down to an even size (H.264 cannot encode odd frames)."""
         return max(2, int(value) - int(value) % 2)
 
+    def set_output_format(self, width: int, height: int, fps: int) -> None:
+        """Apply a canvas size and rate, keeping the Output tab in sync."""
+        width = self._even(width)
+        height = self._even(height)
+        fps = max(1, min(120, int(fps)))
+        output = self.project.output
+        if (output.canvas_w, output.canvas_h, output.fps) == (width, height, fps):
+            return
+        output.canvas_w, output.canvas_h, output.fps = width, height, fps
+        for name, value in (("width_spin", width), ("height_spin", height),
+                            ("fps_spin", fps)):
+            spin = getattr(self, name, None)
+            if spin is not None:
+                spin.blockSignals(True)
+                spin.setValue(value)
+                spin.blockSignals(False)
+        self._sync_output_controls()
+        self._mark_dirty()
+        if self.engine is not None:
+            self.restart_engine()
+        self._status(f"Output {width}×{height} · {fps} fps")
+
+    def _sync_output_controls(self) -> None:
+        """Hook for subclasses that show the canvas format elsewhere."""
+
     def _write_project(self) -> Path:
         """Synchronise the widgets into the model and save the project."""
         self._store_playlist_state()
@@ -2959,12 +3193,45 @@ class AnyCamWindow(QMainWindow):
         if was_running:
             self.start_engine()
 
+    def _screen_source_fps(self) -> float | None:
+        """Frames per second actually arriving from the screen layer(s).
+
+        Returns None until there is a previous sample, so the label does not
+        flash a meaningless number on the first tick.
+        """
+        engine = self.engine
+        if engine is None:
+            return None
+        health = getattr(engine.report, "source_health", {}) or {}
+        total = 0
+        found = False
+        for layer in self.scene.layers:
+            if layer.kind != "screen":
+                continue
+            entry = health.get(layer.id)
+            if entry is None:
+                continue
+            found = True
+            total += int(entry.get("frames") or 0)
+        if not found:
+            return None
+        now = time.monotonic()
+        previous = getattr(self, "_screen_fps_prev", None)
+        self._screen_fps_prev = (total, now)
+        if previous is None or now <= previous[1]:
+            return None
+        return max(0.0, (total - previous[0]) / (now - previous[1]))
+
+
     def _screen_sizes(self) -> dict[str, tuple[int, int]]:
         """Portal stream size per screen layer (crop base and node check)."""
         sizes: dict[str, tuple[int, int]] = {}
         for layer_id, session in self._screen_sessions.items():
             stream = session.streams[0] if session.streams else None
-            if stream is not None and stream.width and stream.height:
+            # A 1x1 (or 0) report is unusable and used to become a square
+            # letterbox that showed only part of the shared picture.
+            if (stream is not None and stream.width > 1
+                    and stream.height > 1):
                 sizes[layer_id] = (int(stream.width), int(stream.height))
         return sizes
 
@@ -2978,10 +3245,15 @@ class AnyCamWindow(QMainWindow):
         self.live_button.setText("Stop stream" if self.live else "Go Live")
         if self.engine is not None:
             self.restart_engine()
-        if self.live:
-            self._status(f"Publishing to {config.redact_url(url)}")
+            if self.live:
+                self._status(f"Publishing to {config.redact_url(url)}")
+            else:
+                self._status("Stream stopped")
         else:
-            self._status("Stream stopped")
+            if self.live:
+                self._status(f"Will publish to {config.redact_url(url)} when preview starts")
+            else:
+                self._status("Stream stopped")
 
     # --------------------------------------------------------------- engine
     def _record_path(self) -> Path:
@@ -2999,7 +3271,8 @@ class AnyCamWindow(QMainWindow):
             return True
         path = self._record_path()
         recorder = Recorder()
-        audio = self.audio_on or bool(self.project.audio.media_file)
+        audio = (self.audio_on or bool(self.project.audio.media_file)
+                 or bool(self.project.audio.desktop_device))
         if not recorder.start(str(path), self.project.output.canvas_w,
                               self.project.output.canvas_h, self.project.output.fps,
                               audio=audio):
@@ -3025,13 +3298,14 @@ class AnyCamWindow(QMainWindow):
             self._status(
                 f"Recording failed: {report.get('error') or 'no frames'}")
 
-    def _start_vcam_output(self) -> bool:
+    def _start_vcam_output(self, setup: bool = False) -> bool:
         if self._vcam_output is not None and self._vcam_output.active:
             return True
         device = self.project.output.vcam_device or config.loopback_device()
         output = VcamOutput()
         if not output.start(device, self.project.output.canvas_w,
-                            self.project.output.canvas_h, self.project.output.fps):
+                            self.project.output.canvas_h,
+                            self.project.output.fps, setup=setup):
             self._status(output.error or "Virtual camera could not start")
             return False
         self._vcam_output = output
@@ -3076,7 +3350,7 @@ class AnyCamWindow(QMainWindow):
             self.record_button.setText("Record")
             return
         recorder = self._recorder
-        if self.vcam_on and not self._start_vcam_output():
+        if self.vcam_on and not self._start_vcam_output(setup=True):
             self.vcam_on = False
             self.vcam_button.setText("Virtual camera")
         vcam_output = self._vcam_output if self.vcam_on else None
@@ -3091,7 +3365,8 @@ class AnyCamWindow(QMainWindow):
                 vcam=self.vcam_on,
                 vcam_output=vcam_output,
                 preview=True,
-                audio=self.audio_on or bool(self.project.audio.media_file),
+                audio=(self.audio_on or bool(self.project.audio.media_file)
+                       or bool(self.project.audio.desktop_device)),
                 # Only an explicit Go Live publishes; a saved URL is inert.
                 rtmp=self.project.output.rtmp_url if self.live else None,
                 screen_fds=self._screen_fds(),
@@ -3122,10 +3397,9 @@ class AnyCamWindow(QMainWindow):
         self.playlist_last = self._started_at
         if self.playlist_index >= len(self.playlist_ids):
             self.playlist_index = len(self.playlist_ids) - 1
-        live_layers = [layer for layer in self.scene.layers
-                       if layer.id not in self._lost_cameras]
-        self.status_chip.setText(
-            "LIVE" if live_layers or not self._lost_cameras else "WAITING")
+        self._screen_fps_prev = None
+        self._source_status = ()
+        self.status_chip.setText("WAITING")
         self.start_button.setText("Stop preview")
         self.timer.start(33)
         if self.engine.report.vcam_error:
@@ -3260,28 +3534,83 @@ class AnyCamWindow(QMainWindow):
         if image is None or image.isNull():
             self._status("No frame to snapshot")
             return
-        path = config.recordings_dir() / overlay.timestamped_name("anycam-snapshot", ".png")
+        path = config.recordings_dir(self.project.output.record_dir) / overlay.timestamped_name("anycam-snapshot", ".png")
         image.save(str(path))
         self._status(f"Snapshot saved to {path}")
+
+    def toggle_multiview(self) -> None:
+        if getattr(self, "_multiview", None) is not None:
+            try:
+                self._multiview.close()
+            except Exception:
+                pass
+            self._multiview = None
+            return
+        if self.engine is None:
+            self._status("Start preview first")
+            return
+        from .multiview import MultiViewDialog
+        pool = getattr(self, "_source_pool", None)
+        if pool is None and self.engine is not None:
+            pool = getattr(self.engine, "pool", None)
+        if pool is None:
+            self._status("No source pool available")
+            return
+        dlg = MultiViewDialog(pool, parent=self)
+        self._multiview = dlg
+        dlg.show()
+
+    def _log_preview_problem(self, message: str) -> None:
+        """Report a dropped preview frame instead of painting black silently."""
+        now = time.monotonic()
+        if now - getattr(self, "_preview_problem_at", 0.0) < 1.0:
+            return
+        self._preview_problem_at = now
+        print(f"[preview] dropped frame: {message}", file=sys.stderr, flush=True)
 
     def _on_frame(self, sample) -> None:
         from gi.repository import Gst
 
         buf = sample.get_buffer()
-        caps = sample.get_caps().get_structure(0)
-        width = caps.get_value("width")
-        height = caps.get_value("height")
+        caps = sample.get_caps()
+        if buf is None or caps is None or caps.get_size() == 0:
+            self._log_preview_problem("sample without buffer or caps")
+            return
+        structure = caps.get_structure(0)
+        if not (structure.has_field("width") and structure.has_field("height")):
+            self._log_preview_problem(
+                f"caps without dimensions: {structure.to_string()}")
+            return
+        width = int(structure.get_value("width"))
+        height = int(structure.get_value("height"))
+        fmt = (str(structure.get_value("format"))
+               if structure.has_field("format") else "")
+        if width <= 0 or height <= 0:
+            self._log_preview_problem(f"invalid preview size {width}x{height}")
+            return
+        if fmt not in ("RGBA", "RGB"):
+            # The preview branch pins RGBA; anything else would be read with
+            # the wrong stride and painted as garbage or black.
+            self._log_preview_problem(f"unexpected preview format {fmt!r}")
+            return
+        stride = width * (4 if fmt == "RGBA" else 3)
         ok, info = buf.map(Gst.MapFlags.READ)
         if not ok:
+            self._log_preview_problem("buffer could not be mapped")
             return
         try:
-            # The preview caps are always RGBA, so every row is width * 4
-            # bytes (row padding is not used by GStreamer video buffers).
-            stride = width * 4
+            mapped = len(info.data)
+            if mapped < stride * height:
+                self._log_preview_problem(
+                    f"short frame: {mapped} bytes, need {stride * height}")
+                return
             raw = bytes(info.data)[: stride * height]
         finally:
             buf.unmap(info)
-        self._pending_frame = (width, height, stride, raw)
+        if not raw:
+            self._log_preview_problem("empty frame")
+            return
+        self._pending_frame = (width, height, stride, raw, fmt)
         self.frame_ready.emit()
 
     def _update_preview(self) -> None:
@@ -3289,11 +3618,55 @@ class AnyCamWindow(QMainWindow):
         self._pending_frame = None
         if frame is None:
             return
-        width, height, stride, raw = frame
+        width, height, stride, raw, fmt = frame
         self._frame_bytes = raw
         self._face_size = (width, height)
-        image = QImage(self._frame_bytes, width, height, stride, QImage.Format.Format_RGBA8888).copy()
+        qformat = (QImage.Format.Format_RGB888 if fmt == "RGB"
+                   else QImage.Format.Format_RGBA8888)
+        image = QImage(self._frame_bytes, width, height, stride, qformat).copy()
         self.preview.set_image(image)
+
+    def _update_source_status(self) -> None:
+        """A running canvas is not proof that its inputs are fresh."""
+        if self.engine is None:
+            return
+        report = self.engine.report
+        visible = [layer for layer in self.scene.layers if layer.visible]
+        stalled = set(report.stalled_sources)
+        stale = [layer.name for layer in visible
+                 if layer.id in stalled and layer.id not in self._lost_cameras]
+        waiting = [layer.name for layer in visible
+                   if layer.id in self._lost_cameras
+                   or not report.source_health.get(layer.id, {}).get("frames")]
+        slow = [layer for layer in visible if layer.kind == "screen"
+                and report.source_health.get(layer.id, {}).get("slow")]
+        if stale:
+            state = ("STALE", tuple(stale))
+            message = "No fresh frames: " + ", ".join(stale)
+            if any(layer.kind == "screen" and layer.id in stalled for layer in visible):
+                message += " · shared window may be hidden or static"
+        elif waiting or (not report.source_health and visible):
+            state = ("WAITING", tuple(waiting))
+            message = "Waiting for source frames" + (": " + ", ".join(waiting) if waiting else "")
+        elif report.instant_fps <= 0:
+            state = ("STALLED", ())
+            message = "Canvas stopped delivering frames"
+        elif slow:
+            state = ("SLOW", tuple(layer.id for layer in slow))
+            rates = [f"{layer.name}: {report.source_health[layer.id]['fps']:.1f} fps"
+                     for layer in slow]
+            message = "Slow screen updates · " + ", ".join(rates)
+            message += " · may be static or compositor-throttled; keep shared windows visible"
+        else:
+            state = ("LIVE", ())
+            message = "Source frames resumed"
+        self.status_chip.setText(state[0])
+        self.status_chip.setToolTip(message)
+        previous = getattr(self, "_source_status", ())
+        if state != previous:
+            self._source_status = state
+            if state[0] != "LIVE" or (previous and previous[0] != "LIVE"):
+                self._status(message)
 
     def _tick(self) -> None:
         if self.engine is None:
@@ -3303,6 +3676,18 @@ class AnyCamWindow(QMainWindow):
         self.engine.pump(0)
         if self._pending_frame is not None:
             self._update_preview()
+        mv = getattr(self, "_multiview", None)
+        if mv is not None:
+            try:
+                mv.pump()
+            except Exception:
+                pass
+        grid = getattr(self, "grid", None)
+        if grid is not None:
+            try:
+                grid.pump()
+            except Exception:
+                pass
         self._track_face()
         rec = self.engine.sample()
         if self.engine.mic_level_db is not None:
@@ -3310,9 +3695,16 @@ class AnyCamWindow(QMainWindow):
             self.mic_level_label.setText("muted" if db < -80 else f"{db:.0f} dB")
         self._advance_playlist(time.monotonic())
         if rec is not None:
-            self.stats_label.setText(
-                f"{rec['fps']:5.1f} fps · {rec['frames']} frames · "
-                f"CPU {rec['cpu_pct']}% · RSS {rec['rss_mib']} MiB")
+            self._update_source_status()
+            stats = (f"{rec['instant_fps']:5.1f} fps · {rec['frames']} frames · "
+                     f"CPU {rec['cpu_pct']}% · RSS {rec['rss_mib']} MiB")
+            source_fps = self._screen_source_fps()
+            if source_fps is not None:
+                # The canvas rate says nothing about the *captured* frames: a
+                # screen source that stopped producing still repeats its last
+                # frame at 60 fps.  Show the source rate next to it.
+                stats += f" · screen {source_fps:.0f} fps"
+            self.stats_label.setText(stats)
         screen_error = getattr(self.engine.report, "screen_error", "")
         if screen_error and screen_error != self._screen_error_shown:
             self._screen_error_shown = screen_error
@@ -3327,6 +3719,28 @@ class AnyCamWindow(QMainWindow):
             self._handle_pipeline_error(
                 f"Pipeline error: {self.engine.report.error}")
             return
+        rtmp_error = getattr(self.engine.report, "rtmp_error", "")
+        if rtmp_error and rtmp_error != getattr(self, "_rtmp_error_shown", ""):
+            self._rtmp_error_shown = rtmp_error
+            self.live = False
+            if hasattr(self, "live_button"):
+                self.live_button.setText("Go Live")
+            self._status(f"Stream stopped: {rtmp_error}")
+        vcam_error = getattr(self.engine.report, "vcam_error", "")
+        if vcam_error and vcam_error != getattr(self, "_vcam_error_shown", ""):
+            self._vcam_error_shown = vcam_error
+            self.vcam_on = False
+            if hasattr(self, "vcam_button"):
+                self.vcam_button.setText("Virtual camera")
+            self._status(vcam_error)
+        source_errors = getattr(self.engine.report, "source_errors", ())
+        non_camera = [e for e in source_errors
+                      if not self._camera_error_layers(e)]
+        if non_camera:
+            msg = non_camera[0]
+            if msg != getattr(self, "_source_error_shown", ""):
+                self._source_error_shown = msg
+                self._status(f"Source error: {msg}")
         if self._render_seconds and time.monotonic() - self._started_at >= self._render_seconds:
             self._render_seconds = 0.0
             QTimer.singleShot(0, self._auto_screenshot)

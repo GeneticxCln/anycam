@@ -1,6 +1,7 @@
 """The virtual camera must be a session output, not an engine-owned pipeline."""
 from __future__ import annotations
 
+import subprocess
 import time
 
 import pytest
@@ -108,3 +109,35 @@ def test_engine_uses_a_session_vcam_tap():
         assert engine.report.vcam_active is True
     finally:
         engine.stop()
+
+
+def test_ensure_vcam_device_is_a_noop_when_the_device_exists(tmp_path):
+    device = tmp_path / "video10"
+    device.write_text("")
+    assert config.ensure_vcam_device(str(device)) == ""
+
+
+def test_ensure_vcam_device_creates_the_loopback_device(tmp_path, monkeypatch):
+    """The app brings its own device up instead of asking for a terminal."""
+    device = tmp_path / "video10"
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        device.write_text("")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(config.subprocess, "run", fake_run)
+    monkeypatch.setattr(config.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert config.ensure_vcam_device(str(device)) == ""
+    assert calls and calls[0][:3] == ["pkexec", "modprobe", "v4l2loopback"]
+    assert "video_nr=10" in calls[0]
+    assert "exclusive_caps=0" in calls[0]
+
+
+def test_ensure_vcam_device_explains_when_it_cannot_prompt(tmp_path, monkeypatch):
+    device = tmp_path / "video10"
+    monkeypatch.setattr(config.shutil, "which", lambda name: None)
+    message = config.ensure_vcam_device(str(device))
+    assert "modprobe v4l2loopback" in message
+    assert "video_nr=10" in message

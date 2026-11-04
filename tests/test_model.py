@@ -56,6 +56,22 @@ def test_scene_preset_roundtrip(tmp_path):
     assert loaded.layers[0].source == "/dev/video0"
 
 
+def test_scene_layout_roundtrip():
+    scene = Scene("s1", "Desk", layout="pip")
+    restored = Scene.from_dict(scene.to_dict())
+    assert restored.layout == "pip"
+    assert Scene.from_dict({"id": "s2", "name": "Old"}).layout == ""
+
+
+def test_audio_config_keeps_desktop_audio():
+    audio = AudioConfig(desktop_device="alsa_output.test.monitor",
+                        desktop_gain_db=-3.0, desktop_muted=True)
+    restored = AudioConfig.from_dict(audio.__dict__)
+    assert restored.desktop_device == "alsa_output.test.monitor"
+    assert restored.desktop_gain_db == -3.0
+    assert restored.desktop_muted is True
+
+
 def test_two_camera_scene_is_side_by_side():
     scene = two_camera_scene("/dev/video2", "/dev/video3")
     assert scene.name == "Two cameras"

@@ -403,6 +403,16 @@ the CachyOS test machine.
   and a live PipeWire session. The fd cannot be serialised, so a saved screen
   layer asks the portal for access again when preview/recording next starts.
   There is no checked-in live screen-capture artifact yet.
+* Niri 26.04 throttles off-screen window rendering, including windows being
+  shared ([upstream issue #539](https://github.com/niri-wm/niri/issues/539)).
+  Keep shared windows visible on an active workspace for smooth capture;
+  switching to a hidden workspace can reduce fresh input to roughly 1 Hz
+  bursts. AnyCam cannot capture frames the compositor has not rendered.
+  The status chip shows `SLOW` for screen input below the lesser of 10 fps
+  and half the canvas rate, measured over approximately three seconds after
+  a two-second warmup. Static, damage-driven shares can also show `SLOW`;
+  it reports low update rate, not necessarily a fault. `STALE` means fresh
+  source identities stopped, while canvas FPS alone may still look normal.
 * Multi-camera is layer-based and shares one canvas/FPS/virtual-camera output;
   capture resolution/FPS can differ per layer, but there are no per-camera
   exposure/focus controls. See the multi-camera section above and

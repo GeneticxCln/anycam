@@ -1143,8 +1143,9 @@ def test_vcam_output_survives_engine_restarts(app, monkeypatch):
             self.stopped = False
             created.append(self)
 
-        def start(self, device, width, height, fps):
+        def start(self, device, width, height, fps, setup=False):
             self.device = device
+            self.setup = setup
             self.active = True
             return True
 
@@ -1179,6 +1180,27 @@ def test_vcam_output_survives_engine_restarts(app, monkeypatch):
         assert output.stopped is True
         assert window._vcam_output is None
     finally:
+        window.close()
+        app.processEvents()
+
+
+def test_screen_source_fps_reports_the_capture_not_the_canvas(app):
+    """The status line must show captured frames, not just the 60 fps canvas."""
+    from types import SimpleNamespace
+
+    window = _window()
+    try:
+        layer = Layer("screen_fps", "screen", "Screen", source="1")
+        window.scene.add_layer(layer)
+        health = {layer.id: {"frames": 100}}
+        window.engine = SimpleNamespace(
+            report=SimpleNamespace(source_health=health))
+        assert window._screen_source_fps() is None  # no previous sample yet
+        health[layer.id]["frames"] = 160
+        window._screen_fps_prev = (100, time.monotonic() - 1.0)
+        assert window._screen_source_fps() == pytest.approx(60, rel=0.2)
+    finally:
+        window.engine = None
         window.close()
         app.processEvents()
 
