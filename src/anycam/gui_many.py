@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QTimer
@@ -27,6 +29,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMenu,
+    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QStatusBar,
@@ -37,7 +40,9 @@ from PySide6.QtWidgets import (
 )
 
 from . import config
-from .gui import AnyCamWindow, PreviewWidget
+from .gui import (
+    AnyCamWindow, PreviewWidget, claim_gui_instance, serve_instance_requests,
+)
 from .layouts import GRID_KINDS, LAYOUT_PRESETS, layout_preset
 from .model import Layer, Project, Scene, empty_project, new_id
 
@@ -155,6 +160,22 @@ class ManyCamWindow(AnyCamWindow):
         self.scene_combo.currentIndexChanged.connect(self._scene_changed)
         self._refresh_scenes()
 
+        # Shown when an application opened the loopback node before AnyCam
+        # was feeding it: that open fails and only the application can retry.
+        self.vcam_hint = QLabel("")
+        self.vcam_hint.setObjectName("hint")
+        self.vcam_hint.setWordWrap(True)
+        self.vcam_hint.hide()
+        self.vcam_dismiss = QPushButton("Dismiss")
+        self.vcam_dismiss.setObjectName("muted")
+        self.vcam_dismiss.hide()
+        self.vcam_dismiss.clicked.connect(self.dismiss_vcam_hint)
+        hint_row = QHBoxLayout()
+        hint_row.setContentsMargins(0, 0, 0, 0)
+        hint_row.addWidget(self.vcam_hint, 1)
+        hint_row.addWidget(self.vcam_dismiss, 0)
+        outer.addLayout(hint_row)
+
         # ---- main area: program monitor (left) + side panel (right) -------
         body = QHBoxLayout()
         body.setSpacing(6)
@@ -263,6 +284,19 @@ class ManyCamWindow(AnyCamWindow):
 
         # Settings is a separate window; build it once, keep it hidden.
         self._settings: QDialog | None = None
+        self._diag_thread: threading.Thread | None = None
+        self._diag_result: dict = {}
+        self._diag_timer = QTimer(self)
+        self._diag_timer.setInterval(150)
+        self._diag_timer.timeout.connect(self._diag_poll)
+        self._fix_thread: threading.Thread | None = None
+        self._fix_result: dict = {}
+        self._fix_timer = QTimer(self)
+        self._fix_timer.setInterval(150)
+        self._fix_timer.timeout.connect(self._fix_poll)
+        # Events logged before the settings window exists are shown once the
+        # Diagnostics tab is built.
+        self._pending_log_lines: list[str] = []
         self._settings = self._build_settings()
         self._refresh_stage_slots()
 
@@ -277,6 +311,7 @@ class ManyCamWindow(AnyCamWindow):
         tabs.addTab(self._playlist_tab(), "Media")
         tabs.addTab(self._output_tab(), "Output")
         tabs.addTab(self._stream_tab(), "Stream")
+        tabs.addTab(self._diagnostics_tab(), "Diagnostics")
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(tabs)
@@ -295,6 +330,205 @@ class ManyCamWindow(AnyCamWindow):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+        self._refresh_diag_state()
+        if not self._diag_result and (
+                self._diag_thread is None or not self._diag_thread.is_alive()):
+            self.measure_vcam_cost()
+
+    # ----------------------------------------------------------- diagnostics
+    def log_event(self, message: str) -> None:
+        """Show session events in the Diagnostics tab as they happen."""
+        super().log_event(message)
+        line = f"{time.strftime('%H:%M:%S')}  {message}"
+        widget = getattr(self, "diag_log", None)
+        if widget is None:
+            pending = getattr(self, "_pending_log_lines", None)
+            if pending is not None:
+                pending.append(line)
+            return
+        widget.appendPlainText(line)
+
+    def _diagnostics_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.diag_state = QLabel("Virtual camera: not started")
+        self.diag_state.setWordWrap(True)
+        layout.addWidget(self.diag_state)
+        self.diag_chromium = QLabel("")
+        self.diag_chromium.setWordWrap(True)
+        layout.addWidget(self.diag_chromium)
+        self.diag_fix = QPushButton("Fix Discord visibility")
+        self.diag_fix.setToolTip(
+            "Reload v4l2loopback with exclusive_caps=1 so Discord, Vesktop "
+            "and Chrome list the camera")
+        self.diag_fix.clicked.connect(self.fix_vcam_visibility)
+        self.diag_fix.hide()
+        layout.addWidget(self.diag_fix)
+        self.diag_cost = QLabel("Conversion cost: not measured yet.")
+        self.diag_cost.setWordWrap(True)
+        layout.addWidget(self.diag_cost)
+        self.diag_button = QPushButton("Measure conversion cost")
+        self.diag_button.clicked.connect(self.measure_vcam_cost)
+        layout.addWidget(self.diag_button)
+        hint = QLabel(
+            "Measured through the same converters the virtual camera uses, on "
+            "synthetic frames at the project size. No camera or loopback "
+            "device is opened; the GPU is chosen whenever it can deliver a "
+            "frame.")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self._build_diagnostics_log(layout)
+        layout.addStretch(1)
+        return page
+
+    def _build_diagnostics_log(self, layout) -> None:
+        """Session log: rebuilds, screen-capture reuse and vcam recovery."""
+        title = QLabel("Session log")
+        title.setObjectName("muted")
+        layout.addWidget(title)
+        self.diag_log = QPlainTextEdit()
+        self.diag_log.setReadOnly(True)
+        self.diag_log.setMaximumBlockCount(300)
+        self.diag_log.setMinimumHeight(140)
+        self.diag_log.setPlaceholderText(
+            "Virtual camera, screen capture and rebuild events appear here.")
+        layout.addWidget(self.diag_log, 1)
+        pending = getattr(self, "_pending_log_lines", [])
+        self._pending_log_lines = []
+        for line in pending:
+            self.diag_log.appendPlainText(line)
+
+    def _refresh_diag_state(self) -> None:
+        if not hasattr(self, "diag_state"):
+            return
+        device = self.project.output.vcam_device or config.loopback_device()
+        output = getattr(self, "_vcam_output", None)
+        if output is not None and output.active:
+            path = {"gpu": "GPU (glcolorconvert)",
+                    "cpu": "CPU (videoconvert)"}.get(
+                        getattr(output, "conversion", ""), "converting")
+            self.diag_state.setText(
+                f"Virtual camera: {device} · running · {path}")
+        else:
+            self.diag_state.setText(f"Virtual camera: {device} · stopped")
+        caps = config.vcam_exclusive_caps()
+        if caps is None:
+            self.diag_chromium.setText(
+                "Chromium/Discord visibility: v4l2loopback is not loaded.")
+        elif caps:
+            self.diag_chromium.setText(
+                "Chromium/Discord visibility: listed (exclusive_caps=1).")
+        else:
+            self.diag_chromium.setText(
+                "Chromium/Discord visibility: NOT listed — the module was "
+                "loaded with exclusive_caps=0. Close AnyCam and Discord, then: "
+                "sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback "
+                "video_nr=10 card_label=AnyCam exclusive_caps=1")
+        if hasattr(self, "diag_fix"):
+            # Only an action when the loaded module is the wrong one: reloading
+            # a correct module would interrupt the camera for no benefit.
+            self.diag_fix.setVisible(caps is False)
+
+    def fix_vcam_visibility(self) -> None:
+        """Reload v4l2loopback so Chromium lists the camera, then re-hold it.
+
+        The module cannot be unloaded while AnyCam keeps ``/dev/video10``
+        open, so the window's sink is released first and recreated after the
+        reload; a running canvas only detaches its tap, so the preview is not
+        interrupted.
+        """
+        if self._fix_thread is not None and self._fix_thread.is_alive():
+            return
+        device = self.project.output.vcam_device or config.loopback_device()
+        if self.engine is not None:
+            self.engine.detach_vcam()
+        self._finish_vcam_output()
+        self.diag_fix.setEnabled(False)
+        self.diag_chromium.setText(
+            "Chromium/Discord visibility: reloading v4l2loopback…")
+        result = self._fix_result = {}
+
+        def run() -> None:
+            try:
+                result["error"] = config.reload_vcam_module(device)
+            except Exception as exc:  # noqa: BLE001 - diagnostics must not crash
+                result["error"] = str(exc)
+
+        self._fix_thread = threading.Thread(
+            target=run, name="anycam-vcam-fix", daemon=True)
+        self._fix_thread.start()
+        self._fix_timer.start()
+
+    def _fix_poll(self) -> None:
+        if self._fix_thread is not None and self._fix_thread.is_alive():
+            return
+        self._fix_timer.stop()
+        self.diag_fix.setEnabled(True)
+        error = str(self._fix_result.get("error") or "")
+        held = self.hold_vcam_device()
+        if not error and self.engine is not None and self.vcam_on and held:
+            if not self.engine.attach_vcam(self._vcam_output):
+                self._status(self.engine.report.vcam_error
+                             or "Virtual camera could not resume")
+        self._refresh_diag_state()
+        if error:
+            # Keep the reason after the refresh: the generic line would hide
+            # whether authorization or an application holding the node failed.
+            self.diag_chromium.setText(
+                f"Chromium/Discord visibility: reload failed — {error}")
+            self._status("Could not reload v4l2loopback for Discord")
+            return
+        self._status("v4l2loopback reloaded: Discord and Chrome can list AnyCam")
+        self.note_vcam_consumers()
+
+    def measure_vcam_cost(self) -> None:
+        """Benchmark both conversion chains off the GUI thread."""
+        if self._diag_thread is not None and self._diag_thread.is_alive():
+            return
+        width = self.project.output.canvas_w or config.CANVAS_W
+        height = self.project.output.canvas_h or config.CANVAS_H
+        fps = self.project.output.fps or config.CANVAS_FPS
+        self._diag_result = {}
+        result = self._diag_result
+        self.diag_button.setEnabled(False)
+        self.diag_cost.setText("Conversion cost: measuring…")
+
+        def run() -> None:
+            try:
+                from .engine.outputs.vcam import measure_conversion
+                result.update(measure_conversion(width, height, fps))
+            except Exception as exc:  # noqa: BLE001 - diagnostics must not crash
+                result["error"] = str(exc)
+
+        self._diag_thread = threading.Thread(
+            target=run, name="anycam-vcam-diag", daemon=True)
+        self._diag_thread.start()
+        self._diag_timer.start()
+
+    def _diag_poll(self) -> None:
+        if self._diag_thread is not None and self._diag_thread.is_alive():
+            return
+        self._diag_timer.stop()
+        self.diag_button.setEnabled(True)
+        self._refresh_diag_state()
+        result = self._diag_result
+        if result.get("error"):
+            self.diag_cost.setText(
+                f"Conversion cost: measurement failed ({result['error']})")
+            return
+        if not result:
+            return
+        costs = []
+        if result.get("gpu") is not None:
+            costs.append(f"GPU {result['gpu']:.2f} ms/frame")
+        if result.get("cpu") is not None:
+            costs.append(f"CPU {result['cpu']:.2f} ms/frame")
+        measured = " · ".join(costs) or "path unavailable"
+        chosen = "GPU" if result.get("chosen") == "gpu" else "CPU"
+        self.diag_cost.setText(
+            f"Measured at {result['width']}×{result['height']}@"
+            f"{result['fps']} fps: {measured}. Path chosen: {chosen}.")
 
     # ---------------------------------------------------------------- scenes
     def _refresh_scenes(self) -> None:
@@ -556,7 +790,15 @@ class ManyCamWindow(AnyCamWindow):
         self._record_history(before)
         self._refresh_scene_cards()
         if self.engine is not None:
-            self.restart_engine()
+            # This is a layout edit, not a source edit.  Move the existing
+            # compositor pads and reveal the layer through its pad; rebuilding
+            # here would drop the screen-capture branch and re-open the portal
+            # session (the window picker) under a running consumer.
+            for target in (layer, occupant):
+                if target is not None:
+                    self.engine.set_layer_box(target.id, target.box)
+            self.engine.set_layer_visible(layer.id, True)
+            self.preview.update()
         elif self.isVisible():
             self.toggle_engine()
         self._status(f"{layer.name} → slot {index + 1}")
@@ -683,9 +925,24 @@ class ManyCamWindow(AnyCamWindow):
 
 def run_gui(project: Project | None = None) -> int:
     app = QApplication(sys.argv[:1])
+    primary, instance_server = claim_gui_instance()
+    if not primary:
+        return 0
     window = ManyCamWindow(project)
+    if instance_server is not None:
+        instance_server.setParent(window)
+        window._instance_server = instance_server
+        serve_instance_requests(instance_server, window)
     app.aboutToQuit.connect(window.shutdown)
     window.show()
+    # Hold the loopback node from launch: apps that remember "AnyCam" must be
+    # able to select it before the first source starts the preview, and an
+    # open that already failed needs its re-select hint.
+    if window.hold_vcam_device():
+        # The card is a placeholder: once a source exists and the preview
+        # starts, the held node follows the canvas without a second click.
+        window.feed_held_vcam()
+        window.note_vcam_consumers()
     QTimer.singleShot(200, window._autostart_preview)
     code = app.exec()
     os._exit(code if code is not None else 0)

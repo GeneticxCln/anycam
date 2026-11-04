@@ -57,7 +57,7 @@ The GUI screenshot that used to be embedded here is in that archive too
 | Persistent virtual-camera output | PASS (offscreen wiring), one session-owned `v4l2sink` survives engine rebuilds; real loopback consumer not exercised because `/dev/video10` is absent | `tests/test_vcam_output.py`, `tests/test_gui.py::test_vcam_output_survives_engine_restarts` |
 | Live record/vcam taps | PASS, Record start/stop and vcam toggle attach/detach valves without rebuilding the canvas | `tests/test_gui.py::test_record_toggle_attaches_without_rebuilding`, `tests/test_gui.py::test_vcam_output_survives_engine_restarts` |
 | `rtmp2sink` preference | PASS, `rtmp2sink` selected when installed, `rtmpsink` fallback; actual delivery still uses the existing receiver evidence | `tests/test_m1_outputs.py::test_stream_prefers_rtmp2sink` |
-| Automated tests | PASS, 152 passed + 1 hardware-gated multicam test | `./scripts/test.sh`; `docs/EVIDENCE.md` §2, §4.10 |
+| Automated tests | PASS, 218 passed + 1 hardware-gated multicam test | `./scripts/test.sh`; `docs/EVIDENCE.md` §2, §4.10 |
 | V4L2 virtual camera | PASS — 720 frames in 12 s, and a `v4l2src` consumer read 60/60 buffers at 1920×1080 YUYV | `evidence/02_virtual_camera/report.json`, `consumer.txt`, `format.txt` |
 
 ## Output mode: 1920×1080@60 (MJPG)
@@ -155,11 +155,12 @@ PYTHONPATH=src .venv/bin/python -m pytest tests/test_multicam.py -v
 
 ## Requirements
 
-Tested on CachyOS (Arch family), kernel 7.3, niri/Wayland, NVIDIA RTX 4060 Ti.
+Tested on CachyOS (Arch family), kernel 7.3, KineticWE 6.7.80 on KWin/Wayland,
+NVIDIA RTX 4060 Ti.
 
 * Python 3.11+ (3.14 here)
 * GStreamer 1.28 with `base`, `good`, `bad`, `ugly`, `libav`, `opengl`, `pulse`
-* PyGObject (`python-gobject`), PySide6 6.11
+* PyGObject (`python-gobject`), PySide6 6.12 (matching the system Qt 6.12)
 * `xdg-desktop-portal` with a desktop backend and PipeWire for screen capture
 * `numpy`, `Pillow`, `psutil`
 * `ffprobe` (ffmpeg), `v4l-utils` (`v4l2-ctl`), `pactl` (PipeWire/PulseAudio)
@@ -170,7 +171,7 @@ Tested on CachyOS (Arch family), kernel 7.3, niri/Wayland, NVIDIA RTX 4060 Ti.
 Arch/CachyOS package names:
 
 ```bash
-sudo pacman -S --needed python python-pyside6 python-gobject gst-plugins-base \
+sudo pacman -S --needed python pyside6 python-gobject gst-plugins-base \
   gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav gst-plugin-opengl \
   gst-plugins-base-libs ffmpeg v4l-utils libpulse pipewire-pulse pipewire \
   xdg-desktop-portal python-numpy python-pillow python-psutil
@@ -282,12 +283,13 @@ with the H.264 video so the MP4 stays synchronised.
 One root-only command (reversible):
 
 ```bash
-sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
-# or: ./scripts/enable-v4l2loopback.sh
+sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam exclusive_caps=1
+# or: ./scripts/enable-v4l2loopback.sh   (reloads a module loaded with 0)
 
-# Keep the default exclusive_caps=0.  AnyCam writes the loopback device while
-# other applications open it as a camera; exclusive_caps=1 makes it appear as
-# only one direction at a time and prevents that simultaneous use.
+# exclusive_caps=1 is required for Discord, Chrome and other Chromium apps to
+# list the node at all.  With the module default (0) the device advertises
+# capture and output together and their device enumeration skips it.  AnyCam
+# holds the device from launch, so it keeps advertising capture while idle.
 v4l2-ctl --list-devices           # expect "AnyCam" / /dev/video10
 ```
 
@@ -296,6 +298,50 @@ Then run AnyCam with the virtual camera branch:
 ```bash
 PYTHONPATH=src python3 -m anycam demo --seconds 30 --vcam   # or use the GUI button
 ```
+
+AnyCam holds the loopback node open from launch and feeds it a "virtual camera
+ready" card at 10 fps, so Discord/Zoom can select **AnyCam** at any time — even
+before the preview starts — instead of failing with `EIO`.  With
+`exclusive_caps=1` the node only advertises capture while something writes to
+it, so start AnyCam before opening the application's camera list; **Settings →
+Diagnostics** says whether the loaded module will be listed by Chromium. Clicking **Virtual
+camera** (or starting the preview with it enabled) replaces the card with the
+live canvas; switching it off returns to the card.
+
+If an application already had the node open when AnyCam launched, that open
+failed before there was a stream. AnyCam shows a dismissible hint naming the
+application; re-select "AnyCam" in its camera list to make it retry. Nothing
+outside the application can repair that open.
+
+The on-screen preview is delivered at 960×540 instead of 1280×720, which is
+already panel resolution for the default window. Measured at 1080p60 on this
+machine, that cut the GUI's CPU from 188% to 162% of one core; the canvas,
+recording and virtual camera output stay at the project resolution.
+
+The virtual-camera branch converts each frame once, not twice. The canvas tap
+forwards the composited RGBA frame untouched and the vcam's own pipeline
+converts it straight to the driver's YUYV. Converting in both stages added a
+second full 1080p60 pass: measured on this machine with the same 480 frames in
+8 s, the tap path went from 58.5% to 40.9% of one core.
+
+When `glupload`/`glcolorconvert`/`gldownload` are available, that single
+conversion runs on the GPU (measured ~21% of a core against ~31% for
+`videoconvert` at 1080p60). The GPU chain is only kept if its first frame
+actually reaches `v4l2sink`; a failed or missing GL setup rebuilds the CPU
+chain automatically, so the virtual camera never depends on working GL.
+
+**Settings → Diagnostics** (and `anycam doctor`) reports which converter the
+virtual camera is running and what each converter costs, in milliseconds of
+pipeline time per frame, measured on synthetic frames at the project size and
+rate. The measurement runs in a background thread and opens neither a camera
+nor the loopback device.
+
+When the loaded module was started with `exclusive_caps=0`, the same tab shows
+**Fix Discord visibility**: it releases AnyCam's handle on the node, reloads
+v4l2loopback through `pkexec` with `exclusive_caps=1`, and holds the device
+again. A running preview is not stopped — only its virtual-camera tap detaches
+for the reload. If authorization is declined or another application still has
+the node open, the reason is shown and the manual command stays on screen.
 
 Undo it with:
 
@@ -363,7 +409,7 @@ and a new segment starts (the status bar reports the segment count).
 
 ```bash
 ./scripts/test.sh
-# 150 passed, 1 skipped (hardware-gated multicam; 151 collected)
+# 218 passed, 1 skipped (hardware-gated multicam; 219 collected)
 ```
 
 Covers geometry, model/JSON round-trips (including audio mixing fields, editor
@@ -394,8 +440,8 @@ the CachyOS test machine.
 * The only privileged change is loading `v4l2loopback`; it is unloaded with one
   command and nothing is persisted unless you add module config yourself.
 * Screen capture goes through `xdg-desktop-portal` ScreenCast + PipeWire, never
-  a niri-specific API. The portal consent dialog is the normal user-facing
-  permission prompt.
+  a compositor-specific API. The portal consent dialog is the normal
+  user-facing permission prompt.
 
 ## Known limitations
 
@@ -403,11 +449,13 @@ the CachyOS test machine.
   and a live PipeWire session. The fd cannot be serialised, so a saved screen
   layer asks the portal for access again when preview/recording next starts.
   There is no checked-in live screen-capture artifact yet.
-* Niri 26.04 throttles off-screen window rendering, including windows being
-  shared ([upstream issue #539](https://github.com/niri-wm/niri/issues/539)).
-  Keep shared windows visible on an active workspace for smooth capture;
-  switching to a hidden workspace can reduce fresh input to roughly 1 Hz
-  bursts. AnyCam cannot capture frames the compositor has not rendered.
+* Compositor frame delivery still bounds a screen share. AnyCam keeps its
+  canvas on the system clock, so a static or damage-driven share no longer
+  caps the preview: the last captured frame is presented at the canvas rate.
+  On KineticWE/KWin a visible window is captured live; a window the compositor
+  has stopped painting (hidden on another virtual desktop, minimised, or a
+  static page) can still stop producing fresh frames. AnyCam cannot capture
+  frames the compositor has not rendered.
   The status chip shows `SLOW` for screen input below the lesser of 10 fps
   and half the canvas rate, measured over approximately three seconds after
   a two-second warmup. Static, damage-driven shares can also show `SLOW`;

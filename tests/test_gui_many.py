@@ -6,6 +6,8 @@ these tests never open a camera or touch the user's project file.
 from __future__ import annotations
 
 import os
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +19,7 @@ from PySide6.QtCore import QPoint
 from PySide6.QtGui import QContextMenuEvent, QImage
 from PySide6.QtWidgets import QApplication
 
+from anycam import portal
 from anycam.gui import AnyCamWindow, PreviewWidget
 from anycam.gui_many import ManyCamWindow
 from anycam.layouts import LAYOUT_PRESETS, layout_preset
@@ -70,6 +73,197 @@ def _camera_project(count: int, kind: str = "test") -> Project:
     project.scenes = [scene]
     project.active_scene = scene.id
     return project
+
+
+class _PadEngine:
+    """Records the only mutations a layout switch is allowed to make."""
+
+    def __init__(self) -> None:
+        self.boxes: dict[str, tuple] = {}
+        self.visible: dict[str, bool] = {}
+        self.detached: list[str] = []
+
+    def set_layer_box(self, layer_id: str, box) -> None:
+        self.boxes[layer_id] = tuple(box)
+
+    def detach_layer(self, layer_id: str) -> None:
+        self.detached.append(layer_id)
+        self.visible[layer_id] = False
+
+    def set_layer_visible(self, layer_id: str, visible: bool) -> None:
+        self.visible[layer_id] = bool(visible)
+
+    def stop(self) -> dict:
+        return {}
+
+
+def test_diagnostics_log_records_vcam_and_screen_events(app):
+    """Rebuild/recovery events must be visible inside the app, not only stderr."""
+    window = _window(empty_project(), app)
+    try:
+        window.log_event("screen capture reused after a rebuild (node 86)")
+        window.log_event("virtual camera: recovered and re-attached to the canvas")
+        text = window.diag_log.toPlainText()
+        assert "screen capture reused after a rebuild" in text
+        assert "virtual camera: recovered" in text
+    finally:
+        _close(window, app)
+
+
+def test_held_vcam_follows_the_canvas_without_a_second_click(app):
+    """Launch holds the node; starting the preview must replace the card."""
+    window = _window(empty_project(), app)
+
+    class Held:
+        active = True
+        device = "/dev/video10"
+
+        def stop(self):
+            self.active = False
+            return {"device": self.device, "ok": True, "error": ""}
+
+    try:
+        assert window.feed_held_vcam() is False
+        window._vcam_output = Held()
+        assert window.feed_held_vcam() is True
+        assert window.vcam_on is True
+        assert "on" in window.vcam_button.text()
+    finally:
+        window._vcam_output = None
+        _close(window, app)
+
+
+def test_manycam_window_shows_a_held_vcam_hint(app, monkeypatch):
+    """The default UI used to lack the banner, so the hint crashed it."""
+    import anycam.gui_many as many
+
+    class HeldVcam:
+        active = True
+        device = "/dev/video10"
+
+    monkeypatch.setattr(many.config, "vcam_consumers",
+                        lambda device=None: ["discord"])
+    window = _window(empty_project(), app)
+    try:
+        window._vcam_output = HeldVcam()
+        window.note_vcam_consumers()
+        assert not window.vcam_hint.isHidden()
+        assert "discord" in window.vcam_hint.text()
+        window.dismiss_vcam_hint()
+        assert window.vcam_hint.isHidden()
+    finally:
+        window._vcam_output = None
+        _close(window, app)
+
+
+def test_launch_hold_feeds_the_canvas_instead_of_the_idle_card(app):
+    """A held node must not stay on the dark ready card once preview runs."""
+    class Held:
+        active = True
+        device = "/dev/video10"
+
+    window = _window(empty_project(), app)
+    try:
+        assert window.enable_held_vcam() is False
+        window._vcam_output = Held()
+        assert window.enable_held_vcam() is True
+        assert window.vcam_on is True
+        assert "on" in window.vcam_button.text().lower()
+    finally:
+        window._vcam_output = None
+        _close(window, app)
+
+
+def test_diagnostics_fix_button_reloads_and_reholds_the_device(app, monkeypatch):
+    """The one-click fix must release the node, reload, then hold it again."""
+    import anycam.gui_many as many
+
+    class Held:
+        active = True
+        device = "/dev/video10"
+
+        def stop(self):
+            self.active = False
+            return {"device": self.device, "ok": True, "error": ""}
+
+    caps = {"value": False}
+    monkeypatch.setattr(many.config, "vcam_exclusive_caps",
+                        lambda path=None: caps["value"])
+    window = _window(empty_project(), app)
+    try:
+        window._vcam_output = Held()
+        window.hold_vcam_device = lambda: True
+        window._refresh_diag_state()
+        assert not window.diag_fix.isHidden()
+
+        calls = []
+        caps["value"] = True
+        monkeypatch.setattr(many.config, "reload_vcam_module",
+                            lambda device=None: calls.append(device) or "")
+        window.fix_vcam_visibility()
+        assert window._fix_thread is not None
+        window._fix_thread.join(5)
+        assert not window._fix_thread.is_alive()
+        window._fix_poll()
+
+        assert calls == ["/dev/video10"]
+        assert "listed" in window.diag_chromium.text()
+        assert window.diag_fix.isHidden()
+    finally:
+        window._vcam_output = None
+        _close(window, app)
+
+
+def test_diagnostics_fix_button_surfaces_an_authorization_failure(app,
+                                                                  monkeypatch):
+    import anycam.gui_many as many
+
+    monkeypatch.setattr(many.config, "vcam_exclusive_caps",
+                        lambda path=None: False)
+    window = _window(empty_project(), app)
+    try:
+        window.hold_vcam_device = lambda: True
+        monkeypatch.setattr(
+            many.config, "reload_vcam_module",
+            lambda device=None: "authorization was cancelled. Run: sudo")
+        window._refresh_diag_state()
+        window.fix_vcam_visibility()
+        window._fix_thread.join(5)
+        window._fix_poll()
+        assert "reload failed" in window.diag_chromium.text()
+        assert "authorization" in window.diag_chromium.text()
+        assert not window.diag_fix.isHidden()
+    finally:
+        window._vcam_output = None
+        _close(window, app)
+
+
+def test_diagnostics_tab_shows_the_measured_conversion_cost(app, monkeypatch):
+    """The settings Diagnostics tab must report the path and its real cost."""
+    import anycam.engine.outputs.vcam as vcam_module
+
+    monkeypatch.setattr(
+        vcam_module, "measure_conversion",
+        lambda *args, **kwargs: {"gpu": 12.5, "cpu": 20.0, "chosen": "gpu",
+                                 "width": 1920, "height": 1080, "fps": 60})
+    window = _window(empty_project(), app)
+    try:
+        window._refresh_diag_state()
+        assert "stopped" in window.diag_state.text()
+        window.measure_vcam_cost()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            app.processEvents()
+            thread = window._diag_thread
+            if thread is None or not thread.is_alive():
+                break
+            time.sleep(0.01)
+        window._diag_poll()
+        text = window.diag_cost.text()
+        assert "GPU 12.50 ms/frame" in text and "CPU 20.00 ms/frame" in text
+        assert "chosen: GPU" in text
+    finally:
+        _close(window, app)
 
 
 def test_scene_cards_are_built_from_the_project(app):
@@ -158,6 +352,206 @@ def test_only_one_program_preview_and_layout_thumbnails(app):
             "full", "split-2", "three-up", "three-across", "grid-2x2", "pip"]
         assert not hasattr(window, "scene_layout_combo")
     finally:
+        _close(window, app)
+
+
+def test_layout_change_updates_the_running_engine_without_rebuild(app):
+    """Switching layout must not tear down the source graph or vcam tap."""
+    window = _window(_camera_project(2), app)
+    try:
+        window.start_engine()
+        assert window.engine is not None
+        previous = window.engine
+        arranged = window.apply_layout("split-2")
+        assert window.engine is previous
+        assert [layer.box for layer in arranged] == list(
+            layout_preset("split-2").boxes)
+        assert all(layer.id in previous._layer_pads for layer in arranged)
+    finally:
+        window.stop_engine()
+        _close(window, app)
+
+
+def test_assigning_a_slot_moves_pads_without_restarting(app, monkeypatch):
+    """Assigning an existing source is a pad edit, not a graph rebuild."""
+    window = _window(_camera_project(2), app)
+    pads = _PadEngine()
+    window.engine = pads
+    restarts: list[int] = []
+    monkeypatch.setattr(window, "restart_engine",
+                        lambda: restarts.append(1))
+    try:
+        window.apply_layout("split-2")
+        first, second = window.scene.layers
+        window._assign_slot(0, second)
+        boxes = layout_preset("split-2").boxes
+        assert pads.boxes[second.id] == boxes[0]
+        assert pads.boxes[first.id] == boxes[1]
+        assert pads.visible[second.id] is True
+        assert restarts == []
+    finally:
+        window.engine = None
+        _close(window, app)
+
+
+def test_layout_switch_keeps_the_portal_session(app, monkeypatch):
+    """A layout switch must not request a new screen-cast session."""
+    project = Project(name="screen")
+    scene = Scene(new_id("scene"), "Screen")
+    screen = Layer(new_id("layer"), "screen", "Screen", source="151",
+                   box=(0.0, 0.0, 1.0, 1.0), z=0)
+    camera = Layer(new_id("layer"), "camera", "Cam", source="/dev/video0",
+                   box=(0.65, 0.60, 0.30, 0.30), z=1)
+    scene.add_layer(screen)
+    scene.add_layer(camera)
+    project.scenes = [scene]
+    project.active_scene = scene.id
+    window = _window(project, app)
+
+    class Session:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    session = Session()
+    window._screen_sessions[screen.id] = session
+    pads = _PadEngine()
+    window.engine = pads
+    restarts: list[int] = []
+    monkeypatch.setattr(window, "restart_engine",
+                        lambda: restarts.append(1))
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("layout switch requested a new portal session")
+
+    monkeypatch.setattr("anycam.gui.portal.request_screen_cast", refuse)
+    try:
+        window.apply_layout("full")
+        window._assign_slot(0, camera)
+        assert window._screen_sessions[screen.id] is session
+        assert session.closed is False
+        assert screen.id in pads.boxes
+        assert camera.id in pads.boxes
+        assert restarts == []
+    finally:
+        window.engine = None
+        _close(window, app)
+
+
+def test_removing_a_camera_does_not_restart_or_close_the_screen_session(
+        app, monkeypatch):
+    """Removing the webcam must leave the screen branch and vcam alive."""
+    project = Project(name="screen")
+    scene = Scene(new_id("scene"), "Screen")
+    screen = Layer(new_id("layer"), "screen", "Screen", source="151",
+                   box=(0.0, 0.0, 1.0, 1.0), z=0)
+    camera = Layer(new_id("layer"), "camera", "Cam", source="/dev/video0",
+                   box=(0.65, 0.60, 0.30, 0.30), z=1)
+    scene.add_layer(screen)
+    scene.add_layer(camera)
+    project.scenes = [scene]
+    project.active_scene = scene.id
+    window = _window(project, app)
+
+    class Session:
+        closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    session = Session()
+    window._screen_sessions[screen.id] = session
+    pads = _PadEngine()
+    window.engine = pads
+    restarts: list[int] = []
+    monkeypatch.setattr(window, "restart_engine",
+                        lambda: restarts.append(1))
+    try:
+        window.remove_layers([camera.id])
+        assert camera.id not in [layer.id for layer in window.scene.layers]
+        assert screen.id in [layer.id for layer in window.scene.layers]
+        assert pads.detached == [camera.id]
+        assert pads.visible[camera.id] is False
+        assert window._screen_sessions[screen.id] is session
+        assert session.closed is False
+        assert restarts == []
+        assert window.engine is pads
+    finally:
+        window.engine = None
+        _close(window, app)
+
+
+def test_screen_remove_and_readd_reuses_the_portal_session(app, monkeypatch):
+    """One picker per launch: remove/add must reuse the open portal stream."""
+    class FakeSession:
+        def __init__(self):
+            self.fd = 7
+            self.node_id = 42
+            self.streams = [SimpleNamespace(width=1920, height=1080,
+                                            source_type="monitor")]
+            self.closed = 0
+
+        def close(self):
+            self.closed += 1
+
+    session = FakeSession()
+    requests: list[int] = []
+    monkeypatch.setattr(
+        portal, "request_screen_cast",
+        lambda: requests.append(1) or session)
+    window = _window(_camera_project(1), app)
+    try:
+        first = window.add_layer("screen")
+        assert first is not None
+        assert requests == [1]
+        window.remove_layers([first.id])
+        assert session.closed == 0
+        assert window._last_screen_session is session
+
+        second = window.add_layer("screen")
+        assert second is not None
+        assert requests == [1], "re-add asked the portal for a new session"
+        assert second.source == "42"
+        assert window._screen_sessions[second.id] is session
+        assert session.closed == 0
+    finally:
+        _close(window, app)
+
+
+def test_adding_a_source_keeps_the_running_pipeline(app):
+    window = _window(_camera_project(1), app)
+    try:
+        window.start_engine()
+        assert window.engine is not None
+        engine = window.engine
+        pipeline = engine.pipeline
+        layer = window.add_layer("test", source="blue",
+                                 box=(0.5, 0.0, 0.5, 1.0))
+        assert layer is not None
+        assert window.engine is engine
+        assert engine.pipeline is pipeline, "adding a source rebuilt the canvas"
+        assert layer.id in engine._layer_pads
+    finally:
+        window.stop_engine()
+        _close(window, app)
+
+
+def test_removing_a_camera_keeps_the_live_canvas(app):
+    """Real engine: removing one source must not replace the pipeline."""
+    window = _window(_camera_project(2), app)
+    try:
+        window.start_engine()
+        assert window.engine is not None
+        previous = window.engine
+        removed = window.scene.layers[0]
+        window.remove_layers([removed.id])
+        assert window.engine is previous
+        assert window.engine.pipeline is not None
+        assert removed.id not in previous._layer_pads
+        assert len(window.scene.layers) == 1
+    finally:
+        window.stop_engine()
         _close(window, app)
 
 
@@ -367,7 +761,8 @@ def test_sidebar_is_layouts_effects_scenes_and_settings_is_a_window(app):
         assert window._settings.isVisible()
         tabs = [window.settings_tabs.tabText(index)
                 for index in range(window.settings_tabs.count())]
-        assert tabs == ["Sources", "Audio", "Media", "Output", "Stream"]
+        assert tabs == ["Sources", "Audio", "Media", "Output", "Stream",
+                        "Diagnostics"]
         assert not hasattr(window, "slot_grid")
     finally:
         _close(window, app)
@@ -531,7 +926,7 @@ def test_source_status_reports_stale_and_recovers_without_restarting(app):
         window._update_source_status()
         assert window.status_chip.text() == "SLOW"
         assert "2.5 fps" in window.statusBar().currentMessage()
-        assert "keep shared windows visible" in window.status_chip.toolTip()
+        assert "compositor frame delivery" in window.status_chip.toolTip()
         report.source_health[first.id].update(fps=30, slow=False)
         window._update_source_status()
         assert window.status_chip.text() == "LIVE"

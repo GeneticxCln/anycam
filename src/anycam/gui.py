@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox,
@@ -31,7 +32,7 @@ from .model import (Effects, Layer, Project, Scene, camera_grid_scene,
 from .engine.outputs.recorder import Recorder
 from .engine.outputs.vcam import VcamOutput
 from .pipeline import AnyCamEngine
-from .pool import SourcePool
+from .pool import SCREEN_IDLE_GRACE_S, SourcePool
 
 STYLE = """
 QMainWindow, QWidget { background: #0b0d10; color: #d7e3ea; font-family: "Noto Sans", "DejaVu Sans"; font-size: 13px; }
@@ -39,6 +40,7 @@ QFrame#panel { background: #101418; border: 1px solid #1e2830; border-radius: 10
 QLabel#title { color: #ffffff; font-size: 20px; font-weight: 700; }
 QLabel#muted { color: #7d8b96; }
 QLabel#accent { color: #5eead0; font-weight: 700; }
+QLabel#hint { background: #12211f; border: 1px solid #5eead0; border-radius: 7px; padding: 7px 10px; color: #d7e3ea; }
 QPushButton { background: #172026; border: 1px solid #26343d; border-radius: 7px; padding: 7px 12px; }
 QPushButton:hover { border-color: #5eead0; }
 QPushButton:pressed { background: #1d2b31; }
@@ -921,11 +923,23 @@ class AnyCamWindow(QMainWindow):
         # Captures are ref-counted, so one pool lives for the window's
         # lifetime and engines acquire/release their sources against it.
         self._source_pool = SourcePool()
+        # Screen-capture retention/reuse events belong in Diagnostics, next to
+        # the virtual camera events they explain (a rebuild that holds the
+        # capture also holds the vcam's last frame).
+        self._source_pool.log_event = self.log_event
         self.recording = False
         self._recorder: Recorder | None = None
         self._recording_path = ""
         self._vcam_output: VcamOutput | None = None
         self.vcam_on = False
+        # Last vcam error already reported, and the throttle for repairing a
+        # dead v4l2sink without rebuilding the canvas on every tick.
+        self._vcam_error_shown = ""
+        self._vcam_retry_at = 0.0
+        # Canvas size the held output was last fed at; the output itself keeps
+        # a fixed camera mode so it never reopens mid-stream.
+        self._vcam_canvas_size: tuple[int, int] | None = None
+
         # Streaming is a separate action: preview must never publish a saved URL.
         self.live = False
         self.audio_on = bool(getattr(self.project.audio, "mic_enabled", False))
@@ -935,6 +949,9 @@ class AnyCamWindow(QMainWindow):
         # Layer currently built without its crop because the editor is open.
         self._crop_preview_layer_id = ""
         self._screen_sessions: dict[str, portal.ScreenSession] = {}
+        # One portal authorization per app launch.  Removing and re-adding a
+        # screen layer must reuse it instead of showing the window picker.
+        self._last_screen_session: portal.ScreenSession | None = None
         self._camera_choices: list[tuple[str, str]] = []
         self._face_detector = None
         self._face_layer_id = next(
@@ -1070,6 +1087,22 @@ class AnyCamWindow(QMainWindow):
         self.status_chip.setObjectName("accent")
         header.addWidget(self.status_chip)
         outer.addLayout(header)
+
+        # Shown when an application opened the loopback node before AnyCam
+        # was feeding it: that open fails and only the application can retry.
+        self.vcam_hint = QLabel("")
+        self.vcam_hint.setObjectName("hint")
+        self.vcam_hint.setWordWrap(True)
+        self.vcam_hint.hide()
+        self.vcam_dismiss = QPushButton("Dismiss")
+        self.vcam_dismiss.setObjectName("muted")
+        self.vcam_dismiss.hide()
+        self.vcam_dismiss.clicked.connect(self.dismiss_vcam_hint)
+        hint_row = QHBoxLayout()
+        hint_row.setContentsMargins(0, 0, 0, 0)
+        hint_row.addWidget(self.vcam_hint, 1)
+        hint_row.addWidget(self.vcam_dismiss, 0)
+        outer.addLayout(hint_row)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         outer.addWidget(splitter, 1)
@@ -2347,7 +2380,13 @@ class AnyCamWindow(QMainWindow):
         if arranged:
             self._record_history(before)
         if self.engine is not None and arranged:
-            self.restart_engine()
+            # A layout only repositions existing pads.  Rebuilding the graph
+            # would tear down every capture (and the vcam tap) mid-stream,
+            # which is what blanked Discord on a layout switch.  Push the new
+            # boxes onto the running compositor instead.
+            for layer in arranged:
+                self.engine.set_layer_box(layer.id, layer.box)
+            self.preview.update()
         if not arranged:
             self._status(f"Layout: {preset.label} · choose a source for each +")
             return arranged
@@ -2393,8 +2432,6 @@ class AnyCamWindow(QMainWindow):
         removed = next((s for s in self.project.scenes if s.id == scene_id), None)
         if removed is None:
             return
-        screen_ids = [layer.id for layer in removed.layers
-                      if layer.id in self._screen_sessions]
         self.project.scenes = [s for s in self.project.scenes if s.id != scene_id]
         if self.project.active_scene not in [s.id for s in self.project.scenes]:
             self.project.active_scene = self.project.scenes[0].id
@@ -2408,8 +2445,6 @@ class AnyCamWindow(QMainWindow):
         self._mark_dirty()
         if self.engine is not None:
             self.restart_engine()
-        for layer_id in screen_ids:
-            self._close_screen_session(layer_id)
 
     def add_layer(self, kind: str, source: str = "",
                   box: tuple[float, float, float, float] | None = None) -> Layer | None:
@@ -2484,21 +2519,45 @@ class AnyCamWindow(QMainWindow):
         self.preview.select_layer(layer.id)
         self._record_history(before)
         if self.engine is not None:
-            self.restart_engine()
+            # Add to the running canvas.  A rebuild would destroy the screen
+            # pipewiresrc (and its portal session) and make Discord go black.
+            attached = False
+            if layer.kind == "screen":
+                session = self._screen_sessions.get(layer.id)
+                fd = session.fd if session is not None else -1
+                size = None
+                if session is not None and session.streams:
+                    stream = session.streams[0]
+                    if stream.width > 1 and stream.height > 1:
+                        size = (stream.width, stream.height)
+                attached = self.engine.add_layer(
+                    layer, screen_fd=fd, screen_size=size)
+            else:
+                attached = self.engine.add_layer(layer)
+            if not attached:
+                self.restart_engine()
         return layer
 
     def _add_screen_layer(
             self, box: tuple[float, float, float, float] | None = None) -> Layer | None:
-        """Ask the portal for a screen stream and add it as a layer."""
-        try:
-            session = portal.request_screen_cast()
-        except Exception as exc:  # noqa: BLE001 - the portal reports user cancellation too
-            self._status(f"Screen capture unavailable: {exc}")
-            print(f"AnyCam screen capture failed: {exc}", file=sys.stderr,
-                  flush=True)
-            if not self.headless:
-                QMessageBox.warning(self, "Screen capture", str(exc))
-            return None
+        """Add a screen stream, reusing this launch's portal authorization."""
+        session = self._last_screen_session
+        if session is not None and session.fd >= 0 and session.streams:
+            print(
+                f"[screen-session] reusing node={session.node_id} for a new "
+                "screen layer; no portal request",
+                file=sys.stderr, flush=True)
+        else:
+            try:
+                session = portal.request_screen_cast()
+            except Exception as exc:  # noqa: BLE001 - the portal reports user cancellation too
+                self._status(f"Screen capture unavailable: {exc}")
+                print(f"AnyCam screen capture failed: {exc}", file=sys.stderr,
+                      flush=True)
+                if not self.headless:
+                    QMessageBox.warning(self, "Screen capture", str(exc))
+                return None
+            self._last_screen_session = session
         stream = session.streams[0]
         size = (f"{stream.width}×{stream.height}"
                 if stream.width > 1 and stream.height > 1 else "Screen")
@@ -2513,11 +2572,19 @@ class AnyCamWindow(QMainWindow):
         for layer in list(self.scene.layers):
             if layer.kind != "screen" or layer.id in self._screen_sessions:
                 continue
-            try:
-                session = portal.request_screen_cast()
-            except Exception as exc:  # noqa: BLE001
-                self._status(f"Screen capture unavailable: {exc}")
-                return False
+            session = self._last_screen_session
+            if session is None or session.fd < 0 or not session.streams:
+                try:
+                    session = portal.request_screen_cast()
+                except Exception as exc:  # noqa: BLE001
+                    self._status(f"Screen capture unavailable: {exc}")
+                    return False
+                self._last_screen_session = session
+            else:
+                print(
+                    f"[screen-session] reusing node={session.node_id} for "
+                    f"saved screen layer {layer.id}; no portal request",
+                    file=sys.stderr, flush=True)
             print(
                 f"[screen-session] layer={layer.id} node={session.node_id} "
                 f"fd={session.fd} streams="
@@ -2542,6 +2609,7 @@ class AnyCamWindow(QMainWindow):
     def _close_screen_sessions(self) -> None:
         sessions = list(self._screen_sessions.values())
         self._screen_sessions.clear()
+        self._last_screen_session = None
         closed: set[int] = set()
         for session in sessions:
             if id(session) not in closed:
@@ -2592,14 +2660,19 @@ class AnyCamWindow(QMainWindow):
                    if layer_id and self.scene.layer(layer_id) is not None]
         if not removed:
             return
-        screen_ids = [layer_id for layer_id in removed
-                      if layer_id in self._screen_sessions]
         before = self._layout_snapshot()
         removed_face = self._face_layer_id in removed
         if removed_face:
             target = self._face_target()
             if target is not None:
                 target.effects.face_effect = "none"
+        if self.engine is not None:
+            # Detach before removing from the model: the engine needs the
+            # layer's spec to release exactly that capture.  Rebuilding here
+            # tore down the screen pipewiresrc and killed the portal session
+            # even when only the camera was removed.
+            for layer_id in removed:
+                self.engine.detach_layer(layer_id)
         for layer_id in removed:
             self.scene.remove_layer(layer_id)
             self._lost_cameras.pop(layer_id, None)
@@ -2608,11 +2681,14 @@ class AnyCamWindow(QMainWindow):
         self._face_layer_id = "" if removed_face else self._face_layer_id
         self._refresh_layers()
         self._record_history(before)
-        if self.engine is not None:
-            # Stop the old pipewiresrc before closing its portal fd.
-            self.restart_engine()
-        for layer_id in screen_ids:
-            self._close_screen_session(layer_id)
+        if self.engine is not None and not any(
+                layer.visible for layer in self.scene.layers):
+            # The permanent zorder=0 standby keeps the canvas alive with a
+            # branded slate instead of the removed source's last frame.
+            self.log_event(
+                "all sources removed; showing the AnyCam standby background")
+        # The portal session and the screen pipewiresrc stay alive: removing
+        # a source must be reversible without a new picker or a black vcam.
 
     def _layers_selection_changed(self) -> None:
         if self._syncing_selection:
@@ -3298,22 +3374,178 @@ class AnyCamWindow(QMainWindow):
             self._status(
                 f"Recording failed: {report.get('error') or 'no frames'}")
 
-    def _start_vcam_output(self, setup: bool = False) -> bool:
+    def show_vcam_hint(self, text: str) -> None:
+        """Keep a dismissible hint above the preview until replaced."""
+        self.vcam_hint.setText(text)
+        self.vcam_hint.show()
+        self.vcam_dismiss.show()
+        self._status(text)
+
+    def dismiss_vcam_hint(self) -> None:
+        self.vcam_hint.hide()
+        self.vcam_dismiss.hide()
+
+    def hold_vcam_device(self) -> bool:
+        """Open the loopback node at launch so apps can select it early.
+
+        No root prompt here: the button still runs the setup path when the
+        device is missing.  The idle card in ``VcamOutput`` is what makes the
+        node stream before the preview exists.
+        """
         if self._vcam_output is not None and self._vcam_output.active:
             return True
         device = self.project.output.vcam_device or config.loopback_device()
         output = VcamOutput()
         if not output.start(device, self.project.output.canvas_w,
                             self.project.output.canvas_h,
-                            self.project.output.fps, setup=setup):
+                            self.project.output.fps):
+            return False
+        self._vcam_output = output
+        return True
+
+    def feed_held_vcam(self) -> bool:
+        """Make the device held at launch follow the canvas automatically.
+
+        The "Virtual camera ready / start the preview" card is only a
+        placeholder: once the engine exists, the held node should show the
+        composed scene without a second button press.  The button still turns
+        the feed off again.
+        """
+        output = self._vcam_output
+        if output is None or not output.active:
+            return False
+        self.vcam_on = True
+        if hasattr(self, "vcam_button"):
+            self.vcam_button.setText("Virtual camera: on")
+        if self.engine is not None and not self.engine.attach_vcam(output):
+            self._status(self.engine.report.vcam_error
+                         or "Virtual camera could not start")
+            return False
+        return True
+
+    def enable_held_vcam(self) -> bool:
+        """Feed the canvas through the loopback node held at launch.
+
+        The idle card says "Start the preview", but a held node whose feed is
+        never switched stays on that near-black card forever, which a consumer
+        cannot tell apart from a dead camera.  Once AnyCam owns the device, the
+        canvas is the virtual camera's picture; turning the button off still
+        returns it to the card.
+        """
+        output = self._vcam_output
+        if output is None or not output.active:
+            return False
+        self.vcam_on = True
+        button = getattr(self, "vcam_button", None)
+        if button is not None:
+            button.setText("Virtual camera: on")
+        if self.engine is not None:
+            self.engine.attach_vcam(output)
+        return True
+
+    def note_vcam_consumers(self) -> None:
+        """Warn about apps that opened the node before AnyCam fed it.
+
+        That open fails with EIO and the app shows nothing until it re-opens
+        the camera; nothing outside the app can repair it.
+        """
+        output = self._vcam_output
+        if output is None or not output.device:
+            return
+        names = config.vcam_consumers(output.device)
+        if not names:
+            return
+        label = ", ".join(names[:2]) + ("…" if len(names) > 2 else "")
+        self.show_vcam_hint(
+            f"{label} already had {Path(output.device).name} open before AnyCam "
+            "started feeding it. If it shows no picture, re-select “AnyCam” "
+            "in that app's camera list.")
+
+    def _start_vcam_output(self, setup: bool = False) -> bool:
+        device = self.project.output.vcam_device or config.loopback_device()
+        width = self.project.output.canvas_w
+        height = self.project.output.canvas_h
+        fps = self.project.output.fps
+        output = self._vcam_output
+        if output is not None and output.active:
+            if not output.error and output.device == device:
+                # Keep the node open while the canvas changes.  OBS's Linux
+                # virtual camera is a separate output with one fixed mode;
+                # reopening v4l2sink for every canvas resize kills the handle
+                # Discord is reading.  The engine tap scales into this mode.
+                if self._vcam_canvas_size != (width, height):
+                    self._vcam_canvas_size = (width, height)
+                    out_w = int(getattr(output, "width", width))
+                    out_h = int(getattr(output, "height", height))
+                    if (out_w, out_h) != (width, height):
+                        self.log_event(
+                            f"virtual camera: canvas {width}×{height} scaled to "
+                            f"{out_w}×{out_h}")
+                return True
+            # A sink error leaves the pipeline object alive but dead; a
+            # changed device needs new caps.  Only those justify a reopen.
+            output.stop()
+            self._vcam_output = None
+        output = VcamOutput()
+        if not output.start(device, width, height, fps, setup=setup):
+            self.log_event(
+                f"virtual camera: {output.error or 'could not start'}")
             self._status(output.error or "Virtual camera could not start")
             return False
         self._vcam_output = output
+        self._vcam_canvas_size = (width, height)
+        out_w = int(getattr(output, "width", width))
+        out_h = int(getattr(output, "height", height))
+        if (out_w, out_h) != (width, height):
+            self.log_event(
+                f"virtual camera: canvas {width}×{height} scaled to "
+                f"{out_w}×{out_h}")
+        return True
+
+    def _recover_vcam(self) -> bool:
+        """Repair a virtual camera that dropped while the canvas kept running.
+
+        A v4l2sink error only kills that output pipeline; it is not the user
+        turning the camera off.  Flipping ``vcam_on`` in response made every
+        later rebuild build without the tap, so the held node sat on the dark
+        "ready" card and Discord showed a black camera until the button was
+        pressed again.  Rebuild the output and reattach it instead, throttled
+        so a device that stays unavailable does not spin the GUI thread.
+        """
+        if not self.vcam_on or self.engine is None:
+            return False
+        now = time.monotonic()
+        if now - self._vcam_retry_at < 2.0:
+            return False
+        self._vcam_retry_at = now
+        output = self._vcam_output
+        if output is not None and (not output.active or output.error):
+            self.log_event(
+                f"virtual camera: rebuilding output after "
+                f"{output.error or 'sink stopped'}")
+            self._finish_vcam_output()
+            output = None
+        if output is None:
+            if not self._start_vcam_output(setup=False):
+                return False
+            output = self._vcam_output
+        if output is None:
+            return False
+        if not self.engine.attach_vcam(output):
+            self.log_event(
+                f"virtual camera: reattach failed "
+                f"({self.engine.report.vcam_error or 'no canvas tap'})")
+            return False
+        self._vcam_error_shown = ""
+        self.vcam_button.setText("Virtual camera: on")
+        self.log_event("virtual camera: recovered and re-attached to the canvas")
+        self._status("Virtual camera re-attached to the canvas")
         return True
 
     def _finish_vcam_output(self) -> None:
         output = self._vcam_output
         self._vcam_output = None
+        self._vcam_canvas_size = None
         if output is None:
             return
         report = output.stop()
@@ -3351,8 +3583,13 @@ class AnyCamWindow(QMainWindow):
             return
         recorder = self._recorder
         if self.vcam_on and not self._start_vcam_output(setup=True):
-            self.vcam_on = False
-            self.vcam_button.setText("Virtual camera")
+            # Keep the request: the held node is still ours, and _recover_vcam
+            # retries.  Clearing vcam_on here made this and every later
+            # rebuild build without the tap, leaving the dark ready card on
+            # the device while the preview looked fine.
+            error = (self._vcam_output.error if self._vcam_output is not None
+                     else "virtual camera could not start")
+            print(f"[vcam] {error}", file=sys.stderr, flush=True)
         vcam_output = self._vcam_output if self.vcam_on else None
         # In crop mode the selected layer is built uncropped, so the editor's
         # window is drawn over the picture it is actually trimming.
@@ -3362,7 +3599,9 @@ class AnyCamWindow(QMainWindow):
             self.engine = AnyCamEngine(
                 self.project,
                 recorder=recorder,
-                vcam=self.vcam_on,
+                # Without an owned output the engine would build its own
+                # v4l2sink, opening the loopback node as a second writer.
+                vcam=self.vcam_on and vcam_output is not None,
                 vcam_output=vcam_output,
                 preview=True,
                 audio=(self.audio_on or bool(self.project.audio.media_file)
@@ -3378,6 +3617,11 @@ class AnyCamWindow(QMainWindow):
             ).build()
             self.engine.start()
             self.preview.layer_sizes = self.engine.source_sizes()
+            if self.vcam_on and not self.engine.report.vcam_active:
+                # The held output exists but this canvas has no tap: reattach
+                # now instead of waiting for the next status tick.
+                self._vcam_retry_at = 0.0
+                self._recover_vcam()
         except Exception as exc:  # noqa: BLE001
             self.engine = None
             # A failed rebuild must not leave the Record button armed with a
@@ -3401,7 +3645,10 @@ class AnyCamWindow(QMainWindow):
         self._source_status = ()
         self.status_chip.setText("WAITING")
         self.start_button.setText("Stop preview")
-        self.timer.start(33)
+        # 16 ms so a 60 fps canvas is actually shown at 60 fps.  The preview
+        # image is capped at 960x540 (~2.1 MB per copy), which fits the frame
+        # budget; a 33 ms tick capped the whole preview at 30 fps.
+        self.timer.start(16)
         if self.engine.report.vcam_error:
             self._status(self.engine.report.vcam_error)
         elif self.engine.report.media_errors:
@@ -3426,6 +3673,11 @@ class AnyCamWindow(QMainWindow):
                 self.recording_segments.append(report["record_path"])
                 self._status(f"Saved {report['record_path']}")
             self.engine = None
+        # The pool keeps a screen capture alive briefly so an immediate
+        # rebuild reuses it (a fresh damage-driven portal stream can be black
+        # until the window repaints).  A real stop must release it afterwards.
+        QTimer.singleShot(int(SCREEN_IDLE_GRACE_S * 1000) + 200,
+                          self._source_pool.sweep)
         self.status_chip.setText("STOPPED")
         self.start_button.setText("Start preview")
         self.preview.image = None
@@ -3513,20 +3765,34 @@ class AnyCamWindow(QMainWindow):
         self.vcam_button.setText("Virtual camera: on" if self.vcam_on else "Virtual camera")
         self.project.output.vcam_device = (self.vcam_edit.text().strip()
                                            or config.loopback_device())
-        if self.vcam_on and not self._start_vcam_output():
+        if not self.vcam_on:
+            if self.engine is not None:
+                self.engine.detach_vcam()
+            # The node stays open with the idle card so the next application
+            # can select it without waiting for the preview.
+            return
+        if self.engine is None:
+            # A loopback writer with no canvas has nothing to push: the sink
+            # never starts streaming, so a consumer that opens the device gets
+            # EIO and no camera at all.  The button starts the preview it
+            # needs instead of leaving an empty device behind.
+            self.start_engine()
+            if self.engine is not None and self.vcam_on:
+                return
+            self.vcam_on = False
+            self.vcam_button.setText("Virtual camera")
+            self._finish_vcam_output()
+            return
+        # Clicking the button is a request to use the virtual camera, so use
+        # the same pkexec setup path as an engine start.  Without setup=True a
+        # missing v4l2loopback device only produced a modprobe instruction.
+        if not self._start_vcam_output(setup=True):
             self.vcam_on = False
             self.vcam_button.setText("Virtual camera")
             return
-        if self.engine is not None:
-            if self.vcam_on:
-                if not self.engine.attach_vcam(self._vcam_output):
-                    self.vcam_on = False
-                    self.vcam_button.setText("Virtual camera")
-                    self._finish_vcam_output()
-                    return
-            else:
-                self.engine.detach_vcam()
-        if not self.vcam_on:
+        if not self.engine.attach_vcam(self._vcam_output):
+            self.vcam_on = False
+            self.vcam_button.setText("Virtual camera")
             self._finish_vcam_output()
 
     def snapshot(self) -> None:
@@ -3559,6 +3825,10 @@ class AnyCamWindow(QMainWindow):
         dlg = MultiViewDialog(pool, parent=self)
         self._multiview = dlg
         dlg.show()
+
+    def log_event(self, message: str) -> None:
+        """Record a session event; the ManyCam window shows these in Diagnostics."""
+        print(f"[diag] {message}", file=sys.stderr, flush=True)
 
     def _log_preview_problem(self, message: str) -> None:
         """Report a dropped preview frame instead of painting black silently."""
@@ -3656,7 +3926,7 @@ class AnyCamWindow(QMainWindow):
             rates = [f"{layer.name}: {report.source_health[layer.id]['fps']:.1f} fps"
                      for layer in slow]
             message = "Slow screen updates · " + ", ".join(rates)
-            message += " · may be static or compositor-throttled; keep shared windows visible"
+            message += " · may be static or limited by compositor frame delivery"
         else:
             state = ("LIVE", ())
             message = "Source frames resumed"
@@ -3727,12 +3997,19 @@ class AnyCamWindow(QMainWindow):
                 self.live_button.setText("Go Live")
             self._status(f"Stream stopped: {rtmp_error}")
         vcam_error = getattr(self.engine.report, "vcam_error", "")
-        if vcam_error and vcam_error != getattr(self, "_vcam_error_shown", ""):
-            self._vcam_error_shown = vcam_error
-            self.vcam_on = False
-            if hasattr(self, "vcam_button"):
-                self.vcam_button.setText("Virtual camera")
-            self._status(vcam_error)
+        if vcam_error:
+            if vcam_error != self._vcam_error_shown:
+                self._vcam_error_shown = vcam_error
+                self.log_event(f"virtual camera: {vcam_error}")
+                self._status(vcam_error)
+            # A sink error is not the user switching the camera off.
+            self._recover_vcam()
+        elif self._vcam_error_shown:
+            self._vcam_error_shown = ""
+        if self.vcam_on and not self.engine.report.vcam_active:
+            # The output may have failed before this canvas was built, so no
+            # vcam_error was ever latched.  Retry until the tap is attached.
+            self._recover_vcam()
         source_errors = getattr(self.engine.report, "source_errors", ())
         non_camera = [e for e in source_errors
                       if not self._camera_error_layers(e)]
@@ -3782,11 +4059,72 @@ class AnyCamWindow(QMainWindow):
         self.statusBar().showMessage(text)
 
 
+INSTANCE_SERVER = f"anycam-gui-{os.getuid()}"
+
+
+def _raise_window(window) -> None:
+    window.showNormal()
+    window.raise_()
+    window.activateWindow()
+
+
+def claim_gui_instance(name: str = INSTANCE_SERVER
+                       ) -> tuple[bool, QLocalServer | None]:
+    """Become the only AnyCam GUI, or forward the launch to the running one.
+
+    Two windows mean two writers racing for the single v4l2loopback node; the
+    losing writer leaves consumers (Discord) on a black camera.  A second
+    launch therefore raises the existing window and exits instead of opening
+    another one.
+    """
+    probe = QLocalSocket()
+    probe.connectToServer(name)
+    if probe.waitForConnected(500):
+        probe.write(b"show")
+        probe.flush()
+        probe.disconnectFromServer()
+        return False, None
+    # No listener: clear the socket a crashed instance may have left behind.
+    QLocalServer.removeServer(name)
+    server = QLocalServer()
+    if not server.listen(name):
+        print(f"[guard] single-instance socket failed: {server.errorString()}",
+              file=sys.stderr, flush=True)
+        server.deleteLater()
+        return False, None
+    return True, server
+
+
+def serve_instance_requests(server: QLocalServer, window) -> None:
+    """Raise the window when a second launch connects to this instance."""
+    def on_connection() -> None:
+        while server.hasPendingConnections():
+            connection = server.nextPendingConnection()
+            if connection is not None:
+                connection.disconnectFromServer()
+                connection.deleteLater()
+        _raise_window(window)
+
+    server.newConnection.connect(on_connection)
+
+
 def run_gui(project: Project | None = None) -> int:
     app = QApplication(sys.argv[:1])
+    primary, instance_server = claim_gui_instance()
+    if not primary:
+        return 0
     window = AnyCamWindow(project)
+    if instance_server is not None:
+        instance_server.setParent(window)
+        window._instance_server = instance_server
+        serve_instance_requests(instance_server, window)
     app.aboutToQuit.connect(window.shutdown)
     window.show()
+    # Hold the loopback node from launch: apps that remember "AnyCam" must be
+    # able to open it before the preview is started.
+    if window.hold_vcam_device():
+        window.feed_held_vcam()
+        window.note_vcam_consumers()
     code = app.exec()
     # GStreamer 1.28's v4l2src segfaults during Python/GStreamer teardown on
     # this machine (niri/Wayland + GStreamer 1.28.8). Skip cleanup and let the

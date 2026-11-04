@@ -14,7 +14,7 @@ pytest.importorskip("gi")
 
 from anycam.model import Layer, OutputConfig, Project, Scene  # noqa: E402
 from anycam.pipeline import AnyCamEngine  # noqa: E402
-from anycam.pool import CaptureSpec, SourcePool, capture_spec  # noqa: E402
+from anycam.pool import CaptureSpec, Entry, SourcePool, capture_spec  # noqa: E402
 from helpers.frames import grab_frame  # noqa: E402
 
 HAS_INTER = False
@@ -89,7 +89,55 @@ def test_invalid_portal_size_is_scaled_to_the_canvas():
     """A 1x1 portal size used to become a not-negotiated pipewiresrc."""
     layer = Layer("screen_layer", "screen", "Screen 1x1", source="86")
     spec = capture_spec(layer, 1920, 1080, 60, screen_size=(1, 1))
-    assert spec.expected == (1920, 1080)
+    # Unknown, not the canvas: _screen still scales to the canvas, but the
+    # size probe must stay off so a real 3831x2100 window is not reported as
+    # a "portal stream" mismatch.
+    assert spec.expected is None
+    built = SourcePool._screen(spec)
+    assert built.size == (1920, 1080)
+    assert built.check_size is None
+
+
+def test_released_screen_capture_survives_a_canvas_rebuild(monkeypatch):
+    """A rebuild must reuse the running screencast, not re-open a dark one.
+
+    KWin's window share is damage-driven: a fresh pipewiresrc has no frame
+    until the window repaints, so the rebuilt canvas went black.  The retained
+    intervideosink hands its last frame to the new canvas instead.
+    """
+
+    class FakePipeline:
+        def __init__(self):
+            self.states = []
+
+        def set_state(self, state):
+            self.states.append(state)
+            return True
+
+    pool = SourcePool()
+    events: list[str] = []
+    pool.log_event = events.append
+    spec = CaptureSpec("screen", "86", 320, 180, 30, expected=(320, 180))
+    pipeline = FakePipeline()
+    entry = Entry(spec=spec, channel="probe", pipeline=pipeline)
+    monkeypatch.setattr(pool, "_build", lambda _spec: entry)
+
+    first = pool.acquire(spec)
+    pool.release(spec)
+    assert pool.entry(spec) is first and first.refs == 0
+    assert any("kept alive" in line for line in events), events
+
+    second = pool.acquire(spec)
+    assert second is first, "the rebuild re-opened the portal capture"
+    assert first.refs == 1
+    assert any("reused after a rebuild" in line for line in events), events
+
+    pool.release(spec)
+    entry.idle_since -= 10.0
+    pool.sweep()
+    assert pool.entry(spec) is None
+    assert pipeline.states, "the idle capture was never torn down"
+    assert any("idle screen capture released" in line for line in events), events
 
 
 def test_layers_on_the_same_source_share_one_capture():
@@ -145,6 +193,38 @@ def test_stop_releases_every_capture():
     assert len(engine.pool.entries()) == 2
     engine.stop()
     assert engine.pool.entries() == []
+
+
+def test_removed_source_is_reattached_to_its_running_capture():
+    """Removing then re-adding a layer must not reopen its capture."""
+    project = two_patterns()
+    engine = AnyCamEngine(project, preview=True).build()
+    try:
+        engine.start()
+        pipeline = engine.pipeline
+        spec = engine._layer_specs["right"]
+        capture = engine.pool.entry(spec)
+        assert capture is not None
+
+        engine.detach_layer("right")
+        project.scene.remove_layer("right")
+        assert engine.pool.entry(spec) is capture
+        assert capture.refs == 0 and capture.retained
+
+        added = Layer("right2", "test", "Right again", source="blue",
+                      box=(0.5, 0.0, 0.5, 1.0), z=2)
+        project.scene.add_layer(added)
+        assert engine.add_layer(added) is True
+        assert engine.pipeline is pipeline, "re-add rebuilt the canvas"
+        assert engine.pool.entry(engine._layer_specs[added.id]) is capture
+        assert capture.refs == 1 and not capture.retained
+
+        deadline = time.monotonic() + 0.6
+        while time.monotonic() < deadline:
+            engine.pump(50)
+        assert added.id in engine._layer_pads
+    finally:
+        engine.stop()
 
 
 def test_health_flags_a_capture_that_stops():

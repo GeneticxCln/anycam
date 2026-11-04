@@ -525,11 +525,19 @@ def screen_chain(node_id: int, width: int, height: int, fps: int, layer=None,
     webcam) while reporting success.
     """
     chain = SourceChain()
-    # Screen nodes are DMA-BUF on niri/Wayland.  pipewiresrc cannot hand those
-    # to videoconvert directly ("no more input formats"); upload to GL and
-    # download to system memory first.  Compositors that expose only system
-    # memory take the old always-copy path.
+    # Screen nodes are DMA-BUF on Wayland compositors (niri and KineticWE/KWin
+    # included).  pipewiresrc cannot hand those to videoconvert directly ("no
+    # more input formats"); upload to GL and download to system memory first.
+    # Compositors that expose only system memory take the old always-copy path.
     props = {"do_timestamp": True, "path": str(int(node_id)),
+             # A screencast is damage-driven: the producer only supplies a new
+             # buffer when the shared surface changes.  pipewiresrc would
+             # otherwise offer that stream's clock as the canvas clock, so a
+             # static or throttled window made the whole preview (and every
+             # other layer) advance at the share's frame rate -- the "1 fps"
+             # window share.  Keep the canvas on the system clock and repeat
+             # the last screen frame until fresh damage arrives.
+             "provide_clock": False,
              # PipeWire defaults to a 16-buffer pool.  A screencast can run at
              # the monitor refresh (up to 120 Hz), so 16 queued frames mean the
              # preview is up to a second behind the desktop.  A small pool
@@ -586,9 +594,10 @@ def screen_chain(node_id: int, width: int, height: int, fps: int, layer=None,
     cropped_w, cropped_h = cropped_size(layer, crop_base[0], crop_base[1])
     _fit_letterbox(chain, cropped_w, cropped_h, width, height, rate=False)
     # The canvas layer_tail owns the output rate.  A forced framerate here
-    # makes niri's DMA-BUF stream emit one frame and then stall.  The same
-    # applies to videorate: a screencast advertises framerate=0/1 (variable),
-    # and a video-rate element fed with that can stop passing frames entirely.
+    # makes a damage-driven DMA-BUF screencast emit one frame and then stall.
+    # The same applies to videorate: a screencast advertises framerate=0/1
+    # (variable), and a video-rate element fed with that can stop passing
+    # frames entirely.
     _finish_chain(chain, width, height, fps, pin_rate=False)
     chain.pause_elements.append(src)
     chain.source_size = crop_base
@@ -689,6 +698,42 @@ def layer_tail(layer, source_size: tuple[int, int], width: int, height: int,
     _fit_letterbox(chain, cropped_w, cropped_h, width, height)
     _finish_chain(chain, width, height, fps)
     chain.source_size = (src_w, src_h)
+    return chain
+
+
+def background_chain(width: int, height: int, fps: int) -> SourceChain:
+    """The permanent branded standby behind every scene layer.
+
+    A live ``videotestsrc`` never EOSes, so the compositor always has a pad
+    producing frames at the canvas caps.  Removing the last source therefore
+    shows this slate immediately instead of leaving the previous video (or a
+    black background) on the virtual camera.  GStreamer spells the YUYV raw
+    format ``YUY2``; the device itself is still YUYV.
+    """
+    width = max(2, int(width))
+    height = max(2, int(height))
+    chain = SourceChain()
+    src = make("videotestsrc", "background_src", is_live=True,
+               pattern="black")
+    tail = caps_filter(
+        f"video/x-raw,format=YUY2,width={width},height={height},"
+        f"framerate={fps}/1")
+    chain.add(
+        src,
+        caps_filter(f"video/x-raw,width={width},height={height},"
+                    f"framerate={fps}/1"),
+        make("videoconvert"),
+        make("textoverlay", "background_label", text="AnyCam",
+             halignment="center", valignment="center",
+             # 96 px at 1080p; scale the point size with the canvas so a
+             # small preview does not become one clipped letter.
+             font_desc=f"Sans {max(24, min(96, height // 11))}",
+             color=0xFFFFFFFF),
+        tail,
+    )
+    chain.tail = tail
+    chain.pause_elements.append(src)
+    chain.source_size = (width, height)
     return chain
 
 

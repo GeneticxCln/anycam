@@ -441,6 +441,7 @@ def test_screen_chain_connects_with_the_node_id():
     chain = sources.screen_chain(123, 640, 360, 30, expected_size=(2560, 1440))
     source = chain.check_element
     assert source.get_property("path") == "123"
+    assert source.get_property("provide-clock") is False
     assert chain.expected_size == (2560, 1440)
 
 

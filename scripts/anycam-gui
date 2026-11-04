@@ -3,8 +3,10 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-if [ -x .venv/bin/anycam ]; then
-  exec .venv/bin/anycam gui "$@"
+# Run the module rather than the console script: a checkout that was moved
+# keeps a stale shebang in .venv/bin/anycam even when .venv/bin/python works.
+if [ -x .venv/bin/python ]; then
+  exec .venv/bin/python -m anycam gui "$@"
 fi
 export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 exec python3 -m anycam gui "$@"

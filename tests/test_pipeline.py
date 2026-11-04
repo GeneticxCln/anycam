@@ -48,6 +48,10 @@ def test_screen_capture_uploads_pipewire_dmabuf_frames():
                if element.get_factory() is not None
                and element.get_factory().get_name() == "pipewiresrc"]
     assert sources
+    # The canvas must own the clock.  Letting pipewiresrc provide the pipeline
+    # clock ties the whole compositor to the share's damage cadence, which is
+    # what turns a static/off-screen window share into a ~1 fps preview.
+    assert sources[0].get_property("provide-clock") is False
     if all(Gst.ElementFactory.find(name) is not None
            for name in ("glupload", "glcolorconvert", "gldownload")):
         assert "glupload" in names
@@ -267,23 +271,60 @@ def test_two_screen_layers_have_unique_elements():
         engine.pipeline.set_state(Gst.State.NULL)
 
 
-def test_empty_layout_builds_the_anycam_template_not_a_test_pattern():
+def test_empty_layout_shows_the_anycam_standby_background():
     project = make_project(320, 180, 30)
     project.scenes[0].layers = []
     engine = AnyCamEngine(project, preview=True).build()
     try:
-        assert "layer_template" in engine._layer_pads
         assert engine.scene.layers == []
-        from anycam.sources import template_chain
+        assert engine._layer_pads == {}
+        pad = engine._background_pad
+        assert pad is not None
+        assert pad.get_property("zorder") == 0
+        assert pad.get_property("alpha") == 1.0
+        assert pad.get_property("width") == 320
+        assert pad.get_property("height") == 180
 
-        chain = template_chain(320, 180, 30)
+        chain = engine._background_chain
+        assert chain is not None
         titles = [element.get_property("text") for element in chain.elements
                   if element.get_factory() is not None
                   and element.get_factory().get_name() == "textoverlay"]
         assert "AnyCam" in titles
-        assert not any("Test pattern" in str(title) for title in titles)
+        sources = [element for element in chain.elements
+                   if element.get_factory() is not None
+                   and element.get_factory().get_name() == "videotestsrc"]
+        assert sources and sources[0].get_property("is-live") is True
     finally:
         engine.pipeline.set_state(Gst.State.NULL)
+
+
+def test_removing_the_last_source_leaves_the_live_standby():
+    """The compositor must never end up with zero pads after a removal."""
+    project = make_project(320, 180, 30)
+    project.scenes[0].layers = [layer for layer in project.scenes[0].layers
+                                if layer.id == "layer_test"]
+    engine = AnyCamEngine(project, preview=True).build()
+    try:
+        engine.start()
+        deadline = time.monotonic() + 0.8
+        while time.monotonic() < deadline:
+            engine.pump(50)
+        assert engine._frame_count > 5
+
+        engine.detach_layer("layer_test")
+        project.scenes[0].remove_layer("layer_test")
+        assert engine._background_pad is not None
+        assert engine._layer_pads == {}
+
+        settled = engine._frame_count
+        deadline = time.monotonic() + 0.8
+        while time.monotonic() < deadline:
+            engine.pump(50)
+        assert engine._frame_count > settled, "the standby stopped producing"
+        assert engine.report.error == "", engine.report.error
+    finally:
+        engine.stop()
 
 
 def test_engine_composites_and_records(tmp_path):
@@ -402,8 +443,9 @@ def test_layer_opacity_and_order_are_applied_live():
 
         engine.scene.layer("layer_test").z = 20
         engine.refresh_layer_order()
-        assert engine._layer_pads["layer_test"].get_property("zorder") == 1
-        assert text_pad.get_property("zorder") == 0
+        assert engine._background_pad.get_property("zorder") == 0
+        assert engine._layer_pads["layer_test"].get_property("zorder") == 2
+        assert text_pad.get_property("zorder") == 1
     finally:
         engine.pipeline.set_state(Gst.State.NULL)
 
@@ -427,6 +469,52 @@ def test_face_overlay_is_a_compositor_pad(tmp_path):
         assert pad.get_property("alpha") == 1.0
     finally:
         engine.pipeline.set_state(Gst.State.NULL)
+
+
+class _FakePad:
+    def __init__(self):
+        self.props = {"xpos": 0, "ypos": 0, "width": 0, "height": 0,
+                      "zorder": 0, "alpha": 0.0}
+
+    def set_property(self, name, value):
+        self.props[name] = value
+
+    def get_property(self, name):
+        return self.props.get(name)
+
+
+def test_removed_screen_layer_reattaches_the_same_source():
+    """The portal stream is bound to pipewiresrc: keep it, relink its pad."""
+    project = make_project(320, 180, 30)
+    engine = AnyCamEngine(project, preview=True).build()
+    try:
+        screen = Layer("screen_live", "screen", "Screen", source="86",
+                       box=(0.0, 0.0, 1.0, 1.0), z=5)
+        pad = _FakePad()
+        chain = object()
+        engine.scene.add_layer(screen)
+        engine._layer_pads[screen.id] = pad
+        engine._layer_chains[screen.id] = chain
+        engine.layer_sources[screen.id] = (1920, 1080)
+        pipeline = engine.pipeline
+
+        engine.detach_layer(screen.id)
+        assert pad.get_property("alpha") == 0.0
+        assert screen.id not in engine._layer_pads
+        assert engine._detached_screens["86"][0]["chain"] is chain
+        project.scene.remove_layer(screen.id)
+
+        readded = Layer("screen_again", "screen", "Screen", source="86",
+                        box=(0.0, 0.0, 1.0, 1.0), z=5)
+        project.scene.add_layer(readded)
+        assert engine.add_layer(readded) is True
+        assert engine.pipeline is pipeline, "re-add rebuilt the canvas"
+        assert engine._layer_pads[readded.id] is pad
+        assert engine._layer_chains[readded.id] is chain
+        assert pad.get_property("alpha") == 1.0
+        assert "86" not in engine._detached_screens
+    finally:
+        engine.stop()
 
 
 def test_build_without_output_branch_is_rejected():

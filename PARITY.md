@@ -13,11 +13,13 @@ Status legend:
 * **blocked** — implementation exists but a platform/permission limit prevents
   verification.
 
-Last updated: 2026-10-31 (audit M0, M1 output pipelines, M1 capture source pool,
-network/output failure gates, media-layer fallback/loop gates, the
-vcam/audio/duplicate-capture gates, hidden-capture/camera-mode gates, and the
-source-health watchdog). Evidence paths name the private archive
-`~/anycam-private-evidence/evidence/` after the M0 move.
+Last updated: 2026-11-04 (KineticWE/KWin screen-capture clock fix and the Qt 6.12
+test environment; prior matrix 2026-10-31 covering audit M0, M1 output
+pipelines, M1 capture source pool, network/output failure gates, media-layer
+fallback/loop gates, the vcam/audio/duplicate-capture gates,
+hidden-capture/camera-mode gates, and the source-health watchdog). Evidence
+paths name the private archive `~/anycam-private-evidence/evidence/` after the
+M0 move.
 
 ## 1. Video sources
 
@@ -29,7 +31,7 @@ source-health watchdog). Evidence paths name the private archive
 | Two-camera scene preset | **verified** (offscreen) | **Add two-camera scene** creates `model.two_camera_scene` with two camera layers at `(0,0,0.5,1)` and `(0.5,0,0.5,1)`, using the first two detected devices. M0 fixed the geometry: each source is fitted into its box and letterboxed instead of being squeezed. | `tests/test_model.py::test_two_camera_scene_is_side_by_side`; `tests/test_gui.py::test_two_camera_scene_preset_positions_both_frames`; pixel check in `tests/test_audit_regressions.py::test_two_camera_boxes_show_their_own_half` and `test_camera_chain_letterboxes_a_1080p_mode` |
 | Three/four-camera grid preset | **verified** (offscreen) | **Add camera grid...** opens `CameraGridDialog` with four 2×2 cells; each cell is assigned a detected camera or left empty, and requires at least three distinct devices. `model.camera_grid_scene` places the non-empty slots at equal quarter cells (three cameras can occupy any three cells). | `tests/test_model.py::test_camera_grid_scene_fills_four_slots` and `test_camera_grid_scene_leaves_configured_slots_empty`; `tests/test_gui.py::test_camera_grid_dialog_prefills_detected_cameras`, `test_camera_grid_scene_button_builds_the_selected_slots`, `test_camera_grid_needs_three_devices` |
 | Camera hot-plug reconnect | **verified** (offscreen); physical pull still blocked | A missing camera node keeps its box in the graph as an opaque generated placeholder card (`AnyCamEngine(skip_layers=…)` + `overlay.render_camera_placeholder`), so the rest of the scene stays live and the slot keeps its position. The same placeholder appears when preview starts with a camera absent. A 1.2 s watcher rebuilds with the real camera when the node returns. A deliberately stopped preview is not restarted. | `tests/test_overlay.py::test_camera_placeholder_is_an_opaque_labeled_card`; `tests/test_pipeline.py::test_skipped_camera_builds_a_placeholder_pad` and `test_all_skipped_cameras_still_build_placeholders`; `tests/test_gui.py::test_camera_loss_drops_layer_but_keeps_preview_alive`, `test_all_lost_cameras_still_show_placeholder_frames` and `test_camera_reconnects_when_its_device_returns` |
-| Screen/window capture via xdg-desktop-portal + PipeWire | **partial** | `portal.request_screen_cast` drives CreateSession → SelectSources → Start → OpenPipeWireRemote; `sources.screen_chain` uses the node id and fd, and the Layers tab has a Screen button | The portal flow is implemented and unit-tested, but no live screen-capture artifact is checked in; a saved screen layer re-requests access on the next engine start |
+| Screen/window capture via xdg-desktop-portal + PipeWire | **partial** | `portal.request_screen_cast` drives CreateSession → SelectSources → Start → OpenPipeWireRemote; `sources.screen_chain` uses the node id and fd, and the Layers tab has a Screen button. The canvas keeps the system clock (`pipewiresrc provide-clock=false`), so damage-driven share cadence cannot cap the whole preview. | The portal flow is implemented and unit-tested, including the clock regression (`tests/test_pipeline.py`, `tests/test_audit_regressions.py`); no live screen-capture artifact is checked in, and a saved screen layer re-requests access on the next engine start |
 | Image source | **verified** | `sources.image_chain` (PNG/JPEG/WebP, `imagefreeze`); Layers tab Image button | Full-frame image source tested (`--source plate.png`); effects + crop wired; GUI image-layer creation covered by `tests/test_gui.py` |
 | Video-file source | **verified** | `pool.SourcePool` captures `filesrc ! decodebin`; Layers tab Video button. After EOS, `poll_errors` seeks the video capture pipeline to 0, so the layer loops instead of ending black. | Full-frame video playback tested (`--source colorful.mp4`), 60 fps; `tests/test_pipeline.py::test_video_layer_loops_without_a_black_frame` confirms a second pass and red centre; GUI video-layer creation covered by `tests/test_gui.py` |
 | Missing media fallback | **verified** | A missing image/video/logo/face path builds `overlay.render_media_error_card` in the layer box and records `media_errors`; the rest of the canvas stays live. | `tests/test_pipeline.py::test_missing_media_layers_render_cards_without_stopping_scene` |
@@ -83,6 +85,10 @@ source-health watchdog). Evidence paths name the private archive
 | Continuous MP4 across canvas rebuilds | **verified** | A session-owned `Recorder` keeps `mp4mux`/filesink alive while engines attach and detach encoded taps; encoder PTS resets are remapped onto the session timeline. | `tests/test_recorder.py::test_two_engines_write_one_continuous_file`, `tests/test_gui.py::test_layer_edit_while_recording_keeps_one_continuous_file` |
 | Persistent virtual camera across rebuilds | **verified (offscreen wiring)** | A window-owned `VcamOutput` keeps `v4l2sink` PLAYING while engines attach and detach taps; the input is not stopped by a canvas rebuild. Real loopback consumer verification still needs `/dev/video10`. | `tests/test_vcam_output.py`, `tests/test_gui.py::test_vcam_output_survives_engine_restarts` |
 | Vcam diagnostics and queue bound | **verified** | Inactive output errors reach `report.vcam_error`, `config.vcam_available(device)` checks the configured node, and both the session and legacy appsrc paths cap at 2 buffers with a downstream leak. | `tests/test_vcam_output.py::test_inactive_vcam_output_is_reported`, `::test_legacy_vcam_appsrc_is_bounded`, `::test_missing_vcam_device_fails_without_a_pipeline` |
+| Vcam converts once per frame | **verified (measured)** | The canvas tap forwards RGBA samples; `VcamOutput` does the only RGBA→YUYV conversion, pinning the driver's colorimetry. A second conversion in the tap was a duplicated 1080p60 pass. | `.freebuff/video-audit/vcam-tap-ab.py`: 58.5% → 40.9% of one core for 480 frames at 60 fps; `tests/test_vcam_output.py::test_engine_uses_a_session_vcam_tap` asserts the tap caps are RGBA and no tap converter exists |
+| GPU vcam conversion with CPU fallback | **verified** | The single conversion runs through `glupload → glcolorconvert → gldownload` when available (~21% vs ~31% of a core at 1080p60). A first-frame probe on the real sink gates the choice; a missing element or failed probe rebuilds the `videoconvert` chain. | `tests/test_vcam_output.py::test_vcam_uses_gpu_conversion_when_available`, `::test_vcam_falls_back_to_cpu_when_gl_is_missing`, `::test_vcam_falls_back_when_the_gl_probe_fails` |
+| Vcam conversion diagnostics | **verified** | Settings → Diagnostics shows the running output's chosen converter and benchmarks both chains in a background thread at the project size/rate; `anycam doctor` publishes the same `vcam_conversion` numbers. | `tests/test_gui_many.py::test_diagnostics_tab_shows_the_measured_conversion_cost`, `tests/test_vcam_output.py::test_measure_conversion_reports_both_paths` |
+| Listed by Chromium-based apps (Discord/Vesktop, Chrome) | **partial — module reload pending** | Chromium enumerates v4l nodes through udev and skips one that advertises capture and output together. The module default `exclusive_caps=0` produces `:capture:video_output:`; loading it with `1` makes the node capture-only while AnyCam writes, which is what the app requires. `Settings → Diagnostics` reports the loaded parameter and offers **Fix Discord visibility**, which releases AnyCam's handle, reloads the module through `pkexec`, and re-holds the device; `scripts/enable-v4l2loopback.sh` does the same from a terminal. | `udevadm info /dev/video10` on this machine (2026-11-04, app stopped): `ID_V4L_CAPABILITIES=:capture:video_output:` with `exclusive_caps=N,…`; `vesktop-bin` 1.6.8 and `google-chrome` 157 installed; `tests/test_vcam_output.py::test_vcam_exclusive_caps_reads_the_module_parameter`, `::test_reload_vcam_module_uses_pkexec_with_chromium_caps`, `::test_reload_vcam_module_reports_when_the_node_is_in_use`, `::test_enable_script_loads_the_module_with_chromium_caps`; `tests/test_gui_many.py::test_diagnostics_fix_button_reloads_and_reholds_the_device`, `::test_diagnostics_fix_button_surfaces_an_authorization_failure` |
 | Audio + video synchronised | **verified** | AAC branch built when `--audio` is used; SystemClock; 5 s record buffer | `evidence/04_audio/av.mp4`, `verify.json` (av_sync true, 0.078 s) |
 | 10-min 1080p60 soak | **pass on drops/memory/stalls** (2026-10-31 synthetic re-run; vcam blocked) | `soak.py` + `scripts/soak.sh`. 600.15 s, 36,009 frames at 60.0 fps, 0.0% preview/recorded drops; RSS 188.7 → 189.0 MiB (0.043 MiB/min, settled 0.038), 12 → 12 FDs, no stalls; finalised 600.15 s MP4 with 36,009 packets. `acceptance.overall=blocked` only because `/dev/video10` was absent (v4l2loopback not loaded). | `evidence/soak_10m/report.json` |
 
@@ -110,7 +116,7 @@ source-health watchdog). Evidence paths name the private archive
 | Project state persistence | **verified** (offscreen) | `EditorConfig` snap settings + `PlaylistConfig` per scene + 800 ms autosave/close save | `tests/test_gui.py` restores snap, playlist and unsaved layer state across windows; `tests/test_model.py` round-trips the new JSON fields |
 | Effect/scene controls | **partial** | Effects tab, scene list, output tab, Audio tab, Playlist tab | Controls exist; before/after captures pending |
 | Desktop entry | **verified** | path-independent `anycam.desktop` + `scripts/install-desktop.sh` | `desktop-file-validate` passes; the installer expands `Exec`/`TryExec` and installs the icon (verified with a temporary `XDG_DATA_HOME`) |
-| Windowed launch on niri | **partial** | `scripts/anycam-gui` | Deliberately not launched on the live desktop; no-window constraint |
+| Windowed launch on Wayland (KineticWE/KWin, niri) | **partial** | `scripts/anycam-gui` | The launcher now runs `python -m anycam` so a moved checkout cannot break it via a stale console-script shebang |
 
 ## Virtual camera in Firefox
 
@@ -121,8 +127,11 @@ source-health watchdog). Evidence paths name the private archive
 Required user action:
 
 ```bash
-sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
+sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam exclusive_caps=1
 ```
+
+`exclusive_caps=1` is also what makes Discord, Vesktop and Chrome list the
+node at all; with `0` they ignore it.
 
 ## Long-run stability
 
@@ -137,7 +146,7 @@ sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam
 |---|---|---|
 | Clean-room, original branding/assets, no ManyCam runtime | **verified** | Original `assets/anycam-logo.png`, no Wine/Proton dependency, no ManyCam files referenced at runtime |
 | Local recordings, no telemetry/cloud | **verified** | No network code except user-supplied source/RTMP fields |
-| Wayland portal capture, no niri-only API | **verified** (spike) | `xdg-desktop-portal` ScreenCast + PipeWire |
+| Wayland portal capture, no compositor-only API | **verified** (spike) | `xdg-desktop-portal` ScreenCast + PipeWire |
 | Reversible system changes | **verified** | Only `modprobe v4l2loopback`; `scripts/disable-v4l2loopback.sh`; documented |
 | Reproducible build/run docs | **verified** | `README.md`, `scripts/setup.sh` |
-| Runnable automated tests | **verified** | `./scripts/test.sh` (150 passed, 1 hardware-gated multicam skip; 151 collected); `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |
+| Runnable automated tests | **verified** | `./scripts/test.sh` (218 passed, 1 hardware-gated multicam skip; 219 collected) after installing PySide6 6.12 to match Qt 6.12; `.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 |

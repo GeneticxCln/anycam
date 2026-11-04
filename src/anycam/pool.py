@@ -41,6 +41,12 @@ from .sources import (
 )
 
 CAPTURE_KINDS = ("camera", "test", "video", "network", "screen")
+# A canvas rebuild releases every capture and immediately acquires it again.
+# Re-creating a screencast's pipewiresrc on a static window gives the rebuilt
+# canvas no frames until the window repaints, which is a black screen.  Keep a
+# released screen capture alive for a moment so the rebuild reuses the running
+# source (and the frame it already has).
+SCREEN_IDLE_GRACE_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -72,6 +78,14 @@ class Entry:
     loops: int = 0
     frames: int = 0
     last_frame: float = 0.0
+    # Set when the last ref was released; a screen capture stays alive until
+    # the grace expires so a rebuild can take it over instead of re-opening
+    # the damage-driven portal stream.
+    idle_since: float = 0.0
+    # A removed layer retains its capture for the whole app lifetime.  The
+    # device/stream must stay open so re-adding the source is a relink, not a
+    # new capture (on Wayland a new pipewiresrc means a new portal prompt).
+    retained: bool = False
 
     def as_dict(self) -> dict:
         return {
@@ -144,11 +158,14 @@ def capture_spec(layer, canvas_w: int, canvas_h: int, fps: int, *,
                 node = None
         if node is None:
             raise RuntimeError("screen layer requires a PipeWire node id from the portal")
-        # Some portal/compositor combinations report 1x1 for a valid stream.
-        # Asking pipewiresrc for that size makes it fail with not-negotiated.
+        # Some portal/compositor combinations report 1x1 (or 0x0) for a valid
+        # stream.  Asking pipewiresrc for that size makes it fail; leaving it
+        # unknown lets _screen scale to the canvas instead -- and, importantly,
+        # stops the size probe from comparing a real 3831x2100 window against
+        # the canvas fallback and reporting a bogus "portal stream" mismatch.
         expected = screen_size
-        if not expected or expected[0] <= 1 or expected[1] <= 1:
-            expected = (max(2, canvas_w), max(2, canvas_h))
+        if expected and (expected[0] <= 1 or expected[1] <= 1):
+            expected = None
         return CaptureSpec("screen", str(node), canvas_w, canvas_h, fps,
                            fd=screen_fd, expected=expected)
     if kind == "video":
@@ -172,26 +189,99 @@ class SourcePool:
         # channel when it is shown again.
         self._channels: dict[CaptureSpec, str] = {}
         self._started = False
+        # Optional sink for session events (the GUI routes these to the
+        # Diagnostics log).  Kept as a callback so the pool stays UI-free.
+        self.log_event = None
 
     # ------------------------------------------------------------------ public
+    def _note(self, message: str) -> None:
+        callback = self.log_event
+        if callback is None:
+            return
+        try:
+            callback(message)
+        except Exception:  # noqa: BLE001 - logging must not break a capture
+            pass
+
     def acquire(self, spec: CaptureSpec) -> Entry:
+        self.sweep()
         entry = self._entries.get(spec)
         if entry is None:
             entry = self._build(spec)
             self._entries[spec] = entry
             if self._started:
                 entry.pipeline.set_state(Gst.State.PLAYING)
+        elif entry.refs == 0 and entry.idle_since and spec.kind == "screen":
+            self._note(
+                f"screen capture reused after a rebuild (node {spec.source})")
+        elif entry.refs == 0 and entry.retained:
+            self._note(f"capture reused after re-add ({entry.channel})")
+        entry.idle_since = 0.0
+        entry.retained = False
         entry.refs += 1
         return entry
+
+    def pin(self, spec: CaptureSpec) -> None:
+        """Keep a capture alive when its last visible layer is removed.
+
+        Removal is not teardown: the source element and its device/portal
+        stream must stay alive so adding the source back only relinks it.
+        ``stop()`` still releases every retained capture at app exit.
+        """
+        entry = self._entries.get(spec)
+        if entry is None:
+            return
+        entry.retained = True
+        entry.idle_since = 0.0
+        self._note(f"capture retained for re-add ({entry.channel})")
 
     def release(self, spec: CaptureSpec) -> None:
         entry = self._entries.get(spec)
         if entry is None:
             return
         entry.refs -= 1
-        if entry.refs <= 0:
+        if entry.refs > 0:
+            return
+        if entry.retained:
+            # The layer was removed, not hidden.  Keep the pipeline PLAYING
+            # (and the device/portal stream open) until the app exits.
+            entry.idle_since = 0.0
+            return
+        if entry.spec.kind == "screen":
+            entry.idle_since = time.monotonic()
+            self._note(
+                f"screen capture kept alive for the next rebuild "
+                f"(node {entry.spec.source})")
+            return
+        entry.pipeline.set_state(Gst.State.NULL)
+        del self._entries[spec]
+
+    def discard(self, spec: CaptureSpec) -> None:
+        """Drop a released capture immediately (a removed layer's source).
+
+        Removal is final, unlike a canvas rebuild: do not keep an idle screen
+        capture around for a layer that no longer exists.  A capture shared
+        with another layer stays alive for its remaining references.
+        """
+        entry = self._entries.get(spec)
+        if entry is None or entry.refs > 0 or entry.retained:
+            return
+        entry.pipeline.set_state(Gst.State.NULL)
+        del self._entries[spec]
+        self._note(f"capture released on removal ({entry.channel})")
+
+    def sweep(self) -> None:
+        """Tear down screen captures whose rebuild grace has expired."""
+        now = time.monotonic()
+        for spec, entry in list(self._entries.items()):
+            if entry.retained or entry.refs > 0 or not entry.idle_since:
+                continue
+            if now - entry.idle_since < SCREEN_IDLE_GRACE_S:
+                continue
             entry.pipeline.set_state(Gst.State.NULL)
             del self._entries[spec]
+            self._note(
+                f"idle screen capture released (node {entry.spec.source})")
 
     def channel_for(self, spec: CaptureSpec) -> str:
         """Stable channel for a spec, even while its capture is released."""
@@ -219,6 +309,7 @@ class SourcePool:
         return list(self._entries.values())
 
     def poll_errors(self) -> None:
+        self.sweep()
         for entry in self._entries.values():
             bus = entry.pipeline.get_bus()
             if bus is None:
@@ -453,4 +544,9 @@ class SourcePool:
             # the canvas layer_tail already owns the output rate.
             caps_filter(f"video/x-raw,format=RGBA,width={expected[0]},height={expected[1]}"),
         ])
-        return _Built(elements, tuple(expected), check=src, check_size=tuple(expected))
+        # Only probe the size when the portal actually reported one.  With an
+        # unknown (0x0) size, the stream is legitimately larger than the
+        # canvas and is scaled here; comparing it would raise a false alarm.
+        check_size = tuple(spec.expected) if spec.expected else None
+        return _Built(elements, tuple(expected), check=src,
+                      check_size=check_size)

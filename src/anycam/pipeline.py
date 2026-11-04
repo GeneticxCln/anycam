@@ -23,8 +23,8 @@ from .model import Layer, Project, Scene
 from .engine.outputs.recorder import Recorder
 from .engine.outputs.vcam import VcamOutput
 from .pool import CAPTURE_KINDS, CaptureSpec, SourcePool, capture_spec
-from .sources import (SourceChain, build_chain, caps_filter, caps_string,
-                      image_chain, layer_tail, make)
+from .sources import (SourceChain, background_chain, build_chain,
+                      caps_filter, caps_string, image_chain, layer_tail, make)
 
 Gst.init(None)
 
@@ -181,6 +181,15 @@ class AnyCamEngine:
         self.bus: Gst.Bus | None = None
         self.chains: list[SourceChain] = []
         self._layer_pads: dict[str, Gst.Pad] = {}
+        # Permanent zorder=0 standby.  It is deliberately not a scene layer:
+        # no remove/add/layout operation can ever detach this pad.
+        self._background_pad: Gst.Pad | None = None
+        self._background_chain: SourceChain | None = None
+        # A screen layer's pipewiresrc owns the portal stream: keep the chain
+        # addressable so deleting the layer can hide its pad without tearing
+        # the source down.  Re-adding then relinks that same source.
+        self._layer_chains: dict[str, SourceChain] = {}
+        self._detached_screens: dict[str, list[dict]] = {}
         # Preview delivery waits until every compositor pad has produced a
         # buffer, so the first shown frame is not the bare background.
         self._pads_with_data: set[str] = set()
@@ -225,6 +234,31 @@ class AnyCamEngine:
         self._audio_eos_pads: list[Gst.Pad] = []
 
     # ------------------------------------------------------------------ build
+    def _build_background(self) -> None:
+        """Create the one compositor pad that is never removed."""
+        assert self.compositor is not None
+        chain = background_chain(self.canvas_w, self.canvas_h, self.fps)
+        self._background_chain = chain
+        self.chains.append(chain)
+        self._add(*chain.elements)
+        self._link(chain.elements)
+        pad = self.compositor.request_pad_simple("sink_%u")
+        if pad is None:
+            raise RuntimeError("compositor refused the background pad")
+        pad.set_property("xpos", 0)
+        pad.set_property("ypos", 0)
+        pad.set_property("width", self.canvas_w)
+        pad.set_property("height", self.canvas_h)
+        pad.set_property("zorder", 0)
+        pad.set_property("alpha", 1.0)
+        if chain.output_pad.link(pad) != Gst.PadLinkReturn.OK:
+            raise RuntimeError("could not link the AnyCam standby background")
+        self._background_pad = pad
+        print(
+            f"[background] live AnyCam standby "
+            f"{self.canvas_w}x{self.canvas_h}@{self.fps} zorder=0",
+            file=sys.stderr, flush=True)
+
     def _add(self, *elements: Gst.Element) -> None:
         assert self.pipeline is not None
         for element in elements:
@@ -447,6 +481,7 @@ class AnyCamEngine:
         if chain.output_pad.link(pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError(f"could not link {layer.name} into the compositor")
         self._layer_pads[layer.id] = pad
+        self._layer_chains[layer.id] = chain
 
         def on_first_buffer(_pad, _info, layer_id=layer.id):
             self._pads_with_data.add(layer_id)
@@ -530,22 +565,21 @@ class AnyCamEngine:
             caps_string(self.canvas_w, self.canvas_h, self.fps), "canvas_caps")
         self._add(self.compositor, rate, canvas_caps, self.tee)
         self._link([self.compositor, rate, canvas_caps, self.tee])
+        # The compositor must never reach zero pads.  This one is live for the
+        # whole canvas lifetime and sits behind every scene layer.
+        self._build_background()
 
         # Build hidden layers too: the playlist toggles their pad alpha live,
         # which is impossible if they were never added to the compositor.
         layers = sorted(self.scene.layers, key=lambda l: l.z)
-        if not layers:
-            # An empty layout is a deliberate state, not a broken feed: show
-            # the branded AnyCam template instead of a test pattern.
-            layers = [Layer("layer_template", "template", "AnyCam",
-                            box=(0, 0, 1, 1))]
-        else:
-            # Skipped camera layers still build a placeholder card; skipped
-            # non-camera layers are left out of the graph.
-            layers = [layer for layer in layers
-                      if layer.kind == "camera" or layer.id not in self.skip_layers]
+        # Skipped camera layers still build a placeholder card; skipped
+        # non-camera layers are left out of the graph.
+        layers = [layer for layer in layers
+                  if layer.kind == "camera" or layer.id not in self.skip_layers]
         try:
-            for zorder, layer in enumerate(layers):
+            # zorder 0 belongs to the permanent standby; scene layers start
+            # at 1 so hiding/removing them can never expose a padless graph.
+            for zorder, layer in enumerate(layers, start=1):
                 self._add_layer(layer, zorder)
         except Exception:
             # A half-built graph must not leave capture pipelines running.
@@ -619,11 +653,13 @@ class AnyCamEngine:
         """A size the GUI can paint without copying the whole canvas.
 
         The preview widget is far smaller than the canvas, and every frame is
-        copied into a QImage on the GUI thread.  At 2560x1440 that copy alone
-        is ~14 MB per frame at 60 fps, which is what made the preview trail
-        the desktop.
+        copied into a QImage on the GUI thread.  The panel is ~1236 px wide at
+        the default window size, so 960x540 is already panel resolution and
+        costs ~14% less CPU than 1280x720 at 60 fps.  Only the preview is
+        scaled down: canvas, recording and the virtual camera keep the project
+        resolution.
         """
-        limit_w, limit_h = 1280, 720
+        limit_w, limit_h = 960, 540
         scale = min(1.0, limit_w / max(1, self.canvas_w),
                     limit_h / max(1, self.canvas_h))
         width = max(2, int(self.canvas_w * scale) // 2 * 2)
@@ -849,19 +885,27 @@ class AnyCamEngine:
                 self.report.vcam_error = (self.vcam_output.error or
                                           f"virtual camera {device} is not running")
                 return
-            fmt = self.vcam_output.pixel_format
-            caps_text = caps_string(self.canvas_w, self.canvas_h, self.fps, fmt)
+            # The virtual camera has one fixed output mode, like OBS's Linux
+            # v4l2sink output.  The canvas may resize or change layout while
+            # the device stays open, so scale/rate the tap into that mode
+            # instead of reopening v4l2sink (which kills consumers' handles).
+            out_w = int(getattr(self.vcam_output, "width", self.canvas_w))
+            out_h = int(getattr(self.vcam_output, "height", self.canvas_h))
+            out_fps = int(getattr(self.vcam_output, "fps", self.fps))
+            caps_text = caps_string(out_w, out_h, out_fps, "RGBA")
             queue = self._branch("vcam")
             queue.set_property("leaky", 2)  # downstream: drop old buffers
             valve = make("valve", "vcam_valve", drop=False)
             self._vcam_valve = valve
-            convert = make("videoconvert")
+            scale = make("videoscale", "vcam_scale")
+            rate = make("videorate", "vcam_rate")
             caps = caps_filter(caps_text, "vcam_caps")
             appsink = make("appsink", "vcam_appsink", emit_signals=True,
                            max_buffers=2, drop=True, sync=False)
-            self._add(valve, convert, caps, appsink)
-            self._link([queue, valve, convert, caps, appsink])
+            self._add(valve, scale, rate, caps, appsink)
+            self._link([queue, valve, scale, rate, caps, appsink])
             appsink.connect("new-sample", self._on_vcam_sample)
+            self._notify_canvas_attached(True)
             self.report.vcam_active = True
             return
 
@@ -919,19 +963,39 @@ class AnyCamEngine:
         else:
             self._vcam_valve.set_property("drop", False)
             self.report.vcam_active = True
+        self._notify_canvas_attached(self._vcam_valve is not None)
+        if self._vcam_valve is not None:
+            # A recovered output may still be frozen from an empty scene.
+            self.resume_vcam()
         return self._vcam_valve is not None
 
     def detach_vcam(self) -> None:
         """Stop feeding the virtual camera without touching the canvas."""
         if self._vcam_valve is not None:
             self._vcam_valve.set_property("drop", True)
-        self.vcam_output = None
+        output, self.vcam_output = self.vcam_output, None
         self.want_vcam = False
         self.report.vcam_active = False
+        if output is not None:
+            setter = getattr(output, "set_canvas_attached", None)
+            if setter is not None:
+                setter(False)
+
+    def _notify_canvas_attached(self, attached: bool) -> None:
+        """Tell the session sink whether the canvas currently owns it."""
+        setter = getattr(self.vcam_output, "set_canvas_attached", None)
+        if setter is not None:
+            setter(attached)
 
     def _on_vcam_sample(self, sink):
         sample = sink.emit("pull-sample")
         if sample is not None:
+            if not getattr(self, "_vcam_sample_logged", False):
+                self._vcam_sample_logged = True
+                caps = sample.get_caps()
+                print(f"[vcam-tap] first canvas sample "
+                      f"{caps.to_string() if caps else 'no caps'}",
+                      file=sys.stderr, flush=True)
             if self.vcam_output is not None:
                 self.vcam_output.push_sample(sample)
             elif self._vcam_appsrc is not None:
@@ -1270,6 +1334,173 @@ class AnyCamEngine:
                 if spec in self._specs:
                     self._specs.remove(spec)
                 self._layer_acquired.discard(layer_id)
+        # The permanent standby keeps the canvas alive when every scene layer
+        # is hidden, so the vcam must never be left frozen on an old frame.
+        self.resume_vcam()
+
+    def freeze_vcam(self) -> None:
+        """Hold the last canvas frame on the vcam while the scene is empty."""
+        output = self.vcam_output
+        if output is None:
+            return
+        freezer = getattr(output, "freeze_last_frame", None)
+        if freezer is not None:
+            freezer()
+        if self._vcam_valve is not None:
+            self._vcam_valve.set_property("drop", True)
+
+    def resume_vcam(self) -> None:
+        """Resume the canvas feed after a source becomes visible again."""
+        output = self.vcam_output
+        if output is None:
+            return
+        if self._vcam_valve is not None:
+            self._vcam_valve.set_property("drop", False)
+        resume = getattr(output, "resume_canvas", None)
+        if resume is not None:
+            resume()
+
+    def detach_layer(self, layer_id: str) -> None:
+        """Remove one layer's contribution without rebuilding the canvas.
+
+        Removal must not destroy the source.  A screen layer's pipewiresrc
+        owns the portal session, so it stays PLAYING, linked to an alpha=0
+        compositor pad, and is reattached when the source is added back.  A
+        pooled capture (camera/video/network/test) is pinned for the same
+        reason; its device is not reopened on re-add.
+        """
+        layer = next((l for l in self.scene.layers if l.id == layer_id), None)
+        if layer is None:
+            return
+        if layer.kind == "screen":
+            self._detach_screen_layer(layer)
+            self.resume_vcam()
+            return
+        spec = self._layer_specs.get(layer_id)
+        if spec is not None:
+            # Pin before set_layer_visible releases this layer's reference:
+            # the capture pipeline keeps running for the app lifetime.
+            self.pool.pin(spec)
+        self.set_layer_visible(layer_id, False)
+        spec = self._layer_specs.pop(layer_id, None)
+        if spec is not None and spec in self._specs:
+            self._specs.remove(spec)
+        self._layer_acquired.discard(layer_id)
+        pad = self._layer_pads.pop(layer_id, None)
+        if pad is not None:
+            # Keep the pad linked but invisible.  Releasing a requested pad
+            # while the compositor is PLAYING can make that branch post
+            # not-linked; the next explicit rebuild drops it for real.
+            pad.set_property("alpha", 0.0)
+        self._layer_chains.pop(layer_id, None)
+        self._layer_frames.pop(layer_id, None)
+        self._layer_last.pop(layer_id, None)
+        self._pads_with_data.discard(layer_id)
+        self.layer_sources.pop(layer_id, None)
+        self._camera_modes.pop(layer_id, None)
+
+    def _detach_screen_layer(self, layer: Layer) -> None:
+        """Hide a screen layer while leaving its portal source untouched."""
+        layer_id = layer.id
+        pad = self._layer_pads.get(layer_id)
+        chain = self._layer_chains.get(layer_id)
+        if pad is not None:
+            pad.set_property("alpha", 0.0)
+        if pad is not None and chain is not None:
+            self._detached_screens.setdefault(str(layer.source), []).append({
+                "chain": chain,
+                "pad": pad,
+                "layer_id": layer_id,
+                "crop": tuple(layer.crop),
+                "effects": copy.deepcopy(layer.effects),
+                "source_size": self.layer_sources.get(layer_id, (0, 0)),
+                "frames": self._layer_frames.get(layer_id, 0),
+                "last": self._layer_last.get(layer_id, 0.0),
+            })
+            print(
+                f"[screen-session] detached layer={layer_id} "
+                f"node={layer.source}; source stays PLAYING for re-add",
+                file=sys.stderr, flush=True)
+        layer.visible = False
+        self._layer_pads.pop(layer_id, None)
+        self._layer_chains.pop(layer_id, None)
+        self._layer_frames.pop(layer_id, None)
+        self._layer_last.pop(layer_id, None)
+        self._pads_with_data.discard(layer_id)
+        self.layer_sources.pop(layer_id, None)
+        self._layer_specs.pop(layer_id, None)
+        self._layer_acquired.discard(layer_id)
+        self._camera_modes.pop(layer_id, None)
+
+    def add_layer(self, layer: Layer, *, screen_fd: int = -1,
+                  screen_size: tuple[int, int] | None = None) -> bool:
+        """Attach a new layer to the running canvas instead of rebuilding.
+
+        Returns False when the graph is not running (the caller then builds
+        one), or when attaching failed.  A previously removed screen layer is
+        reattached to its still-PLAYING pipewiresrc and compositor pad, so no
+        portal picker appears and the virtual camera never stops.
+        """
+        if self.pipeline is None or self.compositor is None:
+            return False
+        if layer.kind == "screen":
+            detached = self._detached_screens.get(str(layer.source), [])
+            for index, entry in enumerate(detached):
+                if (tuple(layer.crop) != entry["crop"]
+                        or layer.effects != entry["effects"]):
+                    continue
+                detached.pop(index)
+                if not detached:
+                    self._detached_screens.pop(str(layer.source), None)
+                pad = entry["pad"]
+                chain = entry["chain"]
+                self._layer_pads[layer.id] = pad
+                self._layer_chains[layer.id] = chain
+                self.layer_sources[layer.id] = entry["source_size"]
+                self._layer_frames[layer.id] = entry["frames"]
+                self._layer_last[layer.id] = entry["last"]
+                self._pads_with_data.add(layer.id)
+                pad.set_property(
+                    "alpha",
+                    float(clamp(layer.alpha)) if layer.visible else 0.0)
+                self.set_layer_box(layer.id, layer.box)
+                self.refresh_layer_order()
+                check = getattr(chain, "check_element", None)
+                health_pad = (check.get_static_pad("src")
+                              if check is not None else None)
+                if health_pad is not None:
+                    def on_buffer(_pad, _info, layer_id=layer.id):
+                        self._layer_frames[layer_id] = (
+                            self._layer_frames.get(layer_id, 0) + 1)
+                        self._layer_last[layer_id] = time.monotonic()
+                        return Gst.PadProbeReturn.OK
+
+                    health_pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
+                print(
+                    f"[screen-session] reattached layer={layer.id} "
+                    f"node={layer.source} without a portal request",
+                    file=sys.stderr, flush=True)
+                self.resume_vcam()
+                return True
+        if layer.kind == "screen":
+            self.screen_fds[layer.id] = int(screen_fd)
+            if screen_size is not None:
+                self.screen_sizes[layer.id] = screen_size
+        ordered = sorted(self.scene.layers, key=lambda item: item.z)
+        try:
+            zorder = max(1, ordered.index(layer) + 1)
+        except ValueError:
+            zorder = max(1, len(ordered))
+        try:
+            self._add_layer(layer, zorder)
+        except Exception as exc:  # noqa: BLE001 - the caller rebuilds on failure
+            print(
+                f"[engine] could not attach {layer.name} live: {exc}",
+                file=sys.stderr, flush=True)
+            return False
+        self.refresh_layer_order()
+        self.resume_vcam()
+        return True
 
     def set_layer_alpha(self, layer_id: str, alpha: float) -> None:
         """Change a layer's opacity without rebuilding the compositor."""
@@ -1282,8 +1513,14 @@ class AnyCamEngine:
             pad.set_property("alpha", layer.alpha)
 
     def refresh_layer_order(self) -> None:
-        """Push the model's z-order onto every existing compositor pad."""
-        for zorder, layer in enumerate(sorted(self.scene.layers, key=lambda l: l.z)):
+        """Push the model's z-order onto every existing compositor pad.
+
+        zorder 0 is reserved for the permanent standby background, so scene
+        layers always start at 1 and can never cover the graph's only pad if
+        the scene becomes empty.
+        """
+        layers = sorted(self.scene.layers, key=lambda l: l.z)
+        for zorder, layer in enumerate(layers, start=1):
             pad = self._layer_pads.get(layer.id)
             if pad is not None:
                 pad.set_property("zorder", int(zorder))
@@ -1303,10 +1540,14 @@ class AnyCamEngine:
         if pad is None:
             return
         rect = box_pixels(layer, self.canvas_w, self.canvas_h)
-        pad.set_property("xpos", rect.x)
-        pad.set_property("ypos", rect.y)
-        pad.set_property("width", rect.w)
-        pad.set_property("height", rect.h)
+        # Do not write a pad property that already has this value.  A layout
+        # click often re-applies the same full-frame box; an unnecessary
+        # compositor pad update can reconfigure the sink and leave a
+        # damage-driven screen source with no buffer to present.
+        for name, value in (("xpos", int(rect.x)), ("ypos", int(rect.y)),
+                            ("width", int(rect.w)), ("height", int(rect.h))):
+            if int(pad.get_property(name)) != value:
+                pad.set_property(name, value)
 
     # ------------------------------------------------------------------- run
     def start(self) -> "AnyCamEngine":
@@ -1533,6 +1774,13 @@ class AnyCamEngine:
         while time.monotonic() < deadline and not self._eos_seen:
             self.pump(100)
         self.pipeline.set_state(Gst.State.NULL)
+        # The tap died with this canvas.  Release the held device back to its
+        # idle card so the next engine can attach, instead of leaving the
+        # output thinking it still owns the feed.
+        if self.vcam_output is not None:
+            setter = getattr(self.vcam_output, "set_canvas_attached", None)
+            if setter is not None:
+                setter(False)
         for spec in self._specs:
             self.pool.release(spec)
         self._specs.clear()

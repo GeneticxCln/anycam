@@ -63,6 +63,55 @@ def _wait_for(app: QApplication, predicate, timeout: float = 5.0) -> bool:
     return False
 
 
+def test_second_gui_launch_is_forwarded_not_started(app):
+    """Two GUI processes would race for the single v4l2loopback writer."""
+    from anycam.gui import claim_gui_instance
+    from PySide6.QtNetwork import QLocalServer
+
+    name = f"anycam-test-{os.getpid()}-{time.monotonic_ns()}"
+    primary, server = claim_gui_instance(name)
+    assert primary is True and server is not None
+    try:
+        second, second_server = claim_gui_instance(name)
+        assert second is False
+        assert second_server is None
+    finally:
+        server.close()
+        QLocalServer.removeServer(name)
+
+
+def test_canvas_resize_reuses_the_open_vcam_output(app):
+    """A canvas resize must not reopen v4l2sink under a consumer."""
+    window = _window()
+
+    class Held:
+        active = True
+        width = 320
+        height = 180
+        fps = 30
+        error = ""
+
+        def __init__(self, device: str) -> None:
+            self.device = device
+
+        def stop(self) -> dict:
+            self.active = False
+            return {"error": ""}
+
+    held = Held(config.loopback_device())
+    window.project.output.vcam_device = held.device
+    window._vcam_output = held
+    try:
+        window.project.output.canvas_w = 3840
+        window.project.output.canvas_h = 2160
+        assert window._start_vcam_output() is True
+        assert window._vcam_output is held
+        assert held.active is True
+    finally:
+        window.close()
+        app.processEvents()
+
+
 def test_preview_delivers_a_live_frame(app):
     window = _window()
     try:
@@ -1132,6 +1181,70 @@ def test_camera_source_error_quarantines_an_existing_device(app):
         app.processEvents()
 
 
+def test_held_vcam_hint_names_the_app_that_opened_first(app, monkeypatch):
+    class HeldVcam:
+        active = True
+        error = ""
+        pixel_format = "YUY2"
+        device = "/dev/video10"
+
+    monkeypatch.setattr(config, "vcam_consumers", lambda device=None: ["discord"])
+    window = _window()
+    try:
+        window._vcam_output = HeldVcam()
+        window.note_vcam_consumers()
+        assert not window.vcam_hint.isHidden()
+        text = window.vcam_hint.text()
+        assert "discord" in text
+        assert "re-select" in text
+        window.dismiss_vcam_hint()
+        assert window.vcam_hint.isHidden()
+        assert window.vcam_dismiss.isHidden()
+    finally:
+        window._vcam_output = None
+        window.close()
+        app.processEvents()
+
+
+def test_vcam_toggle_starts_the_preview_it_needs(app, monkeypatch):
+    """The button must not leave a loopback device with nothing to push."""
+
+    class FakeVcam:
+        def __init__(self):
+            self.active = False
+            self.error = ""
+            self.pixel_format = "YUY2"
+
+        def start(self, device, width, height, fps, setup=False):
+            self.device = device
+            self.active = True
+            return True
+
+        def push_sample(self, _sample):
+            return None
+
+        def poll(self):
+            return None
+
+        def stop(self):
+            self.active = False
+            return {"device": self.device, "ok": True, "error": ""}
+
+    monkeypatch.setattr("anycam.gui.VcamOutput", FakeVcam)
+    window = _window()
+    try:
+        assert window.engine is None
+        window.toggle_vcam()
+        assert window.vcam_on is True
+        # No canvas means no frames: a consumer reading /dev/video10 fails
+        # with EIO instead of showing a camera.
+        assert window.engine is not None, window.statusBar().currentMessage()
+        assert window.engine.report.vcam_active is True
+    finally:
+        window.close()
+        app.processEvents()
+
+
 def test_vcam_output_survives_engine_restarts(app, monkeypatch):
     created = []
 
@@ -1145,6 +1258,7 @@ def test_vcam_output_survives_engine_restarts(app, monkeypatch):
 
         def start(self, device, width, height, fps, setup=False):
             self.device = device
+            self.width, self.height, self.fps = width, height, fps
             self.setup = setup
             self.active = True
             return True
@@ -1171,14 +1285,72 @@ def test_vcam_output_survives_engine_restarts(app, monkeypatch):
         assert window.engine is first, "toggling vcam rebuilt the canvas"
         assert len(created) == 1
         output = created[0]
+        assert output.setup is True, "the button must also create the device"
         window.restart_engine()
         assert len(created) == 1, "a rebuild created a second v4l2sink"
         assert window._vcam_output is output
         assert window.engine is not first
         window.toggle_vcam()
         assert window.vcam_on is False
-        assert output.stopped is True
-        assert window._vcam_output is None
+        # The node stays held (idle card) so the next consumer can select it;
+        # only the live canvas tap is detached.
+        assert output.stopped is False
+        assert window._vcam_output is output
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_vcam_sink_error_is_rebuilt_not_turned_off(app, monkeypatch):
+    """One dead v4l2sink must not disable the user's camera for the session.
+
+    A latched sink error made every later rebuild build without the tap, so
+    the held node stayed on the dark ready card while the canvas kept running.
+    """
+    created = []
+
+    class FakeVcam:
+        def __init__(self):
+            self.active = False
+            self.error = ""
+            self.pixel_format = "YUY2"
+            created.append(self)
+
+        def start(self, device, width, height, fps, setup=False):
+            self.device = device
+            self.width, self.height, self.fps = width, height, fps
+            if len(created) == 1:
+                self.error = "Error in IOCTL: Invalid argument"
+                return False
+            self.active = True
+            return True
+
+        def push_sample(self, _sample):
+            return None
+
+        def poll(self):
+            return None
+
+        def stop(self):
+            self.active = False
+            return {"device": self.device, "ok": True, "error": ""}
+
+        def set_canvas_attached(self, _attached):
+            return None
+
+    monkeypatch.setattr("anycam.gui.VcamOutput", FakeVcam)
+    window = _window()
+    try:
+        window.vcam_on = True
+        window.start_engine()
+        assert window.engine is not None, window.statusBar().currentMessage()
+        # The first output failed; the request survives and the retry built a
+        # second output and attached it without a button press.
+        assert window.vcam_on is True
+        assert len(created) == 2
+        assert window._vcam_output is created[-1]
+        assert window.engine.report.vcam_active is True
+        assert window.vcam_button.text() == "Virtual camera: on"
     finally:
         window.close()
         app.processEvents()

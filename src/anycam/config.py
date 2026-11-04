@@ -259,14 +259,14 @@ def ensure_vcam_device(device: str | None = None, *, prompt: bool = True) -> str
         return f"virtual camera device {dev} does not exist"
     number = match.group(1)
     manual = (f"sudo modprobe v4l2loopback video_nr={number} "
-              f"card_label=AnyCam exclusive_caps=0")
+              f"card_label=AnyCam exclusive_caps=1")
     if (not prompt or shutil.which("pkexec") is None
             or shutil.which("modprobe") is None):
         return f"{dev} is missing; load v4l2loopback first: {manual}"
     try:
         result = subprocess.run(
             ["pkexec", "modprobe", "v4l2loopback", f"video_nr={number}",
-             "card_label=AnyCam", "exclusive_caps=0"],
+             "card_label=AnyCam", "exclusive_caps=1"],
             capture_output=True, text=True, timeout=60,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:  # noqa: BLE001
@@ -283,12 +283,136 @@ def ensure_vcam_device(device: str | None = None, *, prompt: bool = True) -> str
             + (f": {detail}" if detail else "") + f". Run: {manual}")
 
 
+def vcam_exclusive_caps(
+        path: str | None = "/sys/module/v4l2loopback/parameters/exclusive_caps"
+) -> bool | None:
+    """Whether the loaded module announces capture-only, as Chromium needs.
+
+    Chromium-based clients (Discord, Chrome) enumerate v4l2 nodes through udev
+    and ignore one that advertises capture and output together, which is what
+    the module default (``exclusive_caps=0``) produces.  ``None`` means the
+    parameter cannot be read (module not loaded).
+    """
+    try:
+        values = Path(path).read_text() if path else ""
+    except OSError:
+        return None
+    return values.split(",")[0].strip() == "Y"
+
+
+def reload_vcam_module(device: str | None = None, *,
+                       prompt: bool = True) -> str:
+    """Reload v4l2loopback with ``exclusive_caps=1`` (Chromium needs it).
+
+    The caller must close every handle it holds on ``device`` first: the
+    module cannot be unloaded while the node is open.  Any other application
+    still holding it makes the unload fail, which is reported instead of
+    retried.  Returns "" on success, a reason otherwise.
+    """
+    dev = device or loopback_device()
+    match = re.search(r"video(\d+)$", dev)
+    if match is None:
+        return f"virtual camera device {dev} is not a video node"
+    number = match.group(1)
+    load = (f"modprobe v4l2loopback video_nr={number} card_label=AnyCam "
+            f"exclusive_caps=1")
+    manual = f"sudo modprobe -r v4l2loopback && sudo {load}"
+    if shutil.which("modprobe") is None:
+        return f"modprobe is missing; run: {manual}"
+    if not prompt or shutil.which("pkexec") is None:
+        return f"reloading needs root; run: {manual}"
+    try:
+        result = subprocess.run(
+            # One prompt for the unload and the load: pkexec authorises the
+            # shell, which runs both steps only if the unload succeeds.
+            ["pkexec", "/bin/sh", "-c",
+             f"modprobe -r v4l2loopback && {load}"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:  # noqa: BLE001
+        return f"could not reload v4l2loopback: {exc}"
+    if result.returncode != 0:
+        lines = (result.stderr or result.stdout or "").strip().splitlines()
+        reason = lines[-1] if lines else f"pkexec exited {result.returncode}"
+        if result.returncode in (126, 127):
+            reason = ("authorization was cancelled or no polkit agent is "
+                      "running")
+        return f"{reason}. Run: {manual}"
+    # The parameter and the node are recreated by udev; give them a moment.
+    for _ in range(60):
+        if Path(dev).exists() and vcam_exclusive_caps() is True:
+            return ""
+        time.sleep(0.05)
+    return (f"v4l2loopback reloaded but {dev} still reports "
+            f"exclusive_caps={vcam_exclusive_caps()}. Run: {manual}")
+
+
 def vcam_available(device: str | None = None) -> bool:
     dev = device or loopback_device()
     if not Path(dev).exists():
         return False
     code, out = run(["v4l2-ctl", "-d", dev, "--info"])
     return code == 0
+
+
+def vcam_consumers(device: str | None = None, proc: str = "/proc") -> list[str]:
+    """Names of the processes that currently have the loopback node open.
+
+    Best effort: another user's descriptors are unreadable and are skipped.
+    The GUI uses this both to tell the user when an app opened the node before
+    AnyCam was feeding it (that open fails with ``EIO`` and needs a re-select)
+    and to avoid converting frames nobody is watching.
+    """
+    target = os.path.realpath(device or loopback_device())
+    names: list[str] = []
+    mine = os.getpid()
+    try:
+        entries = list(Path(proc).iterdir())
+    except OSError:
+        return names
+    for entry in entries:
+        if not entry.name.isdigit() or int(entry.name) == mine:
+            continue
+        try:
+            fds = list((entry / "fd").iterdir())
+        except OSError:
+            continue
+        opened = False
+        for fd in fds:
+            try:
+                if os.readlink(fd) == target:
+                    opened = True
+                    break
+            except OSError:
+                continue
+        if not opened:
+            continue
+        try:
+            name = (entry / "comm").read_text().strip()
+        except OSError:
+            name = ""
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+# The virtual camera keeps one camera-sized mode while the program canvas
+# may be 4K or change while a consumer is watching.  Re-negotiating the
+# loopback device for every canvas change closes the node and leaves apps
+# (Discord) on a dead handle; scale into this fixed mode instead.
+VCAM_MAX_W = 1920
+VCAM_MAX_H = 1080
+
+
+def vcam_output_size(width: int, height: int) -> tuple[int, int]:
+    """Fixed virtual-camera mode for a canvas, preserving its aspect ratio."""
+    width = max(2, int(width))
+    height = max(2, int(height))
+    scale = min(1.0, VCAM_MAX_W / width, VCAM_MAX_H / height)
+    out_w = max(2, int(round(width * scale)))
+    out_h = max(2, int(round(height * scale)))
+    # YUYV needs even dimensions in both axes.
+    return out_w // 2 * 2, out_h // 2 * 2
 
 
 def vcam_pixel_format(device: str) -> str:

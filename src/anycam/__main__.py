@@ -32,6 +32,13 @@ def cmd_doctor(_args) -> int:
         "pactl": config.has_command("pactl"),
     }
     summary["checks"] = checks
+    try:
+        from .engine.outputs.vcam import measure_conversion
+
+        summary["vcam_conversion"] = measure_conversion(
+            config.CANVAS_W, config.CANVAS_H, config.CANVAS_FPS)
+    except Exception as exc:  # noqa: BLE001 - doctor must still report
+        summary["vcam_conversion"] = {"error": str(exc)}
     print(json.dumps(summary, indent=2))
     return 0 if all(checks.values()) else 1
 
