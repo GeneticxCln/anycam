@@ -17,20 +17,21 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_this_is_version_one_everywhere():
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    assert config.VERSION == "1.0.0"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", config.VERSION)
+    assert config.VERSION.split(".")[0] == "1"                # this is still major version 1
     assert pyproject["project"]["version"] == config.VERSION
     import anycam
 
     assert anycam.__version__ == config.VERSION
-    assert about.RELEASE_TAG == "v1.0.0"
+    assert about.RELEASE_TAG == f"v{config.VERSION}"
     assert about.headline() == "AnyCam v1"
-    assert "Version 1" in about.release_line() and "1.0.0" in about.release_line()
+    assert "Version 1" in about.release_line() and config.VERSION in about.release_line()
 
 
 def test_about_lists_the_runtime_and_credits():
     rows = dict(about.runtime_rows())
     assert {"Release", "Python", "Qt (PySide6)", "GStreamer", "onnxruntime", "System"} <= set(rows)
-    assert rows["Release"].startswith("v1.0.0")
+    assert rows["Release"].startswith(f"v{config.VERSION}")
     names = " ".join(item[0] + item[1] for item in about.CREDITS)
     assert "Noto" in names and "YuNet" in names and "MediaPipe" in names
     assert all(item[2] for item in about.CREDITS)           # every credit names a licence
@@ -69,7 +70,7 @@ def test_settings_has_an_about_tab_showing_version_one(window):
     assert win.settings_tabs.tabText(win.settings_tabs.currentIndex()) == "About"
     text = " ".join(label.text() for label in page.findChildren(QLabel))
     assert "AnyCam v1" in text
-    assert "Version 1" in text and "1.0.0" in text
+    assert "Version 1" in text and config.VERSION in text
     assert about.REPO_URL in text and "MIT" in text
     assert "Noto" in text
 
@@ -86,7 +87,7 @@ def test_copy_version_details_puts_the_release_on_the_clipboard(window):
     win, app = window
     win._copy_version_details()
     text = QApplication.clipboard().text()
-    assert "AnyCam v1" in text and "1.0.0" in text and "Python:" in text
+    assert "AnyCam v1" in text and config.VERSION in text and "Python:" in text
 
 
 # ------------------------------------------------------------ release packaging

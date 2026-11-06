@@ -102,7 +102,7 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           cat > notes.md <<NOTES
-          ## AnyCam ${GITHUB_REF_NAME} (Version ${version%%.*})
+          ## ${GITHUB_REF_NAME}
 
           Linux-native virtual camera studio: cameras, screens, video, overlays, face masks,
           themed frames and animations composed into one picture for Discord, Chrome, OBS and
@@ -123,6 +123,6 @@ jobs:
           else
             gh release create "$GITHUB_REF_NAME" dist/* \
               --repo "$GITHUB_REPOSITORY" \
-              --title "AnyCam ${GITHUB_REF_NAME} - Version ${version%%.*}" \
+              --title "${GITHUB_REF_NAME}" \
               --notes-file notes.md --generate-notes --verify-tag
           fi

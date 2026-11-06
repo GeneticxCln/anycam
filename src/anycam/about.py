@@ -7,7 +7,7 @@ import sys
 from . import config
 
 RELEASE_TAG = f"v{config.VERSION}"
-RELEASE_NAME = "Version 1"
+RELEASE_NAME = f"Version {config.VERSION.split('.')[0]}"
 REPO_URL = "https://github.com/GeneticxCln/anycam"
 LICENSE_NAME = "MIT"
 
@@ -49,7 +49,7 @@ def headline() -> str:
 
 
 def release_line() -> str:
-    """``Version 1 (release 1.0.0)``."""
+    """``Version 1  ·  release 1.0.1`` (the major number, then the full release)."""
     return f"{RELEASE_NAME}  ·  release {config.VERSION}"
 
 
