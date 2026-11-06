@@ -28,15 +28,18 @@ jobs:
             gstreamer1.0-tools gstreamer1.0-plugins-base \
             gstreamer1.0-x gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
-            gstreamer1.0-libav \
+            gstreamer1.0-libav gstreamer1.0-pipewire \
             ffmpeg libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 \
             libxcb-cursor0 libxcb-xinerama0
 
-      # textoverlay (the Pango plugin) ships in gstreamer1.0-x on Ubuntu, not
-      # in plugins-base.  Without it every AnyCam standby/template chain dies
-      # with "GStreamer element 'textoverlay' is not installed".
-      - name: The Pango text overlay is installed
-        run: /usr/bin/gst-inspect-1.0 textoverlay
+      # textoverlay (the Pango plugin) ships in gstreamer1.0-x and pipewiresrc
+      # in gstreamer1.0-pipewire on Ubuntu, not in plugins-base/bad.  Without
+      # them the standby chain and every screen chain raise "GStreamer element
+      # '...' is not installed" instead of skipping.
+      - name: The GStreamer elements the suite needs are installed
+        run: |
+          /usr/bin/gst-inspect-1.0 textoverlay
+          /usr/bin/gst-inspect-1.0 pipewiresrc
 
       - name: Install Python dependencies
         run: |
@@ -91,12 +94,18 @@ jobs:
             gstreamer1.0-tools gstreamer1.0-plugins-base \
             gstreamer1.0-x gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
-            gstreamer1.0-libav \
+            gstreamer1.0-libav gstreamer1.0-pipewire \
             ffmpeg libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 \
             libxcb-cursor0 libxcb-xinerama0
 
-      - name: The Pango text overlay is installed
-        run: /usr/bin/gst-inspect-1.0 textoverlay
+      # textoverlay (the Pango plugin) ships in gstreamer1.0-x and pipewiresrc
+      # in gstreamer1.0-pipewire on Ubuntu, not in plugins-base/bad.  Without
+      # them the standby chain and every screen chain raise "GStreamer element
+      # '...' is not installed" instead of skipping.
+      - name: The GStreamer elements the suite needs are installed
+        run: |
+          /usr/bin/gst-inspect-1.0 textoverlay
+          /usr/bin/gst-inspect-1.0 pipewiresrc
 
       - name: Install Python dependencies
         run: |
