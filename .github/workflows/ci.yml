@@ -12,6 +12,10 @@ jobs:
     env:
       PYTHONPATH: src
       QT_QPA_PLATFORM: offscreen
+      # Stream pytest's output instead of flushing it once at the end: a test
+      # that blocks must name itself in the log, not leave the step empty
+      # until the job timeout kills it.
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -22,10 +26,17 @@ jobs:
             python3 python3-pip python3-gi python3-gi-cairo \
             gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
             gstreamer1.0-tools gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
-            gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+            gstreamer1.0-x gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
             ffmpeg libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 \
             libxcb-cursor0 libxcb-xinerama0
+
+      # textoverlay (the Pango plugin) ships in gstreamer1.0-x on Ubuntu, not
+      # in plugins-base.  Without it every AnyCam standby/template chain dies
+      # with "GStreamer element 'textoverlay' is not installed".
+      - name: The Pango text overlay is installed
+        run: /usr/bin/gst-inspect-1.0 textoverlay
 
       - name: Install Python dependencies
         run: |
@@ -38,4 +49,78 @@ jobs:
         run: /usr/bin/python3 -m compileall -q src tests
 
       - name: Run tests
-        run: /usr/bin/python3 -m pytest tests
+        # addopts in pyproject.toml is "-q", which cancels out -v and would
+        # hide the name of the test that is running.  --timeout turns a stuck
+        # GStreamer call into one failed test with its stack dump, instead of
+        # a job that sits silent until timeout-minutes kills it.
+        run: |
+          /usr/bin/python3 -m pytest tests \
+            -o addopts="" -v \
+            --timeout=180 --timeout-method=thread \
+            --junitxml=report.xml
+
+      - name: Upload the test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report
+          path: report.xml
+          if-no-files-found: warn
+
+  # The same suite with the hardware masking switch on.  A developer runs
+  # `pytest tests --no-hardware` on a machine that does have cameras, a
+  # loopback node and audio; this job is the reference that run is compared
+  # against (same tests, same skips).  If the two ever disagree, the switch is
+  # not describing the device layer faithfully.
+  test-no-hardware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PYTHONPATH: src
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 python3-pip python3-gi python3-gi-cairo \
+            gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+            gstreamer1.0-tools gstreamer1.0-plugins-base \
+            gstreamer1.0-x gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
+            ffmpeg libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-xinerama0
+
+      - name: The Pango text overlay is installed
+        run: /usr/bin/gst-inspect-1.0 textoverlay
+
+      - name: Install Python dependencies
+        run: |
+          /usr/bin/python3 -m pip install --break-system-packages --upgrade pip
+          /usr/bin/python3 -m pip install --break-system-packages \
+            "PySide6-Essentials>=6.6" numpy Pillow psutil pytest pytest-timeout \
+            onnxruntime
+
+      - name: Compile sources
+        run: /usr/bin/python3 -m compileall -q src tests
+
+      - name: Run tests with hardware masked
+        # -rs keeps the skip reasons in the log: that list is what a developer
+        # compares against their own --no-hardware run.
+        run: |
+          /usr/bin/python3 -m pytest tests \
+            -o addopts="" -v -rs --no-hardware \
+            --timeout=180 --timeout-method=thread \
+            --junitxml=report.xml
+
+      - name: Upload the test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pytest-report-no-hardware
+          path: report.xml
+          if-no-files-found: warn

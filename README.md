@@ -106,6 +106,42 @@ permission through the portal.
 .venv/bin/python -m pytest tests     # 676 tests; the GUI and engine tests run offscreen
 ```
 
+### Reproduce CI locally
+
+`.github/workflows/ci.yml` runs the suite on Ubuntu 24.04 with system GStreamer and no
+camera, loopback device, display or desktop portal, so the hardware-only tests skip there.
+Run the same steps in a matching container:
+
+```bash
+docker run --rm -it -v "$PWD:/src" -w /src ubuntu:24.04 bash -c '
+  apt-get update &&
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-gi python3-gi-cairo \
+    gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+    gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-x \
+    gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-ugly gstreamer1.0-libav ffmpeg \
+    libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 \
+    libxcb-cursor0 libxcb-xinerama0 &&
+  gst-inspect-1.0 textoverlay &&
+  python3 -m pip install --break-system-packages \
+    "PySide6-Essentials>=6.6" numpy Pillow psutil pytest pytest-timeout onnxruntime &&
+  PYTHONPATH=src QT_QPA_PLATFORM=offscreen PYTHONUNBUFFERED=1 \
+    python3 -m pytest tests -v --timeout=180 --timeout-method=thread'
+```
+
+The `gst-inspect-1.0 textoverlay` line is deliberate: the Pango overlay lives in
+`gstreamer1.0-x` on Ubuntu, not in `plugins-base`, and without it every AnyCam standby
+chain fails. With `--timeout`, one blocked GStreamer call shows up as a single failed test
+with its stack dump instead of a silent step. `act -j test` runs the workflow file itself
+when Docker is available.
+
+On a machine that does have the hardware, the same conditions can be simulated without
+a container: `pytest tests --no-hardware` (or `ANYCAM_TEST_ENV=ci`) makes device discovery
+report no cameras, no loopback node, no audio sources and no desktop portal. CI runs both
+variants — `test` on the bare runner and `test-no-hardware` with the switch on — so a masked
+local run has a reference for its pass/skip list.
+
 More: [PARITY.md](PARITY.md) (feature matrix), [TODO.md](TODO.md), [docs/](docs/) (evidence,
 regressions, phone camera), and the `NOTICE.md` files in `src/anycam/assets/models/` and
 `src/anycam/assets/emoji/` (third-party assets and licences).
