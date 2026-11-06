@@ -2119,7 +2119,7 @@ class AnyCamWindow(QMainWindow):
             "(for example a portrait effect and a distortion).")
         self.filter_slot.currentIndexChanged.connect(self._filter_slot_changed)
         row.addWidget(self.filter_slot)
-        self.thumb_refresh = QPushButton("Use current picture")
+        self.thumb_refresh = QPushButton("Use picture")
         self.thumb_refresh.setToolTip(
             "Redraw the previews from what the program shows right now.")
         self.thumb_refresh.clicked.connect(self._refresh_effect_previews)
@@ -3116,10 +3116,12 @@ class AnyCamWindow(QMainWindow):
         selected = self.preview.selected_layer()
         if selected is not None and selected.kind != "particles":
             return selected
-        main = [layer for layer in self.scene.layers
-                if layer.visible and layer.kind in self._CAPTURE_KINDS]
-        if main:
-            return max(main, key=lambda layer: layer.z)
+        for kinds in (self._CAPTURE_KINDS, ("image",)):
+            # Live sources first; a still image only when it is the picture.
+            main = [layer for layer in self.scene.layers
+                    if layer.visible and layer.kind in kinds]
+            if main:
+                return max(main, key=lambda layer: layer.z)
         return selected
 
     def _apply_effects(self, layer: Layer) -> None:

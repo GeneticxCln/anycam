@@ -616,3 +616,27 @@ def test_two_generated_layers_built_back_to_back_get_different_element_names():
         for chain in (first, second):
             for hook in chain.cleanup:
                 hook()
+
+
+# ------------------------- a still image can be the picture; live sources win
+def test_effects_go_to_a_still_image_when_it_is_the_only_picture(window):
+    win, app = window
+    win.scene.layers.clear()
+    still = Layer("still", "image", "Portrait", source="", box=(0, 0, 1, 1), z=1)
+    win.scene.add_layer(still)
+    win._refresh_layers()
+    _deselect(win, app)
+    _click(win, app, "Tech frames", "Cyber HUD")
+    assert still.effects.frame_style == "cyber-hud"
+    assert "Portrait" in win.browse_target.text()
+
+
+def test_a_live_source_beats_a_logo_image_on_top_of_it(window):
+    win, app = window
+    logo = Layer("logo", "image", "Logo", source="", box=(0.8, 0.05, 0.15, 0.15), z=9)
+    win.scene.add_layer(logo)
+    win._refresh_layers()
+    _deselect(win, app)
+    _click(win, app, "Tech frames", "Cyber HUD")
+    assert _main_layer(win).effects.frame_style == "cyber-hud"
+    assert logo.effects.frame_style == "none"
