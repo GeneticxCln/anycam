@@ -80,7 +80,10 @@ def test_screen_capture_uploads_pipewire_dmabuf_frames():
     # The canvas must own the clock.  Letting pipewiresrc provide the pipeline
     # clock ties the whole compositor to the share's damage cadence, which is
     # what turns a static/off-screen window share into a ~1 fps preview.
-    assert sources[0].get_property("provide-clock") is False
+    # PipeWire older than the one this was written on has no such property;
+    # the driver default applies there, so only assert it when it exists.
+    if sources[0].find_property("provide-clock") is not None:
+        assert sources[0].get_property("provide-clock") is False
     assert "videoflip" in names
     flip = next(element for element in chain.elements
                 if element.get_factory().get_name() == "videoflip")
@@ -88,7 +91,8 @@ def test_screen_capture_uploads_pipewire_dmabuf_frames():
     if all(Gst.ElementFactory.find(name) is not None
            for name in ("glupload", "glcolorconvert", "gldownload")):
         assert "glupload" in names
-        assert sources[0].get_property("always-copy") is False
+        if sources[0].find_property("always-copy") is not None:
+            assert sources[0].get_property("always-copy") is False
     else:
         assert sources[0].get_property("always-copy") is True
     # One-slot queue leaking downstream: stale frames are dropped rather than

@@ -37,6 +37,7 @@ from .sources import (
     choose_from_modes,
     jpeg_decoder,
     make,
+    make_optional,
     video_size,
 )
 
@@ -548,7 +549,7 @@ class SourcePool:
             props["fd"] = int(spec.fd)
         print(f"[screen-chain] node={node} fd={spec.fd} expected={spec.expected}",
               file=sys.stderr, flush=True)
-        src = make("pipewiresrc", **props)
+        src = make_optional("pipewiresrc", **props)
         expected = spec.expected or (max(2, spec.width), max(2, spec.height))
         elements: list[Gst.Element] = [src]
         # Same reason as sources.screen_chain: keep the newest frame and always

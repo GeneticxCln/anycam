@@ -36,6 +36,21 @@ def make(factory: str, name: str | None = None, **props) -> Gst.Element:
     return element
 
 
+def make_optional(factory: str, name: str | None = None, **props) -> Gst.Element:
+    """Make an element, skipping properties this build does not provide.
+
+    ``pipewiresrc`` gained ``provide-clock`` in a newer PipeWire than Ubuntu
+    24.04 ships (1.0.5).  Setting it there raises ``TypeError`` and took the
+    whole screen chain down instead of falling back to the default.
+    """
+    element = make(factory, name)
+    for key, value in props.items():
+        prop = key.replace("_", "-")
+        if element.find_property(prop) is not None:
+            element.set_property(prop, value)
+    return element
+
+
 def caps_string(width: int, height: int, fps: int, fmt: str = "RGBA") -> str:
     return f"video/x-raw,format={fmt},width={width},height={height},framerate={fps}/1"
 
@@ -685,7 +700,7 @@ def screen_chain(node_id: int, width: int, height: int, fps: int, layer=None,
              "max_buffers": 3, "min_buffers": 1}
     if fd is not None and fd >= 0:
         props["fd"] = int(fd)
-    src = make("pipewiresrc", **props)
+    src = make_optional("pipewiresrc", **props)
     chain.add(src)
     # A live screencast must never back-pressure the PipeWire stream: the
     # compositor only consumes ``fps`` frames of a stream that can run at the
