@@ -70,6 +70,31 @@ def test_two_engines_write_one_continuous_file(tmp_path):
     assert float(video["duration"]) > 1.5, info
 
 
+def test_recorder_parses_the_selected_hevc_codec(tmp_path):
+    if Gst.ElementFactory.find("nvh265enc") is None:
+        pytest.skip("nvh265enc unavailable")
+    if Gst.ElementFactory.find("h265parse") is None:
+        pytest.skip("h265parse unavailable")
+    out = tmp_path / "hevc.mp4"
+    project = build_demo_project("testsrc", 320, 180, 30)
+    project.output.encoder = "nvenc_h265"
+    recorder = Recorder()
+    assert recorder.start(str(out), 320, 180, 30, codec="h265")
+    engine = AnyCamEngine(project, recorder=recorder, preview=True).build()
+    engine.start()
+    try:
+        for _ in range(60):
+            engine.pump(50)
+            time.sleep(0.01)
+    finally:
+        engine.stop()
+    result = recorder.stop()
+    assert result["ok"], result
+    info = _probe(out)
+    video = next(s for s in info["streams"] if s["codec_type"] == "video")
+    assert video["codec_name"] == "hevc", info
+
+
 def test_recorder_muxes_audio_and_video(tmp_path):
     wav = tmp_path / "tone.wav"
     with wave.open(str(wav), "wb") as handle:

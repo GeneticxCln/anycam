@@ -52,10 +52,19 @@ def cmd_demo(args) -> int:
 def cmd_gui(args) -> int:
     if args.screenshot:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    if getattr(args, "ui", "manycam") == "classic":
-        from .gui import run_gui, run_screenshot
-    else:
-        from .gui_many import run_gui, run_screenshot
+    try:
+        if getattr(args, "ui", "manycam") == "classic":
+            from .gui import run_gui, run_screenshot
+        else:
+            from .gui_many import run_gui, run_screenshot
+    except ImportError as exc:
+        if "PySide6" in str(exc) or getattr(exc, "name", "") == "PySide6":
+            print("AnyCam's window needs PySide6 (matching your system Qt): "
+                  "install your distribution's pyside6 package, or "
+                  "pip install 'anycam[gui]'.\n"
+                  f"({exc})", file=sys.stderr)
+            return 2
+        raise
 
     if args.screenshot:
         return run_screenshot(args.screenshot, args.seconds, source=args.source)

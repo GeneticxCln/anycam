@@ -69,6 +69,47 @@ def test_stream_prefers_rtmp2sink():
 
 
 @pytest.mark.skipif(not HAS_RTMP, reason="rtmpsink unavailable")
+def test_rtmp_uses_nvenc_and_cuda_when_available(monkeypatch):
+    if Gst.ElementFactory.find("nvh264enc") is None:
+        pytest.skip("nvh264enc unavailable")
+    if Gst.ElementFactory.find("cudaupload") is None:
+        pytest.skip("cudaupload unavailable")
+    from anycam import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "nvenc_available",
+                        lambda codec="h264": codec == "h264")
+    project = make_project()
+    project.output.encoder = "nvenc_av1"
+    engine = AnyCamEngine(
+        project, rtmp="rtmp://127.0.0.1:1/live/key").build()
+    try:
+        assert engine.report.rtmp_encoder == "nvh264enc"
+        assert "RTMP/FLV uses H.264" in engine.report.rtmp_encoder_note
+        assert engine.pipeline.get_by_name("rtmp_cuda_upload") is not None
+        assert engine.pipeline.get_by_name("rtmp_raw") is None
+    finally:
+        if engine._rtmp_pipeline is not None:
+            engine._rtmp_pipeline.set_state(Gst.State.NULL)
+        engine.pipeline.set_state(Gst.State.NULL)
+
+
+@pytest.mark.skipif(not HAS_RTMP, reason="rtmpsink unavailable")
+def test_rtmp_cpu_fallback_keeps_i420_conversion():
+    project = make_project()
+    project.output.encoder = "cpu"
+    engine = AnyCamEngine(
+        project, rtmp="rtmp://127.0.0.1:1/live/key").build()
+    try:
+        assert engine.report.rtmp_encoder == "x264enc"
+        assert engine.pipeline.get_by_name("rtmp_raw") is not None
+        assert engine.pipeline.get_by_name("rtmp_cuda_upload") is None
+    finally:
+        if engine._rtmp_pipeline is not None:
+            engine._rtmp_pipeline.set_state(Gst.State.NULL)
+        engine.pipeline.set_state(Gst.State.NULL)
+
+
+@pytest.mark.skipif(not HAS_RTMP, reason="rtmpsink unavailable")
 def test_unresponsive_rtmp_cannot_stall_the_canvas():
     """The canvas must keep producing while the publish pipeline is stuck."""
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import time
 from dataclasses import dataclass, field
 
 import gi
@@ -55,6 +56,30 @@ class ScreenSession:
     def node_id(self) -> int:
         return self.streams[0].node_id if self.streams else -1
 
+    def open_remote(self) -> int:
+        """Open a fresh PipeWire remote for one consumer.
+
+        ``pipewiresrc`` takes ownership of the fd it is given and closes it
+        when that pipeline stops.  Reusing ``fd`` for a rebuild therefore
+        connects to a dead socket; each screen chain needs its own remote.
+        """
+        if self.connection is None or not self.session_handle:
+            raise PortalError("screen-cast session is no longer available")
+        return _open_pipewire_remote(self.connection, self.session_handle)
+
+    def take_remote(self) -> int:
+        """Return an fd whose ownership passes to the next pipewiresrc.
+
+        The fd opened during ``request_screen_cast`` can only be consumed
+        once.  Subsequent calls open another remote on the same portal
+        session, so removing and re-adding a screen layer never prompts the
+        user again and a canvas rebuild gets a live source.
+        """
+        if self.fd >= 0:
+            fd, self.fd = self.fd, -1
+            return fd
+        return self.open_remote()
+
     def close(self) -> None:
         _close_session(self.connection, self.session_handle)
         if self.fd >= 0:
@@ -90,12 +115,38 @@ def _request_path(connection: Gio.DBusConnection, token: str) -> str:
     return f"{OBJECT_PATH}/request/{sender}/{token}"
 
 
+def _open_pipewire_remote(connection: Gio.DBusConnection,
+                         session_handle: str) -> int:
+    """Ask the portal for a new PipeWire remote socket."""
+    try:
+        reply, fd_list = connection.call_with_unix_fd_list_sync(
+            BUS_NAME, OBJECT_PATH, SCREENCAST_IFACE, "OpenPipeWireRemote",
+            GLib.Variant("(oa{sv})", (session_handle, {})),
+            GLib.VariantType.new("(h)"), Gio.DBusCallFlags.NONE, -1, None, None,
+        )
+    except GLib.Error as exc:
+        raise PortalError(
+            f"ScreenCast.OpenPipeWireRemote failed: {exc.message}") from exc
+    fd_index = int(reply.unpack()[0])
+    if fd_list is None:
+        raise PortalError("the portal returned no PipeWire fd")
+    # ``UnixFDList.get`` already returns a fresh duplicate that the caller owns
+    # (the list keeps its own copy until it is freed).  Duplicating it again
+    # leaked the first descriptor on every call.
+    raw_fd = fd_list.get(fd_index)
+    if raw_fd < 0:
+        raise PortalError("the portal returned an invalid PipeWire fd")
+    return raw_fd
+
+
 def _call_and_wait(
     connection: Gio.DBusConnection,
     method: str,
     parameters: GLib.Variant,
     request_path: str,
     timeout: float,
+    *,
+    pump=None,
 ) -> dict:
     """Call a ScreenCast request method and wait for its Response signal.
 
@@ -129,7 +180,19 @@ def _call_and_wait(
             BUS_NAME, OBJECT_PATH, SCREENCAST_IFACE, method, parameters,
             GLib.VariantType.new("(o)"), Gio.DBusCallFlags.NONE, -1, None,
         )
-        loop.run()
+        if pump is None:
+            loop.run()
+        else:
+            # A portal request waits for the system picker.  Running the
+            # GLib loop by hand lets the GUI keep painting and responding
+            # instead of being marked "Not Responding" while the picker is
+            # open.  pump() is expected to process Qt events.
+            context = GLib.MainContext.default()
+            while "response" not in state and not timed_out["value"]:
+                while context.pending():
+                    context.iteration(False)
+                pump()
+                time.sleep(0.005)
     except GLib.Error as exc:
         raise PortalError(f"ScreenCast.{method} failed: {exc.message}") from exc
     finally:
@@ -175,8 +238,30 @@ def _session_handle(results: dict) -> str:
     return str(value) if value else ""
 
 
+def select_sources_options(handle_token: str, types: int = 3,
+                           restore_token: str = "") -> dict:
+    """The ``SelectSources`` options.
+
+    ``persist_mode`` 2 asks the portal to remember the choice until revoked and
+    to return a ``restore_token`` from ``Start``; without it the portal never
+    issued one, so a restored token could not exist.  Passing the token back
+    lets the portal skip its picker for that same source.
+    """
+    options = {
+        "handle_token": GLib.Variant("s", handle_token),
+        "types": GLib.Variant("u", int(types)),  # 1 monitor | 2 window
+        "multiple": GLib.Variant("b", False),
+        # 1 = hidden, 2 = embedded, 4 = metadata.
+        "cursor_mode": GLib.Variant("u", 2),
+        "persist_mode": GLib.Variant("u", 2),
+    }
+    if restore_token:
+        options["restore_token"] = GLib.Variant("s", restore_token)
+    return options
+
+
 def request_screen_cast(timeout: float = 120.0, restore_token: str = "",
-                        types: int = 3) -> ScreenSession:
+                        types: int = 3, *, pump=None) -> ScreenSession:
     """Ask the portal for one monitor/window stream.
 
     ``types`` is the portal's source bitmask: 1 = monitor, 2 = window, 3 = both.
@@ -194,7 +279,7 @@ def request_screen_cast(timeout: float = 120.0, restore_token: str = "",
             "handle_token": GLib.Variant("s", create_token),
             "session_handle_token": GLib.Variant("s", token),
         },)),
-        _request_path(connection, create_token), timeout,
+        _request_path(connection, create_token), timeout, pump=pump,
     )
     session_handle = _session_handle(create_results)
     if not session_handle:
@@ -207,20 +292,12 @@ def request_screen_cast(timeout: float = 120.0, restore_token: str = "",
         # (cursor_mode 2; 1 means hidden).
         select_token = f"{token}_select"
         select_request = _request_path(connection, select_token)
-        select_options = {
-            "handle_token": GLib.Variant("s", select_token),
-            "types": GLib.Variant("u", int(types)),  # 1 monitor | 2 window
-            "multiple": GLib.Variant("b", False),
-            # 1 = hidden, 2 = embedded, 4 = metadata.  The old value 1 hid
-            # the cursor, so screen captures never showed a pointer.
-            "cursor_mode": GLib.Variant("u", 2),     # embedded
-        }
-        if restore_token:
-            select_options["restore_token"] = GLib.Variant("s", restore_token)
+        select_options = select_sources_options(
+            select_token, types, restore_token)
         _call_and_wait(
             connection, "SelectSources",
             GLib.Variant("(oa{sv})", (session_handle, select_options)),
-            select_request, timeout,
+            select_request, timeout, pump=pump,
         )
 
         # 3. Start -> streams and a restore token.
@@ -231,29 +308,15 @@ def request_screen_cast(timeout: float = 120.0, restore_token: str = "",
                 session_handle, "",
                 {"handle_token": GLib.Variant("s", start_token)},
             )),
-            _request_path(connection, start_token), timeout,
+            _request_path(connection, start_token), timeout, pump=pump,
         )
         streams = _decode_streams(start_results)
         if not streams:
             raise PortalError("the portal returned no screen streams")
 
-        # 4. OpenPipeWireRemote -> fd for pipewiresrc.
-        reply, fd_list = connection.call_with_unix_fd_list_sync(
-            BUS_NAME, OBJECT_PATH, SCREENCAST_IFACE, "OpenPipeWireRemote",
-            GLib.Variant("(oa{sv})", (session_handle, {})),
-            GLib.VariantType.new("(h)"), Gio.DBusCallFlags.NONE, -1, None, None,
-        )
-        fd_index = int(reply.unpack()[0])
-        if fd_list is None:
-            raise PortalError("the portal returned no PipeWire fd")
-        raw_fd = fd_list.get(fd_index)
-        if raw_fd < 0:
-            raise PortalError("the portal returned an invalid PipeWire fd")
-        # The UnixFDList owns (or borrows) the returned descriptor; duplicate
-        # it so the session outlives the reply object without a double-close.
-        fd = os.dup(raw_fd)
+        # 4. OpenPipeWireRemote -> initial fd for the first consumer.
         restore = _unpack(start_results.get("restore_token", "")) or ""
-        session.fd = fd
+        session.fd = session.open_remote()
         session.streams = streams
         session.restore_token = str(restore)
         return session

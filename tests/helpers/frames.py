@@ -54,8 +54,14 @@ class Frame:
         return max(self.average(*box)) < 24
 
 
-def grab_frame(project, timeout: float = 6.0, **engine_options) -> Frame:
-    """Run ``project`` for at most ``timeout`` seconds and return one frame."""
+def grab_frame(project, timeout: float = 6.0, until=None, **engine_options) -> Frame:
+    """Run ``project`` for at most ``timeout`` seconds and return one frame.
+
+    ``until`` is an optional predicate on a Frame: keep running until it holds
+    (a cold video decoder can take over a second to show its first picture), then
+    return that frame; on timeout the latest frame is returned so the test's own
+    assertion reports what was on screen.
+    """
     frames: list[Frame] = []
 
     def on_frame(sample) -> None:
@@ -82,6 +88,8 @@ def grab_frame(project, timeout: float = 6.0, **engine_options) -> Frame:
         # still be black (or show only one layer).  Wait for the graph to
         # settle, then inspect the latest frame.
         while time.monotonic() < end and len(frames) < 10:
+            engine.pump(50)
+        while until is not None and frames and time.monotonic() < end and not until(frames[-1]):
             engine.pump(50)
         # Snapshot before teardown: stop() flushes the remaining frames and
         # the last of those is black.

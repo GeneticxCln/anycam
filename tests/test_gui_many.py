@@ -439,6 +439,106 @@ def test_layout_switch_keeps_the_portal_session(app, monkeypatch):
         _close(window, app)
 
 
+def test_camera_picker_rescans_after_a_device_renumber(app, monkeypatch):
+    """A cached /dev/videoN that disappeared must not be added to the PiP."""
+    window = _window(empty_project(), app)
+    window._camera_choices = [("Old", "/dev/anycam-old-camera")]
+    monkeypatch.setattr(
+        window, "_scan_camera_choices",
+        lambda: [("Current", "/dev/anycam-current-camera")])
+    try:
+        assert window._choose_camera_device() == "/dev/anycam-current-camera"
+    finally:
+        _close(window, app)
+
+
+def test_camera_error_keeps_a_live_screen_instead_of_rebuilding(app, monkeypatch):
+    """A busy camera must not tear down the live PiP screen share."""
+    project = Project(name="screen")
+    scene = Scene(new_id("scene"), "Screen")
+    screen = Layer(new_id("layer"), "screen", "Screen", source="151",
+                   box=(0.0, 0.0, 1.0, 1.0), z=1)
+    camera = Layer(new_id("layer"), "camera", "Cam", source="/dev/video0",
+                   box=(0.66, 0.60, 0.32, 0.38), z=2)
+    scene.add_layer(screen)
+    scene.add_layer(camera)
+    project.scenes = [scene]
+    project.active_scene = scene.id
+    window = _window(project, app)
+
+    class Engine:
+        def __init__(self):
+            self.dropped = []
+
+        def drop_capture(self, layer_id):
+            self.dropped.append(layer_id)
+            return True
+
+        def stop(self):
+            return {}
+
+    engine = Engine()
+    window.engine = engine
+    restarts = []
+    monkeypatch.setattr(window, "restart_engine",
+                        lambda: restarts.append(1))
+    try:
+        window._handle_pipeline_error(
+            "Camera source error: v4l2src: Device or resource busy")
+        assert engine.dropped == [camera.id]
+        assert restarts == []
+        assert window._lost_cameras == {camera.id: camera.source}
+        assert "screen preview kept live" in window.statusBar().currentMessage()
+    finally:
+        window.engine = None
+        _close(window, app)
+
+
+def test_camera_reconnect_reattaches_capture_without_rebuilding_the_screen(
+        app, monkeypatch):
+    """A returned camera resumes on the existing canvas channel."""
+    project = Project(name="screen")
+    scene = Scene(new_id("scene"), "Screen")
+    screen = Layer(new_id("layer"), "screen", "Screen", source="151",
+                   box=(0.0, 0.0, 1.0, 1.0), z=1)
+    camera = Layer(new_id("layer"), "camera", "Cam", source="/dev/video-cam",
+                   box=(0.66, 0.60, 0.32, 0.38), z=2)
+    scene.add_layer(screen)
+    scene.add_layer(camera)
+    project.scenes = [scene]
+    project.active_scene = scene.id
+    window = _window(project, app)
+
+    class Engine:
+        def __init__(self):
+            self.attached = []
+
+        def attach_capture(self, layer_id):
+            self.attached.append(layer_id)
+            return True
+
+        def stop(self):
+            return {}
+
+    engine = Engine()
+    window.engine = engine
+    window._lost_cameras = {camera.id: camera.source}
+    window._camera_watch.start()
+    restarts = []
+    monkeypatch.setattr(window, "restart_engine",
+                        lambda: restarts.append(1))
+    monkeypatch.setattr("anycam.gui.Path.exists", lambda self: True)
+    try:
+        window._reconnect_cameras()
+        assert engine.attached == [camera.id]
+        assert restarts == []
+        assert window._lost_cameras == {}
+        assert "Camera reconnected" in window.statusBar().currentMessage()
+    finally:
+        window.engine = None
+        _close(window, app)
+
+
 def test_removing_a_camera_does_not_restart_or_close_the_screen_session(
         app, monkeypatch):
     """Removing the webcam must leave the screen branch and vcam alive."""
@@ -492,6 +592,10 @@ def test_screen_remove_and_readd_reuses_the_portal_session(app, monkeypatch):
                                             source_type="monitor")]
             self.closed = 0
 
+        def take_remote(self):
+            fd, self.fd = self.fd, -1
+            return fd
+
         def close(self):
             self.closed += 1
 
@@ -515,6 +619,37 @@ def test_screen_remove_and_readd_reuses_the_portal_session(app, monkeypatch):
         assert second.source == "42"
         assert window._screen_sessions[second.id] is session
         assert session.closed == 0
+    finally:
+        _close(window, app)
+
+
+def test_adding_a_screen_after_its_fd_was_used_reuses_the_portal_session(
+        app, monkeypatch):
+    """A consumed fd must not force a second portal picker."""
+    class FakeSession:
+        fd = -1
+        streams = [SimpleNamespace(width=1920, height=1080, source_type="monitor")]
+
+        @property
+        def node_id(self):
+            return 42
+
+        def close(self):
+            pass
+
+    session = FakeSession()
+    requests: list[int] = []
+    monkeypatch.setattr(
+        portal, "request_screen_cast",
+        lambda **_kwargs: requests.append(1) or session)
+    window = _window(empty_project(), app)
+    window._last_screen_session = session
+    try:
+        layer = window.add_layer("screen")
+        assert layer is not None
+        assert layer.source == "42"
+        assert window._screen_sessions[layer.id] is session
+        assert requests == []
     finally:
         _close(window, app)
 
@@ -762,7 +897,7 @@ def test_sidebar_is_layouts_effects_scenes_and_settings_is_a_window(app):
         tabs = [window.settings_tabs.tabText(index)
                 for index in range(window.settings_tabs.count())]
         assert tabs == ["Sources", "Audio", "Media", "Output", "Stream",
-                        "Diagnostics"]
+                        "Diagnostics", "About"]
         assert not hasattr(window, "slot_grid")
     finally:
         _close(window, app)
@@ -870,7 +1005,24 @@ def test_right_click_menu_removes_a_layer_from_the_layout(app):
         window.apply_layout("full")
         layer = window.scene.layers[0]
         menu = window._preview_menu(layer.id)
-        assert [action.text() for action in menu.actions()] == [f"Remove {layer.name}"]
+        labels = [action.text() for action in menu.actions()
+                  if not action.isSeparator()]
+        assert labels[0].startswith(layer.name)
+        assert "Input" in labels
+        assert "Output" in labels
+        assert "Duplicate layer" in labels
+        assert f"Remove {layer.name}" in labels
+        inputs = next(action.menu() for action in menu.actions()
+                      if action.text() == "Input")
+        input_labels = [action.text() for action in inputs.actions()]
+        assert "Add video file…" in input_labels
+        assert "Add native desktop share…" in input_labels
+        outputs = next(action.menu() for action in menu.actions()
+                       if action.text() == "Output")
+        output_labels = [action.text() for action in outputs.actions()
+                         if not action.isSeparator()]
+        assert "Virtual camera" in output_labels
+        assert "Snapshot" in output_labels
 
         window.remove_layers([layer.id])
         assert window.scene.layers == []
@@ -985,7 +1137,6 @@ def test_multiview_negotiates_rgba_and_hands_an_owned_image_to_gui(app):
     from PySide6.QtWidgets import QLabel
     from anycam.multiview import SourcePreview
     from anycam.pool import CaptureSpec, SourcePool
-    from gi.repository import Gst
 
     pool = SourcePool()
     entry = pool.acquire(CaptureSpec("test", "red", 322, 180, 30))
@@ -1023,5 +1174,33 @@ def test_new_preset_starts_as_an_empty_single_layout(app):
         assert scene.layers == []
         assert scene.layout == "full"
         assert window.scene_cards.count() == 2
+    finally:
+        _close(window, app)
+
+
+def test_launch_refreshes_udev_so_chromium_lists_anycam(app, monkeypatch):
+    """The app, not the user, must repair cached udev capabilities."""
+    from anycam import gui
+
+    window = _window(empty_project(), app)
+    try:
+        monkeypatch.setattr(gui.config, "vcam_udev_capabilities",
+                            lambda device=None: ":video_output:")
+        monkeypatch.setattr(gui.config, "vcam_exclusive_caps",
+                            lambda path=None: True)
+        calls = []
+
+        def fake_refresh(device=None, *, prompt=True):
+            calls.append(device)
+            return ""
+
+        monkeypatch.setattr(gui.config, "refresh_vcam_udev", fake_refresh)
+        window.ensure_vcam_visible("/dev/video10")
+        assert window._vcam_udev_thread is not None
+        window._vcam_udev_thread.join(5)
+        assert not window._vcam_udev_thread.is_alive()
+        window._vcam_udev_poll()
+        assert calls == ["/dev/video10"]
+        assert "announced to Chromium" in window.diag_log.toPlainText()
     finally:
         _close(window, app)

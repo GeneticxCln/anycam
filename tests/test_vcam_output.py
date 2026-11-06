@@ -49,9 +49,11 @@ class FakeVcam:
         return None
 
 
-def test_vcam_output_size_scales_a_4k_canvas_to_the_device():
+def test_vcam_output_size_follows_the_canvas_up_to_4k():
     """A fixed camera mode is what keeps v4l2sink open across resizes."""
-    assert config.vcam_output_size(3840, 2160) == (1920, 1080)
+    assert config.vcam_output_size(3840, 2160) == (3840, 2160)
+    assert config.vcam_output_size(2560, 1440) == (2560, 1440)
+    assert config.vcam_output_size(5120, 2880) == (3840, 2160)
     assert config.vcam_output_size(1920, 1080) == (1920, 1080)
     assert config.vcam_output_size(1280, 720) == (1280, 720)
 
@@ -262,8 +264,8 @@ class _FreezeVcam(FakeVcam):
         self.resumes += 1
 
 
-def test_hiding_the_last_layer_holds_and_resumes_the_vcam():
-    """A scene with no visible source must keep the last real picture."""
+def test_hiding_the_last_layer_keeps_the_standby_live():
+    """The permanent standby keeps the canvas live with no visible source."""
     project = Project(name="freeze")
     scene = Scene(new_id("scene"), "Scene")
     first = Layer(new_id("layer"), "test", "First", source="ball",
@@ -291,8 +293,14 @@ def test_hiding_the_last_layer_holds_and_resumes_the_vcam():
 
         engine.set_layer_visible(first.id, False)
         assert fake.frozen is False, "one source is still visible"
+        before = fake.pushed
         engine.set_layer_visible(second.id, False)
-        assert fake.frozen is True, "the last picture must be held, not black"
+        assert fake.frozen is False, "the standby must not freeze the vcam"
+        deadline = time.monotonic() + 2.0
+        while fake.pushed <= before and time.monotonic() < deadline:
+            engine.pump(50)
+            time.sleep(0.01)
+        assert fake.pushed > before, "the standby must keep the canvas live"
         engine.set_layer_visible(second.id, True)
         assert fake.frozen is False
         assert fake.resumes >= 1
@@ -482,3 +490,50 @@ def test_measure_conversion_reports_both_paths():
     assert result["cpu"] is not None and result["cpu"] > 0
     assert result["chosen"] == ("gpu" if result["gpu"] is not None
                                 else "cpu")
+
+
+def test_vcam_udev_capabilities_reads_the_property_udev_announces(monkeypatch):
+    """Chromium reads ID_V4L_CAPABILITIES, not the module parameter."""
+    calls = []
+
+    def fake_run(cmd, timeout=5.0):
+        calls.append(cmd)
+        return 0, ("DEVPATH=/devices/virtual/video4linux/video10\n"
+                   "E: ID_V4L_CAPABILITIES=:capture:\n")
+
+    monkeypatch.setattr(config.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(config, "run", fake_run)
+    assert config.vcam_udev_capabilities("/dev/video10") == ":capture:"
+    assert calls[0][:3] == ["udevadm", "info", "--query=property"]
+
+
+def test_refresh_vcam_udev_triggers_a_change_after_anycam_starts(monkeypatch):
+    """A capture-only module still needs udev re-read while the feed runs."""
+    caps = {"value": ":video_output:"}
+    monkeypatch.setattr(config.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(config, "vcam_udev_capabilities",
+                        lambda device=None: caps["value"])
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        caps["value"] = ":capture:"
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(config.subprocess, "run", fake_run)
+    assert config.refresh_vcam_udev("/dev/video10") == ""
+    assert calls[0][:2] == ["pkexec", "udevadm"]
+    assert "--action=change" in calls[0]
+    assert "--sysname-match" in calls[0]
+    assert "video10" in calls[0]
+
+
+def test_refresh_vcam_udev_skips_a_node_chromium_already_lists(monkeypatch):
+    """A correct cached value must not trigger a password prompt."""
+    monkeypatch.setattr(config, "vcam_udev_capabilities",
+                        lambda device=None: ":capture:")
+    calls = []
+    monkeypatch.setattr(config.subprocess, "run",
+                        lambda *args, **kwargs: calls.append(args))
+    assert config.refresh_vcam_udev("/dev/video10") == ""
+    assert calls == []

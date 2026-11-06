@@ -200,6 +200,10 @@ class VcamOutput:
         self.height = 0
         self.fps = 30
         self.error = ""
+        # True when ``error`` came from a failed push (which can clear itself
+        # on the next good frame), False for a sink error (the v4l2sink
+        # pipeline is dead and only a rebuild brings it back).
+        self._error_from_push = False
         # "gpu" or "cpu": which conversion chain the running pipeline uses.
         self.conversion = ""
         self._pipeline: Gst.Pipeline | None = None
@@ -245,6 +249,7 @@ class VcamOutput:
         width, height = config.vcam_output_size(width, height)
         self.device = device
         self.error = ""
+        self._error_from_push = False
         if setup:
             # The user just asked for the virtual camera: bring the loopback
             # device up (pkexec/polkit prompt) instead of telling them to run
@@ -536,8 +541,18 @@ class VcamOutput:
             except Exception:  # noqa: BLE001 - the pipeline is going away
                 return
 
+    def _push_failed(self, message: str) -> None:
+        """Record a push failure; log it once, not once per frame."""
+        if message != self.error:
+            print(f"[vcam] {message}", file=sys.stderr, flush=True)
+        self.error = message
+        self._error_from_push = True
+
     def push_sample(self, sample) -> None:
-        if self._appsrc is None or self.error:
+        if self._appsrc is None:
+            return
+        if self.error and not self._error_from_push:
+            # A dead sink cannot accept frames; the owner rebuilds the output.
             return
         if self._frozen:
             # The canvas is empty; a black compositor frame must not replace
@@ -568,22 +583,32 @@ class VcamOutput:
         try:
             result = self._appsrc.emit(method, payload)
         except Exception as exc:  # noqa: BLE001
-            self.error = f"virtual camera push failed: {exc}"
-            print(f"[vcam] push failed: {exc}", file=sys.stderr, flush=True)
+            self._push_failed(f"virtual camera push failed: {exc}")
+            return
+        if result == Gst.FlowReturn.FLUSHING:
+            # The pipeline is shutting down or restarting; not a fault.
             return
         if result != Gst.FlowReturn.OK:
             # The appsrc caps are fixed at start; a canvas that negotiated a
             # different size is rejected here.  Silently ignoring this left
             # the idle card frozen on screen while the preview looked fine.
             caps = sample.get_caps()
-            self.error = ("virtual camera rejected the canvas frame ("
-                          f"{result.value_nick})")
-            print(
-                f"[vcam] {self.error}; frame="
-                f"{caps.to_string() if caps else 'no caps'}; appsrc="
-                f"{self._appsrc.get_property('caps').to_string()}",
-                file=sys.stderr, flush=True)
+            message = ("virtual camera rejected the canvas frame ("
+                       f"{result.value_nick})")
+            if message != self.error:
+                print(
+                    f"[vcam] {message}; frame="
+                    f"{caps.to_string() if caps else 'no caps'}; appsrc="
+                    f"{self._appsrc.get_property('caps').to_string()}",
+                    file=sys.stderr, flush=True)
+            self._push_failed(message)
             return
+        if self._error_from_push:
+            # A good frame after a failed push: the output works again.
+            print("[vcam] canvas frames accepted again", file=sys.stderr,
+                  flush=True)
+            self.error = ""
+            self._error_from_push = False
         if not self._live_logged:
             self._live_logged = True
             caps = sample.get_caps()
@@ -607,7 +632,9 @@ class VcamOutput:
                 # Log it: a latched sink error used to be invisible until the
                 # camera silently stayed on the ready card.
                 print(f"[vcam] sink error: {error}", file=sys.stderr, flush=True)
-                self.error = error
+            # The sink itself failed: frames cannot recover without a rebuild.
+            self.error = error
+            self._error_from_push = False
 
     def stop(self) -> dict:
         pipeline = self._pipeline

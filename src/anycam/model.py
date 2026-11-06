@@ -19,29 +19,103 @@ def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
 
+# A project file is user data that may be hand-edited, truncated by an older
+# build, or written by a newer one.  Loading must keep what is usable and say
+# what was dropped, instead of one odd value refusing the whole project.
+def _finite(value: float) -> bool:
+    return value == value and value not in (float("inf"), float("-inf"))
+
+
+def _coerce(value: Any, default: Any) -> Any:
+    """``value`` converted to the type of ``default``, or ``default``."""
+    kind = type(default)
+    try:
+        if kind is bool:
+            if isinstance(value, str):
+                text = value.strip().lower()
+                if text in ("true", "1", "yes", "on"):
+                    return True
+                if text in ("false", "0", "no", "off", ""):
+                    return False
+                return default
+            if isinstance(value, (bool, int, float)):
+                return bool(value)
+            return default
+        if kind is int:
+            if isinstance(value, bool):
+                return default
+            number = float(value)
+            return int(number) if _finite(number) else default
+        if kind is float:
+            if isinstance(value, bool):
+                return default
+            number = float(value)
+            return number if _finite(number) else default
+        if kind is str:
+            return value if isinstance(value, str) else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return value if value is not None else default
+
+
+def _quad(value: Any, default: tuple[float, float, float, float]
+          ) -> tuple[float, float, float, float]:
+    """Four finite numbers (a box or a crop), or ``default``."""
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return default
+    try:
+        numbers = tuple(float(item) for item in value)
+    except (TypeError, ValueError):
+        return default
+    return numbers if all(_finite(item) for item in numbers) else default  # type: ignore[return-value]
+
+
+def _coerce_fields(cls, data: Any, skip: tuple[str, ...] = ()):
+    """Build a settings dataclass from ``data``, defaulting any bad field."""
+    instance = cls()
+    if not isinstance(data, dict):
+        return instance
+    for item in fields(cls):
+        if item.name in skip or item.name not in data:
+            continue
+        setattr(instance, item.name,
+                _coerce(data[item.name], getattr(instance, item.name)))
+    return instance
+
+
 @dataclass
 class Effects:
     brightness: float = 0.0          # -1 .. 1
-    contrast: float = 1.0            # 0 .. 3
-    saturation: float = 1.0          # 0 .. 3
-    blur: float = 0.0                # 0 .. 40 px sigma
+    contrast: float = 1.0            # 0 .. 2 (GStreamer videobalance limit)
+    saturation: float = 1.0          # 0 .. 2
+    hue: float = 0.0                 # -1 .. 1 (full hue rotation)
     chroma_enabled: bool = False
     chroma_key: str = "#00ff00"
     chroma_similarity: float = 0.35
     chroma_smoothness: float = 0.10
-    # Reserved for the background/face effects.  They are serialised so a
-    # future build can load projects, but the compositor does not implement
-    # them and the GUI controls are disabled.
-    background_mode: str = "none"    # none | blur | replace
-    background_blur: float = 18.0
-    background_image: str = ""
-    face_effect: str = "none"        # none | spotlight | frame
-    face_strength: float = 0.6
+    # Fast look-up-table style.  Kept separate from the colour sliders so a
+    # preset never has to rebuild the layer graph.
+    color_effect: str = "none"     # none|sepia|heat|xray|xpro|yellowblue
+    mirror: bool = False             # horizontal flip, live
+    # One live filter from anycam.effects (distortion, retro TV, cleanup) and
+    # its 0..1 strength.  Swapped in while running, so it never rebuilds.
+    filter: str = "none"
+    filter_amount: float = 0.5
+    # A second, independent slot, so two filters stack (e.g. a portrait effect
+    # and a distortion).  Filter 2 runs after filter 1.
+    filter2: str = "none"
+    filter2_amount: float = 0.5
+    # Frame drawn over this layer's box.  Rendered to a transparent PNG and
+    # overlaid in the source chain, so changing it does not rebuild the canvas.
+    frame_style: str = "none"       # see overlay.WINDOW_FRAME_STYLES
+    frame_color: str = "#5eead0"
+    frame_width: int = 6
+    # Fill outside shaped windows (circle, heart ...), vignette and TV bezel.
+    frame_matte: str = "#0b0d10"
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Effects":
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in (data or {}).items() if k in known})
+    def from_dict(cls, data: dict[str, Any] | None) -> "Effects":
+        return _coerce_fields(cls, data)
 
 
 @dataclass
@@ -67,15 +141,16 @@ class PlaylistConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "PlaylistConfig":
-        data = data or {}
+        data = data if isinstance(data, dict) else {}
         ids = data.get("layer_ids", [])
         if not isinstance(ids, list):
             ids = []
+        interval = _coerce(data.get("interval"), 3.0)
         return cls(
             layer_ids=[str(value) for value in ids if value],
-            interval=float(data.get("interval") or 3.0),
-            loop=bool(data.get("loop", True)),
-            index=int(data.get("index", -1)),
+            interval=interval if interval > 0 else 3.0,
+            loop=_coerce(data.get("loop"), True),
+            index=_coerce(data.get("index"), -1),
         )
 
 
@@ -88,11 +163,7 @@ class EditorConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "EditorConfig":
-        data = data or {}
-        return cls(
-            snap_enabled=bool(data.get("snap_enabled", True)),
-            snap_px=float(data.get("snap_px", 6.0)),
-        )
+        return _coerce_fields(cls, data)
 
 
 @dataclass
@@ -124,21 +195,48 @@ class Layer:
     camera_width: int = 0
     camera_height: int = 0
     camera_fps: int = 0
+    # Reserved scene-decoration marker.  "backdrop" layers sit behind every
+    # capture layer and are replaced (not stacked) by the Looks tab.
+    role: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Layer":
-        data = dict(data)
-        if "effects" in data:
-            data["effects"] = Effects.from_dict(data["effects"])
-        data["box"] = tuple(data.get("box", (0, 0, 1, 1)))
-        data["crop"] = tuple(data.get("crop", (0, 0, 0, 0)))
-        known_pi = {f.name for f in fields(PlaylistItem)}
-        data["playlist"] = [PlaylistItem(**{k: v for k, v in p.items()
-                                            if k in known_pi})
-                            if isinstance(p, dict) else p
-                            for p in data.get("playlist", [])]
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        """Read one layer, defaulting any field that is missing or malformed.
+
+        Only a layer that cannot be identified at all (no ``kind``) is refused;
+        the caller drops it and reports why.
+        """
+        if not isinstance(data, dict):
+            raise ValueError("layer entry is not an object")
+        kind = data.get("kind")
+        if not isinstance(kind, str) or not kind.strip():
+            raise ValueError("layer has no kind")
+        raw_id = data.get("id")
+        layer_id = str(raw_id) if raw_id not in (None, "") else new_id("layer")
+        name = data.get("name")
+        layer = cls(id=layer_id, kind=kind.strip(),
+                    name=name if isinstance(name, str) and name else kind.strip())
+        special = ("id", "kind", "name", "box", "crop", "effects", "playlist")
+        for item in fields(cls):
+            if item.name in special or item.name not in data:
+                continue
+            setattr(layer, item.name,
+                    _coerce(data[item.name], getattr(layer, item.name)))
+        layer.box = _quad(data.get("box"), layer.box)
+        layer.crop = _quad(data.get("crop"), layer.crop)
+        layer.effects = Effects.from_dict(data.get("effects"))
+        items = data.get("playlist")
+        for entry in items if isinstance(items, list) else []:
+            if isinstance(entry, dict) and isinstance(entry.get("source"), str):
+                layer.playlist.append(PlaylistItem(
+                    source=entry["source"],
+                    duration=_coerce(entry.get("duration"), 4.0),
+                    kind=_coerce(entry.get("kind"), "image")))
+        if layer.kind == "network" and "@" in layer.name:
+            # Older builds named a network layer after the URL's host part,
+            # camera password included.
+            layer.name = layer.name.rpartition("@")[2]
+        return layer
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -159,14 +257,38 @@ class Scene:
     layout: str = ""
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Scene":
+    def from_dict(cls, data: dict[str, Any],
+                  warnings: list[str] | None = None) -> "Scene":
+        if not isinstance(data, dict):
+            raise ValueError("scene entry is not an object")
+        name = _coerce(data.get("name"), "Scene") or "Scene"
+        layers: list[Layer] = []
+        seen: set[str] = set()
+        raw = data.get("layers")
+        for index, entry in enumerate(raw if isinstance(raw, list) else []):
+            try:
+                layer = Layer.from_dict(entry)
+            except (ValueError, TypeError) as exc:
+                if warnings is not None:
+                    warnings.append(
+                        f"scene \"{name}\": skipped layer {index + 1} ({exc})")
+                continue
+            if layer.id in seen:
+                # Duplicate ids make every lookup by id pick the wrong layer.
+                layer.id = new_id("layer")
+                if warnings is not None:
+                    warnings.append(
+                        f"scene \"{name}\": layer {index + 1} repeated an id; "
+                        "it was given a new one")
+            seen.add(layer.id)
+            layers.append(layer)
         return cls(
             id=data.get("id") or new_id("scene"),
-            name=data.get("name", "Scene"),
-            layers=[Layer.from_dict(x) for x in data.get("layers", [])],
-            transition=data.get("transition", "cut"),
+            name=name,
+            layers=layers,
+            transition=_coerce(data.get("transition"), "cut"),
             playlist=PlaylistConfig.from_dict(data.get("playlist")),
-            layout=str(data.get("layout") or ""),
+            layout=_coerce(data.get("layout"), ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -211,9 +333,8 @@ class AudioConfig:
     desktop_muted: bool = False
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "AudioConfig":
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in (data or {}).items() if k in known})
+    def from_dict(cls, data: dict[str, Any] | None) -> "AudioConfig":
+        return _coerce_fields(cls, data)
 
 
 @dataclass
@@ -222,15 +343,28 @@ class OutputConfig:
     canvas_h: int = 1080
     fps: int = 60
     vcam_device: str = "/dev/video10"
+    # Portal screen captures: automatic follows the compositor's orientation
+    # tag.  rotate-180 / vertical-flip / none are explicit corrections for a
+    # share that is wrong.
+    screen_flip: str = "automatic"
     # Empty means "follow the XDG video directory".  The field used to be
     # ignored: recordings always went to ~/Videos/AnyCam regardless.
     record_dir: str = ""
     rtmp_url: str = ""
+    # H.264 encoder for recordings: auto prefers NVENC when a working NVIDIA
+    # driver/plugin is present, nvenc forces it, and cpu forces x264.
+    encoder: str = "auto"
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "OutputConfig":
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in (data or {}).items() if k in known})
+    def from_dict(cls, data: dict[str, Any] | None) -> "OutputConfig":
+        output = _coerce_fields(cls, data)
+        defaults = cls()
+        # A canvas or rate the encoder cannot use would only fail later.
+        if output.canvas_w < 2 or output.canvas_h < 2:
+            output.canvas_w, output.canvas_h = defaults.canvas_w, defaults.canvas_h
+        if output.fps < 1:
+            output.fps = defaults.fps
+        return output
 
 
 @dataclass
@@ -241,6 +375,9 @@ class Project:
     editor: EditorConfig = field(default_factory=EditorConfig)
     scenes: list[Scene] = field(default_factory=list)
     active_scene: str = ""
+    # What loading had to drop or repair; never written back to the file.
+    load_warnings: list[str] = field(default_factory=list, repr=False,
+                                     compare=False)
 
     @property
     def scene(self) -> Scene:
@@ -264,19 +401,38 @@ class Project:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Project":
+        if not isinstance(data, dict):
+            raise ValueError("a project file must contain a JSON object")
+        warnings: list[str] = []
+        scenes: list[Scene] = []
+        seen: set[str] = set()
+        raw = data.get("scenes")
+        for index, entry in enumerate(raw if isinstance(raw, list) else []):
+            try:
+                scene = Scene.from_dict(entry, warnings)
+            except (ValueError, TypeError) as exc:
+                warnings.append(f"skipped scene {index + 1} ({exc})")
+                continue
+            if scene.id in seen:
+                scene.id = new_id("scene")
+                warnings.append(
+                    f"scene \"{scene.name}\" repeated an id; it was given a new one")
+            seen.add(scene.id)
+            scenes.append(scene)
         p = cls(
-            name=data.get("name", "AnyCam project"),
-            output=OutputConfig.from_dict(data.get("output", {})),
-            audio=AudioConfig.from_dict(data.get("audio", {})),
+            name=_coerce(data.get("name"), "AnyCam project"),
+            output=OutputConfig.from_dict(data.get("output")),
+            audio=AudioConfig.from_dict(data.get("audio")),
             editor=EditorConfig.from_dict(data.get("editor")),
-            scenes=[Scene.from_dict(s) for s in data.get("scenes", [])],
-            active_scene=data.get("active_scene", ""),
+            scenes=scenes,
+            active_scene=_coerce(data.get("active_scene"), ""),
         )
         if not p.scenes:
             p.scenes = [Scene(new_id("scene"), "Scene 1")]
             p.active_scene = p.scenes[0].id
-        if not p.active_scene:
+        if p.active_scene not in {scene.id for scene in p.scenes}:
             p.active_scene = p.scenes[0].id
+        p.load_warnings = warnings
         return p
 
     def save(self, path: str | Path) -> Path:
@@ -290,13 +446,19 @@ class Project:
         path.parent.mkdir(parents=True, exist_ok=True)
         data = json.dumps(self.to_dict(), indent=2) + "\n"
         temp = path.with_name(path.name + ".tmp")
+        payload = data.encode("utf-8")
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            os.write(fd, data.encode("utf-8"))
+            view = memoryview(payload)
+            while view:  # os.write may write less than asked
+                view = view[os.write(fd, view):]
             os.fsync(fd)
         finally:
             os.close(fd)
-        if path.exists():
+        if path.exists() and _is_readable_project(path):
+            # Only a file that still parses is worth keeping as the backup.
+            # Copying a truncated one replaced the last good .bak with it, so
+            # the second save after a crash destroyed the recovery copy.
             try:
                 shutil.copy2(path, path.with_name(path.name + ".bak"))
             except OSError:
@@ -312,6 +474,14 @@ class Project:
     @classmethod
     def load(cls, path: str | Path) -> "Project":
         return cls.from_dict(json.loads(Path(path).read_text()))
+
+
+def _is_readable_project(path: Path) -> bool:
+    """Whether ``path`` holds a JSON object, i.e. is a usable backup."""
+    try:
+        return isinstance(json.loads(path.read_text()), dict)
+    except (OSError, ValueError):
+        return False
 
 
 def two_camera_scene(left_source: str, right_source: str,
@@ -402,5 +572,6 @@ def save_scene_preset(scene: Scene, directory: str | Path) -> Path:
     return path
 
 
-def load_scene_preset(path: str | Path) -> Scene:
-    return Scene.from_dict(json.loads(Path(path).read_text()))
+def load_scene_preset(path: str | Path,
+                      warnings: list[str] | None = None) -> Scene:
+    return Scene.from_dict(json.loads(Path(path).read_text()), warnings)

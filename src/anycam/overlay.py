@@ -7,12 +7,67 @@ the same assets are used by the headless demo, the GUI and the tests.
 from __future__ import annotations
 
 import hashlib
+import random
+import re
+import time
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from . import config
 from .geometry import crop_pixels
+
+# Rendered overlays are cheap to regenerate (every render rewrites its file),
+# but a crop drag writes a new box-sized PNG per step.  Keep the cache bounded.
+OVERLAY_CACHE_MAX_BYTES = 256 * 1024 * 1024
+OVERLAY_CACHE_MAX_FILES = 1500
+_PRUNE_INTERVAL_S = 30.0
+_last_prune = 0.0
+
+
+def prune_overlay_cache(directory: Path | None = None, *,
+                        max_bytes: int = OVERLAY_CACHE_MAX_BYTES,
+                        max_files: int = OVERLAY_CACHE_MAX_FILES,
+                        keep: Path | None = None) -> int:
+    """Delete the least recently written overlay PNGs beyond the limits.
+
+    ``keep`` (the file just written) is never removed.  A file a running
+    pipeline already loaded stays valid on Linux even once unlinked.  Returns
+    the number of files removed.
+    """
+    directory = directory or (config.cache_dir() / "overlays")
+    try:
+        entries = [(path, path.stat()) for path in directory.glob("*.png")]
+    except OSError:
+        return 0
+    entries.sort(key=lambda item: item[1].st_mtime)
+    total = sum(stat.st_size for _path, stat in entries)
+    count = len(entries)
+    removed = 0
+    for path, stat in entries:
+        if total <= max_bytes and count <= max_files:
+            break
+        if keep is not None and path == keep:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= stat.st_size
+        count -= 1
+        removed += 1
+    return removed
+
+
+def _maybe_prune(keep: Path) -> None:
+    """Prune at most every ``_PRUNE_INTERVAL_S`` seconds, off the hot path."""
+    global _last_prune
+    now = time.monotonic()
+    if now - _last_prune < _PRUNE_INTERVAL_S:
+        return
+    _last_prune = now
+    prune_overlay_cache(keep=keep)
+
 
 _FONT_CANDIDATES = (
     "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
@@ -91,6 +146,335 @@ def render_text_png(
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     image.save(out)
+    return out
+
+
+# Border styles draw only a line or bezel over the picture.  Shaped windows
+# (circle ... star) also cover everything outside the shape with the matte
+# colour, so the picture really appears cut to that shape.
+WINDOW_FRAME_STYLES: dict[str, str] = {
+    "none": "None",
+    "line": "Line",
+    "rounded": "Rounded",
+    "double": "Double line",
+    "corners": "Corner brackets",
+    "neon": "Neon glow",
+    "vignette": "Vignette",
+    "polaroid": "Polaroid",
+    "tv": "TV screen",
+    "film": "Film strip",
+    "circle": "Circle window",
+    "oval": "Oval window",
+    "window": "Rounded window",
+    "hexagon": "Hexagon window",
+    "diamond": "Diamond window",
+    "heart": "Heart window",
+    "star": "Star window",
+}
+
+def _merge_themes() -> None:
+    from . import frames
+    for key, (label, _group, _painter) in frames.THEMES.items():
+        WINDOW_FRAME_STYLES.setdefault(key, label)
+
+
+_merge_themes()
+
+# Styles that cut the picture to a shape.
+SHAPED_FRAME_STYLES = ("circle", "oval", "window", "hexagon", "diamond", "heart", "star")
+# These keep their proportions; the others stretch to the box.
+_UNIFORM_SHAPES = ("circle", "hexagon", "heart", "star")
+_SUPERSAMPLE = 3
+
+
+def _shape_points(style: str, width: int, height: int,
+                  margin: float) -> list[tuple[float, float]]:
+    """Outline of a shaped window inscribed in the box, in pixels."""
+    import math
+
+    left, top = margin, margin
+    span_w, span_h = max(2.0, width - 2 * margin), max(2.0, height - 2 * margin)
+
+    def fit(points, uniform=True):
+        xs, ys = [p[0] for p in points], [p[1] for p in points]
+        min_x, max_x, min_y, max_y = min(xs), max(xs), min(ys), max(ys)
+        scale_x = span_w / (max_x - min_x)
+        scale_y = span_h / (max_y - min_y)
+        if uniform:
+            scale_x = scale_y = min(scale_x, scale_y)
+        offset_x = left + (span_w - (max_x - min_x) * scale_x) / 2.0
+        offset_y = top + (span_h - (max_y - min_y) * scale_y) / 2.0
+        return [(offset_x + (x - min_x) * scale_x,
+                 offset_y + (y - min_y) * scale_y) for x, y in points]
+
+    if style == "hexagon":
+        return fit([(math.cos(math.pi / 6 + i * math.pi / 3),
+                     math.sin(math.pi / 6 + i * math.pi / 3)) for i in range(6)])
+    if style == "diamond":
+        return fit([(0.5, 0.0), (1.0, 0.5), (0.5, 1.0), (0.0, 0.5)], uniform=False)
+    if style == "star":
+        points = []
+        for index in range(10):
+            radius = 1.0 if index % 2 == 0 else 0.42
+            angle = -math.pi / 2 + index * math.pi / 5
+            points.append((math.cos(angle) * radius, math.sin(angle) * radius))
+        return fit(points)
+    if style == "heart":
+        points = []
+        for step in range(120):
+            t = step / 120 * 2 * math.pi
+            points.append((16 * math.sin(t) ** 3,
+                           -(13 * math.cos(t) - 5 * math.cos(2 * t)
+                             - 2 * math.cos(3 * t) - math.cos(4 * t))))
+        return fit(points)
+    return []
+
+
+def _shaped_window(width: int, height: int, style: str, border: tuple,
+                   matte: tuple, thickness: int) -> Image.Image:
+    """Matte outside a shape, with a border ring along its edge."""
+    scale = _SUPERSAMPLE
+    big_w, big_h = width * scale, height * scale
+    margin = max(2, thickness) * scale
+    inside = Image.new("L", (big_w, big_h), 0)
+    ring = Image.new("L", (big_w, big_h), 0)
+    draw_in, draw_ring = ImageDraw.Draw(inside), ImageDraw.Draw(ring)
+    box = [margin, margin, big_w - margin - 1, big_h - margin - 1]
+    stroke = max(1, thickness) * scale
+    if style == "circle":
+        side = min(big_w, big_h) - 2 * margin
+        left, top = (big_w - side) // 2, (big_h - side) // 2
+        circle = [left, top, left + side, top + side]
+        draw_in.ellipse(circle, fill=255)
+        draw_ring.ellipse(circle, outline=255, width=stroke)
+    elif style == "oval":
+        draw_in.ellipse(box, fill=255)
+        draw_ring.ellipse(box, outline=255, width=stroke)
+    elif style == "window":
+        radius = int(min(big_w, big_h) * 0.16)
+        draw_in.rounded_rectangle(box, radius=radius, fill=255)
+        draw_ring.rounded_rectangle(box, radius=radius, outline=255, width=stroke)
+    else:
+        points = _shape_points(style, big_w, big_h, margin)
+        draw_in.polygon(points, fill=255)
+        draw_ring.line(points + [points[0]], fill=255, width=stroke, joint="curve")
+    inside = inside.resize((width, height), Image.LANCZOS)
+    ring = ring.resize((width, height), Image.LANCZOS)
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    outside = inside.point(lambda value: 255 - value)
+    image.paste(Image.new("RGBA", (width, height), matte), (0, 0), outside)
+    image.paste(Image.new("RGBA", (width, height), border), (0, 0), ring)
+    return image
+
+
+def _vignette(width: int, height: int, matte: tuple) -> Image.Image:
+    import numpy as np
+
+    ys, xs = np.mgrid[0:height, 0:width]
+    dx = (xs - width / 2.0) / (width / 2.0)
+    dy = (ys - height / 2.0) / (height / 2.0)
+    distance = np.sqrt(dx * dx + dy * dy) / 1.4142
+    alpha = np.clip((distance - 0.45) / 0.55, 0.0, 1.0) ** 1.6 * 215
+    pixels = np.zeros((height, width, 4), dtype=np.uint8)
+    pixels[..., 0], pixels[..., 1], pixels[..., 2] = matte[0], matte[1], matte[2]
+    pixels[..., 3] = alpha.astype(np.uint8)
+    return Image.fromarray(pixels, "RGBA")
+
+
+def _neon(width: int, height: int, rgba: tuple, thickness: int) -> Image.Image:
+    from PIL import ImageFilter
+
+    margin = max(3, thickness * 2)
+    line = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    ImageDraw.Draw(line).rounded_rectangle(
+        [margin, margin, width - margin - 1, height - margin - 1],
+        radius=max(3, int(min(width, height) * 0.06)), outline=rgba,
+        width=max(1, thickness))
+    glow = line.filter(ImageFilter.GaussianBlur(max(2.0, thickness * 1.8)))
+    # Brighter core inside the same outline, so it reads as a lit tube.
+    core = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    light = tuple(min(255, int(c + (255 - c) * 0.6)) for c in rgba[:3]) + (255,)
+    ImageDraw.Draw(core).rounded_rectangle(
+        [margin, margin, width - margin - 1, height - margin - 1],
+        radius=max(3, int(min(width, height) * 0.06)), outline=light,
+        width=max(1, thickness // 3))
+    image = Image.alpha_composite(glow, glow)
+    image = Image.alpha_composite(image, line)
+    return Image.alpha_composite(image, core)
+
+
+def _themes():
+    from . import frames
+    return frames
+
+
+def render_window_frame(
+    width: int,
+    height: int,
+    style: str = "rounded",
+    color: str = "#5eead0",
+    thickness: int = 6,
+    out: Path | None = None,
+    matte: str = "#0b0d10",
+) -> Path:
+    """Render a transparent overlay that frames one layer's picture.
+
+    Border styles draw a line or bezel.  Shaped windows (``SHAPED_FRAME_STYLES``)
+    cover everything outside the shape with ``matte`` and draw the border
+    colour along the edge.  ``film`` and ``polaroid`` are matted borders too.
+    """
+    width, height = max(8, int(width)), max(8, int(height))
+    style = style if style in WINDOW_FRAME_STYLES else "rounded"
+    thickness = max(1, min(48, int(thickness)))
+    rgba = parse_color(color, (94, 234, 208, 255))
+    matte_rgba = parse_color(matte, (11, 13, 16, 255))
+    image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    if style == "none":
+        pass
+    elif style in _themes().THEMES:
+        image = _themes().render(style, width, height, thickness, color)
+    elif style in SHAPED_FRAME_STYLES:
+        image = _shaped_window(width, height, style, rgba, matte_rgba, thickness)
+    elif style == "vignette":
+        image = _vignette(width, height, matte_rgba)
+    elif style == "neon":
+        image = _neon(width, height, rgba, thickness)
+    elif style == "polaroid":
+        side = max(thickness, int(min(width, height) * 0.05))
+        bottom = max(side * 3, int(height * 0.17))
+        draw.rectangle([0, 0, width - 1, height - 1], fill=rgba)
+        draw.rectangle([side, side, width - side - 1, height - bottom - 1],
+                       fill=(0, 0, 0, 0))
+        draw.rectangle([side - 1, side - 1, width - side, height - bottom],
+                       outline=(0, 0, 0, 60))
+    elif style == "tv":
+        bezel = max(thickness * 2, int(min(width, height) * 0.07))
+        radius = max(6, int(min(width, height) * 0.09))
+        draw.rectangle([0, 0, width - 1, height - 1], fill=matte_rgba)
+        draw.rounded_rectangle([bezel, bezel, width - bezel - 1, height - bezel - 1],
+                               radius=radius, fill=(0, 0, 0, 0))
+        draw.rounded_rectangle([bezel - 2, bezel - 2, width - bezel + 1, height - bezel + 1],
+                               radius=radius + 2, outline=rgba, width=max(1, thickness // 3))
+        led = max(2, bezel // 5)
+        draw.ellipse([width - bezel - led * 3, height - bezel // 2 - led // 2,
+                      width - bezel - led * 2, height - bezel // 2 + led // 2 + 1], fill=rgba)
+    elif style == "film":
+        draw.rectangle([0, 0, width - 1, height - 1], fill=rgba)
+        inner = max(thickness, int(min(width, height) * 0.09))
+        draw.rectangle([inner, inner, width - inner - 1, height - inner - 1],
+                       fill=(0, 0, 0, 0))
+        hole = max(2, thickness)
+        step = max(hole * 3, 2)
+        for x in range(inner + hole, width - inner - hole, step):
+            draw.rectangle([x, max(1, inner // 2 - hole // 2),
+                            x + hole, max(1, inner // 2 + hole // 2)],
+                           fill=(16, 20, 24, 255))
+            draw.rectangle([x, height - inner // 2 - hole // 2,
+                            x + hole, height - inner // 2 + hole // 2],
+                           fill=(16, 20, 24, 255))
+    else:
+        margin = max(1, thickness // 2 + 1)
+        outer = [margin, margin, width - margin - 1, height - margin - 1]
+        if style == "rounded":
+            radius = max(3, int(min(width, height) * 0.08))
+            draw.rounded_rectangle(outer, radius=radius, outline=rgba, width=thickness)
+        elif style == "line":
+            draw.rectangle(outer, outline=rgba, width=thickness)
+        elif style == "double":
+            draw.rectangle(outer, outline=rgba, width=max(1, thickness // 2))
+            inset = margin + max(2, thickness * 2)
+            draw.rectangle([inset, inset, width - inset - 1, height - inset - 1],
+                           outline=rgba, width=max(1, thickness // 2))
+        elif style == "corners":
+            tick = max(12, min(width, height) // 6)
+            for x, y, dx, dy in (
+                (margin, margin, 1, 1),
+                (width - margin - 1, margin, -1, 1),
+                (margin, height - margin - 1, 1, -1),
+                (width - margin - 1, height - margin - 1, -1, -1),
+            ):
+                draw.line([x, y, x + dx * tick, y], fill=rgba, width=thickness)
+                draw.line([x, y, x, y + dy * tick], fill=rgba, width=thickness)
+    if out is None:
+        digest = hashlib.sha1(
+            f"frame3|{style}|{color}|{matte}|{thickness}|{width}x{height}".encode()
+        ).hexdigest()[:16]
+        out = config.cache_dir() / "overlays" / f"frame-{digest}.png"
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    image.save(out)
+    return out
+
+
+BACKGROUND_NAMES = (
+    "Aurora", "Midnight", "Sunset", "Studio", "Ocean",
+    "Neon Grid", "Bokeh", "Carbon", "Paper", "Vignette",
+)
+
+
+def render_background(name: str, width: int, height: int,
+                      out: Path | None = None) -> Path:
+    """Render a fast, cached static backdrop at the project canvas size."""
+    width, height = max(64, int(width)), max(64, int(height))
+    name = name if name in BACKGROUND_NAMES else "Studio"
+    palettes = {
+        "Aurora": ((8, 20, 35), (24, 82, 92), (94, 234, 208)),
+        "Midnight": ((3, 7, 18), (13, 27, 50), (79, 111, 178)),
+        "Sunset": ((30, 8, 30), (174, 68, 58), (255, 179, 94)),
+        "Studio": ((35, 40, 44), (61, 69, 74), (190, 200, 203)),
+        "Ocean": ((2, 18, 32), (6, 74, 102), (64, 196, 204)),
+        "Neon Grid": ((8, 2, 20), (45, 8, 76), (236, 63, 180)),
+        "Bokeh": ((18, 12, 28), (63, 30, 70), (255, 190, 120)),
+        "Carbon": ((16, 18, 20), (33, 37, 41), (92, 101, 108)),
+        "Paper": ((214, 198, 166), (238, 226, 199), (122, 100, 72)),
+        "Vignette": ((7, 9, 12), (27, 32, 37), (120, 135, 145)),
+    }
+    top, bottom, accent = palettes[name]
+    image = Image.new("RGBA", (width, height), (*top, 255))
+    draw = ImageDraw.Draw(image)
+    for y in range(height):
+        t = y / max(1, height - 1)
+        colour = tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3))
+        draw.line([(0, y), (width, y)], fill=(*colour, 255))
+    rng = random.Random(name)
+    layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    glow = ImageDraw.Draw(layer)
+    for _ in range(7):
+        radius = rng.randint(max(20, width // 14), max(30, width // 5))
+        cx = rng.randint(-radius, width + radius)
+        cy = rng.randint(-radius, height + radius)
+        alpha = rng.randint(24, 74)
+        glow.ellipse([cx - radius, cy - radius, cx + radius, cy + radius],
+                     fill=(*accent, alpha))
+    image = Image.alpha_composite(image, layer)
+    draw = ImageDraw.Draw(image)
+    if name == "Neon Grid":
+        grid = max(20, width // 28)
+        for x in range(-height, width + height, grid):
+            draw.line([(x, 0), (x - height, height)], fill=(*accent, 45), width=1)
+        for y in range(0, height, grid):
+            draw.line([(0, y), (width, y)], fill=(*accent, 35), width=1)
+    elif name == "Carbon":
+        for offset in range(-height, width, 28):
+            draw.line([(offset, 0), (offset + height, height)],
+                      fill=(*accent, 28), width=2)
+    elif name == "Paper":
+        for _ in range(max(400, width * height // 5000)):
+            x, y = rng.randrange(width), rng.randrange(height)
+            draw.point((x, y), fill=(*accent, rng.randint(12, 34)))
+    elif name == "Vignette":
+        edge = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        ed = ImageDraw.Draw(edge)
+        ed.rectangle([0, 0, width - 1, height - 1], outline=(0, 0, 0, 220),
+                     width=max(12, min(width, height) // 12))
+        image = Image.alpha_composite(image, edge)
+    if out is None:
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        out = config.cache_dir() / "backgrounds" / f"{slug}-{width}x{height}.png"
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    image.convert("RGB").save(out)
     return out
 
 
@@ -246,7 +630,8 @@ def _fingerprint(source: Path) -> str:
 def fit_rgba(source: Path, width: int, height: int, out: Path | None = None) -> Path:
     """Fit an image/logo into a layer box, preserving aspect, transparent fill."""
     width, height = max(8, int(width)), max(8, int(height))
-    image = Image.open(source).convert("RGBA")
+    with Image.open(source) as opened:
+        image = opened.convert("RGBA")
     scale = min(width / image.width, height / image.height)
     resized = image.resize((max(1, int(image.width * scale)), max(1, int(image.height * scale))), Image.LANCZOS)
     canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -257,6 +642,7 @@ def fit_rgba(source: Path, width: int, height: int, out: Path | None = None) -> 
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out)
+    _maybe_prune(out)
     return out
 
 
@@ -290,6 +676,7 @@ def prepare_rgba(source: Path, width: int, height: int,
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(out)
+    _maybe_prune(out)
     return out
 
 

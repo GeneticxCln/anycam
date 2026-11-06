@@ -237,7 +237,9 @@ class SourcePool:
 
     def release(self, spec: CaptureSpec) -> None:
         entry = self._entries.get(spec)
-        if entry is None:
+        if entry is None or entry.refs <= 0:
+            # An unmatched release must not drive the count negative: the next
+            # acquire would then start at zero and be torn down under its user.
             return
         entry.refs -= 1
         if entry.refs > 0:
@@ -283,6 +285,34 @@ class SourcePool:
             self._note(
                 f"idle screen capture released (node {entry.spec.source})")
 
+    def probe_size(self, spec: CaptureSpec) -> tuple[int, int]:
+        """The native frame size a capture for ``spec`` will have.
+
+        A hidden layer builds its canvas tail before its capture exists.  It
+        must still use the real source size: crop fractions and the fit are
+        computed from it, and the canvas-sized request is only right when the
+        camera happens to deliver exactly that mode.
+        """
+        entry = self._entries.get(spec)
+        if entry is not None:
+            return entry.source_size
+        fallback = spec.expected or (max(2, spec.width), max(2, spec.height))
+        try:
+            if spec.kind == "camera":
+                device = spec.source or config.camera_device()
+                modes = camera_modes(device)
+                mode = choose_from_modes(modes, spec.width, spec.height,
+                                         spec.fps)
+                if not modes:
+                    mode = _loopback_mode(device, spec.width, spec.height,
+                                          spec.fps) or mode
+                return (mode.width, mode.height)
+            if spec.kind == "video":
+                return video_size(spec.source) or fallback
+        except Exception:  # noqa: BLE001 - a probe must never block a build
+            pass
+        return fallback
+
     def channel_for(self, spec: CaptureSpec) -> str:
         """Stable channel for a spec, even while its capture is released."""
         channel = self._channels.get(spec)
@@ -321,7 +351,10 @@ class SourcePool:
                     break
                 if msg.type == Gst.MessageType.ERROR:
                     err, debug = msg.parse_error()
-                    entry.error = f"{err.message} ({debug})"
+                    # A network source's URL (camera password included) is
+                    # often quoted by the failing element.
+                    entry.error = config.redact_text(
+                        f"{err.message} ({debug})", entry.spec.source)
                     print(f"[capture-error] {entry.channel} {entry.error}",
                           file=sys.stderr, flush=True)
                 elif entry.spec.kind == "video" and not entry.error:
@@ -533,6 +566,9 @@ class SourcePool:
             # Compositors that only expose system-memory buffers still need
             # the deprecated copy path.
             src.set_property("always-copy", True)
+        if Gst.ElementFactory.find("videoflip") is not None:
+            elements.append(make("videoflip",
+                                 method=config.screen_flip_method()))
         elements.extend([
             make("videoconvert"),
             caps_filter("video/x-raw,format=RGBA"),

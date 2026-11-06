@@ -71,6 +71,7 @@ def test_screen_capture_uploads_dmabuf_frames():
         assert source.get_property("always-copy") is False
     else:
         assert source.get_property("always-copy") is True
+    assert "videoflip" in names
     assert "videoscale" in names
     assert "videorate" not in names
     # The format is pinned right after videoconvert, before any consumer can

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "anycam"
-version = "0.1.0"
+version = "1.0.0"
 description = "AnyCam - Linux-native virtual camera studio"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,7 +16,12 @@ dependencies = [
   "psutil>=5.9",
 ]
 
+# PyGObject (``gi``) and the GStreamer plugins are required too, but they come
+# from the distribution (python-gobject, gst-plugins-*), not from PyPI, so they
+# cannot be declared here.  See the README's Requirements section.
 [project.optional-dependencies]
+# The window.  Without it only the CLI/headless demo works.
+gui = ["PySide6>=6.6"]
 dev = ["pytest>=8", "pytest-timeout>=2"]
 # Powers the bundled YuNet face overlay; install with `pip install -e '.[face]'`.
 face = ["onnxruntime>=1.16"]
@@ -33,4 +38,4 @@ addopts = "-q"
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.setuptools.package-data]
-anycam = ["ui/*.qss", "assets/*.png", "assets/models/*.onnx"]
+anycam = ["ui/*.qss", "assets/*.png", "assets/*.jpg", "assets/models/*.onnx", "assets/models/*.md", "assets/emoji/*.png", "assets/emoji/*.json", "assets/emoji/*.md"]

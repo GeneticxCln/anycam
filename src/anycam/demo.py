@@ -101,7 +101,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--brightness", type=float, default=0.0, help="-1..1")
     parser.add_argument("--contrast", type=float, default=1.0)
     parser.add_argument("--saturation", type=float, default=1.0)
-    parser.add_argument("--blur", type=float, default=0.0, help="gaussian sigma")
     parser.add_argument("--chroma", default="", help="key colour, e.g. #00ff00")
     parser.add_argument("--chroma-similarity", type=float, default=0.35)
     parser.add_argument("--crop", default="", help="left,top,right,bottom normalised fractions")
@@ -128,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
             project.scene.add_layer(layer)
             playlist_ids.append(layer.id)
     if any((args.brightness, args.contrast != 1.0, args.saturation != 1.0,
-            args.blur, args.chroma, args.crop)):
+            args.chroma, args.crop)):
         source_layer = next((l for l in project.scene.layers
                              if l.kind in ("camera", "test", "video", "network", "image", "logo", "screen")), None)
         if source_layer is not None:
@@ -136,7 +135,6 @@ def main(argv: list[str] | None = None) -> int:
             fx.brightness = args.brightness
             fx.contrast = args.contrast
             fx.saturation = args.saturation
-            fx.blur = args.blur
             if args.crop:
                 source_layer.crop = tuple(float(v) for v in args.crop.split(","))
             if args.chroma:

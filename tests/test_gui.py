@@ -126,6 +126,32 @@ def test_preview_delivers_a_live_frame(app):
         app.processEvents()
 
 
+def test_restart_keeps_the_last_preview_frame_on_screen(app, monkeypatch):
+    """A scene/resolution rebuild must not blank the program monitor."""
+    window = _window()
+    image = QImage(32, 18, QImage.Format.Format_RGBA8888)
+    image.fill(QColor("red"))
+    window.preview.set_image(image)
+
+    class Engine:
+        def stop(self) -> dict:
+            return {}
+
+    started: list[bool] = []
+    window.engine = Engine()
+    monkeypatch.setattr(window, "start_engine",
+                        lambda: started.append(True))
+    try:
+        window.restart_engine()
+        assert window.engine is None
+        assert window.preview.image is image
+        assert started == [True]
+    finally:
+        window.engine = None
+        window.close()
+        app.processEvents()
+
+
 def test_snapshot_writes_the_live_frame(app, tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_VIDEOS_DIR", str(tmp_path))
     window = _window()
@@ -894,19 +920,24 @@ def test_add_image_video_and_network_source_layers(app, tmp_path):
 
 
 def test_camera_picker_keeps_a_device_per_layer(app, monkeypatch):
+    # Use paths that do not exist on the host.  A real /dev/videoN would be
+    # canonicalised to its /dev/v4l/by-id name and make this test depend on
+    # the machine's current camera numbering.
+    desk = "/dev/anycam-desk-cam"
+    wide = "/dev/anycam-wide-cam"
     cameras = [
-        config.CameraInfo("/dev/video2", "Desk Cam", ["MJPG"]),
-        config.CameraInfo("/dev/video3", "Wide Cam", ["MJPG"]),
+        config.CameraInfo(desk, "Desk Cam", ["MJPG"]),
+        config.CameraInfo(wide, "Wide Cam", ["MJPG"]),
         config.CameraInfo("/dev/video10", "AnyCam", ["YUYV"]),
     ]
     monkeypatch.setattr(config, "list_video_devices", lambda: cameras)
     window = _window()
     try:
-        first = window.add_layer("camera", "/dev/video2")
-        second = window.add_layer("camera", "/dev/video3")
+        first = window.add_layer("camera", desk)
+        second = window.add_layer("camera", wide)
         assert first is not None and second is not None
-        assert first.source == "/dev/video2"
-        assert second.source == "/dev/video3"
+        assert first.source == desk
+        assert second.source == wide
         assert first.name == "Desk Cam"
         assert second.name == "Wide Cam"
         # AnyCam's own virtual camera must never be offered as an input.
@@ -914,24 +945,24 @@ def test_camera_picker_keeps_a_device_per_layer(app, monkeypatch):
 
         window.preview.set_selection([first.id], first.id)
         assert window.camera_combo.isEnabled()
-        assert window.camera_combo.currentData() == "/dev/video2"
+        assert window.camera_combo.currentData() == desk
         window.camera_width.setValue(1280)
         window.camera_height.setValue(720)
         window.camera_fps.setValue(25)
         assert (first.camera_width, first.camera_height, first.camera_fps) == (1280, 720, 25)
         window.camera_combo.setCurrentIndex(
-            window.camera_combo.findData("/dev/video3"))
-        assert first.source == "/dev/video3"
+            window.camera_combo.findData(wide))
+        assert first.source == wide
 
         window.preview.set_selection([second.id], second.id)
-        assert window.camera_combo.currentData() == "/dev/video3"
+        assert window.camera_combo.currentData() == wide
         assert (window.camera_width.value(), window.camera_height.value(),
                 window.camera_fps.value()) == (0, 0, 0)
         assert (second.camera_width, second.camera_height, second.camera_fps) == (0, 0, 0)
         monkeypatch.setattr(QInputDialog, "getItem",
-                            lambda *args, **kwargs: ("Wide Cam · /dev/video3", True))
-        assert window._choose_camera_device() == "/dev/video3"
-        assert window.add_layer("camera", "/dev/video2").source == "/dev/video2"
+                            lambda *args, **kwargs: ("Wide Cam · " + wide, True))
+        assert window._choose_camera_device() == wide
+        assert window.add_layer("camera", desk).source == desk
     finally:
         window.close()
         app.processEvents()
@@ -1388,12 +1419,17 @@ def test_add_screen_layer_keeps_portal_session(app, monkeypatch):
         def node_id(self):
             return self.streams[0].node_id
 
+        def take_remote(self):
+            fd, self.fd = self.fd, -1
+            return fd
+
         def close(self):
             self.closed = True
 
     session = FakeSession()
-    monkeypatch.setattr(portal, "request_screen_cast", lambda: session)
+    monkeypatch.setattr(portal, "request_screen_cast", lambda **_kwargs: session)
     window = _window()
+    window.headless = True
     try:
         layer = window.add_layer("screen")
         assert layer is not None and layer.kind == "screen"
@@ -1408,61 +1444,36 @@ def test_add_screen_layer_keeps_portal_session(app, monkeypatch):
         app.processEvents()
 
 
-def test_face_overlay_follows_detector_and_can_be_disabled(app, monkeypatch):
-    from anycam import face as face_module
+def test_screen_fds_are_renewed_for_each_canvas_build(app):
+    """A screen rebuild must not reuse the fd pipewiresrc already consumed."""
+    class FakeSession:
+        def __init__(self):
+            self.fd = 12
+            self.next_fd = 20
+            self.calls = 0
 
-    class FakeDetector:
-        faces = [face_module.Face(0.2, 0.3, 0.1, 0.1, 0.95)]
+        def take_remote(self):
+            self.calls += 1
+            if self.fd >= 0:
+                fd, self.fd = self.fd, -1
+                return fd
+            fd = self.next_fd
+            self.next_fd += 1
+            return fd
 
-        def detect(self, frame):
-            assert frame.shape[2] == 3
-            return list(type(self).faces)
+        def close(self):
+            pass
 
-    monkeypatch.setattr(face_module, "FaceDetector", FakeDetector)
     window = _window()
     try:
-        camera = next(layer for layer in window.scene.layers
-                      if layer.kind in ("camera", "test", "video", "screen", "network"))
-        camera.effects.face_effect = "frame"
-        assert window._sync_face_overlay() is True
-        face_layer = window.scene.layer(window._face_layer_id)
-        assert face_layer is not None and face_layer.kind == "face"
-        assert face_layer.visible is False
-
-        class FakeEngine:
-            def __init__(self):
-                self.boxes = {}
-                self.visible = {}
-
-            def set_layer_box(self, layer_id, box):
-                self.boxes[layer_id] = box
-                window.scene.layer(layer_id).box = box
-
-            def set_layer_visible(self, layer_id, visible):
-                self.visible[layer_id] = visible
-                window.scene.layer(layer_id).visible = visible
-
-        engine = FakeEngine()
-        window.engine = engine
-        window._frame_bytes = bytes(320 * 180 * 4)
-        window._face_size = (320, 180)
-        window._face_last = 0.0
-        window._track_face()
-        assert engine.visible[face_layer.id] is True
-        box = engine.boxes[face_layer.id]
-        assert box[0] < 0.2 and box[1] < 0.3
-        assert box[2] > 0.1 and box[3] > 0.1
-
-        FakeDetector.faces = []
-        window._face_last = 0.0
-        window._track_face()
-        assert engine.visible[face_layer.id] is False
-
-        camera.effects.face_effect = "none"
-        assert window._sync_face_overlay() is True
-        assert window.scene.layer(face_layer.id) is None
+        layer = Layer("screen_build", "screen", "Screen", source="42")
+        window.scene.add_layer(layer)
+        session = FakeSession()
+        window._screen_sessions[layer.id] = session
+        assert window._screen_fds() == {layer.id: 12}
+        assert window._screen_fds() == {layer.id: 20}
+        assert session.calls == 2
     finally:
-        window.engine = None
         window.close()
         app.processEvents()
 
@@ -1556,6 +1567,125 @@ def test_playlist_snap_and_autosave_persist(app, tmp_path, monkeypatch):
         assert restored.playlist_index == 0
     finally:
         restored.close()
+        app.processEvents()
+
+
+def test_effects_follow_selection_and_update_without_a_rebuild(app):
+    window = _window()
+
+    class FakeEngine:
+        def __init__(self):
+            self.calls = []
+
+        def set_layer_effects(self, layer_id, effects):
+            self.calls.append((layer_id, effects))
+            return True
+
+    camera = next(layer for layer in window.scene.layers if layer.kind == "test")
+    selected = next(layer for layer in window.scene.layers if layer.kind == "text")
+    fake = FakeEngine()
+    window.engine = fake
+    try:
+        window.preview.set_selection([selected.id], selected.id)
+        app.processEvents()
+        assert window.effects_target.text().startswith(selected.name)
+
+        window._set_effect("brightness", 25)
+        assert selected.effects.brightness == pytest.approx(0.25)
+        assert camera.effects.brightness == 0.0
+        assert fake.calls[-1][0] == selected.id
+
+        window.effect_preset.setCurrentIndex(
+            window.effect_preset.findData("Mono"))
+        assert selected.effects.saturation == 0.0
+        assert fake.calls[-1][0] == selected.id
+    finally:
+        window.engine = None
+        window.close()
+        app.processEvents()
+
+
+def test_window_frame_controls_update_the_selected_layer(app):
+    window = _window()
+
+    class FakeEngine:
+        def __init__(self):
+            self.calls = []
+
+        def set_layer_effects(self, layer_id, effects):
+            self.calls.append((layer_id, effects))
+            return True
+
+    selected = next(layer for layer in window.scene.layers
+                    if layer.kind == "test")
+    fake = FakeEngine()
+    window.engine = fake
+    try:
+        window.preview.set_selection([selected.id], selected.id)
+        app.processEvents()
+        window.frame_style.setCurrentIndex(
+            window.frame_style.findData("neon"))
+        app.processEvents()
+        assert selected.effects.frame_style == "neon"
+        assert fake.calls[-1][0] == selected.id
+        assert window.frame_color.isEnabled()
+
+        window._set_effect("frame_width", 12)
+        assert selected.effects.frame_width == 12
+        assert fake.calls[-1][1] is selected.effects
+
+        window.frame_style.setCurrentIndex(
+            window.frame_style.findData("none"))
+        app.processEvents()
+        assert selected.effects.frame_style == "none"
+        assert not window.frame_color.isEnabled()
+    finally:
+        window.engine = None
+        window.close()
+        app.processEvents()
+
+
+def test_output_tab_saves_the_encoder_choice(app):
+    window = _window()
+    try:
+        assert window.encoder_combo.findData("nvenc_h265") >= 0
+        assert window.encoder_combo.findData("nvenc_av1") >= 0
+        index = window.encoder_combo.findData("cpu")
+        assert index >= 0
+        window.encoder_combo.setCurrentIndex(index)
+        app.processEvents()
+        assert window.project.output.encoder == "cpu"
+        assert window.encoder_combo.currentData() == "cpu"
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_backdrop_tab_replaces_static_and_3d_backdrops(app, tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    window = _window()
+    try:
+        window._apply_background("Aurora")
+        static = [layer for layer in window._active_backdrops()
+                  if layer.visible]
+        assert len(static) == 1
+        assert static[0].kind == "image"
+        assert static[0].role == "backdrop"
+
+        window._apply_animation("tunnel")
+        motion = [layer for layer in window._active_backdrops()
+                  if layer.visible]
+        assert len(motion) == 1
+        assert motion[0].kind == "animation"
+        assert motion[0].source == "tunnel"
+        # The replaced backdrop is deleted, not left behind hidden.
+        assert static[0] not in window.scene.layers
+        assert len(window._active_backdrops()) == 1
+
+        window._clear_backdrop()
+        assert window._active_backdrops() == []
+    finally:
+        window.close()
         app.processEvents()
 
 

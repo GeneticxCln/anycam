@@ -88,20 +88,23 @@ def test_two_camera_boxes_show_their_own_half(tmp_path):
     assert frame.corner_is_black((80, 20, 240, 50)), frame.average(80, 20, 240, 50)
 
 
-def test_camera_chain_letterboxes_a_1080p_mode(monkeypatch):
-    """B22: a 16:9 camera in a narrow box gets bars instead of a squeeze."""
+def test_camera_chain_fits_a_1080p_mode_without_baked_bars(monkeypatch):
+    """B22: a 16:9 camera in a narrow box is fitted, not squeezed.
+
+    The chain delivers the fitted picture (960x540 here) and adds no black
+    bands; the compositor pad centres it (``sizing-policy``), which is what
+    keeps the picture undistorted when the box changes without a rebuild.
+    """
     monkeypatch.setattr(
         sources, "camera_modes",
         lambda device: [sources.CameraMode("MJPG", 1920, 1080, 60)])
     layer = Layer("l_cam", "camera", "Cam", source="/dev/video0",
                   box=(0.0, 0.0, 0.5, 1.0))
     chain = sources.camera_chain("/dev/video0", 960, 1080, 60, layer)
-    boxes = [element for element in chain.elements
-             if element.get_factory().get_name() == "videobox"]
-    assert len(boxes) == 1, "a 16:9 frame in a 0.89 box must be letterboxed"
-    assert boxes[0].get_property("top") == -270
-    assert boxes[0].get_property("bottom") == -270
-    assert boxes[0].get_property("left") == 0
+    assert not [element for element in chain.elements
+                if element.get_factory().get_name() == "videobox"]
+    caps = chain.tail.get_property("caps").get_structure(0)
+    assert (caps.get_value("width"), caps.get_value("height")) == (960, 540)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg missing")
@@ -119,7 +122,8 @@ def test_video_layer_keeps_its_aspect(tmp_path):
     project = make_project(640, 360, 25)
     _add(project, Layer("l_video", "video", "Clip", source=str(clip),
                         box=(0.0, 0.0, 1.0, 1.0), z=1))
-    frame = grab_frame(project, timeout=8.0)
+    frame = grab_frame(project, timeout=8.0,
+                       until=lambda f: f.average(160, 160, 480, 200)[0] > 150)
     assert frame.average(160, 160, 480, 200)[0] > 150
     # Pillarbox bands: a stretched 4:3 frame would be red at x=20.
     assert frame.corner_is_black((5, 160, 60, 200)), frame.average(5, 160, 60, 200)
@@ -155,13 +159,122 @@ def test_chroma_tolerance_is_not_scaled_to_bytes():
                  chroma_smoothness=0.25)
     layer = Layer("l", "camera", "Cam", effects=fx)
     elements = sources._effects_chain(layer)
-    alpha = elements[0]
-    assert alpha.get_property("noise-level") == pytest.approx(0.35)
-    assert alpha.get_property("black-sensitivity") == 32
-    assert alpha.get_property("white-sensitivity") == 32
+    alpha = elements["alpha"]
+    assert alpha.get_property("noise-level") == pytest.approx(22.4)
+    assert alpha.get_property("black-sensitivity") == 121
+    assert alpha.get_property("white-sensitivity") == 121
 
     fx.chroma_similarity = 0.9
-    assert sources._effects_chain(layer)[0].get_property("noise-level") == pytest.approx(0.9)
+    sources.apply_effects(elements, fx)
+    assert alpha.get_property("noise-level") == pytest.approx(57.6)
+
+
+def test_chroma_key_removes_green_from_the_picture():
+    """A green layer keyed over red must actually show the red layer."""
+    from helpers.frames import grab_frame
+    from anycam.model import Effects
+
+    project = make_project(320, 180, 30)
+    _add(project, Layer("red", "test", "Red", source="red", z=1))
+    _add(project, Layer(
+        "green", "test", "Green", source="green", z=2,
+        effects=Effects(chroma_enabled=True, chroma_key="#00ff00",
+                        chroma_similarity=0.35, chroma_smoothness=0.1)))
+
+    frame = grab_frame(project)
+    pixel = frame.pixel(160, 90)
+    assert pixel[0] > 200 and pixel[1] < 30, pixel
+
+
+def test_window_frame_is_drawn_over_the_layer_pixels(tmp_path):
+    """Frame styles must reach the composited picture, not just the model."""
+    from helpers.frames import grab_frame
+    from anycam.model import Effects
+
+    project = make_project(320, 180, 30)
+    _add(project, Layer(
+        "framed", "test", "Framed", source="red", z=1,
+        effects=Effects(frame_style="corners", frame_color="#00ff00",
+                        frame_width=8)))
+    frame = grab_frame(project)
+    corner = frame.pixel(6, 6)
+    centre = frame.pixel(160, 90)
+    assert corner[1] > 120 and corner[0] < 80, corner
+    assert centre[0] > 200 and centre[1] < 40, centre
+
+
+def test_window_frame_style_and_alpha_change_without_a_rebuild(tmp_path):
+    """The frame overlay must be live-toggleable on an already built chain."""
+    from anycam.model import Effects
+
+    layer = Layer("framed", "test", "Framed", source="red",
+                  effects=Effects(frame_style="line", frame_color="#ff0000",
+                                  frame_width=6))
+    chain = sources.test_chain(320, 180, 30, layer)
+    frame = chain.effects["frame"]
+    assert Path(frame.get_property("location")).exists()
+    assert frame.get_property("alpha") == pytest.approx(1.0)
+
+    layer.effects.frame_style = "none"
+    sources.apply_effects(chain.effects, layer.effects)
+    assert frame.get_property("alpha") == pytest.approx(0.0)
+    layer.effects.frame_style = "neon"
+    sources.apply_effects(chain.effects, layer.effects)
+    assert frame.get_property("alpha") == pytest.approx(1.0)
+
+
+def test_static_backdrop_sits_behind_a_capture_layer(tmp_path):
+    """A generated backdrop is a real image layer, not a fake control."""
+    from helpers.frames import grab_frame
+
+    bg = overlay.render_background("Studio", 320, 180, tmp_path / "studio.png")
+    project = make_project(320, 180, 30)
+    _add(project, Layer("bg", "image", "Backdrop", source=str(bg),
+                        box=(0.0, 0.0, 1.0, 1.0), z=1, role="backdrop"))
+    _add(project, Layer("cam", "test", "Cam", source="red",
+                        box=(0.25, 0.25, 0.5, 0.5), z=2))
+    frame = grab_frame(project)
+    corner = frame.average(4, 4, 50, 50)
+    centre = frame.pixel(160, 90)
+    assert corner[0] < 130, corner
+    assert centre[0] > 200 and centre[1] < 40, centre
+
+
+def test_animation_chain_builds_a_live_motion_source():
+    """Animated backdrops are drawn procedurally and really move."""
+    chain = sources.animation_chain("tunnel", 320, 180, 30)
+    try:
+        names = [element.get_factory().get_name() for element in chain.elements
+                 if element.get_factory() is not None]
+        assert "appsrc" in names
+        assert chain.output_pad is not None
+        assert chain.cleanup, "the generator thread needs a stop hook"
+    finally:
+        for hook in chain.cleanup:
+            hook()
+
+
+def test_effect_rack_updates_live_and_has_no_blur_path():
+    """Colour, hue and chroma are live properties; no CPU blur in the rack."""
+    from anycam.model import Effects
+
+    fx = Effects(brightness=0.1, contrast=1.2, saturation=1.1, hue=-0.2,
+                 chroma_enabled=True)
+    layer = Layer("l", "camera", "Cam", effects=fx)
+    elements = sources._effects_chain(layer)
+    assert {"balance", "alpha", "videoflip"} <= set(elements)
+
+    fx.chroma_enabled = False
+    fx.color_effect = "sepia"
+    fx.mirror = True
+    sources.apply_effects(elements, fx)
+    assert elements["alpha"].get_property("alpha") == pytest.approx(1.0)
+    assert elements["balance"].get_property("hue") == pytest.approx(-0.2)
+    assert int(elements["videoflip"].get_property("video-direction")) == 4
+    if "style" in elements:
+        assert int(elements["style"].get_property("preset")) == 2
+    assert not any(element.get_factory().get_name() == "gaussianblur"
+                   for element in elements.values())
 
 
 # --------------------------------------------------------------------- B29
@@ -173,7 +286,7 @@ def test_bad_chroma_colour_cannot_break_the_graph():
     assert sources.parse_chroma_color("#12zz34") == (0, 255, 0)
     layer = Layer("l", "camera", "Cam",
                   effects=_effects(fx_color="#fff"))
-    assert sources._effects_chain(layer)[0].get_property("target-r") == 255
+    assert sources._effects_chain(layer)["alpha"].get_property("target-r") == 255
 
 
 def _effects(fx_color: str = "#00ff00"):

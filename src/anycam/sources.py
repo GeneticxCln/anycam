@@ -2,12 +2,14 @@
 
 Every source produces a normalised RGBA video stream at the layer box size and
 frame rate.  Aspect ratio is preserved: the picture is scaled to fit inside the
-box and the remaining bands are letterboxed, so a 16:9 camera in a portrait
+box (the compositor pad centres it), so a 16:9 camera in a portrait
 box shows the whole frame instead of a squeezed one.  A small amount of probing
 is used for cameras so the pipeline does not fail when a device does not
 advertise the exact MJPG mode we prefer.
 """
 from __future__ import annotations
+
+import itertools
 
 import os
 import re
@@ -19,7 +21,10 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
-from .geometry import crop_pixels, fit_contain
+from . import config, procedural
+from .geometry import Rect, crop_pixels, fit_contain
+from .effects import FilterSlot, SwapGate
+from .model import Effects
 
 
 def make(factory: str, name: str | None = None, **props) -> Gst.Element:
@@ -227,6 +232,13 @@ class SourceChain:
     # Negotiated source size before the box fit: the crop editor and the
     # normalised crop both need to know what "100%" means for this layer.
     source_size: tuple[int, int] | None = None
+    # The live effect rack (balance, blur, alpha) is kept on the chain so a
+    # slider can change properties on the running graph without a rebuild.
+    effects: dict = field(default_factory=dict)
+    # Called when the canvas goes away (a procedural source stops its thread).
+    cleanup: list = field(default_factory=list)
+    # Object with ``restart()`` (a lower third slides in again when shown).
+    control: object = None
 
     def add(self, *elements: Gst.Element) -> None:
         self.elements.extend(elements)
@@ -255,37 +267,134 @@ def parse_chroma_color(value: str, default: tuple[int, int, int] = (0, 255, 0)) 
     return default
 
 
-def _effects_chain(layer) -> list[Gst.Element]:
-    """Optional colour / blur / chroma-key elements for a camera-like source."""
-    fx = getattr(layer, "effects", None)
-    if fx is None:
-        return []
-    elements: list[Gst.Element] = []
-    if fx.chroma_enabled:
-        alpha = make("alpha", method="custom", prefer_passthrough=True)
-        red, green, blue = parse_chroma_color(fx.chroma_key or "#00ff00")
-        alpha.set_property("target-r", red)
-        alpha.set_property("target-g", green)
-        alpha.set_property("target-b", blue)
-        # ``noise-level`` is 0..64 (float), not a byte; multiplying by 255 made
-        # anything above 25% clamp to the maximum and key out the picture.
-        similarity = max(0.0, min(1.0, float(fx.chroma_similarity)))
-        smoothness = max(0.0, min(1.0, float(fx.chroma_smoothness)))
-        alpha.set_property("noise-level", similarity)
-        alpha.set_property("black-sensitivity", max(1, int(round(smoothness * 128))))
-        alpha.set_property("white-sensitivity", max(1, int(round(smoothness * 128))))
-        elements.append(alpha)
-    if fx.brightness or fx.contrast != 1.0 or fx.saturation != 1.0:
-        balance = make("videobalance")
-        balance.set_property("brightness", max(-1.0, min(1.0, fx.brightness)))
-        balance.set_property("contrast", max(0.0, min(3.0, fx.contrast)))
-        balance.set_property("saturation", max(0.0, min(3.0, fx.saturation)))
-        elements.append(balance)
-    if fx.blur and fx.blur > 0.2:
-        blur = make("gaussianblur")
-        blur.set_property("sigma", float(fx.blur))
-        elements.append(blur)
+def _effect_number(value, default: float) -> float:
+    """Read a numeric effect value without letting malformed JSON stop a build."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+COLOR_EFFECTS = frozenset({"none", "sepia", "heat", "xray", "xpro", "yellowblue"})
+
+ANIMATION_PRESETS: dict[str, dict[str, object]] = {
+    key: {"label": generator.label}
+    for key, generator in procedural.GENERATORS.items()
+}
+
+
+def _effects_chain(layer) -> dict[str, Gst.Element]:
+    """The cheap, always-present effect rack for one layer.
+
+    Everything here is a per-pixel or scanline transform: ``videobalance``
+    for colour, ``coloreffects`` for the film LUTs, ``videoflip`` for mirror,
+    and ``alpha`` for the chroma key.  They stay wired so every control is
+    live and nothing rebuilds the canvas.  Heavier effects (blur, distortion,
+    the retro TV family) are not here: they live in the swappable filter slot
+    (``anycam.effects``) so a layer only pays for the one it uses.
+    """
+    fx = getattr(layer, "effects", None) or Effects()
+    balance = make("videobalance")
+    # ``set`` with alpha=1 preserves an existing per-pixel alpha channel (text
+    # and logo layers), while ``custom`` performs the chroma key.
+    alpha = make("alpha", method="set", alpha=1.0, prefer_passthrough=True)
+    flip = make("videoflip", video_direction="identity")
+    elements = {"balance": balance, "videoflip": flip, "alpha": alpha}
+    if Gst.ElementFactory.find("coloreffects") is not None:
+        elements["style"] = make("coloreffects", preset="none")
+    apply_effects(elements, fx)
     return elements
+
+
+def apply_effects(elements: dict, fx: Effects) -> None:
+    """Apply an Effects model to a live rack without renegotiating the graph."""
+    if not elements:
+        return
+    balance = elements.get("balance")
+    if balance is not None:
+        balance.set_property("brightness", max(-1.0, min(1.0, _effect_number(
+            getattr(fx, "brightness", 0.0), 0.0))))
+        # videobalance advertises 0..2 for contrast/saturation.  The old GUI
+        # offered 300%, which is outside the element range and could fail at
+        # runtime, so both the clamp and the panel range now stop at 200%.
+        balance.set_property("contrast", max(0.0, min(2.0, _effect_number(
+            getattr(fx, "contrast", 1.0), 1.0))))
+        balance.set_property("saturation", max(0.0, min(2.0, _effect_number(
+            getattr(fx, "saturation", 1.0), 1.0))))
+        balance.set_property("hue", max(-1.0, min(1.0, _effect_number(
+            getattr(fx, "hue", 0.0), 0.0))))
+
+    for slot_key, attr in (("slot", "filter"), ("slot2", "filter2")):
+        slot = elements.get(slot_key)
+        if slot is not None:
+            slot.apply(getattr(fx, attr, "none"),
+                       _effect_number(getattr(fx, f"{attr}_amount", 0.5), 0.5))
+
+    flip = elements.get("videoflip")
+    if flip is not None:
+        flip.set_property("video-direction",
+                          "horiz" if bool(getattr(fx, "mirror", False)) else "identity")
+
+    style = elements.get("style")
+    if style is not None:
+        effect = str(getattr(fx, "color_effect", "none") or "none").lower()
+        style.set_property("preset", effect if effect in COLOR_EFFECTS else "none")
+
+    frame = elements.get("frame")
+    if frame is not None:
+        from . import overlay
+        width = int(frame.get_property("overlay-width") or 640)
+        height = int(frame.get_property("overlay-height") or 360)
+        frame_style = str(getattr(fx, "frame_style", "none") or "none").lower()
+        if frame_style not in overlay.WINDOW_FRAME_STYLES:
+            frame_style = "none"
+        frame_color = str(getattr(fx, "frame_color", "#5eead0") or "#5eead0")
+        frame_width = max(1, min(48, int(_effect_number(
+            getattr(fx, "frame_width", 6), 6))))
+        frame_matte = str(getattr(fx, "frame_matte", "#0b0d10") or "#0b0d10")
+        path = overlay.render_window_frame(
+            width, height, frame_style, frame_color, frame_width,
+            matte=frame_matte)
+        frame.set_property("location", str(path))
+        # A transparent PNG plus alpha=0 is a true bypass for the common case.
+        frame.set_property("alpha", 0.0 if frame_style == "none" else 1.0)
+
+    alpha = elements.get("alpha")
+    if alpha is not None:
+        if bool(getattr(fx, "chroma_enabled", False)):
+            red, green, blue = parse_chroma_color(
+                str(getattr(fx, "chroma_key", "#00ff00") or "#00ff00"))
+            alpha.set_property("method", "custom")
+            alpha.set_property("target-r", red)
+            alpha.set_property("target-g", green)
+            alpha.set_property("target-b", blue)
+            # ``noise-level`` is 0..64, so map the UI's 0..1 tolerance onto
+            # that range.  Keeping the default sensitivity at ~100 is also
+            # essential: the old 13 made bright green count as "too bright to
+            # key", which is why the checkbox appeared to do nothing.
+            similarity = max(0.0, min(1.0, _effect_number(
+                getattr(fx, "chroma_similarity", 0.35), 0.35)))
+            smoothness = max(0.0, min(1.0, _effect_number(
+                getattr(fx, "chroma_smoothness", 0.10), 0.10)))
+            alpha.set_property("noise-level", similarity * 64.0)
+            sensitivity = max(1, min(128, int(round(128.0 - smoothness * 28.0))))
+            alpha.set_property("black-sensitivity", sensitivity)
+            alpha.set_property("white-sensitivity", sensitivity)
+        else:
+            # Clear any previous key and restore opaque output.  Switching the
+            # method live is supported by the element and avoids a graph
+            # rebuild when the checkbox is toggled.
+            alpha.set_property("method", "set")
+            alpha.set_property("alpha", 1.0)
+
+
+def _add_effects(chain: SourceChain, layer) -> None:
+    elements = _effects_chain(layer)
+    chain.effects = elements
+    chain.add(elements["balance"])
+    if "style" in elements:
+        chain.add(elements["style"])
+    chain.add(elements["videoflip"], elements["alpha"], make("videoconvert"))
 
 
 def camera_capture_request(layer, width: int, height: int,
@@ -312,35 +421,57 @@ def cropped_size(layer, width: int, height: int) -> tuple[int, int]:
 
 
 def _fit_letterbox(chain: SourceChain, src_w: int, src_h: int,
-                   width: int, height: int, rate: bool = True) -> None:
-    """Scale a source into the box preserving aspect and pad with black bands.
+                   width: int, height: int, rate: bool = True) -> Rect:
+    """Scale a source to fit inside the box, preserving its aspect ratio.
 
-    The compositor pad stays exactly the layer box, so the drag/resize handles
-    and the picture now describe the same rectangle.  ``videobox`` uses
-    negative insets to *add* borders.
+    The chain outputs only the fitted picture (the returned rectangle's size).
+    The compositor pad is the layer box and uses ``sizing-policy=
+    keep-aspect-ratio``, so it centres the picture in the box and keeps doing
+    so when the box is moved or resized live.  Baking black bands into the
+    frame here (the old ``videobox``) distorted the picture as soon as the pad
+    changed shape without a rebuild.  The bands are now transparent.
     """
     rect = fit_contain(src_w, src_h, width, height)
     chain.add(make("videoscale"))
-    if (rect.w, rect.h) != (int(width), int(height)):
-        chain.add(caps_filter(
-            f"video/x-raw,format=RGBA,width={rect.w},height={rect.h}"))
-        box = make("videobox", fill="black")
-        box.set_property("left", -rect.x)
-        box.set_property("top", -rect.y)
-        box.set_property("right", -(int(width) - rect.w - rect.x))
-        box.set_property("bottom", -(int(height) - rect.h - rect.y))
-        chain.add(box)
+    chain.add(caps_filter(
+        f"video/x-raw,format=RGBA,width={rect.w},height={rect.h}"))
     if rate:
         chain.add(make("videorate"))
+    return rect
 
 
 def _finish_chain(chain: SourceChain, width: int, height: int, fps: int, *,
-                  pin_rate: bool = True) -> None:
+                  pin_rate: bool = True, layer=None) -> None:
     caps = caps_string(width, height, fps) if pin_rate else (
         f"video/x-raw,format=RGBA,width={width},height={height}")
+    if layer is not None:
+        # The swappable filter stage sits after the fit, so a distortion is
+        # relative to the picture the viewer sees and costs no more than the
+        # fitted size.  It is a pass-through until a filter is chosen.
+        fx = getattr(layer, "effects", None) or Effects()
+        gate = SwapGate()    # the two slots must not swap at the same time
+        slot = FilterSlot(getattr(fx, "filter", "none"),
+                          getattr(fx, "filter_amount", 0.5), chain.elements,
+                          size=(int(width), int(height)), fps=int(fps), gate=gate)
+        chain.add(slot.element)
+        chain.effects["slot"] = slot
+        chain.cleanup.append(slot.close)
+        slot2 = FilterSlot(getattr(fx, "filter2", "none"),
+                           getattr(fx, "filter2_amount", 0.5), chain.elements,
+                           size=(int(width), int(height)), fps=int(fps), gate=gate)
+        chain.add(slot2.element)
+        chain.effects["slot2"] = slot2
+        chain.cleanup.append(slot2.close)
+    if layer is not None and Gst.ElementFactory.find("gdkpixbufoverlay") is not None:
+        frame = make("gdkpixbufoverlay", overlay_width=int(width),
+                     overlay_height=int(height))
+        chain.add(frame)
+        chain.effects["frame"] = frame
     tail = caps_filter(caps)
     chain.add(tail)
     chain.tail = tail
+    if layer is not None:
+        apply_effects(chain.effects, getattr(layer, "effects", None) or Effects())
 
 
 def camera_chain(device: str, width: int, height: int, fps: int, layer=None,
@@ -368,14 +499,12 @@ def camera_chain(device: str, width: int, height: int, fps: int, layer=None,
         caps = caps_filter(f"video/x-raw,format={fmt},width={mode.width},height={mode.height},framerate={mode.fps}/1")
         chain.add(caps)
     chain.add(make("videoconvert"))
-    effects = _effects_chain(layer)
-    if effects:
-        chain.add(*effects, make("videoconvert"))
+    _add_effects(chain, layer)
     # Crop percentages apply to the camera frame, not the compositor box.
     chain.add(*_crop_chain(layer, mode.width, mode.height))
     cropped_w, cropped_h = cropped_size(layer, mode.width, mode.height)
-    _fit_letterbox(chain, cropped_w, cropped_h, width, height)
-    _finish_chain(chain, width, height, fps)
+    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height)
+    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
     chain.camera_mode = mode
     chain.capture_request = (cap_w, cap_h, cap_fps)
     chain.camera_probe_error = camera_probe_error(device)
@@ -434,6 +563,17 @@ def video_size(path: str) -> tuple[int, int] | None:
     return None
 
 
+def _image_pixel_size(path: Path) -> tuple[int, int] | None:
+    """Natural pixel size of an image file, or ``None`` when unreadable."""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as opened:
+            return int(opened.width), int(opened.height)
+    except Exception:  # noqa: BLE001 - an unreadable file is the decoder's problem
+        return None
+
+
 def image_chain(path: str, width: int, height: int, fps: int, layer=None,
                 fit: bool = True) -> SourceChain:
     chain = SourceChain()
@@ -453,19 +593,22 @@ def image_chain(path: str, width: int, height: int, fps: int, layer=None,
         decoder = make("decodebin")
         chain.dynamic_from = decoder
     chain.add(decoder, make("videoconvert"))
-    chain.add(*_crop_chain(layer, width, height))
+    # A raw image is cropped and fitted by its own size.  Taking the box size
+    # for it stretched every photo to the box and applied crop fractions to
+    # the wrong dimensions.  Pre-rendered overlays (fit=False) are box-sized.
+    src_w, src_h = (_image_pixel_size(source) or (width, height)) if fit else (width, height)
+    chain.add(*_crop_chain(layer, src_w, src_h))
     chain.add(make("imagefreeze"))
     # Overlay images are pre-rendered at box size with their transparency
     # already baked in (fit=False stretches them to the pad, which is what the
-    # rendered PNG expects).  A raw image file is fitted with black bars.
+    # rendered PNG expects).  A raw image file is fitted inside the box.
+    fitted = Rect(0, 0, int(width), int(height))
     if fit:
-        cropped_w, cropped_h = cropped_size(layer, width, height)
-        _fit_letterbox(chain, cropped_w, cropped_h, width, height, rate=False)
-    effects = _effects_chain(layer)
-    if effects:
-        chain.add(*effects, make("videoconvert"))
-    _finish_chain(chain, width, height, fps)
-    chain.source_size = (width, height)
+        cropped_w, cropped_h = cropped_size(layer, src_w, src_h)
+        fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height, rate=False)
+    _add_effects(chain, layer)
+    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
+    chain.source_size = (src_w, src_h)
     return chain
 
 
@@ -476,14 +619,12 @@ def file_video_chain(path: str, width: int, height: int, fps: int, layer=None) -
     chain.pause_elements.append(src)
     decode = make("decodebin")
     chain.add(decode, make("videoconvert"))
-    effects = _effects_chain(layer)
-    if effects:
-        chain.add(*effects, make("videoconvert"))
+    _add_effects(chain, layer)
     source_w, source_h = video_size(path) or (width, height)
     chain.add(*_crop_chain(layer, source_w, source_h))
     cropped_w, cropped_h = cropped_size(layer, source_w, source_h)
-    _fit_letterbox(chain, cropped_w, cropped_h, width, height)
-    _finish_chain(chain, width, height, fps)
+    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height)
+    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
     chain.dynamic_from = decode
     chain.source_size = (source_w, source_h)
     return chain
@@ -494,17 +635,15 @@ def network_chain(uri: str, width: int, height: int, fps: int, layer=None,
     chain = SourceChain()
     decode = make("uridecodebin", uri=uri)
     chain.add(decode, make("videoconvert"))
-    effects = _effects_chain(layer)
-    if effects:
-        chain.add(*effects, make("videoconvert"))
+    _add_effects(chain, layer)
     # The stream's own size is unknown before negotiation.  Until a probe tells
     # us otherwise, treat the canvas as the source so crop fractions stay a
     # fraction of a normal 1080p feed rather than of the (much smaller) box.
     source_w, source_h = source_size or (width, height)
     chain.add(*_crop_chain(layer, source_w, source_h))
     cropped_w, cropped_h = cropped_size(layer, source_w, source_h)
-    _fit_letterbox(chain, cropped_w, cropped_h, width, height)
-    _finish_chain(chain, width, height, fps)
+    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height)
+    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
     chain.dynamic_from = decode
     chain.pause_elements.append(decode)
     chain.source_size = (source_w, source_h)
@@ -513,7 +652,8 @@ def network_chain(uri: str, width: int, height: int, fps: int, layer=None,
 
 def screen_chain(node_id: int, width: int, height: int, fps: int, layer=None,
                  fd: int | None = None,
-                 expected_size: tuple[int, int] | None = None) -> SourceChain:
+                 expected_size: tuple[int, int] | None = None,
+                 flip: str | None = None) -> SourceChain:
     """Capture a PipeWire node exported by xdg-desktop-portal ScreenCast.
 
     ``fd`` is the PipeWire remote returned by OpenPipeWireRemote.  Passing it is
@@ -580,25 +720,29 @@ def screen_chain(node_id: int, width: int, height: int, fps: int, layer=None,
                 f"video/x-raw,format=RGBA,width={max(2, fit.w)},height={max(2, fit.h)}"))
     else:
         src.set_property("always-copy", True)
+    # A window share must not come out upside down.  Honour the compositor's
+    # image-orientation tag when it is present; KWin/NVIDIA can drop it while
+    # still rotating the buffer, so screen_flip_method() also accepts a forced
+    # correction through ANYCAM_SCREEN_FLIP.
+    if Gst.ElementFactory.find("videoflip") is not None:
+        chain.add(make("videoflip", method=config.screen_flip_method(flip)))
     chain.add(make("videoconvert"))
     chain.add(caps_filter("video/x-raw,format=RGBA"))
     chain.check_element = src
     chain.expected_size = (source_w, source_h)
-    effects = _effects_chain(layer)
-    if effects:
-        chain.add(*effects, make("videoconvert"))
+    _add_effects(chain, layer)
     # Crop against the frame the crop was computed on: the fitted size when the
     # GPU already scaled it, the native size otherwise.
     crop_base = (fit.w, fit.h) if gl_scale else (source_w, source_h)
     chain.add(*_crop_chain(layer, crop_base[0], crop_base[1]))
     cropped_w, cropped_h = cropped_size(layer, crop_base[0], crop_base[1])
-    _fit_letterbox(chain, cropped_w, cropped_h, width, height, rate=False)
+    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height, rate=False)
     # The canvas layer_tail owns the output rate.  A forced framerate here
     # makes a damage-driven DMA-BUF screencast emit one frame and then stall.
     # The same applies to videorate: a screencast advertises framerate=0/1
     # (variable), and a video-rate element fed with that can stop passing
     # frames entirely.
-    _finish_chain(chain, width, height, fps, pin_rate=False)
+    _finish_chain(chain, fitted.w, fitted.h, fps, pin_rate=False, layer=layer)
     chain.pause_elements.append(src)
     chain.source_size = crop_base
     return chain
@@ -660,15 +804,89 @@ def test_chain(width: int, height: int, fps: int, layer=None) -> SourceChain:
     # geometry is the box (this also makes crop behave like every other kind).
     chain.add(caps_filter(f"video/x-raw,format=RGBA,width={width},height={height}"))
     chain.add(make("videoconvert"))
-    effects = _effects_chain(layer)
-    if effects:
-        chain.add(*effects, make("videoconvert"))
+    _add_effects(chain, layer)
     chain.add(*_crop_chain(layer, width, height))
     cropped_w, cropped_h = cropped_size(layer, width, height)
-    _fit_letterbox(chain, cropped_w, cropped_h, width, height)
-    _finish_chain(chain, width, height, fps)
+    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height)
+    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
     chain.pause_elements.append(src)
     chain.source_size = (width, height)
+    return chain
+
+
+_source_counter = itertools.count(1)
+
+
+def _next_source_number() -> int:
+    """A process-wide unique number for generated-source element names.
+
+    The names used ``id(chain) & 0xFFFF``: a removed layer's element stays in
+    the pipeline (linked, alpha 0), and a new chain could be allocated at a
+    reused address, so two ``appsrc`` elements got the same name and the live
+    add failed (forcing a full rebuild).
+    """
+    return next(_source_counter)
+
+
+def animation_chain(preset: str, width: int, height: int, fps: int,
+                    layer=None) -> SourceChain:
+    """A live animated backdrop drawn procedurally (see ``anycam.procedural``).
+
+    The generator runs at a small internal size with the box's aspect ratio,
+    so scaling it up fills the box instead of leaving bands.
+    """
+    chain = SourceChain()
+    key = procedural.generator_key(preset)
+    source = procedural.ProceduralSource(
+        key, f"backdrop_{key}_{_next_source_number():x}", width, height, fps)
+    chain.add(source.appsrc)
+    chain.cleanup.append(source.stop)
+    fitted = _fit_letterbox(chain, source.width, source.height, width, height)
+    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
+    chain.source_size = (source.width, source.height)
+    return chain
+
+
+ANIMATED_KINDS = ("ticker", "lower_third", "gif", "drawing", "particles")
+
+
+def animated_chain(layer, width: int, height: int, fps: int) -> SourceChain:
+    """Ticker, lower third or animated image, drawn procedurally with alpha."""
+    from . import animated
+
+    kind = layer.kind
+    width, height = max(8, int(width)), max(8, int(height))
+    if kind == "ticker":
+        generator = animated.Ticker(width, height, layer.source, layer.color,
+                                    layer.background)
+        size = (width, height)
+    elif kind == "lower_third":
+        name, _sep, title = str(layer.source or "").partition("|")
+        generator = animated.LowerThird(width, height, name.strip(), title.strip(),
+                                        layer.color, layer.background)
+        size = (width, height)
+    elif kind == "particles":
+        from . import particles
+        generator, size = particles.make(layer.source, width, height)
+        controller = particles.Switcher(generator, width, height)
+        generator = controller
+    elif kind == "drawing":
+        generator = animated.DrawingCanvas(width, height, animated.parse_strokes(layer.source))
+        size = (width, height)
+        fps = min(int(fps), 10)        # it only changes when a stroke is added
+    else:
+        generator = animated.GifPlayer(str(Path(layer.source).expanduser()))
+        size = generator.size
+    chain = SourceChain()
+    source = procedural.ProceduralSource(
+        kind, f"anim_{kind}_{_next_source_number():x}", width, height, fps,
+        generator=generator, size=size)
+    chain.add(source.appsrc)
+    chain.cleanup.append(source.stop)
+    chain.control = generator
+    fitted = _fit_letterbox(chain, size[0], size[1], width, height)
+    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
+    chain.source_size = size
     return chain
 
 
@@ -689,14 +907,12 @@ def layer_tail(layer, source_size: tuple[int, int], width: int, height: int,
     src = make("intervideosrc", f"src_{channel}_{tag}", channel=channel)
     rate = caps_filter(f"video/x-raw,framerate={fps}/1")
     chain.add(src, rate, make("videoconvert"))
-    effects = _effects_chain(layer)
-    if effects:
-        chain.add(*effects, make("videoconvert"))
+    _add_effects(chain, layer)
     src_w, src_h = source_size
     chain.add(*_crop_chain(layer, src_w, src_h))
     cropped_w, cropped_h = cropped_size(layer, src_w, src_h)
-    _fit_letterbox(chain, cropped_w, cropped_h, width, height)
-    _finish_chain(chain, width, height, fps)
+    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height)
+    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
     chain.source_size = (src_w, src_h)
     return chain
 
@@ -739,7 +955,8 @@ def background_chain(width: int, height: int, fps: int) -> SourceChain:
 
 def build_chain(layer, width: int, height: int, fps: int, screen_node: int | None = None,
                 screen_fd: int | None = None, canvas: tuple[int, int] | None = None,
-                screen_size: tuple[int, int] | None = None) -> SourceChain:
+                screen_size: tuple[int, int] | None = None,
+                screen_flip: str | None = None) -> SourceChain:
     kind = layer.kind
     canvas_w, canvas_h = canvas or (width, height)
     if kind == "camera":
@@ -760,7 +977,7 @@ def build_chain(layer, width: int, height: int, fps: int, screen_node: int | Non
         if node is None:
             raise RuntimeError("screen layer requires a PipeWire node id from the portal")
         return screen_chain(node, width, height, fps, layer, fd=screen_fd,
-                            expected_size=screen_size)
+                            expected_size=screen_size, flip=screen_flip)
     if kind == "image" or kind == "logo":
         return image_chain(layer.source, width, height, fps, layer)
     if kind == "video":
@@ -770,6 +987,10 @@ def build_chain(layer, width: int, height: int, fps: int, screen_node: int | Non
                              source_size=(canvas_w, canvas_h))
     if kind == "test":
         return test_chain(width, height, fps, layer)
+    if kind == "animation":
+        return animation_chain(layer.source, width, height, fps, layer)
+    if kind in ANIMATED_KINDS:
+        return animated_chain(layer, width, height, fps)
     if kind == "template":
         return template_chain(width, height, fps)
     raise ValueError(f"unsupported layer kind: {kind}")

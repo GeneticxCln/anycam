@@ -29,6 +29,10 @@ class Face:
     w: float
     h: float
     score: float
+    # Eye, eye, nose tip, mouth corner, mouth corner, normalised 0..1.  The
+    # first eye is the one on the left of the picture.  None if the model gave
+    # no landmarks.
+    landmarks: tuple[tuple[float, float], ...] | None = None
 
 
 class FaceDetector:
@@ -120,6 +124,9 @@ def _decode(outs: list[np.ndarray], names: list[str], width: int, height: int,
         cls = _output(outs, names, f"cls_{stride}", index).reshape(-1)
         obj = _output(outs, names, f"obj_{stride}", index + len(_STRIDES)).reshape(-1)
         bbox = _output(outs, names, f"bbox_{stride}", index + 2 * len(_STRIDES)).reshape(-1, 4)
+        kps = None
+        if f"kps_{stride}" in names:
+            kps = outs[names.index(f"kps_{stride}")].reshape(-1, 10)
         # The exported model emits probabilities already; OpenCV clamps them
         # and takes the geometric mean instead of adding a sigmoid here.
         cls = np.clip(cls, 0.0, 1.0)
@@ -144,8 +151,14 @@ def _decode(outs: list[np.ndarray], names: list[str], width: int, height: int,
             x2, y2 = min(1.0, x + w), min(1.0, y + h)
             if x2 - x1 <= 0.0 or y2 - y1 <= 0.0:
                 continue
+            landmarks = None
+            if kps is not None:
+                landmarks = tuple(
+                    (((col + float(kps[i, 2 * j])) * stride) / width,
+                     ((row + float(kps[i, 2 * j + 1])) * stride) / height)
+                    for j in range(5))
             results.append(Face(x=x1, y=y1, w=x2 - x1, h=y2 - y1,
-                                score=float(scores[i])))
+                                score=float(scores[i]), landmarks=landmarks))
     return results
 
 
@@ -172,3 +185,22 @@ def _iou(a: Face, b: Face) -> float:
 
 def model_available() -> bool:
     return Path(os.environ.get(MODEL_ENV) or DEFAULT_MODEL).exists()
+
+
+_SHARED: dict = {}
+_SHARED_LOCK = __import__("threading").Lock()
+
+
+def shared_detector() -> "FaceDetector | None":
+    """One detector for every effect (the session is loaded once), or None.
+
+    ``None`` when the model or onnxruntime is missing; callers then skip the
+    face-dependent part instead of failing the layer.
+    """
+    with _SHARED_LOCK:
+        if "detector" not in _SHARED:
+            try:
+                _SHARED["detector"] = FaceDetector()
+            except Exception:  # noqa: BLE001 - optional feature
+                _SHARED["detector"] = None
+        return _SHARED["detector"]

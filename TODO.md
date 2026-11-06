@@ -51,7 +51,7 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 
 - [ ] Split `gui.py` into `ui/` modules.
 - [ ] Text/title editor with lower-third templates, dynamic clock and timer (B32).
-- [ ] Effects panel follows the selected layer and updates without a rebuild (B33).
+- [x] Effects panel follows the selected layer and updates without a rebuild (B33). Passed 2026-11-06: selected-layer GUI test plus real compositor live property probe.
 - [ ] Reload refreshes audio widgets from the model (B34).
 - [ ] Persist "Include microphone" and vcam on/off (B35).
 - [ ] Window fits 1366×768; numeric fields readable; remove the dead right strip (B36).
@@ -81,9 +81,9 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 
 - [ ] Move inference to a separate worker process; also removes face detection from the UI thread (B43).
 - [ ] Person segmentation on ONNX Runtime: blur, remove, replace with image/video/any source.
-- [ ] Face landmarks: 2D props and 3D masks that follow the face.
-- [ ] Stickers, emoji, animated GIFs; drag and drop; filters and LUTs.
-- [ ] Open effect pack format, groups, favourites, original starter pack.
+- [x] Face landmarks: 2D props that follow the face (sunglasses, hat, crown, mustache, cat, halo, frame, pixelate). Passed 2026-11-06: `tests/test_processors.py`. [x] Full-face 2D masks (cyber, web hero, robot, skull, zombie, tiger and 16 more) warped from five landmarks; passed 2026-11-06: `tests/test_themed_content.py`. [ ] True 3D (depth) masks.
+- [x] Stickers on the face, animated GIFs, filters. Passed 2026-11-06: `tests/test_processors.py`, `tests/test_overlays_and_stacking.py`. [x] Emoji pack, emoji eyes, orbiting emoji, emoji rain, 32 themed frames and 42 particle animations; passed 2026-11-06: `tests/test_themed_content.py`. [ ] Drag and drop, `.cube` LUT import.
+- [~] Effect browser with search, categories and thumbnails is done (`tests/test_effects_browser.py`). [ ] Open effect pack format, favourites.
 - [ ] Auto-framing.
 - [ ] Acceptance: 1080p30 with AI on at ≤1.5 CPU cores without a GPU; a slow model never slows the canvas; crashed worker recovers; every model licence recorded in `NOTICE`.
 

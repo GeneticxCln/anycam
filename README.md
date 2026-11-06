@@ -32,11 +32,13 @@ The GUI screenshot that used to be embedded here is in that archive too
 | StreamCam capture → 1080p60 compositor (MJPG) | PASS, 0.276% dropped in 10 s | `evidence/01_camera/report.json` |
 | Text/badge overlay layers (three independent layers) | PASS | `evidence/00_skeleton/composite.png` |
 | Synchronised H.264 MP4, ffprobe-valid (I420, H.264 High) | PASS, 1920×1080, 60/1, 611 frames | `evidence/01_camera/composite.mp4` |
+| Hardware H.264/H.265/AV1 recording (NVENC) | PASS on RTX 4060 Ti: HEVC and AV1 muxed to MP4; H.264 4K60 CUDA path tested | `tests/test_pipeline.py::test_hardware_hevc_and_av1_record_to_mp4`, `tests/test_recorder.py::test_recorder_parses_the_selected_hevc_codec` |
+| NVENC vs x264 at 4K60 (real 10 s recording) | NVENC 53.69 fps, 10.52% wall-clock drop; x264 30.3 fps, 49.51% drop; per-frame CPU 0.152 vs 0.236 CPU-s | `.freebuff/encoder-benchmark/report.json` |
 | Standalone Qt GUI with live preview + snapshot | PASS (offscreen; live frame, F5 snapshot written) | `evidence/00_skeleton/gui.png`, `docs/REGRESSIONS.md` |
 | Audio (mic + media file, mixed, AAC, gain/mute) | PASS, 0.078 s A/V delta, levels verified | `evidence/04_audio/av.mp4`, `verify.json` |
 | RTMP publish to local receiver | PASS, 1280×720 H.264 High yuv420p + AAC, 8.23 s | `evidence/05_rtmp/received.flv` |
 | Playlist / slideshow with PiP rotation | PASS, 5 rotating plates captured | `evidence/03_playlist/rotate_01..05.png` |
-| Effects (brightness, contrast, saturation, blur, chroma) | PASS, before/after captures | `evidence/06_effects/*.png` |
+| Effects (brightness, contrast, saturation, chroma, film looks, mirror, window frames, backdrops, 3D motion) | PASS, live per-layer updates and pixel regressions | `evidence/06_effects/*.png`; `tests/test_audit_regressions.py`; `tests/test_overlay.py` |
 | YuNet face overlay in the live compositor | PASS, real portrait tracked, 640×480 preview at 31 fps, pad alpha 1.0 | `evidence/09_face/report.json`, `preview.png` |
 | Local RTSP network source | PASS, ffmpeg RTP → local RTSP server → `uridecodebin` → compositor | `evidence/08_rtsp/pytest.txt`, `junit.xml` |
 | Two-camera composite (real + synthetic v4l2loopback) | PASS, 119 composited frames; both camera chains delivered 119 buffers | `evidence/10_multicam/report.json`, `junit.xml` |
@@ -118,6 +120,93 @@ layer. It does not use ManyCam code, assets or trademarks.
   reconnected.
 * AnyCam's own virtual-camera node is excluded from the input picker, so an
   accidental output-to-input feedback loop is not offered.
+* **Effects browser.** The Effects tab has a thumbnail library in sixteen
+  categories (Looks, Portrait, Face, Masks, Framing, Distort, Retro TV,
+  Touch-up, Frames, Shapes, Holiday / Nature / Fun / Tech / Fancy frames,
+  Animations, Emoji rain) with search; click a tile to apply it. Each tile is drawn
+  with the real effect on a sample picture. Effects apply live and never
+  rebuild the canvas. "Apply to all sources", Copy, Paste and Clear work on
+  whole layers, and every individual control remains on the Adjust page.
+* **Filters.** 31 GStreamer filters (16 distortions such as pinch, bulge,
+  sphere, twirl, fisheye, kaleidoscope and water ripple; 12 retro TV looks;
+  blur, soften and denoise) plus the Python effects below. A layer has two
+  filter slots, so two filters stack (for example a portrait effect and a
+  distortion). A filter is swapped in on the running pipeline.
+* **Portrait effects** keep the person and change what is behind them: blur,
+  dim, black and white, spotlight, and replacement with a gradient or an
+  animated backdrop. They use the bundled MediaPipe selfie-segmentation model
+  (`src/anycam/assets/models/NOTICE.md`, Apache-2.0); without it, a
+  head-and-shoulders mask from the face detector is used.
+* **Face effects** follow the face using the detector's five landmarks:
+  sunglasses, party hat, crown, mustache, clown nose, cat, halo and a face
+  frame, plus pixelate or blur face for privacy. **Framing**: digital zoom
+  and auto-frame (keeps the face centred).
+* **Face masks** (the Masks category) are painted full-face masks that are
+  warped onto each face from its eyes and mouth, so they scale, roll and follow
+  the head: cyber face (with a scanning line and pulsing visor), neon contour,
+  robot, cyborg, alien, a web-pattern hero mask, hero eye mask, ninja, skull,
+  sugar skull, zombie, vampire, devil, clown, harlequin, pirate, masquerade,
+  frosty snowman, tiger, panda, puppy and fox. The Face category also has
+  emoji eyes (hearts, stars, fire, sparkles, money, dizzy) and emoji that
+  orbit the head (hearts, stars, butterflies, flowers, snowflakes, notes, party,
+  bats). The picture-based ones use the bundled emoji pack.
+* **Themed frames.** 32 finished, multi-colour frames in five groups:
+  Holiday (Christmas, Christmas lights, winter snow, Halloween, Valentine,
+  birthday bunting, New Year, autumn leaves, confetti), Nature (cherry
+  blossom, flower garden, tropical, ocean, cute animals, deep space), Fun
+  (candy, champion, music, comic book, washi tape, postage stamp), Tech (cyber
+  HUD, RGB gaming, VHS tape, neon pink + blue, neon green, orange and violet)
+  and Fancy (gold, wood, royal blue and gold, rainbow). They mix gradients,
+  stripes, drawn art and emoji; thickness scales them.
+* **Animations.** 42 particle animations that are added as a layer on top of
+  the picture and really move: snowfall, blizzard, rain, storm, clouds,
+  autumn leaves, cherry blossoms, butterflies, bubbles, fireflies, rising
+  hearts, heart rain, roses, confetti, party, balloons, fireworks, sparkle
+  burst, twinkling and shooting stars, glitter, magic dust, fire embers,
+  Matrix code, Christmas, Halloween bats and ghosts, New Year, space, pizza,
+  money, music, fire, animal parade and more. The **Emoji rain** category
+  makes any of the 171 bundled emoji fall. Each frame is a function of time
+  (drawn at most 960 px wide, 1-6 ms), so a slow frame never desyncs it.
+* **Emoji pack.** 171 curated pictures from Google's Noto Emoji (Apache-2.0,
+  pinned commit, SHA-256 per file; see `src/anycam/assets/emoji/NOTICE.md`),
+  rebuilt by `scripts/fetch-emoji.py`.
+* **Window frames and shapes** are per layer: 16 styles including neon glow,
+  vignette, polaroid, TV screen, film strip, and shaped windows (circle,
+  oval, rounded, hexagon, diamond, heart, star) that really cut the picture,
+  with a border colour, a matte colour and a thickness.
+* **Backdrops** are in the Backdrop tab: ten generated static backgrounds
+  and five procedural animated ones (3D tunnel, starfield, plasma, aurora,
+  water ripples) that are drawn with numpy at low resolution and really move.
+  Applying one replaces the previous backdrop and can inset capture layers so
+  the background is visible; clearing it puts them back.
+* **Overlays.** A scrolling ticker, a lower third that slides in each time it
+  is shown, and animated GIF/WebP/APNG layers, each added from the source
+  menus; the ticker and lower third can be edited live from the layer's
+  right-click menu.
+* **Drawing.** The **Draw** button turns the pointer into a pen, marker,
+  arrow or box with a colour and size, plus Undo and Clear. Strokes are stored
+  with the project and update the running canvas without a rebuild.
+
+## Releases
+
+**Version 1 (v1.0.0)** is the first release. Settings → **About** shows the version and
+the versions of Python, Qt, GStreamer and onnxruntime this copy is running on.
+
+Pushing a tag such as `v1.0.0` runs `.github/workflows/release.yml`: it checks the tag
+matches `pyproject.toml`, builds the source tarball (`anycam-1.0.0.tar.gz`) and the wheel,
+verifies the bundled emoji, models and styles are inside both, installs the wheel into a
+clean environment as a smoke test, and publishes a GitHub Release with `SHA256SUMS`.
+To cut the next release, bump `version` in `pyproject.toml` and `VERSION` in
+`src/anycam/config.py`, commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+Install from a release:
+
+```
+pip install anycam-1.0.0.tar.gz            # or the .whl
+pip install 'anycam[gui,face]'             # PySide6 and onnxruntime, for the window and face effects
+```
+
+PyGObject and the GStreamer plugins come from the distribution (see Requirements).
 
 ### Limits compared with ManyCam
 
@@ -128,7 +217,7 @@ layer. It does not use ManyCam code, assets or trademarks.
 | Camera controls | Per-layer capture size/FPS plus automatic pixel-format selection; no per-layer exposure, focus, white-balance or manual mode UI |
 | Shared output | All camera layers share one canvas size, frame rate and virtual-camera output |
 | Scenes | Multiple scenes and layers, but switching rebuilds the graph as a hard cut; no animated transitions |
-| Effects | Colour, blur, chroma key, face overlay; no ManyCam-style effect library, filters or masks |
+| Effects | A browsable library of about 300 effects, frames, masks and animations (colour looks, filters, portrait and face effects, frames and shapes, animated backdrops, overlays, drawing). There is no community effect pack format, true 3D (depth) face masks, or lip/expression tracking; masks are 2D paintings warped from five landmarks |
 | Virtual cameras | One v4l2loopback output at a time, not multiple named virtual devices |
 | Recording | Local H.264 MP4; a graph rebuild while recording starts a new segment rather than one continuous file |
 | Streaming | RTMP/RTMPS output, no built-in platform presets or reconnect/bitrate UI |
@@ -160,12 +249,17 @@ NVIDIA RTX 4060 Ti.
 
 * Python 3.11+ (3.14 here)
 * GStreamer 1.28 with `base`, `good`, `bad`, `ugly`, `libav`, `opengl`, `pulse`
-* PyGObject (`python-gobject`), PySide6 6.12 (matching the system Qt 6.12)
+* PyGObject (`python-gobject`), always required and only available from your
+  distribution, not PyPI
+* PySide6 6.12 (matching the system Qt 6.12) for the window; from PyPI use the
+  `gui` extra, `pip install -e '.[gui]'`, but the wheel's Qt must match the
+  system Qt or the import fails
 * `xdg-desktop-portal` with a desktop backend and PipeWire for screen capture
 * `numpy`, `Pillow`, `psutil`
 * `ffprobe` (ffmpeg), `v4l-utils` (`v4l2-ctl`), `pactl` (PipeWire/PulseAudio)
-* Optional: `onnxruntime` for the YuNet face overlay (also available as the
-  `face` extra: `pip install -e '.[face]'`)
+* `onnxruntime` for the portrait and face effects (the YuNet and selfie
+  segmentation models are bundled; without it those effects are simply
+  unavailable). Also the `face` extra: `pip install -e '.[face]'`
 * Root once: `v4l2loopback` kernel module, for the virtual camera only
 
 Arch/CachyOS package names:
@@ -247,11 +341,10 @@ and the snap toggle/tolerance in the Layers tab can turn that off or make it
 stricter; Ctrl+Alt+arrows align selected layers to canvas edges, Ctrl+Alt+H/V
 centre them, and Ctrl+D duplicates them; Ctrl+Z / Ctrl+Shift+Z or the
 Undo/Redo buttons step through layout edits and layer add/remove/duplicate),
-colour/blur/chroma and face-overlay controls (background replacement remains
-disabled), record, virtual-camera and
+colour, film-look, mirror and chroma controls, record, virtual-camera and
 snapshot buttons, an audio tab (device, gain, mute, media mixing), a playlist tab
-(images/video, interval, loop), and an output tab for canvas size, FPS, V4L2
-device and RTMP URL. Video and image files, RTSP/HTTP URLs and screen capture are
+(images/video, interval, loop), and an output tab for canvas size, FPS, encoder,
+V4L2 device and RTMP URL. Video and image files, RTSP/HTTP URLs and screen capture are
 added from the Layers tab; screen capture goes through the xdg-desktop-portal
 ScreenCast chooser and keeps the returned PipeWire session alive while the layer
 exists. Playlist state and snap preferences are saved with the project, and
@@ -277,6 +370,44 @@ PYTHONPATH=src python3 -m anycam demo --seconds 60 --source camera --audio   --a
 `rtmps://` URLs use `rtmp2sink` when installed and fall back to `rtmpsink` (librtmp). Both inputs are
 resampled to 48 kHz stereo and mixed by `audiomixer`; the AAC track is muxed
 with the H.264 video so the MP4 stays synchronised.
+
+### Hardware encoding and latency
+
+The Output tab can select **Auto**, **NVIDIA NVENC H.264**, **NVIDIA NVENC
+H.265 (HEVC)**, **NVIDIA NVENC AV1** or **CPU x264**. Auto uses H.264 NVENC
+only when both the `nvcodec` GStreamer plugin and a working `nvidia-smi` driver
+are present; otherwise it records with x264. `ANYCAM_ENCODER=nvenc`,
+`nvenc_h265`, `nvenc_av1` and `cpu` override the saved setting for headless
+runs.
+
+Recording MP4s can carry H.264, H.265 or AV1. An unavailable H.265 encoder
+falls back to H.264 NVENC, and AV1 falls back through H.265 NVENC to H.264
+NVENC, then x264. There is deliberately no CPU H.265/AV1 fallback: those
+software encoders cannot sustain a 4K60 multi-camera canvas. RTMP/FLV carries
+H.264/AAC only, so the stream branch stays H.264 even when recording uses HEVC
+or AV1. RTMP bitrate follows the canvas above 1080p: H.264 uses 18 Mbit/s at
+1440p and 34 Mbit/s at 4K instead of sending a soft 12 Mbit/s 4K stream.
+
+The NVENC branch feeds compositor RGBA through `cudaupload` when CUDA is
+available and encodes directly from that GPU buffer. It skips the CPU
+`videoconvert` and I420 copy used by x264, so 1080p/4K recording does not add
+that CPU conversion pass while several camera layers are compositing. NVENC also
+runs with zero-latency mode. The 4K canvas limit is 3840×2160; NVENC itself
+accepts up to 4096×4096. If the NVIDIA driver or plugin disappears, Auto falls
+back to x264 rather than killing the recording.
+
+Measured 2026-11-06 on the RTX 4060 Ti, 4K60, 10 s of synthetic test pattern
+plus badge, recording only (no preview or audio): NVENC H.264 delivered 561
+frames in 10.45 s (53.69 fps, 10.52% missing against wall time) at 813.9% mean
+process CPU; x264 delivered 314 frames in 10.36 s (30.3 fps, 49.51% missing) at
+716.3% CPU. CPU is process-wide, where 100% is one saturated core; NVENC's raw
+total is higher because it delivered 1.79× more frames. Per delivered frame,
+NVENC used about 0.152 CPU-seconds versus 0.236 for x264. Even NVENC did not
+hold a perfect 60 fps in this 4K synthetic run.
+
+NVIDIA Broadcast SDK AI effects (background blur, noise removal and
+auto-framing) are not wired in. The SDK is distributed for Windows only, so a
+Linux control would be a fake; AnyCam does not expose one.
 
 ### Virtual camera
 
@@ -315,8 +446,16 @@ outside the application can repair that open.
 
 The on-screen preview is delivered at 960×540 instead of 1280×720, which is
 already panel resolution for the default window. Measured at 1080p60 on this
-machine, that cut the GUI's CPU from 188% to 162% of one core; the canvas,
-recording and virtual camera output stay at the project resolution.
+machine, that cut the GUI's CPU from 188% to 162% of one core; the canvas and
+recording stay at the project resolution, and the virtual camera follows it up
+to 3840×2160.
+
+The vcam mode is fixed when it starts so changing resolution does not close the
+node under Discord. Toggle **Virtual camera** off and on after changing from
+1080p to 1440p/4K to apply the new mode; a 4K vcam was verified by writing a 4K
+YUYV stream to `/dev/video10` and reading it back with ffmpeg. When a 4K canvas
+is viewed through an already-open 1080p vcam, the tap uses 4-tap scaling instead
+of bilinear so text stays crisp.
 
 The virtual-camera branch converts each frame once, not twice. The canvas tap
 forwards the composited RGBA frame untouched and the vcam's own pipeline
@@ -342,6 +481,14 @@ v4l2loopback through `pkexec` with `exclusive_caps=1`, and holds the device
 again. A running preview is not stopped — only its virtual-camera tap detaches
 for the reload. If authorization is declined or another application still has
 the node open, the reason is shown and the manual command stays on screen.
+
+AnyCam also refreshes udev automatically after it starts feeding the node.
+With `exclusive_caps=1` the kernel only advertises capture while a writer is
+streaming, and udev caches the capabilities from device-add time, so the node
+can stay invisible to Chromium clients even when the module is configured
+correctly. If the cached value still says video output, AnyCam asks for
+authorization once and re-runs `udevadm trigger`; Discord, Vesktop and Chrome
+then list **AnyCam** without a manual step.
 
 Undo it with:
 
@@ -390,7 +537,14 @@ screen (pipewiresrc) ───────────────────�
 * `src/anycam/overlay.py` — original text/badge/logo rendering with Pillow.
 * `src/anycam/portal.py` — xdg-desktop-portal ScreenCast client (session, node
   id and PipeWire fd).
-* `src/anycam/face.py` — YuNet ONNX face detection for the live face overlay.
+* `src/anycam/face.py` — YuNet ONNX face detection with five landmarks.
+* `src/anycam/segment.py` — person segmentation (bundled ONNX model).
+* `src/anycam/effects.py` — the filter registry and the live-swappable filter
+  slot; `src/anycam/processors.py` — Python per-frame effects (portrait, face,
+  framing) and their worker bin; `src/anycam/effect_thumbs.py` — browser
+  thumbnails.
+* `src/anycam/procedural.py`, `src/anycam/animated.py` — animated backdrops,
+  ticker, lower third, GIF player and the drawing canvas.
 * `src/anycam/pipeline.py` — GStreamer graph, preview/vcam/record branches, EOS
   handling, reports and ffprobe verification.
 * `src/anycam/gui.py` — standalone Qt window.
@@ -449,6 +603,14 @@ the CachyOS test machine.
   and a live PipeWire session. The fd cannot be serialised, so a saved screen
   layer asks the portal for access again when preview/recording next starts.
   There is no checked-in live screen-capture artifact yet.
+* Portal shares carry an `image-orientation` tag. **Automatic** follows that
+  tag and does not force a KWin rotation: rotating at the source also flips
+  AnyCam's preview and every vcam consumer. The **Output → Screen capture →
+  Rotation** setting can override it: choose **Rotate 180°** if a specific
+  share is upside down, **Flip vertically** for a pure vertical mirror, or
+  **No correction** to disable it. `ANYCAM_SCREEN_FLIP` (`rotate-180`,
+  `vertical-flip`, `none`) is available for headless runs. A receiver that
+  flips only its own preview does not require changing the source.
 * Compositor frame delivery still bounds a screen share. AnyCam keeps its
   canvas on the system clock, so a static or damage-driven share no longer
   caps the preview: the last captured frame is presented at the canvas rate.
@@ -477,14 +639,28 @@ the CachyOS test machine.
   backpressure handling for a slow network source.
 * Image and video layers cannot have their source file replaced in place; remove
   and re-add the layer to switch files.
-* Background blur/replacement is not implemented and its controls remain
-  disabled. The face-tracked overlay is implemented with the bundled YuNet
-  model and runs locally on preview frames; it follows the largest detected
-  face and can use the frame or spotlight style.
-* Rebuilding the graph while recording (scene/effect change, text/image/crop
-  edit, or undo/redo) starts a new MP4 segment; segments are playable and
-  reported, not merged into one file. Live transforms, opacity, ordering and
-  canvas alignment do not rebuild, so they do not split a recording.
+* NVIDIA Broadcast / Tensor Core AI effects are not available in this Linux
+  build. NVIDIA distributes the Broadcast SDK for Windows 10/11 only; there is
+  no public Linux runtime here to call. Hardware **encoding** is separate and
+  supported through NVENC; background blur, noise removal and auto-framing
+  remain absent rather than being simulated with slow CPU filters.
+* H.265 and AV1 recording need the matching NVENC codec. Missing codecs fall
+  back to H.264 NVENC and then x264; CPU H.265/AV1 is not offered. RTMP/FLV
+  stays H.264 because FLV does not carry HEVC or AV1 here.
+* Python effects (portrait, face, framing) cost CPU per frame. At 1080p most
+  fit a 30 fps budget; blurred backgrounds, animated backdrops and
+  auto-frame are close to it, and a layer then updates at a lower rate
+  while the rest of the canvas stays live. Run `scripts/bench-effects.py` on
+  the streaming machine to see the cost per effect at your canvas size.
+* Radioactive and Optical (retro TV) show only what moves, so they look odd on
+  a still picture.
+* A layer has two filter slots, so at most two filters at once.
+* A ticker's or lower third's text can be edited, but its position and size
+  are changed like any other layer.
+* Rebuilding the graph while recording (scene change, text/image/crop edit, or
+  undo/redo) starts a new MP4 segment; segments are playable and reported, not
+  merged into one file. Live transforms, opacity, ordering, canvas alignment
+  and per-layer effects do not rebuild, so they do not split a recording.
 * Undo/redo covers layer layout and add/remove/duplicate in the active scene.
   Scene switches and playlist add/clear still reset the history.
 * Playlist rotation is full-frame and uses one global interval; there is no

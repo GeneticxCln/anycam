@@ -6,22 +6,27 @@ platform and avoids a QML scene-graph dependency in headless CI.
 """
 from __future__ import annotations
 
+import copy
+import fcntl
 import os
+import re
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox,
-    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider,
-    QSpinBox, QSplitter, QStatusBar, QTabWidget, QVBoxLayout, QWidget,
+    QApplication, QButtonGroup, QCheckBox, QColorDialog, QComboBox, QDialog,
+    QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QFrame,
+    QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
+    QProgressDialog, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
+    QSplitter, QStatusBar, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from . import config, overlay, portal
@@ -31,8 +36,11 @@ from .model import (Effects, Layer, Project, Scene, camera_grid_scene,
                     default_project, new_id, two_camera_scene)
 from .engine.outputs.recorder import Recorder
 from .engine.outputs.vcam import VcamOutput
-from .pipeline import AnyCamEngine
+from .pipeline import AnyCamEngine, nvenc_available, recording_codec
 from .pool import SCREEN_IDLE_GRACE_S, SourcePool
+from . import animated, effect_thumbs, effects as effect_library
+from . import emoji as emoji_library, frames as frames_library, particles as particles_library
+from .sources import ANIMATION_PRESETS
 
 STYLE = """
 QMainWindow, QWidget { background: #0b0d10; color: #d7e3ea; font-family: "Noto Sans", "DejaVu Sans"; font-size: 13px; }
@@ -60,6 +68,58 @@ QSlider::groove:horizontal { height: 4px; background: #1e2830; border-radius: 2p
 QSlider::handle:horizontal { width: 14px; margin: -5px 0; border-radius: 7px; background: #5eead0; }
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { background: #0e1216; border: 1px solid #26343d; border-radius: 6px; padding: 5px; }
 """
+
+# Colour looks.  Each is a set of videobalance values in the units of
+# model.Effects and applies live; the film looks and the filters in
+# anycam.effects are separate, stackable stages.
+EFFECT_STYLES: dict[str, str] = {
+    "None": "none",
+    "Sepia": "sepia",
+    "Heat camera": "heat",
+    "X-Ray": "xray",
+    "Cross process": "xpro",
+    "Yellow / blue": "yellowblue",
+}
+EFFECT_PRESETS: dict[str, dict[str, float]] = {
+    "Original": {"brightness": 0.0, "contrast": 1.0, "saturation": 1.0,
+                 "hue": 0.0},
+    "Warm": {"brightness": 0.03, "contrast": 1.05, "saturation": 1.12,
+             "hue": -0.035},
+    "Cool": {"brightness": 0.01, "contrast": 1.04, "saturation": 1.06,
+             "hue": 0.045},
+    "Mono": {"brightness": 0.01, "contrast": 1.10, "saturation": 0.0,
+             "hue": 0.0},
+    "Noir": {"brightness": 0.0, "contrast": 1.35, "saturation": 0.0,
+             "hue": 0.0},
+    "Vivid": {"brightness": 0.0, "contrast": 1.18, "saturation": 1.35,
+              "hue": 0.0},
+    "Studio": {"brightness": 0.02, "contrast": 1.10, "saturation": 1.08,
+               "hue": 0.0},
+    "Fade": {"brightness": 0.05, "contrast": 0.85, "saturation": 0.85,
+             "hue": 0.0},
+    "Golden": {"brightness": 0.04, "contrast": 1.03, "saturation": 1.14,
+               "hue": -0.06},
+    "Cinematic": {"brightness": 0.0, "contrast": 1.12, "saturation": 0.92,
+                  "hue": 0.02},
+    "Dream": {"brightness": 0.07, "contrast": 0.93, "saturation": 1.15,
+              "hue": 0.02},
+    "Moody": {"brightness": -0.035, "contrast": 1.16, "saturation": 0.82,
+              "hue": -0.02},
+    "Pastel": {"brightness": 0.075, "contrast": 0.88, "saturation": 1.12,
+               "hue": 0.015},
+    "Neon": {"brightness": 0.0, "contrast": 1.28, "saturation": 1.62,
+             "hue": 0.055},
+    "Vintage": {"brightness": 0.045, "contrast": 0.96, "saturation": 0.78,
+                "hue": -0.045},
+    "Teal / Orange": {"brightness": 0.01, "contrast": 1.14,
+                      "saturation": 1.22, "hue": 0.035},
+    "Infrared": {"brightness": 0.0, "contrast": 1.25, "saturation": 1.72,
+                 "hue": -0.12},
+    "Silver": {"brightness": 0.02, "contrast": 1.22, "saturation": 0.08,
+               "hue": 0.0},
+    "Night": {"brightness": -0.065, "contrast": 1.10, "saturation": 0.72,
+              "hue": 0.06},
+}
 
 
 class LayoutHistory:
@@ -133,6 +193,7 @@ class PreviewWidget(QWidget):
     edit_started = Signal(str)
     edit_finished = Signal(str, bool)
     context_menu_requested = Signal(str, QPoint)
+    stroke_finished = Signal(object)     # a finished drawing stroke (dict)
 
     HANDLE = 9.0
     MIN_BOX = 0.02
@@ -145,10 +206,17 @@ class PreviewWidget(QWidget):
         self.scene: Scene | None = None
         self.selected_id = ""
         self.selected_ids: list[str] = []
-        self.edit_mode = "move"          # move | crop
+        self.edit_mode = "move"          # move | crop | draw
+        self.draw_tool = "pen"           # pen | marker | arrow | box
+        self.draw_color = "#ff3b5c"
+        self.draw_width = 0.006          # fraction of the canvas width
+        self._stroke: dict | None = None
         # Source size per layer, so the crop window can follow the picture
         # inside the box instead of the box (which may contain bars).
         self.layer_sizes: dict[str, tuple[int, int]] = {}
+        # Project canvas size in pixels (the preview image is a scaled-down copy);
+        # spacing guides report distances in these units.
+        self.canvas_size: tuple[int, int] | None = None
         self._drag: dict | None = None
         self._guides: list[tuple[str, float]] = []
         self._spacing: list[tuple[str, float, float, float, int]] = []
@@ -191,12 +259,71 @@ class PreviewWidget(QWidget):
         self.update()
 
     def set_edit_mode(self, mode: str) -> None:
-        if mode not in ("move", "crop"):
+        if mode not in ("move", "crop", "draw"):
             return
         self.edit_mode = mode
         self._drag = None
-        self.unsetCursor()
+        self._stroke = None
+        if mode == "draw":
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.unsetCursor()
         self.update()
+
+    # ----------------------------------------------------------------- drawing
+    def _begin_stroke(self, pos: QPointF) -> None:
+        if not self.canvas_rect().contains(pos):
+            return
+        x, y = self.point_norm(pos)
+        self._stroke = {"tool": self.draw_tool, "color": self.draw_color,
+                        "width": self.draw_width, "points": [[x, y]]}
+        self.update()
+
+    def _extend_stroke(self, pos: QPointF) -> None:
+        if self._stroke is None:
+            return
+        x, y = self.point_norm(pos)
+        x, y = max(0.0, min(1.0, x)), max(0.0, min(1.0, y))
+        points = self._stroke["points"]
+        if self._stroke["tool"] in ("arrow", "box"):
+            points[:] = [points[0], [x, y]]        # a shape: start and current end
+        elif abs(x - points[-1][0]) + abs(y - points[-1][1]) > 0.0015:
+            points.append([x, y])
+        self.update()
+
+    def _finish_stroke(self) -> None:
+        stroke, self._stroke = self._stroke, None
+        self.update()
+        if stroke is None:
+            return
+        if stroke["tool"] in ("arrow", "box") and len(stroke["points"]) < 2:
+            return                                  # a click, not a shape
+        self.stroke_finished.emit(stroke)
+
+    def _paint_stroke(self, painter: QPainter) -> None:
+        """The stroke being drawn, so it follows the pointer before it is saved."""
+        stroke = self._stroke
+        canvas = self.canvas_rect()
+        if stroke is None or canvas.isEmpty():
+            return
+        colour = QColor(stroke["color"])
+        width = max(2.0, stroke["width"] * canvas.width())
+        points = [QPointF(canvas.x() + x * canvas.width(), canvas.y() + y * canvas.height())
+                  for x, y in stroke["points"]]
+        tool = stroke["tool"]
+        if tool == "marker":
+            colour.setAlpha(110)
+            width *= 4
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(colour, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                   Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        if tool == "box" and len(points) >= 2:
+            painter.drawRect(QRectF(points[0], points[-1]).normalized())
+        elif len(points) == 1:
+            painter.drawPoint(points[0])
+        else:
+            painter.drawPolyline(points)
 
     def cancel_pending_edits(self) -> None:
         """Drop a queued keyboard nudge so it cannot fire after shutdown."""
@@ -343,6 +470,8 @@ class PreviewWidget(QWidget):
         if self.scene is None or not self.canvas_rect().contains(pos):
             return None
         for layer in reversed(self.scene.ordered()):
+            if layer.kind == "drawing":
+                continue   # full-canvas and on top: it must not swallow clicks
             if self.box_rect(layer).contains(pos):
                 return layer
         return None
@@ -394,6 +523,9 @@ class PreviewWidget(QWidget):
             super().mousePressEvent(event)
             return
         self.setFocus()
+        if self.edit_mode == "draw":
+            self._begin_stroke(event.position())
+            return
         self._show_selection()
         pos = event.position()
         layer = self.selected_layer()
@@ -422,6 +554,13 @@ class PreviewWidget(QWidget):
         self._begin_drag(target, pos, mode, "")
 
     def mouseMoveEvent(self, event) -> None:
+        if self.edit_mode == "draw":
+            if self._stroke is not None:
+                if not (event.buttons() & Qt.MouseButton.LeftButton):
+                    self._finish_stroke()
+                else:
+                    self._extend_stroke(event.position())
+            return
         if self._drag is not None:
             if not (event.buttons() & Qt.MouseButton.LeftButton):
                 self._end_drag()
@@ -441,6 +580,10 @@ class PreviewWidget(QWidget):
             self.unsetCursor()
 
     def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self._stroke is not None:
+            self._extend_stroke(event.position())
+            self._finish_stroke()
+            return
         if event.button() == Qt.MouseButton.LeftButton and self._drag is not None:
             self._end_drag()
             return
@@ -540,6 +683,7 @@ class PreviewWidget(QWidget):
                 dy *= canvas.height() / picture.height()
         if mode == "move":
             dx, dy, guides, spacing = self._snap_move(self._drag["group"], dx, dy)
+            dx, dy = self._clamp_group_move(self._drag["group"], dx, dy)
             for layer_id, start in self._drag["group"]:
                 item = self.scene.layer(layer_id)
                 if item is None:
@@ -562,6 +706,27 @@ class PreviewWidget(QWidget):
         self._drag["changed"] = True
         self.update()
         self.geometry_changed.emit(layer.id)
+
+    @staticmethod
+    def _clamp_group_move(group: list[tuple[str, tuple]], dx: float,
+                          dy: float) -> tuple[float, float]:
+        """Stop the whole group at the canvas edge.
+
+        Clamping each layer separately let the one nearest the edge stop while
+        the rest kept moving, which changed their positions relative to each
+        other mid-drag.
+        """
+        if not group:
+            return dx, dy
+        low_x = max(-box[0] for _id, box in group)
+        high_x = min(1.0 - box[0] - box[2] for _id, box in group)
+        low_y = max(-box[1] for _id, box in group)
+        high_y = min(1.0 - box[1] - box[3] for _id, box in group)
+        if low_x <= high_x:
+            dx = max(low_x, min(high_x, dx))
+        if low_y <= high_y:
+            dy = max(low_y, min(high_y, dy))
+        return dx, dy
 
     @staticmethod
     def _shift_box(box: tuple, dx: float, dy: float) -> tuple:
@@ -632,6 +797,12 @@ class PreviewWidget(QWidget):
         spacing = self._spacing_guides(left, top, width, height, selected)
         return dx, dy, guides, spacing
 
+    def _canvas_pixels(self) -> tuple[int, int]:
+        """Canvas size in pixels; the preview image is only a scaled copy."""
+        if self.canvas_size:
+            return self.canvas_size
+        return (self.image.width(), self.image.height())
+
     def _spacing_guides(self, left: float, top: float, width: float,
                         height: float, selected: set[str]) -> list[tuple]:
         """Nearest horizontal and vertical gaps to non-selected layers, in px."""
@@ -661,12 +832,12 @@ class PreviewWidget(QWidget):
             gap, start, end, fixed = min(horizontal, key=lambda item: item[0])
             if gap > 0.001:
                 spacing.append(("v", start, end, fixed,
-                                int(round(gap * self.image.width()))))
+                                int(round(gap * self._canvas_pixels()[0]))))
         if vertical:
             gap, start, end, fixed = min(vertical, key=lambda item: item[0])
             if gap > 0.001:
                 spacing.append(("h", start, end, fixed,
-                                int(round(gap * self.image.height()))))
+                                int(round(gap * self._canvas_pixels()[1]))))
         return spacing
 
     def _resized_box(self, start: tuple, handle: str, dx: float, dy: float) -> tuple:
@@ -747,8 +918,10 @@ class PreviewWidget(QWidget):
         x = (self.width() - scaled.width()) // 2
         y = (self.height() - scaled.height()) // 2
         painter.drawImage(x, y, scaled)
-        self._paint_selection(painter)
-        self._paint_guides(painter)
+        if self.edit_mode != "draw":
+            self._paint_selection(painter)
+            self._paint_guides(painter)
+        self._paint_stroke(painter)
 
     def _paint_selection(self, painter: QPainter) -> None:
         if self.scene is None or not self._selection_visible:
@@ -836,12 +1009,14 @@ class PreviewWidget(QWidget):
                 painter.drawText(label, f"{gap} px")
 
 
-def _slider_row(label: str, low: int, high: int, value: int, callback) -> tuple[QWidget, QSlider, QLabel]:
+def _slider_row(label: str, low: int, high: int, value: int, callback,
+                display=None) -> tuple[QWidget, QSlider, QLabel]:
     holder = QWidget()
     row = QGridLayout(holder)
     row.setContentsMargins(0, 0, 0, 0)
     title = QLabel(label)
-    value_label = QLabel(str(value))
+    format_value = display or str
+    value_label = QLabel(format_value(value))
     value_label.setObjectName("accent")
     slider = QSlider(Qt.Orientation.Horizontal)
     slider.setRange(low, high)
@@ -849,8 +1024,71 @@ def _slider_row(label: str, low: int, high: int, value: int, callback) -> tuple[
     row.addWidget(title, 0, 0)
     row.addWidget(value_label, 0, 1, alignment=Qt.AlignmentFlag.AlignRight)
     row.addWidget(slider, 1, 0, 1, 2)
-    slider.valueChanged.connect(lambda v: (value_label.setText(str(v)), callback(v)))
+    slider.valueChanged.connect(
+        lambda v: (value_label.setText(format_value(v)), callback(v)))
     return holder, slider, value_label
+
+
+class OverlayDialog(QDialog):
+    """Edit a ticker's text, or a lower third's name and title, and its colours."""
+
+    def __init__(self, layer: Layer, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Edit {layer.name}")
+        self._layer = layer
+        self._colour = layer.color or "#ffffff"
+        self._background = layer.background or "#101418cc"
+        form = QFormLayout(self)
+        if layer.kind == "lower_third":
+            name, _sep, title = str(layer.source or "").partition("|")
+            self.first = QLineEdit(name)
+            self.second = QLineEdit(title)
+            form.addRow("Name", self.first)
+            form.addRow("Title", self.second)
+        else:
+            self.first = QLineEdit(layer.source)
+            self.second = None
+            form.addRow("Text", self.first)
+        self.colour_button = QPushButton(self._colour)
+        self.colour_button.clicked.connect(self._pick_colour)
+        self.background_button = QPushButton(self._background)
+        self.background_button.clicked.connect(self._pick_background)
+        form.addRow("Text colour", self.colour_button)
+        form.addRow("Background", self.background_button)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+        self._paint()
+
+    def _paint(self) -> None:
+        self.colour_button.setText(self._colour)
+        self.background_button.setText(self._background)
+
+    def _pick_colour(self) -> None:
+        chosen = QColorDialog.getColor(QColor(self._colour), self, "Text colour")
+        if chosen.isValid():
+            self._colour = chosen.name()
+            self._paint()
+
+    def _pick_background(self) -> None:
+        chosen = QColorDialog.getColor(
+            QColor(overlay.parse_color(self._background, (16, 20, 24, 204))[0],
+                   *overlay.parse_color(self._background, (16, 20, 24, 204))[1:]),
+            self, "Background", QColorDialog.ColorDialogOption.ShowAlphaChannel)
+        if chosen.isValid():
+            self._background = (f"#{chosen.red():02x}{chosen.green():02x}"
+                                f"{chosen.blue():02x}{chosen.alpha():02x}")
+            self._paint()
+
+    def values(self) -> tuple[str, str, str]:
+        """``(source, text colour, background)`` as stored on the layer."""
+        if self.second is not None:
+            source = f"{self.first.text().strip()}|{self.second.text().strip()}"
+        else:
+            source = self.first.text().strip()
+        return source, self._colour, self._background
 
 
 class CameraGridDialog(QDialog):
@@ -939,6 +1177,14 @@ class AnyCamWindow(QMainWindow):
         # Canvas size the held output was last fed at; the output itself keeps
         # a fixed camera mode so it never reopens mid-stream.
         self._vcam_canvas_size: tuple[int, int] | None = None
+        # udev caches V4L2 capabilities from device-add time, so a correct
+        # exclusive_caps=1 module can still be invisible to Chromium clients.
+        self._vcam_udev_thread: threading.Thread | None = None
+        self._vcam_udev_result: dict[str, str] = {}
+        self._vcam_udev_attempted: set[str] = set()
+        self._vcam_udev_timer = QTimer(self)
+        self._vcam_udev_timer.setInterval(200)
+        self._vcam_udev_timer.timeout.connect(self._vcam_udev_poll)
 
         # Streaming is a separate action: preview must never publish a saved URL.
         self.live = False
@@ -952,14 +1198,10 @@ class AnyCamWindow(QMainWindow):
         # One portal authorization per app launch.  Removing and re-adding a
         # screen layer must reuse it instead of showing the window picker.
         self._last_screen_session: portal.ScreenSession | None = None
+        # Layer id -> (box before, box after) for each capture layer inset to
+        # reveal a backdrop, so clearing the backdrop can put them back.
+        self._backdrop_insets: dict[str, tuple[tuple, tuple]] = {}
         self._camera_choices: list[tuple[str, str]] = []
-        self._face_detector = None
-        self._face_layer_id = next(
-            (layer.id for layer in self.scene.layers if layer.kind == "face"), "")
-        self._face_last = 0.0
-        self._face_size = (0, 0)
-        self._frame_bytes = b""
-        self._face_error = ""
         # A camera unplugged mid-stream is dropped from the graph instead of
         # killing the whole scene; this timer rebuilds once the node returns.
         self._lost_cameras: dict[str, str] = {}
@@ -993,7 +1235,7 @@ class AnyCamWindow(QMainWindow):
         self.resize(1440, 900)
         self.setStyleSheet(STYLE)
         self._build_ui()
-        self._sync_face_overlay()
+        self.preview.stroke_finished.connect(self._draw_stroke_finished)
         self._install_shortcuts()
         self._pending_frame = None
         self.frame_ready.connect(self._update_preview)
@@ -1119,7 +1361,10 @@ class AnyCamWindow(QMainWindow):
         self.preview.geometry_changed.connect(self._preview_geometry)
         self.preview.edit_started.connect(self._preview_edit_started)
         self.preview.edit_finished.connect(self._preview_edit_finished)
+        self.preview.context_menu_requested.connect(self._preview_context_menu)
         preview_layout.addWidget(self.preview, 1)
+        self.draw_bar = self._build_draw_bar()
+        preview_layout.addWidget(self.draw_bar)
         controls = QHBoxLayout()
         self.start_button = QPushButton("Start preview")
         self.start_button.setObjectName("primary")
@@ -1132,8 +1377,12 @@ class AnyCamWindow(QMainWindow):
         self.snapshot_button.clicked.connect(self.snapshot)
         self.multiview_button = QPushButton("Multi-view")
         self.multiview_button.clicked.connect(self.toggle_multiview)
+        self.draw_button = QPushButton("Draw")
+        self.draw_button.setCheckable(True)
+        self.draw_button.setToolTip("Draw on the picture: pen, marker, arrows and boxes")
+        self.draw_button.clicked.connect(self.toggle_draw)
         for button in (self.start_button, self.record_button, self.vcam_button,
-                       self.snapshot_button, self.multiview_button):
+                       self.snapshot_button, self.multiview_button, self.draw_button):
             controls.addWidget(button)
         controls.addSpacing(10)
         controls.addWidget(QLabel("Layout"))
@@ -1157,6 +1406,7 @@ class AnyCamWindow(QMainWindow):
         side.addTab(self._scene_tab(), "Scene")
         side.addTab(self._layers_tab(), "Layers")
         side.addTab(self._effects_tab(), "Effects")
+        side.addTab(self._backdrop_tab(), "Backdrop")
         side.addTab(self._audio_tab(), "Audio")
         side.addTab(self._playlist_tab(), "Playlist")
         side.addTab(self._output_tab(), "Output")
@@ -1170,12 +1420,99 @@ class AnyCamWindow(QMainWindow):
         else:
             self._status("Ready. No virtual camera output yet.")
 
+    # --------------------------------------------------------------- context menu
+    def _preview_menu(self, layer_id: str) -> QMenu:
+        """Shared canvas menu: source actions first, program outputs second."""
+        menu = QMenu(self)
+        layer = self.scene.layer(layer_id) if layer_id else None
+        if layer is not None:
+            title = menu.addAction(f"{layer.name}  ·  {layer.kind}")
+            title.setEnabled(False)
+            menu.addSeparator()
+
+        inputs = menu.addMenu("Input")
+        for label, kind in (
+            ("Add camera…", "camera"),
+            ("Add video file…", "video"),
+            ("Add image…", "image"),
+            ("Add native desktop share…", "screen"),
+            ("Add a different desktop share…", "screen-new"),
+            ("Add phone URL…", "network"),
+            ("Add text…", "text"),
+            ("Add scrolling ticker…", "ticker"),
+            ("Add lower third…", "lower_third"),
+            ("Add animated GIF…", "gif"),
+            ("Add test pattern", "test"),
+        ):
+            if kind == "screen-new" and self._last_screen_session is None:
+                continue
+            action = inputs.addAction(label)
+            action.setData(f"add:{kind}")
+
+        outputs = menu.addMenu("Output")
+        for label, attr, data in (
+            ("Virtual camera", "vcam_on", "vcam"),
+            ("Record program", "recording", "record"),
+            ("Go Live", "live", "live"),
+        ):
+            action = outputs.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(bool(getattr(self, attr, False)))
+            action.setData(data)
+        outputs.addSeparator()
+        snapshot = outputs.addAction("Snapshot")
+        snapshot.setData("snapshot")
+
+        if layer is not None:
+            menu.addSeparator()
+            if layer.kind in ("ticker", "lower_third"):
+                edit = menu.addAction(f"Edit {layer.name}…")
+                edit.setData("edit")
+            duplicate = menu.addAction("Duplicate layer")
+            duplicate.setData("duplicate")
+            remove = menu.addAction(f"Remove {layer.name}")
+            remove.setData("remove")
+        return menu
+
+    def _preview_context_menu(self, layer_id: str, position) -> None:
+        menu = self._preview_menu(layer_id)
+        chosen = menu.exec(position)
+        if chosen is None:
+            return
+        data = str(chosen.data() or "")
+        if data.startswith("add:"):
+            self.add_layer(data.split(":", 1)[1])
+        elif data == "vcam":
+            self.toggle_vcam()
+        elif data == "record":
+            self.toggle_record()
+        elif data == "live":
+            self.toggle_live()
+        elif data == "snapshot":
+            self.snapshot()
+        elif data == "edit":
+            self.edit_overlay(layer_id)
+        elif data == "duplicate":
+            if layer_id:
+                self.preview.select_layer(layer_id)
+            self.duplicate_layer()
+        elif data == "remove":
+            self.remove_layers([layer_id])
+
     def _load_saved_project(self) -> Project:
         path = config.project_path()
         if not path.exists():
             return default_project()
         try:
-            return Project.load(path)
+            project = Project.load(path)
+            if project.load_warnings:
+                # Tolerant loading kept what was usable; say what was not.
+                self._load_warning = (
+                    f"Loaded {path.name} with repairs: "
+                    + "; ".join(project.load_warnings[:3])
+                    + (f" (+{len(project.load_warnings) - 3} more)"
+                       if len(project.load_warnings) > 3 else ""))
+            return project
         except Exception as exc:  # noqa: BLE001 - a corrupt save must not brick the app
             # Keep the unreadable file: the next autosave writes defaults over
             # the path, and the old project may still be recoverable by hand.
@@ -1372,7 +1709,9 @@ class AnyCamWindow(QMainWindow):
         sources = (("Camera", "camera"), ("Test pattern", "test"),
                    ("Text", "text"), ("Logo", "logo"),
                    ("Image", "image"), ("Video file", "video"),
-                   ("Screen", "screen"), ("Network URL", "network"))
+                   ("Screen", "screen"), ("Network URL", "network"),
+                   ("Ticker", "ticker"), ("Lower third", "lower_third"),
+                   ("Animated GIF", "gif"))
         for index, (label, kind) in enumerate(sources):
             button = QPushButton(f"+ {label}")
             button.clicked.connect(lambda _=False, k=kind: self.add_layer(k))
@@ -1391,93 +1730,933 @@ class AnyCamWindow(QMainWindow):
         self._refresh_layers()
         return page
 
+    # Browse: the thumbnail library.  Adjust: every individual control.
+    FRAME_GROUPS = {f"{group} frames": group for group in frames_library.GROUPS}
+    EFFECT_CATEGORIES = ("Looks", "Portrait", "Face", "Masks", "Framing", "Distort",
+                         "Retro TV", "Touch-up", "Frames", "Shapes",
+                         *FRAME_GROUPS, "Animations", "Emoji rain")
+    _CAPTURE_KINDS = ("camera", "screen", "video", "network", "test")
+
     def _effects_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        tabs = QTabWidget()
+        # Adjust is built first: it owns the widgets the sync code fills in.
+        adjust = self._effects_adjust_page()
+        tabs.addTab(self._effects_browse_page(), "Browse")
+        tabs.addTab(adjust, "Adjust")
+        self.effects_tabs = tabs
+        layout.addWidget(tabs)
+        self._sync_effects_controls()
+        return page
+
+    def _effects_adjust_page(self) -> QWidget:
         page = QWidget()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         body = QWidget()
         layout = QVBoxLayout(body)
         fx = self._current_effects()
+        self._syncing_effects = False
+        self._effect_sliders: dict[str, QSlider] = {}
+        self._effect_controls: list[QWidget] = []
+        self._chroma_controls: list[QWidget] = []
 
-        box = QGroupBox("Colour")
-        box_layout = QVBoxLayout(box)
-        for label, low, high, value, attr in (
-            ("Brightness", -100, 100, int(fx.brightness * 100), "brightness"),
-            ("Contrast", 0, 300, int(fx.contrast * 100), "contrast"),
-            ("Saturation", 0, 300, int(fx.saturation * 100), "saturation"),
-            ("Blur", 0, 40, int(fx.blur), "blur"),
+        target = QGroupBox("Target")
+        target_layout = QVBoxLayout(target)
+        self.effects_target = QLabel("No layer selected")
+        self.effects_target.setObjectName("accent")
+        target_layout.addWidget(self.effects_target)
+        self.effects_hint = QLabel(
+            "Select a layer in the preview or Layers tab. Effects are per "
+            "layer, so changing one source never alters the rest of the scene.")
+        self.effects_hint.setObjectName("muted")
+        self.effects_hint.setWordWrap(True)
+        target_layout.addWidget(self.effects_hint)
+        layout.addWidget(target)
+
+        look = QGroupBox("Look")
+        look_layout = QGridLayout(look)
+        look_layout.addWidget(QLabel("Preset"), 0, 0)
+        self.effect_preset = QComboBox()
+        self.effect_preset.addItem("Custom", "")
+        for name in EFFECT_PRESETS:
+            self.effect_preset.addItem(name, name)
+        self.effect_preset.currentIndexChanged.connect(self._apply_effect_preset)
+        look_layout.addWidget(self.effect_preset, 0, 1)
+        reset = QPushButton("Reset all effects")
+        reset.clicked.connect(self._reset_effects)
+        look_layout.addWidget(reset, 1, 0, 1, 2)
+        layout.addWidget(look)
+        self._effect_controls.extend((self.effect_preset, reset))
+
+        colour = QGroupBox("Colour")
+        colour_layout = QVBoxLayout(colour)
+        for key, label, low, high, value, callback, display in (
+            ("brightness", "Brightness", -100, 100, int(round(fx.brightness * 100)),
+             lambda v: self._set_effect("brightness", v), None),
+            ("contrast", "Contrast", 0, 200, int(round(fx.contrast * 100)),
+             lambda v: self._set_effect("contrast", v), None),
+            ("saturation", "Saturation", 0, 200, int(round(fx.saturation * 100)),
+             lambda v: self._set_effect("saturation", v), None),
+            ("hue", "Hue", -180, 180, int(round(fx.hue * 180)),
+             lambda v: self._set_effect("hue", v), lambda v: f"{v}\u00b0"),
         ):
-            holder, slider, _label = _slider_row(label, low, high, value,
-                                                 lambda v, a=attr: self._set_effect(a, v))
-            setattr(self, f"slider_{attr}", slider)
-            box_layout.addWidget(holder)
-        layout.addWidget(box)
+            holder, slider, _label = _slider_row(
+                label, low, high, value, callback, display=display)
+            self._effect_sliders[key] = slider
+            colour_layout.addWidget(holder)
+        layout.addWidget(colour)
+        self._effect_controls.append(colour)
+
+        style = QGroupBox("Film look")
+        style_layout = QGridLayout(style)
+        style_layout.addWidget(QLabel("Look"), 0, 0)
+        self.effect_style = QComboBox()
+        for label, value in EFFECT_STYLES.items():
+            self.effect_style.addItem(label, value)
+        index = self.effect_style.findData(fx.color_effect)
+        self.effect_style.setCurrentIndex(index if index >= 0 else 0)
+        self.effect_style.currentIndexChanged.connect(
+            lambda: self._set_effect("color_effect", self.effect_style.currentData()))
+        style_layout.addWidget(self.effect_style, 0, 1)
+        self.effect_mirror = QCheckBox("Mirror horizontally")
+        self.effect_mirror.setChecked(bool(fx.mirror))
+        self.effect_mirror.toggled.connect(
+            lambda checked: self._set_effect("mirror", bool(checked)))
+        style_layout.addWidget(self.effect_mirror, 1, 0, 1, 2)
+        style_note = QLabel(
+            "Look-up-table looks and mirror are per-pixel/scanline work, "
+            "so they stay live at camera speed.")
+        style_note.setObjectName("muted")
+        style_note.setWordWrap(True)
+        style_layout.addWidget(style_note, 2, 0, 1, 2)
+        layout.addWidget(style)
+        self._effect_controls.append(style)
+
+        frame = QGroupBox("Window frame")
+        frame_layout = QGridLayout(frame)
+        frame_layout.addWidget(QLabel("Shape"), 0, 0)
+        self.frame_style = QComboBox()
+        for value, label in overlay.WINDOW_FRAME_STYLES.items():
+            self.frame_style.addItem(label, value)
+        index = self.frame_style.findData(fx.frame_style)
+        self.frame_style.setCurrentIndex(index if index >= 0 else 0)
+        self.frame_style.currentIndexChanged.connect(self._frame_style_changed)
+        frame_layout.addWidget(self.frame_style, 0, 1)
+        frame_layout.addWidget(QLabel("Colour"), 1, 0)
+        frame_colour_row = QHBoxLayout()
+        self.frame_color = QLineEdit(fx.frame_color)
+        self.frame_color.setMaxLength(9)
+        self.frame_color.setPlaceholderText("#5eead0")
+        self.frame_color.editingFinished.connect(
+            lambda: self._set_effect("frame_color", self.frame_color.text()))
+        frame_pick = QPushButton("Pick\u2026")
+        frame_pick.clicked.connect(self._pick_frame_color)
+        frame_colour_row.addWidget(self.frame_color, 1)
+        frame_colour_row.addWidget(frame_pick)
+        frame_layout.addLayout(frame_colour_row, 1, 1)
+        holder, frame_width, _label = _slider_row(
+            "Thickness", 1, 24, int(fx.frame_width),
+            lambda v: self._set_effect("frame_width", v),
+            display=lambda v: f"{v} px")
+        self._effect_sliders["frame_width"] = frame_width
+        frame_layout.addWidget(holder, 2, 0, 1, 2)
+        frame_layout.addWidget(QLabel("Matte"), 3, 0)
+        matte_row = QHBoxLayout()
+        self.frame_matte = QLineEdit(fx.frame_matte)
+        self.frame_matte.setMaxLength(9)
+        self.frame_matte.setPlaceholderText("#0b0d10")
+        self.frame_matte.editingFinished.connect(
+            lambda: self._set_effect("frame_matte", self.frame_matte.text()))
+        matte_pick = QPushButton("Pick\u2026")
+        matte_pick.clicked.connect(self._pick_frame_matte)
+        matte_row.addWidget(self.frame_matte, 1)
+        matte_row.addWidget(matte_pick)
+        frame_layout.addLayout(matte_row, 3, 1)
+        frame_note = QLabel(
+            "Frames follow the picture. Shaped windows (circle, heart, star ...), "
+            "the TV screen and the vignette fill the area outside with the "
+            "matte colour; the other styles draw a border in the frame colour.")
+        frame_note.setObjectName("muted")
+        frame_note.setWordWrap(True)
+        frame_layout.addWidget(frame_note, 4, 0, 1, 2)
+        layout.addWidget(frame)
+        self._effect_controls.append(frame)
+        self._frame_controls = [self.frame_color, frame_pick, frame_width,
+                                self.frame_matte, matte_pick]
 
         chroma = QGroupBox("Chroma key")
         chroma_layout = QGridLayout(chroma)
-        self.chroma_enabled = QCheckBox("Enable")
+        self.chroma_enabled = QCheckBox("Key out a colour")
         self.chroma_enabled.setChecked(fx.chroma_enabled)
-        self.chroma_enabled.toggled.connect(lambda v: self._set_effect("chroma_enabled", v))
-        self.chroma_color = QLineEdit(fx.chroma_key)
-        self.chroma_color.setMaxLength(9)
-        self.chroma_color.editingFinished.connect(
-            lambda: self._set_effect("chroma_key", self.chroma_color.text()))
+        self.chroma_enabled.toggled.connect(self._chroma_toggled)
         chroma_layout.addWidget(self.chroma_enabled, 0, 0, 1, 2)
         chroma_layout.addWidget(QLabel("Key colour"), 1, 0)
-        chroma_layout.addWidget(self.chroma_color, 1, 1)
-        holder, slider, _ = _slider_row("Tolerance", 0, 100, int(fx.chroma_similarity * 100),
-                                        lambda v: self._set_effect("chroma_similarity", v / 100.0))
-        chroma_layout.addWidget(holder, 2, 0, 1, 2)
+        colour_row = QHBoxLayout()
+        self.chroma_color = QLineEdit(fx.chroma_key)
+        self.chroma_color.setMaxLength(9)
+        self.chroma_color.setPlaceholderText("#00ff00")
+        self.chroma_color.editingFinished.connect(
+            lambda: self._set_effect("chroma_key", self.chroma_color.text()))
+        pick = QPushButton("Pick\u2026")
+        pick.clicked.connect(self._pick_chroma_color)
+        colour_row.addWidget(self.chroma_color, 1)
+        colour_row.addWidget(pick)
+        chroma_layout.addLayout(colour_row, 1, 1)
+        for key, label, value in (
+            ("chroma_similarity", "Tolerance", int(round(fx.chroma_similarity * 100))),
+            ("chroma_smoothness", "Edge softness", int(round(fx.chroma_smoothness * 100))),
+        ):
+            holder, slider, _label = _slider_row(
+                label, 0, 100, value,
+                lambda v, a=key: self._set_effect(a, v / 100.0))
+            self._effect_sliders[key] = slider
+            chroma_layout.addWidget(holder, 2 if key == "chroma_similarity" else 3,
+                                    0, 1, 2)
+        chroma_note = QLabel(
+            "Pick the backdrop colour. Tolerance widens the key; edge softness "
+            "blends the boundary instead of leaving a hard cutout.")
+        chroma_note.setObjectName("muted")
+        chroma_note.setWordWrap(True)
+        chroma_layout.addWidget(chroma_note, 4, 0, 1, 2)
         layout.addWidget(chroma)
+        self._effect_controls.append(chroma)
+        self._chroma_controls.extend((self.chroma_color, pick,
+                                      self._effect_sliders["chroma_similarity"],
+                                      self._effect_sliders["chroma_smoothness"]))
+        self._update_frame_controls()
 
-        background = QGroupBox("Background (not implemented)")
-        background.setEnabled(False)
-        bg_layout = QGridLayout(background)
-        self.background_mode = QComboBox()
-        self.background_mode.addItems(["none", "blur", "replace"])
-        self.background_mode.setCurrentText(fx.background_mode)
-        self.background_mode.currentTextChanged.connect(lambda v: self._set_effect("background_mode", v))
-        bg_layout.addWidget(QLabel("Mode"), 0, 0)
-        bg_layout.addWidget(self.background_mode, 0, 1)
-        holder, slider, _ = _slider_row("Blur strength", 0, 40, int(fx.background_blur),
-                                        lambda v: self._set_effect("background_blur", float(v)))
-        bg_layout.addWidget(holder, 1, 0, 1, 2)
-        background_note = QLabel("Background blur/replacement needs segmentation; "
-                                 "the controls are disabled in this build.")
-        background_note.setObjectName("muted")
-        background_note.setWordWrap(True)
-        bg_layout.addWidget(background_note, 2, 0, 1, 2)
-        layout.addWidget(background)
-
-        face = QGroupBox("Face effect")
-        face_layout = QGridLayout(face)
-        self.face_effect = QComboBox()
-        self.face_effect.addItems(["none", "spotlight", "frame"])
-        self.face_effect.setCurrentText(fx.face_effect)
-        self.face_effect.currentTextChanged.connect(lambda v: self._set_effect("face_effect", v))
-        face_layout.addWidget(QLabel("Effect"), 0, 0)
-        face_layout.addWidget(self.face_effect, 0, 1)
-        holder, _slider, _label = _slider_row(
-            "Padding", 0, 100, int(fx.face_strength * 100),
-            lambda v: self._set_effect("face_strength", v / 100.0))
-        face_layout.addWidget(holder, 1, 0, 1, 2)
-        face_note = QLabel("The bundled YuNet detector runs locally on preview frames. "
-                           "The compositor overlay follows the largest detected face; "
-                           "no image leaves this machine.")
-        face_note.setObjectName("muted")
-        face_note.setWordWrap(True)
-        face_layout.addWidget(face_note, 2, 0, 1, 2)
-        layout.addWidget(face)
         layout.addStretch(1)
 
-        apply = QPushButton("Apply effects")
-        apply.setObjectName("primary")
-        apply.clicked.connect(self.restart_engine)
-        layout.addWidget(apply)
+        live = QLabel("Changes apply live \u00b7 no canvas rebuild, no output interruption")
+        live.setObjectName("muted")
+        live.setWordWrap(True)
+        layout.addWidget(live)
+        scroll.setWidget(body)
+        container = QVBoxLayout(page)
+        container.addWidget(scroll)
+        self._sync_effects_controls()
+        return page
+
+    def edit_overlay(self, layer_id: str, values: tuple[str, str, str] | None = None) -> bool:
+        """Edit a ticker or lower third; ``values`` skips the dialog (tests, scripts)."""
+        layer = self.scene.layer(layer_id)
+        if layer is None or layer.kind not in ("ticker", "lower_third"):
+            return False
+        if values is None:
+            dialog = OverlayDialog(layer, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return False
+            values = dialog.values()
+        source, colour, background = values
+        if not source.strip("| "):
+            self._status("Text cannot be empty")
+            return False
+        layer.source, layer.color, layer.background = source, colour, background
+        if layer.kind == "lower_third":
+            layer.name = source.partition("|")[0] or layer.name
+        self._refresh_layers()
+        self._mark_dirty()
+        # Applied to the running canvas; a rebuild only if it is not there yet.
+        if self.engine is not None and not self.engine.update_overlay(layer):
+            self.restart_engine()
+        self._status(f"Updated {layer.name}")
+        return True
+
+    # -------------------------------------------------------- drawing on video
+    DRAW_COLOURS = ("#ff3b5c", "#facc15", "#5eead0", "#60a5fa", "#ffffff", "#111827")
+    DRAW_TOOLS = (("pen", "Pen"), ("marker", "Marker"), ("arrow", "Arrow"),
+                  ("box", "Box"))
+
+    def _build_draw_bar(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("panel")
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(8, 4, 8, 4)
+        self.draw_tool_buttons: dict[str, QPushButton] = {}
+        for key, label in self.DRAW_TOOLS:
+            button = QPushButton(label)
+            button.setCheckable(True)
+            button.setChecked(key == "pen")
+            button.clicked.connect(lambda _=False, k=key: self._draw_tool(k))
+            self.draw_tool_buttons[key] = button
+            layout.addWidget(button)
+        layout.addSpacing(8)
+        self.draw_colour_buttons: dict[str, QPushButton] = {}
+        for colour in self.DRAW_COLOURS:
+            swatch = QPushButton()
+            swatch.setFixedSize(22, 22)
+            swatch.setToolTip(colour)
+            swatch.setStyleSheet(
+                f"background:{colour}; border:2px solid #26343d; border-radius:11px;")
+            swatch.clicked.connect(lambda _=False, c=colour: self._draw_colour(c))
+            self.draw_colour_buttons[colour] = swatch
+            layout.addWidget(swatch)
+        more = QPushButton("\u2026")
+        more.setFixedWidth(28)
+        more.setToolTip("Pick another colour")
+        more.clicked.connect(self._pick_draw_colour)
+        layout.addWidget(more)
+        layout.addSpacing(8)
+        layout.addWidget(QLabel("Size"))
+        self.draw_width_slider = QSlider(Qt.Orientation.Horizontal)
+        self.draw_width_slider.setRange(1, 20)
+        self.draw_width_slider.setValue(4)
+        self.draw_width_slider.setFixedWidth(90)
+        self.draw_width_slider.valueChanged.connect(self._draw_width)
+        layout.addWidget(self.draw_width_slider)
+        layout.addStretch(1)
+        undo = QPushButton("Undo")
+        undo.clicked.connect(self._draw_undo)
+        clear = QPushButton("Clear")
+        clear.clicked.connect(self._draw_clear)
+        done = QPushButton("Done")
+        done.setObjectName("primary")
+        done.clicked.connect(lambda: self.toggle_draw(False))
+        for button in (undo, clear, done):
+            layout.addWidget(button)
+        bar.hide()
+        return bar
+
+    def toggle_draw(self, on: bool | None = None) -> None:
+        """Enter or leave draw mode (the pointer then draws instead of moving layers)."""
+        if on is None:
+            on = self.preview.edit_mode != "draw"
+        self.preview.set_edit_mode("draw" if on else "move")
+        self.draw_bar.setVisible(bool(on))
+        button = getattr(self, "draw_button", None)
+        if button is not None:
+            button.blockSignals(True)
+            button.setChecked(bool(on))
+            button.blockSignals(False)
+        self._status("Draw: drag on the picture. Done returns to editing." if on
+                     else "Editing")
+
+    def _draw_tool(self, key: str) -> None:
+        self.preview.draw_tool = key
+        for name, button in self.draw_tool_buttons.items():
+            button.setChecked(name == key)
+
+    def _draw_colour(self, colour: str) -> None:
+        self.preview.draw_color = colour
+
+    def _pick_draw_colour(self) -> None:
+        chosen = QColorDialog.getColor(QColor(self.preview.draw_color), self, "Drawing colour")
+        if chosen.isValid():
+            self._draw_colour(chosen.name())
+
+    def _draw_width(self, value: int) -> None:
+        self.preview.draw_width = value * 0.0015
+
+    def _drawing_layer(self) -> Layer | None:
+        """The layer strokes go to: the selected drawing layer, else the topmost."""
+        selected = self.preview.selected_layer()
+        if selected is not None and selected.kind == "drawing":
+            return selected
+        drawings = [layer for layer in self.scene.layers if layer.kind == "drawing"]
+        return max(drawings, key=lambda layer: layer.z) if drawings else None
+
+    def _draw_stroke_finished(self, stroke: dict) -> None:
+        layer = self._drawing_layer()
+        if layer is None:
+            layer = Layer(new_id("layer"), "drawing", "Drawing",
+                          source=animated.dump_strokes([stroke]),
+                          box=(0.0, 0.0, 1.0, 1.0), z=0)
+            self._insert_layer(layer)
+            self._mark_dirty()
+            return
+        strokes = animated.parse_strokes(layer.source)
+        strokes.append(stroke)
+        self._apply_strokes(layer, strokes)
+
+    def _apply_strokes(self, layer: Layer, strokes: list[dict]) -> None:
+        layer.source = animated.dump_strokes(strokes)
+        self._mark_dirty()
+        if self.engine is not None and not self.engine.set_layer_strokes(layer.id, strokes):
+            self.restart_engine()
+
+    def _draw_undo(self) -> None:
+        layer = self._drawing_layer()
+        strokes = animated.parse_strokes(layer.source) if layer is not None else []
+        if not strokes:
+            self._status("Nothing to undo")
+            return
+        strokes.pop()
+        self._apply_strokes(layer, strokes)
+
+    def _draw_clear(self) -> None:
+        layer = self._drawing_layer()
+        if layer is not None and animated.parse_strokes(layer.source):
+            self._apply_strokes(layer, [])
+            self._status("Drawing cleared")
+
+    # ------------------------------------------------------- effects browser
+    def _effects_browse_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        self.browse_target = QLabel("No layer selected")
+        self.browse_target.setObjectName("accent")
+        layout.addWidget(self.browse_target)
+        self.effects_all = QCheckBox("Apply to all sources")
+        self.effects_all.setToolTip(
+            "Apply the chosen effect to every visible camera, screen, video, "
+            "network and pattern layer instead of only the selected one.")
+        layout.addWidget(self.effects_all)
+
+        row = QHBoxLayout()
+        self.effect_category = QComboBox()
+        for name in self.EFFECT_CATEGORIES:
+            self.effect_category.addItem(name, name)
+        self.effect_category.currentIndexChanged.connect(self._populate_effect_grid)
+        row.addWidget(self.effect_category, 1)
+        self.filter_slot = QComboBox()
+        self.filter_slot.addItem("Filter 1", 1)
+        self.filter_slot.addItem("Filter 2", 2)
+        self.filter_slot.setToolTip(
+            "A layer has two filter slots, so two filters can be on at once "
+            "(for example a portrait effect and a distortion).")
+        self.filter_slot.currentIndexChanged.connect(self._filter_slot_changed)
+        row.addWidget(self.filter_slot)
+        self.thumb_refresh = QPushButton("Use current picture")
+        self.thumb_refresh.setToolTip(
+            "Redraw the previews from what the program shows right now.")
+        self.thumb_refresh.clicked.connect(self._refresh_effect_previews)
+        row.addWidget(self.thumb_refresh)
+        layout.addLayout(row)
+
+        tools = QHBoxLayout()
+        self.effect_search = QLineEdit()
+        self.effect_search.setPlaceholderText("Search all effects\u2026")
+        self.effect_search.setClearButtonEnabled(True)
+        self.effect_search.textChanged.connect(self._populate_effect_grid)
+        tools.addWidget(self.effect_search, 1)
+        for label, tip, handler in (
+                ("Copy", "Copy this layer's effects", self._copy_effects),
+                ("Paste", "Paste the copied effects onto the selected layer(s)",
+                 self._paste_effects),
+                ("Clear", "Remove every effect from the selected layer(s)",
+                 self._clear_effects)):
+            button = QPushButton(label)
+            button.setToolTip(tip)
+            button.clicked.connect(handler)
+            tools.addWidget(button)
+        layout.addLayout(tools)
+
+        self.effect_grid = QListWidget()
+        self.effect_grid.setObjectName("effectGrid")
+        # The app-wide item padding breaks icon-mode sizing (tiles were clipped
+        # to a strip), so the grid carries its own rules.
+        self.effect_grid.setStyleSheet(
+            "QListWidget#effectGrid::item { padding: 0px; margin: 1px; "
+            "border: 2px solid transparent; border-radius: 7px; color: #9fb0bb; }"
+            "QListWidget#effectGrid::item:selected { border: 2px solid #5eead0; "
+            "background: #12302d; color: #5eead0; }"
+            "QListWidget#effectGrid::item:hover { background: #16222a; }")
+        self.effect_grid.setViewMode(QListWidget.ViewMode.IconMode)
+        self.effect_grid.setIconSize(QSize(112, 63))
+        self.effect_grid.setGridSize(QSize(126, 96))
+        self.effect_grid.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.effect_grid.setMovement(QListWidget.Movement.Static)
+        self.effect_grid.setWordWrap(True)
+        self.effect_grid.setSpacing(2)
+        self.effect_grid.setUniformItemSizes(True)
+        self.effect_grid.itemClicked.connect(self._effect_item_clicked)
+        self.effect_grid.installEventFilter(self)
+        layout.addWidget(self.effect_grid, 1)
+
+        holder, strength, label = _slider_row(
+            "Strength", 0, 100, 50,
+            lambda v: self._set_effect(self._slot_attr() + "_amount", v / 100.0))
+        self._effect_sliders["filter_amount"] = strength
+        self.filter_strength_row = holder
+        layout.addWidget(holder)
+        self.effect_note = QLabel(
+            "Click a tile to apply it. Effects stack: a look, a filter and a "
+            "frame can all be on at once. Changes are live.")
+        self.effect_note.setObjectName("muted")
+        self.effect_note.setWordWrap(True)
+        layout.addWidget(self.effect_note)
+
+        self._thumb_sample_image = None
+        self._thumb_cache: dict[tuple, QPixmap] = {}
+        self._thumb_queue: list[tuple] = []
+        self._thumb_timer = QTimer(self)
+        self._thumb_timer.setInterval(15)
+        self._thumb_timer.timeout.connect(self._render_pending_thumbs)
+        self._effect_entries: list[dict] = []
+        self._populate_effect_grid()
+        return page
+
+    def _effect_catalog(self, category: str) -> list[dict]:
+        entries = self._effect_catalog_raw(category)
+        for entry in entries:
+            entry.setdefault("category", category)
+        return entries
+
+    def _search_catalog(self, text: str) -> list[dict]:
+        """Every tile, in any category, whose name or description matches."""
+        needle = text.strip().lower()
+        found: list[dict] = []
+        for category in self.EFFECT_CATEGORIES:
+            for entry in self._effect_catalog(category):
+                if entry["label"].startswith("No "):
+                    continue          # "No filter" / "No frame" belong to their category
+                haystack = f"{entry['label']} {entry.get('tip', '')} {category}".lower()
+                if all(word in haystack for word in needle.split()):
+                    found.append(entry)
+        return found
+
+    def _effect_catalog_raw(self, category: str) -> list[dict]:
+        """The tiles of one category: label, what they set, how they preview."""
+        entries: list[dict] = []
+        if category == "Looks":
+            for name, values in EFFECT_PRESETS.items():
+                entries.append({"label": name, "kind": "look",
+                                "apply": dict(values), "preview": dict(values)})
+            for label, value in EFFECT_STYLES.items():
+                if value != "none":
+                    entries.append({"label": label, "kind": "film",
+                                    "apply": {"color_effect": value},
+                                    "preview": {"color_effect": value}})
+        elif category in effect_library.FILTER_CATEGORIES:
+            entries.append({"label": "No filter", "kind": "filter",
+                            "apply": {"filter": "none"}, "preview": {}})
+            for spec in effect_library.available_filters(category):
+                values = {"filter": spec.key, "filter_amount": spec.default}
+                entries.append({"label": spec.label, "kind": "filter",
+                                "apply": values, "preview": values,
+                                "tip": spec.description,
+                                "amount": bool(spec.prop)})
+        elif category in self.FRAME_GROUPS:
+            entries.append({"label": "No frame", "kind": "frame",
+                            "apply": {"frame_style": "none"}, "preview": {}})
+            for key, (label, group, _painter) in frames_library.THEMES.items():
+                if group == self.FRAME_GROUPS[category]:
+                    values = {"frame_style": key}
+                    entries.append({"label": label, "kind": "frame", "apply": values,
+                                    "preview": dict(values),
+                                    "tip": f"{label}: a finished {group.lower()} frame"})
+        elif category == "Animations":
+            entries.append({"label": "No animation", "kind": "particles", "source": "",
+                            "apply": {}, "preview": {}, "tip": "Remove the animation"})
+            for key, (label, group, _factory) in particles_library.PRESETS.items():
+                entries.append({"label": label, "kind": "particles", "source": key,
+                                "apply": {}, "preview": {}, "particles": key,
+                                "tip": f"{group}: adds a moving {label.lower()} layer on top"})
+        elif category == "Emoji rain":
+            entries.append({"label": "No animation", "kind": "particles", "source": "",
+                            "apply": {}, "preview": {}, "tip": "Remove the animation"})
+            for code, name, group, words in emoji_library.available():
+                entries.append({"label": name, "kind": "particles", "source": f"emoji:{code}",
+                                "apply": {}, "preview": {}, "particles": f"emoji:{code}",
+                                "tip": f"{group}: makes {name.lower()} fall across the picture ({words})"})
+        elif category in ("Frames", "Shapes"):
+            entries.append({"label": "No frame", "kind": "frame",
+                            "apply": {"frame_style": "none"}, "preview": {}})
+            for key, label in overlay.WINDOW_FRAME_STYLES.items():
+                shaped = key in overlay.SHAPED_FRAME_STYLES
+                if (key == "none" or key in frames_library.THEMES
+                        or shaped != (category == "Shapes")):
+                    continue
+                values = {"frame_style": key}
+                entries.append({"label": label, "kind": "frame",
+                                "apply": values,
+                                "preview": {**values, "frame_color": "#ff4d7a",
+                                            "frame_width": 6}})
+        return entries
+
+    def _slot_attr(self) -> str:
+        """The Effects field of the chosen filter slot: ``filter`` or ``filter2``."""
+        combo = getattr(self, "filter_slot", None)
+        return "filter2" if combo is not None and combo.currentData() == 2 else "filter"
+
+    def _filter_slot_changed(self, *_args) -> None:
+        self._sync_effects_controls()
+
+    def _effect_entry_matches(self, entry: dict, fx: Effects) -> bool:
+        apply = entry["apply"]
+        if entry["kind"] == "look":
+            return all(abs(float(getattr(fx, key)) - float(value)) < 1e-4
+                       for key, value in apply.items())
+        if entry["kind"] == "particles":
+            current = self._animation_layers()
+            if not entry["source"]:
+                return not current
+            return bool(current) and current[0].source == entry["source"]
+        if entry["kind"] == "filter":
+            return getattr(fx, self._slot_attr()) == apply["filter"]
+        return all(getattr(fx, key) == value for key, value in apply.items()
+                   if key != "filter_amount")
+
+    def _thumb_sample(self):
+        if self._thumb_sample_image is None:
+            self._thumb_sample_image = self._current_picture_sample()
+        return self._thumb_sample_image
+
+    def _current_picture_sample(self):
+        """The program picture for previews, or the built-in sample."""
+        from PIL import Image
+
+        image = getattr(self.preview, "image", None)
+        if image is not None and not image.isNull():
+            rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
+            width, height = rgba.width(), rgba.height()
+            data = bytes(rgba.constBits())[: width * height * 4]
+            return Image.frombytes("RGBA", (width, height), data).convert("RGB")
+        return effect_thumbs.default_sample()
+
+    def _populate_effect_grid(self, *_args) -> None:
+        category = str(self.effect_category.currentData() or "Looks")
+        query = self.effect_search.text() if hasattr(self, "effect_search") else ""
+        self._effect_entries = (self._search_catalog(query) if query.strip()
+                                else self._effect_catalog(category))
+        self.effect_grid.clear()
+        self._thumb_queue.clear()
+        sample_id = id(self._thumb_sample_image)
+        for index, entry in enumerate(self._effect_entries):
+            item = QListWidgetItem(entry["label"])
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            item.setToolTip(entry.get("tip") or entry["label"])
+            # An ::item style rule makes Qt size a tile from its text alone,
+            # which clipped the thumbnail to a strip; state the size outright.
+            item.setSizeHint(QSize(122, 92))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter
+                                  | Qt.AlignmentFlag.AlignTop)
+            key_category = entry.get("category", category)
+            cached = self._thumb_cache.get((key_category, entry["label"], sample_id))
+            if cached is not None:
+                item.setIcon(QIcon(cached))
+            else:
+                self._thumb_queue.append((item, key_category, entry, sample_id))
+            self.effect_grid.addItem(item)
+        if self._thumb_queue and self.effect_grid.isVisible():
+            self._thumb_timer.start()
+        self._select_current_effect_tile()
+
+    def _render_pending_thumbs(self) -> None:
+        """Draw a couple of tiles per tick so the window stays responsive.
+
+        Only while the grid is on screen: tiles for a tab nobody opened (or a
+        window that has closed) are not worth the GUI thread's time, and the
+        queue is picked up again when the grid is shown.
+        """
+        if not self.effect_grid.isVisible():
+            self._thumb_timer.stop()
+            return
+        for _ in range(2):
+            if not self._thumb_queue:
+                self._thumb_timer.stop()
+                return
+            item, category, entry, sample_id = self._thumb_queue.pop(0)
+            try:
+                if entry.get("particles"):
+                    picture = effect_thumbs.particle_thumbnail(
+                        entry["particles"], self._thumb_sample())
+                else:
+                    fx = Effects(**entry["preview"])
+                    picture = effect_thumbs.render_thumbnail(fx, self._thumb_sample())
+            except Exception:  # noqa: BLE001 - a tile without a preview is fine
+                picture = None
+            if picture is None:
+                continue
+            width, height = picture.size
+            image = QImage(picture.tobytes(), width, height, width * 3,
+                           QImage.Format.Format_RGB888).copy()
+            pixmap = QPixmap.fromImage(image)
+            self._thumb_cache[(category, entry["label"], sample_id)] = pixmap
+            try:
+                item.setIcon(QIcon(pixmap))
+            except RuntimeError:
+                pass  # the list was repopulated while this tile was queued
+
+    def _refresh_effect_previews(self) -> None:
+        self._thumb_sample_image = self._current_picture_sample()
+        self._thumb_cache.clear()
+        self._populate_effect_grid()
+
+    def _copy_effects(self) -> None:
+        layer = self._effects_layer()
+        if layer is None:
+            self._status("Select a layer to copy effects from")
+            return
+        self._effects_clipboard = copy.deepcopy(layer.effects)
+        self._status(f"Copied the effects of {layer.name}")
+
+    def _paste_effects(self) -> None:
+        clipboard = getattr(self, "_effects_clipboard", None)
+        targets = self._effect_targets()
+        if clipboard is None or not targets:
+            self._status("Copy a layer's effects first, then select where to paste")
+            return
+        for layer in targets:
+            layer.effects = copy.deepcopy(clipboard)
+            self._apply_effects(layer)
+        self._sync_effects_controls()
+        self._mark_dirty()
+        self._status(f"Pasted effects onto {len(targets)} layer(s)")
+
+    def _clear_effects(self) -> None:
+        targets = self._effect_targets()
+        if not targets:
+            self._status("Select a layer in the preview or Layers tab first")
+            return
+        for layer in targets:
+            layer.effects = Effects()
+            self._apply_effects(layer)
+        self._sync_effects_controls()
+        self._mark_dirty()
+        self._status(f"Cleared the effects of {len(targets)} layer(s)")
+
+    def _effect_targets(self) -> list[Layer]:
+        if self.effects_all.isChecked():
+            return [layer for layer in self.scene.layers
+                    if layer.visible and layer.kind in self._CAPTURE_KINDS]
+        layer = self._effects_layer()
+        return [layer] if layer is not None else []
+
+    def _animation_layers(self) -> list[Layer]:
+        return [layer for layer in self.scene.layers if layer.kind == "particles"]
+
+    def _set_animation(self, source: str) -> None:
+        """Show one animation at a time: swap it live, toggle it off, or clear it.
+
+        Several full-canvas animation layers piled up (one per click) and
+        starved the canvas, so there is only ever one.  Picking another swaps the
+        generator inside the running layer; picking the active one again, or
+        "No animation", removes it.
+        """
+        from . import particles
+
+        current = self._animation_layers()
+        if not source or (current and current[0].source == source):
+            if current:
+                self.remove_layers([layer.id for layer in current])
+                self._status("Animation removed")
+            self._select_current_effect_tile()
+            return
+        if current:
+            keep, extra = current[0], current[1:]
+            if extra:
+                self.remove_layers([layer.id for layer in extra])
+            before = self._layout_snapshot()
+            keep.source = source
+            keep.name = particles.label_for(source)
+            if self.engine is not None and not self.engine.update_overlay(keep):
+                self.remove_layers([keep.id])
+                self.add_layer("particles", source=source)
+            self._refresh_layers()
+            self._record_history(before)
+            self._mark_dirty()
+        else:
+            self.add_layer("particles", source=source)
+        self._status(f"Animation: {particles.label_for(source)} (click it again to remove)")
+        self._select_current_effect_tile()
+
+    def _effect_item_clicked(self, item) -> None:
+        index = item.data(Qt.ItemDataRole.UserRole)
+        if index is None or not 0 <= int(index) < len(self._effect_entries):
+            return
+        entry = self._effect_entries[int(index)]
+        if entry["kind"] == "particles":
+            self._set_animation(entry["source"])
+            return
+        targets = self._effect_targets()
+        if not targets:
+            self._status("Select a layer in the preview or Layers tab first")
+            return
+        attr = self._slot_attr()
+        for layer in targets:
+            for key, value in entry["apply"].items():
+                if entry["kind"] == "filter":
+                    # Filter tiles go to the chosen slot.
+                    key = key.replace("filter", attr, 1)
+                setattr(layer.effects, key, value)
+            self._apply_effects(layer)
+        self._sync_effects_controls()
+        self._mark_dirty()
+        count = f" on {len(targets)} sources" if len(targets) > 1 else ""
+        self._status(f"{entry['label']}{count}")
+
+    def _select_current_effect_tile(self) -> None:
+        layer = self._effects_layer()
+        if layer is None or not hasattr(self, "effect_grid"):
+            return
+        self.effect_grid.blockSignals(True)
+        try:
+            self.effect_grid.clearSelection()
+            for index, entry in enumerate(self._effect_entries):
+                if self._effect_entry_matches(entry, layer.effects):
+                    self.effect_grid.setCurrentRow(index)
+                    break
+        finally:
+            self.effect_grid.blockSignals(False)
+
+    def _sync_filter_strength(self, fx: Effects) -> None:
+        attr = self._slot_attr()
+        spec = effect_library.FILTERS.get(getattr(fx, attr))
+        has_amount = bool(spec is not None and spec.prop)
+        self.filter_strength_row.setVisible(has_amount)
+        slider = self._effect_sliders.get("filter_amount")
+        if slider is not None and has_amount:
+            slider.blockSignals(True)
+            slider.setValue(int(round(getattr(fx, attr + "_amount") * 100)))
+            slider.blockSignals(False)
+
+    def _backdrop_tab(self) -> QWidget:
+        page = QWidget()
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        body = QWidget()
+        layout = QVBoxLayout(body)
+
+        intro = QLabel(
+            "Backdrops sit behind every capture layer. Static looks are "
+            "generated at the project canvas size; motion looks use live "
+            "GPU 3D shaders when OpenGL is available.")
+        intro.setObjectName("muted")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        static = QGroupBox("Static backgrounds")
+        static_grid = QGridLayout(static)
+        for index, name in enumerate(overlay.BACKGROUND_NAMES):
+            button = QPushButton(name)
+            button.clicked.connect(
+                lambda _checked=False, value=name: self._apply_background(value))
+            static_grid.addWidget(button, index // 2, index % 2)
+        layout.addWidget(static)
+
+        motion = QGroupBox("Animated backdrops")
+        motion_grid = QGridLayout(motion)
+        for index, (key, spec) in enumerate(ANIMATION_PRESETS.items()):
+            button = QPushButton(str(spec["label"]))
+            button.clicked.connect(
+                lambda _checked=False, value=key: self._apply_animation(value))
+            motion_grid.addWidget(button, index // 2, index % 2)
+        layout.addWidget(motion)
+
+        actions = QGroupBox("Composition")
+        actions_layout = QVBoxLayout(actions)
+        self.inset_on_backdrop = QCheckBox(
+            "Inset cameras when a backdrop is applied")
+        self.inset_on_backdrop.setChecked(True)
+        actions_layout.addWidget(self.inset_on_backdrop)
+        inset = QPushButton("Inset capture layers now")
+        inset.clicked.connect(self._inset_capture_layers)
+        actions_layout.addWidget(inset)
+        clear = QPushButton("Clear backdrop")
+        clear.clicked.connect(self._clear_backdrop)
+        actions_layout.addWidget(clear)
+        self.backdrop_status = QLabel("No backdrop selected")
+        self.backdrop_status.setObjectName("accent")
+        self.backdrop_status.setWordWrap(True)
+        actions_layout.addWidget(self.backdrop_status)
+        layout.addWidget(actions)
+
+        layout.addStretch(1)
         scroll.setWidget(body)
         container = QVBoxLayout(page)
         container.addWidget(scroll)
         return page
+
+    def _active_backdrops(self) -> list[Layer]:
+        return [layer for layer in self.scene.layers
+                if getattr(layer, "role", "") == "backdrop"]
+
+    def _remove_backdrops(self) -> None:
+        """Delete the current backdrop layers, not just hide them.
+
+        A hidden backdrop stayed in the scene (and was rebuilt as a full-canvas
+        chain on every restart), so each switch of look added another one.
+        """
+        old = [layer.id for layer in self._active_backdrops()]
+        if old:
+            self.remove_layers(old)
+
+    def _replace_backdrop(self, layer: Layer) -> Layer:
+        had_backdrop = bool(self._active_backdrops())
+        self._remove_backdrops()
+        new_layer = self._insert_layer(layer)
+        others = [item.z for item in self.scene.layers if item is not new_layer]
+        new_layer.z = min(others, default=1) - 1
+        if self.engine is not None:
+            self.engine.refresh_layer_order()
+        self._refresh_layers()
+        # Inset once, when the first backdrop appears.  Switching from Aurora
+        # to Sunset must not shrink the camera a second time.
+        if not had_backdrop and self.inset_on_backdrop.isChecked():
+            self._inset_capture_layers()
+        return new_layer
+
+    def _apply_background(self, name: str) -> None:
+        width = int(self.project.output.canvas_w)
+        height = int(self.project.output.canvas_h)
+        path = overlay.render_background(name, width, height)
+        layer = Layer(
+            new_id("layer"), "image", f"Backdrop · {name}",
+            source=str(path), box=(0.0, 0.0, 1.0, 1.0), z=0,
+            role="backdrop",
+        )
+        self._replace_backdrop(layer)
+        self.backdrop_status.setText(f"Backdrop: {name}")
+        self._status(f"Backdrop: {name}")
+
+    def _apply_animation(self, key: str) -> None:
+        spec = ANIMATION_PRESETS.get(key, {})
+        label = str(spec.get("label", key))
+        layer = Layer(
+            new_id("layer"), "animation", f"Motion · {label}",
+            source=key, box=(0.0, 0.0, 1.0, 1.0), z=0,
+            role="backdrop",
+        )
+        self._replace_backdrop(layer)
+        self.backdrop_status.setText(f"Motion: {label}")
+        self._status(f"Motion backdrop: {label}")
+
+    def _clear_backdrop(self) -> None:
+        had_backdrop = bool(self._active_backdrops())
+        self._remove_backdrops()
+        self._restore_inset_layers()
+        if had_backdrop:
+            self._mark_dirty()
+        self.backdrop_status.setText("No backdrop selected")
+        self._status("Backdrop cleared")
+
+    def _inset_capture_layers(self) -> None:
+        changed = 0
+        for layer in self.scene.layers:
+            if layer.kind not in ("camera", "screen", "video", "network", "test"):
+                continue
+            x, y, w, h = layer.box
+            box = (x + w * 0.055, y + h * 0.055, w * 0.89, h * 0.89)
+            self._backdrop_insets[layer.id] = (tuple(layer.box), box)
+            layer.box = box
+            if self.engine is not None:
+                self.engine.set_layer_box(layer.id, box)
+            changed += 1
+        self.preview.update()
+        self._mark_dirty()
+        if changed:
+            self._status(f"Inset {changed} capture layer(s) to reveal the backdrop")
+
+    def _restore_inset_layers(self) -> None:
+        """Undo the backdrop inset on layers the user has not moved since."""
+        restored = 0
+        for layer_id, (original, inset) in list(self._backdrop_insets.items()):
+            layer = self.scene.layer(layer_id)
+            if layer is None:
+                continue  # another scene's layer, or removed: keep/forget below
+            del self._backdrop_insets[layer_id]
+            if all(abs(a - b) < 1e-6 for a, b in zip(layer.box, inset)):
+                layer.box = original
+                if self.engine is not None:
+                    self.engine.set_layer_box(layer_id, original)
+                restored += 1
+        if restored:
+            self.preview.update()
+            self._mark_dirty()
 
     def _audio_tab(self) -> QWidget:
         page = QWidget()
@@ -1812,6 +2991,68 @@ class AnyCamWindow(QMainWindow):
         grid.addWidget(QLabel("FPS"), 2, 0); grid.addWidget(self.fps_spin, 2, 1)
         layout.addWidget(box)
 
+        encoder_box = QGroupBox("Video encoder")
+        encoder_grid = QGridLayout(encoder_box)
+        self.encoder_combo = QComboBox()
+        for label, value in (
+            ("Auto (NVENC H.264 when available)", "auto"),
+            ("NVIDIA NVENC H.264", "nvenc"),
+            ("NVIDIA NVENC H.265 (HEVC)", "nvenc_h265"),
+            ("NVIDIA NVENC AV1", "nvenc_av1"),
+            ("CPU x264", "cpu"),
+        ):
+            self.encoder_combo.addItem(label, value)
+        saved_encoder = str(self.project.output.encoder or "auto").lower()
+        chosen = self.encoder_combo.findData(saved_encoder)
+        self.encoder_combo.setCurrentIndex(chosen if chosen >= 0 else 0)
+        self.encoder_combo.currentIndexChanged.connect(self._encoder_changed)
+        encoder_grid.addWidget(QLabel("Encoder"), 0, 0)
+        encoder_grid.addWidget(self.encoder_combo, 0, 1)
+        nv_ready = nvenc_available()
+        encoder_note = QLabel(
+            "NVENC detected. Recording can use H.264, H.265 or AV1 on the GPU "
+            "through CUDA; missing codecs fall back to H.264 NVENC, then x264. "
+            "RTMP/FLV always streams H.264." if nv_ready else
+            "NVENC was not detected. Auto records with CPU x264; install the "
+            "GStreamer nvcodec plugin and an NVIDIA driver to enable GPU encoding.")
+        encoder_note.setObjectName("muted")
+        encoder_note.setWordWrap(True)
+        encoder_grid.addWidget(encoder_note, 1, 0, 1, 2)
+        layout.addWidget(encoder_box)
+
+        screen_box = QGroupBox("Screen capture")
+        screen_grid = QGridLayout(screen_box)
+        self.screen_flip_combo = QComboBox()
+        for label, value in (
+            ("Automatic (follow stream orientation)", "automatic"),
+            ("Rotate 180°", "rotate-180"),
+            ("Flip vertically", "vertical-flip"),
+            ("No correction", "none"),
+        ):
+            self.screen_flip_combo.addItem(label, value)
+        index = self.screen_flip_combo.findData(self.project.output.screen_flip)
+        self.screen_flip_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.screen_flip_combo.currentIndexChanged.connect(
+            self._screen_flip_changed)
+        self.screen_rotate_button = QPushButton("Rotate 180°")
+        self.screen_rotate_button.setCheckable(True)
+        self.screen_rotate_button.setToolTip(
+            "Rotate the screen capture 180°; uncheck to remove the rotation")
+        self.screen_rotate_button.setChecked(
+            self.project.output.screen_flip == "rotate-180")
+        self.screen_rotate_button.toggled.connect(self._screen_rotate_toggled)
+        screen_grid.addWidget(QLabel("Rotation"), 0, 0)
+        screen_grid.addWidget(self.screen_flip_combo, 0, 1)
+        screen_grid.addWidget(self.screen_rotate_button, 0, 2)
+        screen_note = QLabel(
+            "Automatic follows the orientation tag reported by the "
+            "compositor. Use Rotate 180° or Flip vertically only if this "
+            "share is wrong.")
+        screen_note.setObjectName("muted")
+        screen_note.setWordWrap(True)
+        screen_grid.addWidget(screen_note, 1, 0, 1, 3)
+        layout.addWidget(screen_box)
+
         box2 = QGroupBox("Video output (virtual camera)")
         grid2 = QGridLayout(box2)
         self.vcam_edit = QLineEdit(self.project.output.vcam_device)
@@ -1858,144 +3099,228 @@ class AnyCamWindow(QMainWindow):
         return self.project.scene
 
     def _current_effects(self) -> Effects:
-        for layer in self.scene.ordered():
-            if layer.kind in ("camera", "test", "video", "screen", "network"):
-                return layer.effects
-        return self.scene.layers[0].effects if self.scene.layers else Effects()
+        layer = self._effects_layer()
+        return layer.effects if layer is not None else Effects()
 
     def _effects_layer(self) -> Layer | None:
-        for layer in self.scene.ordered():
-            if layer.kind in ("camera", "test", "video", "screen", "network"):
-                return layer
-        return None
+        """The layer the Effects panel edits.
+
+        That is the selected layer.  With nothing selected, or only an animation
+        layer selected (effects mean nothing to those), it is the main picture:
+        the top visible camera, screen, video, network or pattern layer.  Without
+        this, clicking a frame or filter straight after opening the app did
+        nothing but flash a status message.
+        """
+        if not hasattr(self, "preview"):
+            return None
+        selected = self.preview.selected_layer()
+        if selected is not None and selected.kind != "particles":
+            return selected
+        main = [layer for layer in self.scene.layers
+                if layer.visible and layer.kind in self._CAPTURE_KINDS]
+        if main:
+            return max(main, key=lambda layer: layer.z)
+        return selected
+
+    def _apply_effects(self, layer: Layer) -> None:
+        """Push effect values onto the running layer without rebuilding."""
+        if self.engine is None:
+            return
+        apply = getattr(self.engine, "set_layer_effects", None)
+        if apply is not None:
+            apply(layer.id, layer.effects)
+        self.preview.update()
 
     def _set_effect(self, attr: str, value) -> None:
+        if getattr(self, "_syncing_effects", False):
+            return
         layer = self._effects_layer()
         if layer is None:
+            self._status("Select a layer in the preview or Layers tab first")
             return
+        fx = layer.effects
         if attr == "brightness":
-            layer.effects.brightness = value / 100.0
+            fx.brightness = max(-1.0, min(1.0, float(value) / 100.0))
         elif attr in ("contrast", "saturation"):
-            setattr(layer.effects, attr, value / 100.0)
-        elif attr == "blur":
-            layer.effects.blur = float(value)
-        elif attr == "face_strength":
-            layer.effects.face_strength = max(0.0, min(1.0, float(value)))
+            setattr(fx, attr, max(0.0, min(2.0, float(value) / 100.0)))
+        elif attr == "hue":
+            fx.hue = max(-1.0, min(1.0, float(value) / 180.0))
+        elif attr in ("chroma_similarity", "chroma_smoothness"):
+            setattr(fx, attr, max(0.0, min(1.0, float(value))))
+        elif attr == "chroma_key":
+            fx.chroma_key = str(value).strip() or "#00ff00"
+        elif attr == "color_effect":
+            choice = str(value or "none").lower()
+            fx.color_effect = choice if choice in EFFECT_STYLES.values() else "none"
+        elif attr == "mirror":
+            fx.mirror = bool(value)
+        elif attr == "frame_style":
+            choice = str(value or "none").lower()
+            fx.frame_style = choice if choice in overlay.WINDOW_FRAME_STYLES else "none"
+            self._update_frame_controls()
+        elif attr == "frame_color":
+            fx.frame_color = str(value).strip() or "#5eead0"
+        elif attr == "frame_matte":
+            fx.frame_matte = str(value).strip() or "#0b0d10"
+        elif attr in ("filter_amount", "filter2_amount"):
+            setattr(fx, attr, max(0.0, min(1.0, float(value))))
+        elif attr == "frame_width":
+            fx.frame_width = max(1, min(48, int(value)))
         else:
-            setattr(layer.effects, attr, value)
-        if attr == "face_effect":
-            changed = self._sync_face_overlay()
-            if changed and self.engine is not None:
-                self.restart_engine()
+            setattr(fx, attr, value)
+        self._apply_effects(layer)
         self._mark_dirty()
 
-    def _face_target(self) -> Layer | None:
-        """The camera-like layer whose effects currently drive the face overlay."""
-        for layer in self.scene.ordered():
-            if layer.kind in ("camera", "test", "video", "screen", "network") \
-                    and layer.effects.face_effect != "none":
-                return layer
-        return None
-
-    def _adopt_face_layer(self) -> None:
-        self._face_layer_id = next(
-            (layer.id for layer in self.scene.layers if layer.kind == "face"), "")
-        self._sync_face_overlay()
-
-    def _sync_face_overlay(self) -> bool:
-        """Add, refresh or remove the compositor layer for the face effect.
-
-        Returns True when the scene changed and a running graph needs a rebuild.
-        """
-        target = self._face_target()
-        existing = self.scene.layer(self._face_layer_id) if self._face_layer_id else None
-        if existing is None:
-            existing = next(
-                (layer for layer in self.scene.layers if layer.kind == "face"), None)
-            self._face_layer_id = existing.id if existing is not None else ""
-
-        if target is None:
-            if existing is None:
-                return False
-            self.scene.remove_layer(existing.id)
-            self._face_layer_id = ""
-            self._refresh_layers()
-            self._mark_dirty()
-            return True
-
-        style = target.effects.face_effect
-        png = overlay.render_face_frame(style=style)
-        if existing is None:
-            layer = Layer(
-                new_id("layer"), "face", "Face overlay", source=str(png),
-                box=(0.32, 0.22, 0.36, 0.48), z=90, visible=False,
-            )
-            self.scene.add_layer(layer)
-            self._face_layer_id = layer.id
-            self._refresh_layers()
-            self._mark_dirty()
-            return True
-        if existing.source != str(png):
-            existing.source = str(png)
-            self._mark_dirty()
-            return True
-        return False
-
-    def _track_face(self) -> None:
-        """Run YuNet on the latest composited frame and move the face layer."""
-        if self.engine is None or not self._face_layer_id or not self._face_bytes():
+    def _chroma_toggled(self, enabled: bool) -> None:
+        if getattr(self, "_syncing_effects", False):
             return
-        now = time.monotonic()
-        if now - self._face_last < 0.2:
-            return
-        self._face_last = now
-        layer = self.scene.layer(self._face_layer_id)
-        target = self._face_target()
-        if layer is None or target is None:
-            return
-        if self._face_detector is None:
-            try:
-                from .face import FaceDetector
+        self._set_effect("chroma_enabled", bool(enabled))
+        self._sync_effects_controls()
 
-                self._face_detector = FaceDetector()
-            except Exception as exc:  # noqa: BLE001 - optional onnxruntime/model
-                self._face_detector = False
-                if not self._face_error:
-                    self._face_error = str(exc)
-                    self._status(f"Face overlay unavailable: {exc}")
-                return
-        if self._face_detector is False:
-            return
-        import numpy as np
+    def _frame_style_changed(self, _index: int = 0) -> None:
+        self._set_effect("frame_style", self.frame_style.currentData())
 
-        width, height, raw = self._face_size[0], self._face_size[1], self._frame_bytes
-        if not width or not height or not raw:
+    def _pick_frame_color(self) -> None:
+        current = QColor(self.frame_color.text().strip())
+        if not current.isValid():
+            current = QColor("#5eead0")
+        colour = QColorDialog.getColor(current, self, "Window frame colour")
+        if not colour.isValid():
             return
+        self.frame_color.setText(colour.name())
+        self._set_effect("frame_color", colour.name())
+
+    def _pick_frame_matte(self) -> None:
+        current = QColor(self.frame_matte.text().strip())
+        if not current.isValid():
+            current = QColor("#0b0d10")
+        colour = QColorDialog.getColor(current, self, "Matte colour")
+        if not colour.isValid():
+            return
+        self.frame_matte.setText(colour.name())
+        self._set_effect("frame_matte", colour.name())
+
+    def _update_frame_controls(self) -> None:
+        layer = self._effects_layer()
+        enabled = bool(layer is not None
+                       and layer.effects.frame_style != "none")
+        for widget in getattr(self, "_frame_controls", []):
+            widget.setEnabled(enabled)
+
+    def _pick_chroma_color(self) -> None:
+        current = QColor(self.chroma_color.text().strip())
+        if not current.isValid():
+            current = QColor("#00ff00")
+        colour = QColorDialog.getColor(current, self, "Chroma key colour")
+        if not colour.isValid():
+            return
+        self.chroma_color.setText(colour.name())
+        self._set_effect("chroma_key", colour.name())
+
+    def _apply_effect_preset(self, _index: int = 0) -> None:
+        if getattr(self, "_syncing_effects", False):
+            return
+        name = self.effect_preset.currentData()
+        if not name or name not in EFFECT_PRESETS:
+            return
+        layer = self._effects_layer()
+        if layer is None:
+            self._status("Select a layer before choosing an effect preset")
+            return
+        for attr, value in EFFECT_PRESETS[name].items():
+            setattr(layer.effects, attr, float(value))
+        self._apply_effects(layer)
+        self._sync_effects_controls()
+        self._mark_dirty()
+        self._status(f"Effect preset: {name}")
+
+    def _match_effect_preset(self, fx: Effects) -> str:
+        for name, values in EFFECT_PRESETS.items():
+            if all(abs(float(getattr(fx, attr, 0.0)) - value) < 1e-4
+                   for attr, value in values.items()):
+                return name
+        return ""
+
+    def _reset_effects(self) -> None:
+        layer = self._effects_layer()
+        if layer is None:
+            self._status("Select a layer before resetting effects")
+            return
+        layer.effects = Effects()
+        self._apply_effects(layer)
+        self._sync_effects_controls()
+        self._mark_dirty()
+        self._status(f"Reset effects on {layer.name}")
+
+    def _sync_effects_controls(self) -> None:
+        """Mirror the selected layer's effect values into the panel."""
+        if not hasattr(self, "effects_target"):
+            return
+        layer = self._effects_layer()
+        self._syncing_effects = True
         try:
-            frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 4)[:, :, :3]
-            faces = self._face_detector.detect(frame)
-        except Exception as exc:  # noqa: BLE001 - inference must not kill preview
-            if not self._face_error:
-                self._face_error = str(exc)
-                self._status(f"Face detection failed: {exc}")
-            return
-        if not faces:
-            if layer.visible:
-                self.engine.set_layer_visible(layer.id, False)
-            return
-        face = max(faces, key=lambda item: item.score)
-        pad = 0.08 + 0.22 * max(0.0, min(1.0, float(target.effects.face_strength)))
-        box = (
-            clamp(face.x - face.w * pad),
-            clamp(face.y - face.h * pad),
-            clamp(face.w * (1.0 + 2.0 * pad), 0.03, 1.0),
-            clamp(face.h * (1.0 + 2.0 * pad), 0.03, 1.0),
-        )
-        self.engine.set_layer_box(layer.id, box)
-        self.engine.set_layer_visible(layer.id, True)
+            enabled = layer is not None
+            for widget in self._effect_controls:
+                widget.setEnabled(enabled)
+            if hasattr(self, "effect_grid"):
+                self.browse_target.setText(
+                    f"{layer.name}  \u00b7  {layer.kind}" if layer is not None
+                    else "No layer selected")
+                if layer is not None:
+                    self._sync_filter_strength(layer.effects)
+                    self._select_current_effect_tile()
+                else:
+                    self.filter_strength_row.setVisible(False)
+            if layer is None:
+                self.effects_target.setText("No layer selected")
+                self.effects_hint.setText(
+                    "Select a layer in the preview or Layers tab. Effects are "
+                    "per layer, so changing one source never alters the rest "
+                    "of the scene.")
+                self._update_frame_controls()
+                self._update_chroma_controls()
+                self.effect_preset.setCurrentIndex(0)
+                return
+            fx = layer.effects
+            self.effects_target.setText(f"{layer.name}  \u00b7  {layer.kind}")
+            self.effects_hint.setText(
+                "These settings apply only to the selected layer. Changes are "
+                "written straight to the running graph.")
+            self._effect_sliders["brightness"].setValue(
+                int(round(fx.brightness * 100)))
+            self._effect_sliders["contrast"].setValue(
+                int(round(fx.contrast * 100)))
+            self._effect_sliders["saturation"].setValue(
+                int(round(fx.saturation * 100)))
+            self._effect_sliders["hue"].setValue(int(round(fx.hue * 180)))
+            style_index = self.effect_style.findData(fx.color_effect)
+            self.effect_style.setCurrentIndex(style_index if style_index >= 0 else 0)
+            self.effect_mirror.setChecked(bool(fx.mirror))
+            frame_index = self.frame_style.findData(fx.frame_style)
+            self.frame_style.setCurrentIndex(frame_index if frame_index >= 0 else 0)
+            self.frame_color.setText(fx.frame_color or "#5eead0")
+            self.frame_matte.setText(fx.frame_matte or "#0b0d10")
+            self._effect_sliders["frame_width"].setValue(int(fx.frame_width))
+            self._update_frame_controls()
+            self._effect_sliders["chroma_similarity"].setValue(
+                int(round(fx.chroma_similarity * 100)))
+            self._effect_sliders["chroma_smoothness"].setValue(
+                int(round(fx.chroma_smoothness * 100)))
+            self.chroma_enabled.setChecked(bool(fx.chroma_enabled))
+            self.chroma_color.setText(fx.chroma_key or "#00ff00")
+            self._update_chroma_controls()
+            name = self._match_effect_preset(fx)
+            index = self.effect_preset.findData(name)
+            self.effect_preset.setCurrentIndex(index if index >= 0 else 0)
+        finally:
+            self._syncing_effects = False
 
-    def _face_bytes(self) -> bool:
-        return bool(self._frame_bytes) and bool(self._face_size[0])
+    def _update_chroma_controls(self) -> None:
+        enabled = bool(getattr(self, "chroma_enabled", None)
+                       and self.chroma_enabled.isChecked()
+                       and self._effects_layer() is not None)
+        for widget in getattr(self, "_chroma_controls", []):
+            widget.setEnabled(enabled)
 
     def _refresh_scenes(self) -> None:
         self.scene_combo.blockSignals(True)
@@ -2040,6 +3365,7 @@ class AnyCamWindow(QMainWindow):
         if hasattr(self, "preview"):
             self.preview.set_scene(self.scene)
             self._sync_transform_fields()
+            self._sync_effects_controls()
 
     def _layers_reordered(self, *_args) -> None:
         # Map the new list order back to scene.layers by z-order.
@@ -2047,13 +3373,19 @@ class AnyCamWindow(QMainWindow):
                for i in range(self.layer_list.count())]
         by_id = {layer.id: layer for layer in self.scene.layers}
         ordered = [by_id[lid] for lid in ids if lid in by_id]
+        if len(ordered) != len(self.scene.layers):
+            return  # the list is mid-update; do not drop layers from the scene
+        before = self._layout_snapshot()
         # Reassign z so the list order is the stacking order.
         for i, layer in enumerate(ordered):
             layer.z = (i + 1) * 10
         self.scene.layers = ordered
+        self._record_history(before)
         self._mark_dirty()
         if self.engine is not None:
-            self.restart_engine()
+            # Stacking is only each pad's zorder: no rebuild, so a screen
+            # share and the virtual camera are not interrupted by a drag.
+            self.engine.refresh_layer_order()
 
     def _scan_camera_choices(self) -> list[tuple[str, str]]:
         """Return (label, device) for usable V4L2 capture nodes."""
@@ -2158,12 +3490,23 @@ class AnyCamWindow(QMainWindow):
                     if device.lower() in text}
         if explicit:
             return explicit
-        markers = (
-            "v4l2", "video4linux", "resource busy", "no space left",
-            "could not open device", "failed to allocate", "input/output error",
-            "not a capture device",
-        )
-        return cameras if any(marker in text for marker in markers) else {}
+        # Pool errors name their capture channel; blame only the cameras that
+        # capture feeds, and nothing at all when it feeds a different kind.
+        channel = re.search(r"anycam-src-\d+", text)
+        if channel is not None and self.engine is not None:
+            fed = self.engine.layers_for_channel(channel.group(0))
+            if fed:
+                return {layer_id: device for layer_id, device in cameras.items()
+                        if layer_id in fed}
+        # Only the camera source element identifies a camera failure.  The old
+        # list also matched "no space left" and "failed to allocate", so a full
+        # disk or a GPU allocation error from any element quarantined every
+        # camera and swapped them for placeholder cards.
+        return cameras if "v4l2src" in text else {}
+
+    def _has_screen_layer(self) -> bool:
+        """Whether this scene is using a portal screen capture."""
+        return any(layer.kind == "screen" for layer in self.scene.layers)
 
     def _handle_pipeline_error(self, message: str) -> None:
         """Treat an unplugged or wedged camera as a temporary loss."""
@@ -2179,6 +3522,21 @@ class AnyCamWindow(QMainWindow):
         # A camera that fails again after a reconnect must not be reopened in
         # a tight loop; repeated opens are what wedges some UVC devices.
         self._camera_retry_ms = min(10000, int(self._camera_retry_ms * 1.5))
+        if (self.engine is not None and self._has_screen_layer()
+                and message.startswith("Camera source error:")):
+            # Do not rebuild a PiP just because the camera failed.  A rebuild
+            # stops the screen pipewiresrc and needs another portal remote; if
+            # the share cannot be reopened the whole PiP disappears.  Drop the
+            # failed capture and retry it on the existing canvas channel.
+            dropped = [layer_id for layer_id in missing
+                       if self.engine.drop_capture(layer_id)]
+            if len(dropped) == len(missing):
+                devices = ", ".join(sorted(set(missing.values())))
+                self._status(
+                    f"{devices} unavailable · screen preview kept live · "
+                    f"retrying in {self._camera_retry_ms / 1000:.1f}s")
+                self._camera_watch.start(self._camera_retry_ms)
+                return
         self._rebuild_without_lost_cameras(message)
 
     def _rebuild_without_lost_cameras(self, message: str = "") -> None:
@@ -2215,6 +3573,30 @@ class AnyCamWindow(QMainWindow):
             return
         for layer_id in restored:
             del self._lost_cameras[layer_id]
+        if self.engine is not None and self._has_screen_layer():
+            # Reattach the camera capture on its existing channel.  Rebuilding
+            # here would stop the live screen pipewiresrc and lose the PiP.
+            failed = [layer_id for layer_id in restored
+                      if not self.engine.attach_capture(layer_id)]
+            if failed:
+                self._lost_cameras.update(
+                    {layer_id: restored[layer_id] for layer_id in failed})
+                self._camera_retry_ms = min(10000, int(self._camera_retry_ms * 1.7))
+                self._camera_watch.start(self._camera_retry_ms)
+                self._status(
+                    "Camera returned but the live capture could not resume; "
+                    f"retrying in {self._camera_retry_ms / 1000:.1f}s"
+                )
+                return
+            self._status(
+                "Camera reconnected: "
+                + ", ".join(sorted(set(restored.values()))))
+            if self._lost_cameras:
+                self._camera_watch.start(self._camera_retry_ms)
+            else:
+                self._camera_retry_ms = 2000
+                self._camera_watch.stop()
+            return
         self._quiet_engine_errors = True
         try:
             if self.engine is not None:
@@ -2253,7 +3635,12 @@ class AnyCamWindow(QMainWindow):
         self._camera_watch.stop()
 
     def _choose_camera_device(self) -> str:
-        if not self._camera_choices:
+        # A UVC replug renumbers the node (for example video0 -> video3).
+        # Refresh a cached choice that no longer exists instead of adding a
+        # dead source to the running PiP.
+        if (not self._camera_choices
+                or any(not Path(device).exists()
+                       for _label, device in self._camera_choices)):
             self._camera_choices = self._scan_camera_choices()
         choices = self._camera_choices
         if not choices:
@@ -2298,7 +3685,6 @@ class AnyCamWindow(QMainWindow):
         self._refresh_scene_list()
         self._refresh_layers()
         self._load_playlist_state()
-        self._adopt_face_layer()
         self._mark_dirty()
         if self.engine is not None:
             self.restart_engine()
@@ -2320,7 +3706,6 @@ class AnyCamWindow(QMainWindow):
         self._refresh_scenes()
         self._refresh_layers()
         self._load_playlist_state()
-        self._adopt_face_layer()
         self._mark_dirty()
         if self.engine is not None:
             self.restart_engine()
@@ -2405,7 +3790,6 @@ class AnyCamWindow(QMainWindow):
         self._refresh_scene_list()
         self._refresh_layers()
         self._load_playlist_state()
-        self._adopt_face_layer()
         self._mark_dirty()
         if self.engine is not None:
             self.restart_engine()
@@ -2441,7 +3825,6 @@ class AnyCamWindow(QMainWindow):
         self._refresh_scene_list()
         self._refresh_layers()
         self._load_playlist_state()
-        self._adopt_face_layer()
         self._mark_dirty()
         if self.engine is not None:
             self.restart_engine()
@@ -2467,6 +3850,47 @@ class AnyCamWindow(QMainWindow):
         elif kind == "text":
             layer = Layer(new_id("layer"), "text", "Caption", source="Your text here",
                           box=(0.05, 0.75, 0.30, 0.08), z=0, font_size=0.04)
+        elif kind == "ticker":
+            if not source:
+                text, ok = QInputDialog.getText(
+                    self, "Ticker", "Text to scroll along the bottom:",
+                    text="Welcome to the stream")
+                if not ok or not text.strip():
+                    return None
+                source = text.strip()
+            layer = Layer(new_id("layer"), "ticker", "Ticker", source=source,
+                          box=(0.0, 0.9, 1.0, 0.1), z=0, color="#ffffff",
+                          background="#101418cc")
+        elif kind == "lower_third":
+            if not source:
+                name, ok = QInputDialog.getText(self, "Lower third", "Name:")
+                if not ok or not name.strip():
+                    return None
+                title, _ok = QInputDialog.getText(
+                    self, "Lower third", "Title or subtitle (optional):")
+                source = f"{name.strip()}|{title.strip()}"
+            layer = Layer(new_id("layer"), "lower_third",
+                          source.partition("|")[0] or "Lower third", source=source,
+                          box=(0.04, 0.66, 0.50, 0.20), z=0, color="#ffffff",
+                          background="#101418e6")
+        elif kind == "particles":
+            from . import particles
+            layer = Layer(new_id("layer"), "particles", particles.label_for(source),
+                          source=source or "confetti", box=(0.0, 0.0, 1.0, 1.0), z=0)
+        elif kind == "gif":
+            if not source:
+                path, _ = QFileDialog.getOpenFileName(
+                    self, "Choose an animated image", "",
+                    "Animated images (*.gif *.webp *.apng *.png)")
+                if not path:
+                    return None
+                source = path
+            path = Path(source).expanduser()
+            if not path.exists():
+                self._status(f"Source file not found: {path}")
+                return None
+            layer = Layer(new_id("layer"), "gif", path.stem, source=str(path),
+                          box=(0.74, 0.05, 0.22, 0.30), z=0)
         elif kind in ("logo", "image", "video"):
             if not source:
                 if kind == "video":
@@ -2502,10 +3926,12 @@ class AnyCamWindow(QMainWindow):
                     or not parsed.netloc):
                 self._status("Network source must be an rtsp://, rtsps://, http:// or https:// URL")
                 return None
-            layer = Layer(new_id("layer"), "network", parsed.netloc or "Network",
+            layer = Layer(new_id("layer"), "network", config.host_of(uri) or "Network",
                           source=uri, box=(0.0, 0.0, 1.0, 1.0), z=0)
-        elif kind == "screen":
-            return self._add_screen_layer(box=box)
+        elif kind in ("screen", "screen-new"):
+            # "screen-new" always opens the system picker, for a share that is
+            # not the one already open.
+            return self._add_screen_layer(box=box, new_share=kind == "screen-new")
         else:
             return None
         if box is not None:
@@ -2516,20 +3942,32 @@ class AnyCamWindow(QMainWindow):
         before = self._layout_snapshot()
         self.scene.add_layer(layer)
         self._refresh_layers()
-        self.preview.select_layer(layer.id)
+        if layer.kind != "particles":
+            # An animation is an overlay: keep the selection on the picture the
+            # user is working on so frames and filters keep going there.
+            self.preview.select_layer(layer.id)
         self._record_history(before)
         if self.engine is not None:
             # Add to the running canvas.  A rebuild would destroy the screen
             # pipewiresrc (and its portal session) and make Discord go black.
             attached = False
-            if layer.kind == "screen":
+            if layer.kind == "screen" and self.engine.can_reattach_screen(layer):
+                # The removed share is still PLAYING; no new remote is needed.
+                attached = self.engine.add_layer(layer)
+            elif layer.kind == "screen":
                 session = self._screen_sessions.get(layer.id)
-                fd = session.fd if session is not None else -1
                 size = None
                 if session is not None and session.streams:
                     stream = session.streams[0]
                     if stream.width > 1 and stream.height > 1:
                         size = (stream.width, stream.height)
+                try:
+                    # pipewiresrc owns and closes this fd with its pipeline.
+                    # A fresh portal remote is required for every consumer.
+                    fd = session.take_remote() if session is not None else -1
+                except Exception as exc:  # noqa: BLE001 - surface, do not kill UI
+                    self._status(f"Screen capture unavailable: {exc}")
+                    return layer
                 attached = self.engine.add_layer(
                     layer, screen_fd=fd, screen_size=size)
             else:
@@ -2538,18 +3976,67 @@ class AnyCamWindow(QMainWindow):
                 self.restart_engine()
         return layer
 
+    def _request_screen_cast(self, restore_token: str = "") -> portal.ScreenSession:
+        """Open the system picker without freezing the Qt event loop.
+
+        ``restore_token`` (from an earlier launch) lets the portal skip the
+        picker for the same source; it is only passed when there is one.
+        """
+        session = self._open_screen_cast(
+            {"restore_token": restore_token} if restore_token else {})
+        # Keep the newest token for the next launch's saved screen layers.
+        config.save_screen_restore_token(getattr(session, "restore_token", ""))
+        return session
+
+    def _open_screen_cast(self, options: dict) -> portal.ScreenSession:
+        if self.headless:
+            return portal.request_screen_cast(**options)
+        app = QApplication.instance()
+        if app is None:
+            return portal.request_screen_cast(**options)
+        dialog = QProgressDialog(
+            "Choose a screen or window in the system picker…",
+            "", 0, 0, self)
+        dialog.setWindowTitle("Desktop capture")
+        dialog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dialog.setCancelButton(None)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.show()
+        try:
+            return portal.request_screen_cast(pump=app.processEvents, **options)
+        finally:
+            dialog.close()
+            dialog.deleteLater()
+
+    def _screen_session_in_use(self, session) -> bool:
+        """Whether a layer that still exists is already showing ``session``."""
+        return any(self._screen_sessions.get(layer.id) is session
+                   for scene in self.project.scenes for layer in scene.layers)
+
     def _add_screen_layer(
-            self, box: tuple[float, float, float, float] | None = None) -> Layer | None:
-        """Add a screen stream, reusing this launch's portal authorization."""
+            self, box: tuple[float, float, float, float] | None = None,
+            *, new_share: bool = False) -> Layer | None:
+        """Add a screen stream.
+
+        The open portal stream is reused only when no layer is showing it any
+        more (a removed share can be put back without another picker).  While
+        a layer is using it, a second "screen" is a different share, so the
+        portal is asked again; reusing the one stream made it impossible to
+        add a second window or monitor without restarting the app.
+        """
         session = self._last_screen_session
-        if session is not None and session.fd >= 0 and session.streams:
+        reuse = (not new_share and session is not None and bool(session.streams)
+                 and not self._screen_session_in_use(session))
+        if reuse:
             print(
                 f"[screen-session] reusing node={session.node_id} for a new "
                 "screen layer; no portal request",
                 file=sys.stderr, flush=True)
         else:
             try:
-                session = portal.request_screen_cast()
+                session = self._request_screen_cast()
             except Exception as exc:  # noqa: BLE001 - the portal reports user cancellation too
                 self._status(f"Screen capture unavailable: {exc}")
                 print(f"AnyCam screen capture failed: {exc}", file=sys.stderr,
@@ -2573,9 +4060,13 @@ class AnyCamWindow(QMainWindow):
             if layer.kind != "screen" or layer.id in self._screen_sessions:
                 continue
             session = self._last_screen_session
-            if session is None or session.fd < 0 or not session.streams:
+            if session is None or not session.streams:
                 try:
-                    session = portal.request_screen_cast()
+                    # Saved layers come back without a picker when the portal
+                    # still honours last launch's choice.  Adding a new share
+                    # never passes a token: the user is picking then.
+                    session = self._request_screen_cast(
+                        restore_token=config.load_screen_restore_token())
                 except Exception as exc:  # noqa: BLE001
                     self._status(f"Screen capture unavailable: {exc}")
                     return False
@@ -2587,7 +4078,7 @@ class AnyCamWindow(QMainWindow):
                     file=sys.stderr, flush=True)
             print(
                 f"[screen-session] layer={layer.id} node={session.node_id} "
-                f"fd={session.fd} streams="
+                f"fd={session.fd if session.fd >= 0 else 'on-demand'} streams="
                 f"{[(s.width, s.height, s.source_type) for s in session.streams]}",
                 file=sys.stderr, flush=True)
             layer.source = str(session.node_id)
@@ -2595,9 +4086,27 @@ class AnyCamWindow(QMainWindow):
         return True
 
     def _screen_fds(self) -> dict[str, int]:
-        return {layer_id: session.fd
-                for layer_id, session in self._screen_sessions.items()
-                if session.fd >= 0 and self.scene.layer(layer_id) is not None}
+        """One owned portal remote per live screen layer for this build.
+
+        ``pipewiresrc`` closes its fd when its pipeline stops, so the session's
+        original fd cannot be handed to a later rebuild.  ``take_remote``
+        consumes it once and opens a fresh remote on the same portal session
+        for each subsequent canvas.
+        """
+        fds: dict[str, int] = {}
+        try:
+            for layer_id, session in self._screen_sessions.items():
+                if self.scene.layer(layer_id) is None:
+                    continue
+                fds[layer_id] = session.take_remote()
+        except Exception:
+            for fd in fds.values():
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
+        return fds
 
     def _close_screen_session(self, layer_id: str) -> None:
         session = self._screen_sessions.pop(layer_id, None)
@@ -2661,11 +4170,6 @@ class AnyCamWindow(QMainWindow):
         if not removed:
             return
         before = self._layout_snapshot()
-        removed_face = self._face_layer_id in removed
-        if removed_face:
-            target = self._face_target()
-            if target is not None:
-                target.effects.face_effect = "none"
         if self.engine is not None:
             # Detach before removing from the model: the engine needs the
             # layer's spec to release exactly that capture.  Rebuilding here
@@ -2678,7 +4182,6 @@ class AnyCamWindow(QMainWindow):
             self._lost_cameras.pop(layer_id, None)
             self.playlist_ids = [item for item in self.playlist_ids if item != layer_id]
         self.playlist_index = min(self.playlist_index, len(self.playlist_ids) - 1)
-        self._face_layer_id = "" if removed_face else self._face_layer_id
         self._refresh_layers()
         self._record_history(before)
         if self.engine is not None and not any(
@@ -2702,6 +4205,7 @@ class AnyCamWindow(QMainWindow):
         self.preview.set_selection(ids, primary)
         self._syncing_selection = False
         self._sync_transform_fields()
+        self._sync_effects_controls()
         layer = self.preview.selected_layer()
         if layer is not None:
             if len(ids) > 1:
@@ -2732,6 +4236,7 @@ class AnyCamWindow(QMainWindow):
             if self.engine is not None:
                 self.restart_engine()
         self._sync_transform_fields()
+        self._sync_effects_controls()
         layer = self.scene.layer(layer_id) if layer_id else None
         if layer is not None:
             if len(self.preview.selected_ids) > 1:
@@ -2824,7 +4329,6 @@ class AnyCamWindow(QMainWindow):
         self._layout_before_edit = None
         self._opacity_before = None
         self._refresh_layers()
-        self._adopt_face_layer()
         self._mark_dirty()
         if self.engine is not None:
             self.restart_engine()
@@ -3136,6 +4640,41 @@ class AnyCamWindow(QMainWindow):
         """Round down to an even size (H.264 cannot encode odd frames)."""
         return max(2, int(value) - int(value) % 2)
 
+    def _encoder_changed(self, _index: int = 0) -> None:
+        value = str(self.encoder_combo.currentData() or "auto").lower()
+        if value == self.project.output.encoder:
+            return
+        self.project.output.encoder = value
+        self._mark_dirty()
+        existing_tap = (self.engine is not None
+                        and getattr(self.engine, "_recorder_valve", None) is not None)
+        if self.recording:
+            self._status("Encoder change applies after this recording and a preview restart")
+        elif existing_tap:
+            self._status("Encoder change saved · restart preview to rebuild the recording tap")
+        elif self.engine is not None:
+            self._status("Encoder change applies to the next recording")
+        else:
+            self._status(f"Recording encoder: {self.encoder_combo.currentText()}")
+
+    def _screen_flip_changed(self, _index: int) -> None:
+        value = str(self.screen_flip_combo.currentData() or "automatic")
+        self.screen_rotate_button.blockSignals(True)
+        self.screen_rotate_button.setChecked(value == "rotate-180")
+        self.screen_rotate_button.blockSignals(False)
+        if value == self.project.output.screen_flip:
+            return
+        self.project.output.screen_flip = value
+        self._mark_dirty()
+        if self.engine is not None:
+            self.restart_engine()
+
+    def _screen_rotate_toggled(self, checked: bool) -> None:
+        value = "rotate-180" if checked else "none"
+        index = self.screen_flip_combo.findData(value)
+        if index >= 0:
+            self.screen_flip_combo.setCurrentIndex(index)
+
     def set_output_format(self, width: int, height: int, fps: int) -> None:
         """Apply a canvas size and rate, keeping the Output tab in sync."""
         width = self._even(width)
@@ -3144,7 +4683,9 @@ class AnyCamWindow(QMainWindow):
         output = self.project.output
         if (output.canvas_w, output.canvas_h, output.fps) == (width, height, fps):
             return
+        resolution_changed = (output.canvas_w, output.canvas_h) != (width, height)
         output.canvas_w, output.canvas_h, output.fps = width, height, fps
+        self.preview.canvas_size = (width, height)
         for name, value in (("width_spin", width), ("height_spin", height),
                             ("fps_spin", fps)):
             spin = getattr(self, name, None)
@@ -3154,6 +4695,8 @@ class AnyCamWindow(QMainWindow):
                 spin.blockSignals(False)
         self._sync_output_controls()
         self._mark_dirty()
+        if resolution_changed and self.recording and self._recorder is not None:
+            self._rotate_recording()
         if self.engine is not None:
             self.restart_engine()
         self._status(f"Output {width}×{height} · {fps} fps")
@@ -3168,6 +4711,10 @@ class AnyCamWindow(QMainWindow):
         self.project.output.canvas_h = self._even(self.height_spin.value())
         self.project.output.fps = self.fps_spin.value()
         self.project.output.vcam_device = self.vcam_edit.text().strip()
+        self.project.output.encoder = str(
+            self.encoder_combo.currentData() or "auto").lower()
+        self.project.output.screen_flip = str(
+            self.screen_flip_combo.currentData() or "automatic")
         self.project.output.rtmp_url = self.rtmp_edit.text().strip()
         self.project.audio.mic_enabled = self.audio_on
         self.project.audio.media_file = self.media_edit.text().strip()
@@ -3234,13 +4781,27 @@ class AnyCamWindow(QMainWindow):
         self._refresh_scene_list()
         self._refresh_layers()
         self._load_playlist_state()
-        self._adopt_face_layer()
         for spin, value in ((self.width_spin, self.project.output.canvas_w),
                             (self.height_spin, self.project.output.canvas_h),
                             (self.fps_spin, self.project.output.fps)):
             spin.blockSignals(True)
             spin.setValue(value)
             spin.blockSignals(False)
+        flip_index = self.screen_flip_combo.findData(
+            self.project.output.screen_flip)
+        self.screen_flip_combo.blockSignals(True)
+        self.screen_flip_combo.setCurrentIndex(flip_index if flip_index >= 0 else 0)
+        self.screen_flip_combo.blockSignals(False)
+        self.screen_rotate_button.blockSignals(True)
+        self.screen_rotate_button.setChecked(
+            self.project.output.screen_flip == "rotate-180")
+        self.screen_rotate_button.blockSignals(False)
+        encoder_index = self.encoder_combo.findData(
+            str(self.project.output.encoder or "auto").lower())
+        self.encoder_combo.blockSignals(True)
+        self.encoder_combo.setCurrentIndex(
+            encoder_index if encoder_index >= 0 else 0)
+        self.encoder_combo.blockSignals(False)
         for edit, value in ((self.vcam_edit, self.project.output.vcam_device),
                             (self.rtmp_edit, self.project.output.rtmp_url),
                             (self.media_edit, self.project.audio.media_file)):
@@ -3265,7 +4826,9 @@ class AnyCamWindow(QMainWindow):
         self.media_gain_slider.blockSignals(False)
         self.media_gain_label.setText(f"{self.project.audio.media_gain_db:+.0f} dB")
         self._sync_editor_controls()
-        self._status(f"Loaded project from {path}")
+        repaired = (f" · repaired: {'; '.join(project.load_warnings[:2])}"
+                    if project.load_warnings else "")
+        self._status(f"Loaded project from {path}{repaired}")
         if was_running:
             self.start_engine()
 
@@ -3338,7 +4901,10 @@ class AnyCamWindow(QMainWindow):
             return Path(self._recording_path)
         stamp = self._session_stamp or overlay.timestamped_name("anycam", "")
         self._session_stamp = stamp
-        path = config.recordings_dir(self.project.output.record_dir) / f"{stamp}.mp4"
+        # A canvas resize starts a new file (see _rotate_recording): -2, -3, ...
+        suffix = f"-{self._segment_index + 1}" if self._segment_index else ""
+        path = (config.recordings_dir(self.project.output.record_dir)
+                / f"{stamp}{suffix}.mp4")
         self._recording_path = str(path)
         return path
 
@@ -3351,12 +4917,25 @@ class AnyCamWindow(QMainWindow):
                  or bool(self.project.audio.desktop_device))
         if not recorder.start(str(path), self.project.output.canvas_w,
                               self.project.output.canvas_h, self.project.output.fps,
-                              audio=audio):
+                              audio=audio,
+                              codec=recording_codec(self.project.output.encoder)):
             self._status(f"Recording could not start: {recorder.error}")
             return False
         self._recorder = recorder
         self._recording_path = str(path)
         return True
+
+    def _rotate_recording(self) -> None:
+        """Close the current file and continue in a new one.
+
+        One MP4 has a single picture size.  Feeding frames of another size
+        into it corrupts or aborts the recording, so a resize ends the file
+        (it is saved and listed) and the rebuilt canvas records into the next.
+        """
+        if self.engine is not None:
+            self.engine.detach_recorder()
+        self._finish_recorder()
+        self._segment_index += 1
 
     def _finish_recorder(self) -> None:
         recorder = self._recorder
@@ -3402,6 +4981,57 @@ class AnyCamWindow(QMainWindow):
             return False
         self._vcam_output = output
         return True
+
+    def ensure_vcam_visible(self, device: str | None = None) -> None:
+        """Make Chromium-based apps list the node AnyCam is feeding.
+
+        ``exclusive_caps=1`` only advertises capture while a writer streams,
+        but udev caches the capabilities from device-add time.  Without a
+        change event Discord, Vesktop and Chrome keep skipping AnyCam even
+        though the module parameter is correct.  This runs once per device and
+        only asks for authorization when the cached value is actually wrong.
+        """
+        dev = (device or self.project.output.vcam_device
+               or config.loopback_device())
+        if dev in self._vcam_udev_attempted:
+            return
+        if config.vcam_exclusive_caps() is not True:
+            return
+        caps = config.vcam_udev_capabilities(dev)
+        if caps is None or "capture" in caps:
+            return
+        self._vcam_udev_attempted.add(dev)
+        result = self._vcam_udev_result = {}
+        self._vcam_udev_timer.start()
+
+        def run() -> None:
+            # exclusive_caps only advertises capture once a buffer is flowing;
+            # give the idle feed a moment to reach v4l2sink before rewiring.
+            time.sleep(0.5)
+            try:
+                result["error"] = config.refresh_vcam_udev(dev)
+            except Exception as exc:  # noqa: BLE001 - a hint must not crash the GUI
+                result["error"] = str(exc)
+
+        self._vcam_udev_thread = threading.Thread(
+            target=run, name="anycam-vcam-udev", daemon=True)
+        self._vcam_udev_thread.start()
+
+    def _vcam_udev_poll(self) -> None:
+        thread = self._vcam_udev_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._vcam_udev_timer.stop()
+        error = str(self._vcam_udev_result.get("error") or "")
+        if error:
+            self.log_event(
+                "virtual camera: Chromium visibility refresh failed — "
+                f"{error}")
+            return
+        self.log_event(
+            "virtual camera: announced to Chromium apps (Discord, Chrome)")
+        if hasattr(self, "_refresh_diag_state"):
+            self._refresh_diag_state()
 
     def feed_held_vcam(self) -> bool:
         """Make the device held at launch follow the canvas automatically.
@@ -3500,6 +5130,8 @@ class AnyCamWindow(QMainWindow):
             self.log_event(
                 f"virtual camera: canvas {width}×{height} scaled to "
                 f"{out_w}×{out_h}")
+        if not self.headless:
+            self.ensure_vcam_visible(device)
         return True
 
     def _recover_vcam(self) -> bool:
@@ -3562,16 +5194,19 @@ class AnyCamWindow(QMainWindow):
         if missing:
             self._lost_cameras.update(missing)
             self._camera_watch.start()
-        self._sync_face_overlay()
         if not self._ensure_screen_sessions():
             return
         self.project.output.canvas_w = self._even(self.width_spin.value())
         self.project.output.canvas_h = self._even(self.height_spin.value())
         self.project.output.fps = self.fps_spin.value()
         self.project.output.vcam_device = self.vcam_edit.text().strip() or config.loopback_device()
+        self.project.output.screen_flip = str(
+            self.screen_flip_combo.currentData() or "automatic")
         self.project.output.rtmp_url = self.rtmp_edit.text().strip()
         self.project.audio.mic_enabled = self.audio_on
         self.project.audio.media_file = self.media_edit.text().strip()
+        self.preview.canvas_size = (self.project.output.canvas_w,
+                                    self.project.output.canvas_h)
         if self.playlist_index >= 0 and self.playlist_ids:
             for position, layer_id in enumerate(self.playlist_ids):
                 layer = self.scene.layer(layer_id)
@@ -3665,7 +5300,7 @@ class AnyCamWindow(QMainWindow):
             devices = ", ".join(sorted(set(self._lost_cameras.values())))
             self._status(f"Preview running · waiting for camera: {devices}")
 
-    def stop_engine(self) -> None:
+    def stop_engine(self, *, clear_preview: bool = True) -> None:
         self.timer.stop()
         if self.engine is not None:
             report = self.engine.stop()
@@ -3680,18 +5315,30 @@ class AnyCamWindow(QMainWindow):
                           self._source_pool.sweep)
         self.status_chip.setText("STOPPED")
         self.start_button.setText("Start preview")
-        self.preview.image = None
-        self.preview.layer_sizes = {}
-        self.preview.update()
+        if clear_preview:
+            self.preview.image = None
+            self.preview.layer_sizes = {}
+            self.preview.update()
 
     def restart_engine(self) -> None:
         was_running = self.engine is not None
         if was_running:
-            self.stop_engine()
+            # Keep the last frame on screen while the replacement graph is
+            # built.  Clearing it here made every scene/resolution change look
+            # like the preview had disappeared, especially when screen capture
+            # or the vcam took a few seconds to come back.
+            self.stop_engine(clear_preview=False)
             self.start_engine()
+
+    def eventFilter(self, watched, event):
+        grid = getattr(self, "effect_grid", None)
+        if watched is grid and event.type() == QEvent.Type.Show and self._thumb_queue:
+            self._thumb_timer.start()
+        return super().eventFilter(watched, event)
 
     def closeEvent(self, event) -> None:
         """Finalise the recording and persist edits before the process exits."""
+        self._stop_thumbnails()
         self.timer.stop()
         self._camera_watch.stop()
         self._transform_timer.stop()
@@ -3706,8 +5353,17 @@ class AnyCamWindow(QMainWindow):
         self._close_screen_sessions()
         event.accept()
 
+    def _stop_thumbnails(self) -> None:
+        timer = getattr(self, "_thumb_timer", None)
+        if timer is not None:
+            timer.stop()
+        queue = getattr(self, "_thumb_queue", None)
+        if queue is not None:
+            queue.clear()
+
     def shutdown(self) -> None:
         """Backstop for QApplication.aboutToQuit and headless teardown."""
+        self._stop_thumbnails()
         self.timer.stop()
         self._camera_watch.stop()
         self._transform_timer.stop()
@@ -3824,7 +5480,15 @@ class AnyCamWindow(QMainWindow):
             return
         dlg = MultiViewDialog(pool, parent=self)
         self._multiview = dlg
+        # Forget it however it was closed, or the next click would only
+        # "close" a dialog that is already gone instead of opening a new one.
+        dlg.finished.connect(lambda _result=0, d=dlg: self._multiview_closed(d))
         dlg.show()
+
+    def _multiview_closed(self, dialog) -> None:
+        if getattr(self, "_multiview", None) is dialog:
+            self._multiview = None
+        dialog.deleteLater()
 
     def log_event(self, message: str) -> None:
         """Record a session event; the ManyCam window shows these in Diagnostics."""
@@ -3889,11 +5553,9 @@ class AnyCamWindow(QMainWindow):
         if frame is None:
             return
         width, height, stride, raw, fmt = frame
-        self._frame_bytes = raw
-        self._face_size = (width, height)
         qformat = (QImage.Format.Format_RGB888 if fmt == "RGB"
                    else QImage.Format.Format_RGBA8888)
-        image = QImage(self._frame_bytes, width, height, stride, qformat).copy()
+        image = QImage(raw, width, height, stride, qformat).copy()
         self.preview.set_image(image)
 
     def _update_source_status(self) -> None:
@@ -3958,7 +5620,6 @@ class AnyCamWindow(QMainWindow):
                 grid.pump()
             except Exception:
                 pass
-        self._track_face()
         rec = self.engine.sample()
         if self.engine.mic_level_db is not None:
             db = self.engine.mic_level_db
@@ -4068,6 +5729,52 @@ def _raise_window(window) -> None:
     window.activateWindow()
 
 
+_INSTANCE_LOCKS: dict[str, int] = {}
+
+
+def _take_instance_lock(name: str) -> bool | None:
+    """Take the per-user launch lock.
+
+    ``True``: this process now owns it (held until exit; the kernel drops it
+    even on a crash, so it can never be stale).  ``False``: another live
+    process owns it.  ``None``: locking is unavailable here.
+    """
+    base = os.environ.get("XDG_RUNTIME_DIR") or str(config.state_dir())
+    try:
+        fd = os.open(os.path.join(base, f"{name}.lock"),
+                     os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    except OSError:
+        os.close(fd)
+        return None
+    previous = _INSTANCE_LOCKS.pop(name, None)
+    if previous is not None:
+        os.close(previous)
+    _INSTANCE_LOCKS[name] = fd
+    return True
+
+
+def _ask_instance_to_show(name: str, attempts: int, wait_ms: int) -> bool:
+    """Ask the running GUI to raise its window; True once it was told."""
+    for _ in range(max(1, attempts)):
+        probe = QLocalSocket()
+        probe.connectToServer(name)
+        if probe.waitForConnected(wait_ms):
+            probe.write(b"show")
+            probe.flush()
+            probe.waitForBytesWritten(200)
+            probe.disconnectFromServer()
+            return True
+        time.sleep(0.2)
+    return False
+
+
 def claim_gui_instance(name: str = INSTANCE_SERVER
                        ) -> tuple[bool, QLocalServer | None]:
     """Become the only AnyCam GUI, or forward the launch to the running one.
@@ -4076,22 +5783,31 @@ def claim_gui_instance(name: str = INSTANCE_SERVER
     losing writer leaves consumers (Discord) on a black camera.  A second
     launch therefore raises the existing window and exits instead of opening
     another one.
+
+    Ownership is a file lock, not "nobody answered the socket within 500 ms":
+    a first window that is busy (a rebuild can block its UI thread for seconds)
+    used to look dead, so the second launch deleted its socket and started a
+    competing writer.  A held lock means a live owner, however busy it is.
     """
-    probe = QLocalSocket()
-    probe.connectToServer(name)
-    if probe.waitForConnected(500):
-        probe.write(b"show")
-        probe.flush()
-        probe.disconnectFromServer()
+    lock = _take_instance_lock(name)
+    if lock is False:
+        if not _ask_instance_to_show(name, attempts=12, wait_ms=500):
+            print("[guard] AnyCam is already running but did not answer; "
+                  "not starting a second window", file=sys.stderr, flush=True)
         return False, None
-    # No listener: clear the socket a crashed instance may have left behind.
+    if lock is None and _ask_instance_to_show(name, attempts=1, wait_ms=500):
+        return False, None
+    # We own the launch (or locking is unavailable and nobody answered): any
+    # socket file left behind belongs to a crashed instance.
     QLocalServer.removeServer(name)
     server = QLocalServer()
     if not server.listen(name):
         print(f"[guard] single-instance socket failed: {server.errorString()}",
               file=sys.stderr, flush=True)
         server.deleteLater()
-        return False, None
+        # The lock already guarantees there is no second writer; only the
+        # "raise the existing window" convenience is lost.
+        return (lock is True), None
     return True, server
 
 
@@ -4125,6 +5841,7 @@ def run_gui(project: Project | None = None) -> int:
     if window.hold_vcam_device():
         window.feed_held_vcam()
         window.note_vcam_consumers()
+        window.ensure_vcam_visible()
     code = app.exec()
     # GStreamer 1.28's v4l2src segfaults during Python/GStreamer teardown on
     # this machine (niri/Wayland + GStreamer 1.28.8). Skip cleanup and let the

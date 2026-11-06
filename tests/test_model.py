@@ -22,13 +22,18 @@ def test_default_project_has_layered_scene():
 
 def test_project_json_roundtrip(tmp_path):
     project = default_project("Roundtrip")
-    project.output = OutputConfig(canvas_w=1280, canvas_h=720, fps=25, rtmp_url="rtmp://localhost/live")
+    project.output = OutputConfig(canvas_w=1280, canvas_h=720, fps=25,
+                                  screen_flip="rotate-180",
+                                  rtmp_url="rtmp://localhost/live",
+                                  encoder="cpu")
     project.audio = AudioConfig(mic_device="mic", mic_gain_db=3.5, mic_muted=True)
     path = project.save(tmp_path / "project.json")
     loaded = Project.load(path)
     assert loaded.name == "Roundtrip"
     assert loaded.output.canvas_w == 1280
+    assert loaded.output.screen_flip == "rotate-180"
     assert loaded.output.rtmp_url == "rtmp://localhost/live"
+    assert loaded.output.encoder == "cpu"
     assert loaded.audio.mic_gain_db == 3.5
     assert loaded.audio.mic_muted is True
     assert len(loaded.scene.layers) == len(project.scene.layers)
@@ -37,12 +42,20 @@ def test_project_json_roundtrip(tmp_path):
 def test_effects_and_playlist_are_serialised():
     layer = Layer(new_id("layer"), "video", "Clip", source="/tmp/a.mp4",
                   box=(0.1, 0.2, 0.3, 0.4), crop=(0.05, 0.0, 0.1, 0.15),
-                  effects=Effects(brightness=0.2, blur=4.0, chroma_enabled=True),
-                  playlist=[PlaylistItem("/tmp/a.png", 3.0)])
+                  effects=Effects(brightness=0.2, hue=-0.1, chroma_enabled=True,
+                                  frame_style="neon", frame_color="#ff00ff",
+                                  frame_width=9),
+                  playlist=[PlaylistItem("/tmp/a.png", 3.0)],
+                  role="backdrop")
     data = layer.to_dict()
     restored = Layer.from_dict(json.loads(json.dumps(data)))
     assert restored.effects.brightness == 0.2
+    assert restored.effects.hue == -0.1
     assert restored.effects.chroma_enabled is True
+    assert restored.effects.frame_style == "neon"
+    assert restored.effects.frame_color == "#ff00ff"
+    assert restored.effects.frame_width == 9
+    assert restored.role == "backdrop"
     assert restored.playlist[0].source == "/tmp/a.png"
     assert restored.box == (0.1, 0.2, 0.3, 0.4)
     assert restored.crop == (0.05, 0.0, 0.1, 0.15)

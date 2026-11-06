@@ -16,8 +16,9 @@ try:
 except Exception:  # pragma: no cover - platform without GStreamer
     HAS_COMPOSITOR = False
 
+from anycam import config
 from anycam.model import Layer, Project, Scene
-from anycam.pipeline import AnyCamEngine, verify_mp4
+from anycam.pipeline import AnyCamEngine, encoder_bitrate, verify_mp4
 
 pytestmark = pytest.mark.skipif(not HAS_COMPOSITOR, reason="GStreamer compositor unavailable")
 
@@ -36,6 +37,34 @@ def make_project(width=640, height=360, fps=30):
     return project
 
 
+def test_screen_flip_method_override(monkeypatch):
+    monkeypatch.delenv("ANYCAM_SCREEN_FLIP", raising=False)
+    monkeypatch.setenv("XDG_SESSION_TYPE", "x11")
+    monkeypatch.setenv("ANYCAM_SCREEN_FLIP", "vertical")
+    assert config.screen_flip_method() == "vertical-flip"
+    monkeypatch.setenv("ANYCAM_SCREEN_FLIP", "180")
+    assert config.screen_flip_method() == "rotate-180"
+    monkeypatch.setenv("ANYCAM_SCREEN_FLIP", "not-a-method")
+    assert config.screen_flip_method() == "automatic"
+    # Automatic must not force a KWin rotation: that rotates the source itself,
+    # so the preview and every vcam consumer are upside down too.
+    monkeypatch.delenv("ANYCAM_SCREEN_FLIP")
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "KDE")
+    assert config.screen_flip_method() == "automatic"
+    assert config.screen_flip_method("rotate-180") == "rotate-180"
+
+
+def test_build_chain_uses_the_project_screen_flip():
+    from anycam.sources import build_chain
+
+    layer = Layer("screen_flip_layer", "screen", "Screen", source="123")
+    chain = build_chain(layer, 320, 180, 30, screen_flip="vertical-flip")
+    flip = next(element for element in chain.elements
+                if element.get_factory().get_name() == "videoflip")
+    assert flip.get_property("method").value_nick == "vertical-flip"
+
+
 def test_screen_capture_uploads_pipewire_dmabuf_frames():
     if Gst.ElementFactory.find("pipewiresrc") is None:
         pytest.skip("pipewiresrc unavailable")
@@ -52,6 +81,10 @@ def test_screen_capture_uploads_pipewire_dmabuf_frames():
     # clock ties the whole compositor to the share's damage cadence, which is
     # what turns a static/off-screen window share into a ~1 fps preview.
     assert sources[0].get_property("provide-clock") is False
+    assert "videoflip" in names
+    flip = next(element for element in chain.elements
+                if element.get_factory().get_name() == "videoflip")
+    assert flip.get_property("method").value_nick == config.screen_flip_method()
     if all(Gst.ElementFactory.find(name) is not None
            for name in ("glupload", "glcolorconvert", "gldownload")):
         assert "glupload" in names
@@ -339,6 +372,124 @@ def test_engine_composites_and_records(tmp_path):
     assert ok, info
     video = next(s for s in info["streams"] if s["codec_type"] == "video")
     assert video["codec_name"] == "h264"
+
+
+def test_encoder_auto_prefers_nvenc_and_cuda_input(monkeypatch):
+    if Gst.ElementFactory.find("nvh264enc") is None:
+        pytest.skip("nvh264enc unavailable")
+    from anycam import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "nvenc_available",
+                        lambda *_args, **_kwargs: True)
+    project = make_project(320, 180, 30)
+    project.output.encoder = "auto"
+    engine = AnyCamEngine(project, preview=True)
+    enc, hardware = engine._make_record_encoder()
+    assert hardware is True
+    assert enc.get_factory().get_name() == "nvh264enc"
+    assert engine.report.encoder == "nvh264enc"
+    assert "NVENC" in engine.report.encoder_note
+
+
+def test_cpu_encoder_keeps_i420_conversion(monkeypatch):
+    from anycam import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "nvenc_available",
+                        lambda *_args, **_kwargs: True)
+    project = make_project(320, 180, 30)
+    project.output.encoder = "cpu"
+    engine = AnyCamEngine(project, preview=True)
+    enc, hardware = engine._make_record_encoder()
+    assert hardware is False
+    assert enc.get_factory().get_name() == "x264enc"
+    path = engine._encoder_input(False, "test")
+    assert [element.get_factory().get_name() for element in path] == [
+        "videoconvert", "capsfilter"]
+    assert path[1].get_property("caps").get_structure(0).get_value("format") == "I420"
+
+
+def test_hardware_recording_uses_cuda_upload(monkeypatch, tmp_path):
+    if Gst.ElementFactory.find("nvh264enc") is None:
+        pytest.skip("nvh264enc unavailable")
+    if Gst.ElementFactory.find("cudaupload") is None:
+        pytest.skip("cudaupload unavailable")
+    from anycam import pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "nvenc_available",
+                        lambda *_args, **_kwargs: True)
+    project = make_project(320, 180, 30)
+    project.output.encoder = "nvenc"
+    engine = AnyCamEngine(project, preview=True,
+                          record_path=tmp_path / "hw.mp4").build()
+    try:
+        assert engine.report.encoder == "nvh264enc"
+        assert engine.pipeline.get_by_name("record_cuda_upload") is not None
+        assert engine.pipeline.get_by_name("record_raw") is None
+    finally:
+        engine.pipeline.set_state(Gst.State.NULL)
+
+
+def test_rtmp_bitrate_scales_above_1080p():
+    """A 4K stream must not still be encoded at the 1080p bitrate."""
+    assert encoder_bitrate("h264", 1920, 1080) == 12000
+    assert encoder_bitrate("h264", 2560, 1440) == 18000
+    assert encoder_bitrate("h264", 3840, 2160) == 34000
+    assert encoder_bitrate("h265", 3840, 2160) == 28000
+
+
+def test_encoder_plan_falls_back_to_h264_for_rtmp(monkeypatch):
+    from anycam import pipeline as pipeline_module
+
+    monkeypatch.setattr(
+        pipeline_module, "nvenc_available",
+        lambda codec="h264": codec in {"h264", "h265", "av1"})
+    plan = pipeline_module.encoder_plan("nvenc_av1")
+    assert plan.codec == "av1"
+    assert "AV1 NVENC" in plan.note
+    rtmp = pipeline_module.encoder_plan("nvenc_av1", purpose="rtmp")
+    assert rtmp.codec == "h264"
+    assert "RTMP/FLV uses H.264" in rtmp.note
+
+    monkeypatch.setattr(
+        pipeline_module, "nvenc_available",
+        lambda codec="h264": codec == "h265")
+    fallback = pipeline_module.encoder_plan("nvenc_av1")
+    assert fallback.codec == "h265"
+    assert "AV1 unavailable" in fallback.note
+
+    monkeypatch.setattr(pipeline_module, "nvenc_available",
+                        lambda _codec="h264": False)
+    assert pipeline_module.encoder_plan("nvenc_h265").codec == "h264"
+
+
+@pytest.mark.parametrize(("preference", "factory", "codec", "probe_codec"), [
+    ("nvenc_h265", "nvh265enc", "h265", "hevc"),
+    ("nvenc_av1", "nvav1enc", "av1", "av1"),
+])
+def test_hardware_hevc_and_av1_record_to_mp4(monkeypatch, tmp_path,
+                                             preference, factory, codec,
+                                             probe_codec):
+    from anycam import pipeline as pipeline_module
+
+    if Gst.ElementFactory.find(factory) is None:
+        pytest.skip(f"{factory} unavailable")
+    if Gst.ElementFactory.find(pipeline_module.ENCODER_PARSERS[codec]) is None:
+        pytest.skip(f"{codec} parser unavailable")
+    monkeypatch.setattr(pipeline_module, "nvenc_available",
+                        lambda *_args, **_kwargs: True)
+    project = make_project(320, 180, 30)
+    project.output.encoder = preference
+    out = tmp_path / f"{codec}.mp4"
+    engine = AnyCamEngine(project, record_path=out).build()
+    report = engine.run(1.0)
+    assert report["error"] == "", report["error"]
+    assert report["video_codec"] == codec
+    assert report["encoder"] == factory
+    ok, info = verify_mp4(str(out), width=320, height=180, fps=30,
+                          min_seconds=0.5)
+    assert ok, info
+    video = next(s for s in info["streams"] if s["codec_type"] == "video")
+    assert video["codec_name"] == probe_codec
 
 
 def test_engine_delivers_preview_frames():

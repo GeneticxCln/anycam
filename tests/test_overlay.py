@@ -34,6 +34,30 @@ def test_face_frame_has_transparent_centre_and_visible_border(tmp_path):
     assert Image.open(spotlight).getpixel((160, 160))[3] > 0
 
 
+def test_window_frames_are_transparent_inside_and_visible_at_the_edge(tmp_path):
+    for style in overlay.WINDOW_FRAME_STYLES:
+        out = tmp_path / f"frame-{style}.png"
+        overlay.render_window_frame(320, 180, style, "#00ff00", 8, out=out)
+        image = Image.open(out)
+        assert image.mode == "RGBA"
+        assert image.size == (320, 180)
+        if style == "none":
+            assert image.getchannel("A").getextrema()[1] == 0
+        else:
+            assert image.getchannel("A").getextrema()[1] > 0, style
+            assert image.getpixel((160, 90))[3] == 0, style
+
+
+def test_backgrounds_render_at_the_requested_canvas_size(tmp_path):
+    for name in ("Aurora", "Studio", "Neon Grid"):
+        out = tmp_path / f"{name}.png"
+        overlay.render_background(name, 320, 180, out=out)
+        image = Image.open(out)
+        assert image.mode == "RGB"
+        assert image.size == (320, 180)
+        assert image.getpixel((5, 5)) != image.getpixel((5, 175))
+
+
 def test_camera_placeholder_is_an_opaque_labeled_card(tmp_path):
     out = tmp_path / "placeholder.png"
     overlay.render_camera_placeholder("Camera 2", "/dev/video3", 640, 360, out=out)

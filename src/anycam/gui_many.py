@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFrame,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMenu,
@@ -222,6 +223,8 @@ class ManyCamWindow(AnyCamWindow):
         self._stage_slots: list[tuple[QPushButton, tuple]] = []
         self._stage_canvas: tuple | None = None
         preview_layout.addWidget(self.preview, 1)
+        self.draw_bar = self._build_draw_bar()
+        preview_layout.addWidget(self.draw_bar)
 
         controls = QHBoxLayout()
         self.start_button = QPushButton("Start preview")
@@ -235,8 +238,12 @@ class ManyCamWindow(AnyCamWindow):
         self.snapshot_button.clicked.connect(self.snapshot)
         self.multiview_button = QPushButton("Multi-view")
         self.multiview_button.clicked.connect(self.toggle_multiview)
+        self.draw_button = QPushButton("Draw")
+        self.draw_button.setCheckable(True)
+        self.draw_button.setToolTip("Draw on the picture: pen, marker, arrows and boxes")
+        self.draw_button.clicked.connect(self.toggle_draw)
         for button in (self.start_button, self.record_button, self.vcam_button,
-                       self.snapshot_button, self.multiview_button):
+                       self.snapshot_button, self.multiview_button, self.draw_button):
             controls.addWidget(button)
         controls.addStretch(1)
         self.stats_label = QLabel("idle")
@@ -247,7 +254,7 @@ class ManyCamWindow(AnyCamWindow):
 
         side = QTabWidget()
         side.setMinimumWidth(320)
-        side.setMaximumWidth(380)
+        side.setMaximumWidth(440)
         side.addTab(self._layouts_tab(), "Layouts")
         side.addTab(self._effects_tab(), "Effects")
         side.addTab(self._scene_tab(), "Scenes")
@@ -312,11 +319,85 @@ class ManyCamWindow(AnyCamWindow):
         tabs.addTab(self._output_tab(), "Output")
         tabs.addTab(self._stream_tab(), "Stream")
         tabs.addTab(self._diagnostics_tab(), "Diagnostics")
+        tabs.addTab(self._about_tab(), "About")
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(tabs)
         self.settings_tabs = tabs
         return dialog
+
+    def _about_tab(self) -> QWidget:
+        """Version, licence, runtime versions and credits."""
+        from . import about
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(8)
+        title = QLabel(about.headline())
+        title.setObjectName("aboutTitle")
+        title.setStyleSheet("font-size: 30px; font-weight: 700; color: #5eead0;")
+        layout.addWidget(title)
+        release = QLabel(about.release_line())
+        release.setObjectName("aboutRelease")
+        release.setStyleSheet("font-size: 15px; font-weight: 600;")
+        layout.addWidget(release)
+        blurb = QLabel(
+            "A Linux-native virtual camera studio: cameras, screens, video, "
+            "overlays, face masks, frames and animations composed into one "
+            "picture for Discord, Chrome, OBS and recordings.")
+        blurb.setWordWrap(True)
+        blurb.setObjectName("muted")
+        layout.addWidget(blurb)
+        link = QLabel(f'<a href="{about.REPO_URL}">{about.REPO_URL}</a>  \u00b7  '
+                      f"{about.LICENSE_NAME} licence")
+        link.setOpenExternalLinks(True)
+        palette = link.palette()
+        palette.setColor(palette.ColorRole.Link, QColor("#5eead0"))   # readable on the dark theme
+        link.setPalette(palette)
+        link.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        layout.addWidget(link)
+
+        runtime = QGroupBox("This installation")
+        grid = QGridLayout(runtime)
+        for row, (name, value) in enumerate(about.runtime_rows()):
+            label = QLabel(name)
+            label.setObjectName("muted")
+            text = QLabel(value)
+            text.setWordWrap(True)
+            text.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            grid.addWidget(label, row, 0)
+            grid.addWidget(text, row, 1)
+        grid.setColumnStretch(1, 1)
+        layout.addWidget(runtime)
+
+        credits = QGroupBox("Built with")
+        credit_grid = QGridLayout(credits)
+        for row, (what, who, licence) in enumerate(about.CREDITS):
+            credit_grid.addWidget(QLabel(what), row, 0)
+            names = QLabel(who)
+            names.setWordWrap(True)
+            credit_grid.addWidget(names, row, 1)
+            credit_grid.addWidget(QLabel(licence), row, 2)
+        credit_grid.setColumnStretch(1, 1)
+        layout.addWidget(credits)
+
+        copy = QPushButton("Copy version details")
+        copy.setToolTip("Copy the release and runtime versions for a bug report")
+        copy.clicked.connect(self._copy_version_details)
+        layout.addWidget(copy)
+        layout.addStretch(1)
+        return page
+
+    def _copy_version_details(self) -> None:
+        from . import about
+
+        lines = [f"{about.headline()} - {about.release_line()}"]
+        lines += [f"{name}: {value}" for name, value in about.runtime_rows()]
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText("\n".join(lines))
+        self._status("Version details copied")
 
     def _open_settings(self, tab: int = 0) -> None:
         dialog = self._settings
@@ -417,8 +498,17 @@ class ManyCamWindow(AnyCamWindow):
             self.diag_chromium.setText(
                 "Chromium/Discord visibility: v4l2loopback is not loaded.")
         elif caps:
-            self.diag_chromium.setText(
-                "Chromium/Discord visibility: listed (exclusive_caps=1).")
+            udev = config.vcam_udev_capabilities(device)
+            if udev is not None and "capture" not in udev:
+                sysname = device.rsplit("/", 1)[-1]
+                self.diag_chromium.setText(
+                    "Chromium/Discord visibility: NOT listed — udev still "
+                    "reports video output. AnyCam refreshes this at launch; "
+                    "if it persists: sudo udevadm trigger --action=change "
+                    f"--sysname-match={sysname}")
+            else:
+                self.diag_chromium.setText(
+                    "Chromium/Discord visibility: listed (exclusive_caps=1).")
         else:
             self.diag_chromium.setText(
                 "Chromium/Discord visibility: NOT listed — the module was "
@@ -587,23 +677,6 @@ class ManyCamWindow(AnyCamWindow):
             self.scene_combo.setCurrentIndex(index)
 
     # ---------------------------------------------------------------- layers
-    def _preview_menu(self, layer_id: str) -> QMenu:
-        """Canvas right-click menu for the layer under the pointer."""
-        menu = QMenu(self)
-        layer = self.scene.layer(layer_id) if layer_id else None
-        if layer is not None:
-            action = menu.addAction(f"Remove {layer.name}")
-            action.setData(layer.id)
-        return menu
-
-    def _preview_context_menu(self, layer_id: str, position) -> None:
-        menu = self._preview_menu(layer_id)
-        if not menu.actions():
-            return
-        chosen = menu.exec(position)
-        if chosen is not None and chosen.data():
-            self.remove_layers([str(chosen.data())])
-
     def _refresh_layers(self) -> None:
         super()._refresh_layers()
         self._refresh_stage_slots()
@@ -718,8 +791,11 @@ class ManyCamWindow(AnyCamWindow):
             action = menu.addAction(label)
             action.setData(f"add:{kind}")
 
-        screen = menu.addAction("Share desktop screen or window…")
+        screen = menu.addAction("Add native desktop share…")
         screen.setData("add:screen")
+        if self._last_screen_session is not None:
+            different = menu.addAction("Add a different desktop share…")
+            different.setData("add:screen-new")
         share_audio = menu.addMenu("Share desktop audio")
         monitors = [source for source in config.list_audio_sources()
                     if source.is_monitor]
@@ -943,6 +1019,7 @@ def run_gui(project: Project | None = None) -> int:
         # starts, the held node follows the canvas without a second click.
         window.feed_held_vcam()
         window.note_vcam_consumers()
+        window.ensure_vcam_visible()
     QTimer.singleShot(200, window._autostart_preview)
     code = app.exec()
     os._exit(code if code is not None else 0)

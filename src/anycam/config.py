@@ -6,13 +6,14 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 APP_NAME = "AnyCam"
 APP_ID = "anycam"
-VERSION = "0.1.0"
+VERSION = "1.0.0"
 
 CANVAS_W = 1920
 CANVAS_H = 1080
@@ -85,8 +86,84 @@ def redact_url(url: str) -> str:
     segments = [segment for segment in parts.path.split("/") if segment]
     if segments:
         segments[-1] = "***"
-    return urlunsplit((parts.scheme, parts.netloc,
+    return urlunsplit((parts.scheme, host_of(url),
                        "/" + "/".join(segments) if segments else "", "", ""))
+
+
+def host_of(url: str) -> str:
+    """``host[:port]`` of a URL, without any ``user:password@`` part.
+
+    ``urlsplit(...).netloc`` keeps the credentials, so using it as a label or
+    in a redacted URL leaked an RTSP camera's password.
+    """
+    from urllib.parse import urlsplit
+
+    return urlsplit(url).netloc.rpartition("@")[2]
+
+
+_USERINFO = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/\s@]+@")
+
+
+def redact_text(text: str, *urls: str) -> str:
+    """Remove stream secrets from a free-form message.
+
+    Element errors (``rtmp2sink``, ``uridecodebin``) often quote the location
+    they were given, stream key and camera password included.  Mask every
+    given URL, the secret pieces it carries, and any ``user:password@`` that
+    appears in the text on its own.
+    """
+    if not text:
+        return text
+    from urllib.parse import urlsplit
+
+    for url in urls:
+        if not url:
+            continue
+        text = text.replace(url, redact_url(url))
+        parts = urlsplit(url)
+        # The userinfo pattern below removes ``user:pw@`` wherever it appears;
+        # this catches the bare password, but not a short one that would also
+        # match ordinary words.
+        if parts.password and len(parts.password) >= 4:
+            text = text.replace(parts.password, "***")
+        segments = [segment for segment in parts.path.split("/") if segment]
+        # A short last segment ("live") is a path, not a key; masking it would
+        # garble unrelated words in the message.
+        if parts.scheme and segments and len(segments[-1]) >= 6:
+            text = text.replace(segments[-1], "***")
+    return _USERINFO.sub(lambda match: match.group("scheme"), text)
+
+
+def screen_token_path() -> Path:
+    return state_dir() / "screen-restore-token"
+
+
+def load_screen_restore_token() -> str:
+    """The portal restore token saved by an earlier launch, or ""."""
+    try:
+        return screen_token_path().read_text().strip()
+    except OSError:
+        return ""
+
+
+def save_screen_restore_token(token: str) -> None:
+    """Remember the portal's restore token (owner-only; it grants access).
+
+    It lives beside the other state rather than in the project: it is a
+    credential for this user's session, not part of a shareable project.
+    """
+    token = (token or "").strip()
+    if not token:
+        return
+    path = screen_token_path()
+    temp = path.with_name(path.name + ".tmp")
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(token + "\n")
+        os.replace(temp, path)
+    except OSError:
+        pass
 
 
 def project_path() -> Path:
@@ -174,11 +251,13 @@ def camera_device(preferred: str | None = None) -> str:
     for candidate in (preferred, os.environ.get("ANYCAM_CAMERA")):
         if candidate and Path(candidate).exists():
             return candidate
-    for cam in list_video_devices():
+    devices = list_video_devices()
+    own = loopback_device()  # once: it scans the devices again
+    for cam in devices:
         # Never pick AnyCam's own v4l2loopback output as the default camera;
         # doing so would feed the compositor back into itself.
         if cam.formats and "anycam" not in (cam.name or "").lower() \
-                and cam.device != loopback_device():
+                and cam.device != own:
             return cam.device
     return "/dev/video0"
 
@@ -243,6 +322,34 @@ def loopback_device() -> str:
     return "/dev/video10"
 
 
+def screen_flip_method(value: str | None = None) -> str:
+    """Orientation correction for portal screen captures.
+
+    Automatic follows the ``image-orientation`` tag exposed by the
+    compositor.  It deliberately does not force a rotation on KWin: rotating
+    the captured source also flips AnyCam's preview and every vcam consumer.
+    Use rotate-180, vertical-flip or none from the Output settings (or
+    ANYCAM_SCREEN_FLIP) when a specific share needs correcting.
+    """
+    raw = os.environ.get("ANYCAM_SCREEN_FLIP", "") if value is None else value
+    value = str(raw or "").strip().lower()
+    aliases = {
+        "": "automatic", "auto": "automatic", "180": "rotate-180",
+        "rotate180": "rotate-180", "vertical": "vertical-flip",
+        "vflip": "vertical-flip", "horizontal": "horizontal-flip",
+        "hflip": "horizontal-flip", "none": "none",
+    }
+    method = aliases.get(value, value)
+    allowed = {
+        "automatic", "none", "clockwise", "rotate-180",
+        "counterclockwise", "horizontal-flip", "vertical-flip",
+        "upper-left-diagonal", "upper-right-diagonal",
+    }
+    if method not in allowed:
+        method = "automatic"
+    return method
+
+
 def ensure_vcam_device(device: str | None = None, *, prompt: bool = True) -> str:
     """Make the v4l2loopback device exist, creating it when necessary.
 
@@ -293,11 +400,82 @@ def vcam_exclusive_caps(
     the module default (``exclusive_caps=0``) produces.  ``None`` means the
     parameter cannot be read (module not loaded).
     """
+    if not path:
+        return None
     try:
-        values = Path(path).read_text() if path else ""
+        values = Path(path).read_text()
     except OSError:
         return None
     return values.split(",")[0].strip() == "Y"
+
+
+def vcam_udev_capabilities(device: str | None = None) -> str | None:
+    """The capabilities udev announces for the loopback node.
+
+    Chromium-based apps enumerate V4L2 nodes through udev and skip a node that
+    advertises video output as well as capture.  This is the value Discord and
+    Chrome actually read, which can lag behind the module parameter because
+    udev caches it from device-add time.
+    """
+    dev = device or loopback_device()
+    if shutil.which("udevadm") is None:
+        return None
+    code, out = run(["udevadm", "info", "--query=property", "--name", dev])
+    if code != 0:
+        return None
+    for line in out.splitlines():
+        line = line.strip().removeprefix("E: ")
+        if line.startswith("ID_V4L_CAPABILITIES="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def refresh_vcam_udev(device: str | None = None, *, prompt: bool = True) -> str:
+    """Re-read the node's capabilities so Chromium apps list AnyCam.
+
+    With ``exclusive_caps=1`` v4l2loopback only advertises capture while a
+    writer streams, but udev caches the capabilities from device-add time.
+    AnyCam therefore has to re-run ``v4l_id`` after its idle feed starts;
+    without that Discord, Vesktop and Chrome keep skipping the node even
+    though the module parameter is correct.  Returns "" on success.
+    """
+    dev = device or loopback_device()
+    current = vcam_udev_capabilities(dev)
+    if current is not None and "capture" in current:
+        return ""
+    match = re.search(r"video(\d+)$", dev)
+    if match is None:
+        return f"virtual camera device {dev} is not a video node"
+    number = match.group(1)
+    manual = (f"sudo udevadm trigger --action=change "
+              f"--sysname-match=video{number}")
+    if shutil.which("udevadm") is None:
+        return f"udevadm is missing; run: {manual}"
+    if not prompt or shutil.which("pkexec") is None:
+        return f"refreshing Chromium visibility needs root; run: {manual}"
+    try:
+        result = subprocess.run(
+            ["pkexec", "udevadm", "trigger", "--action=change",
+             "--sysname-match", f"video{number}"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"could not refresh Chromium visibility: {exc}"
+    if result.returncode != 0:
+        lines = (result.stderr or result.stdout or "").strip().splitlines()
+        reason = lines[-1] if lines else f"pkexec exited {result.returncode}"
+        if result.returncode in (126, 127):
+            reason = ("authorization was cancelled or no polkit agent is "
+                      "running")
+        return f"{reason}. Run: {manual}"
+    # udev updates the database asynchronously after the change event.
+    for _ in range(40):
+        current = vcam_udev_capabilities(dev)
+        if current is not None and "capture" in current:
+            return ""
+        time.sleep(0.05)
+    return (f"{dev} still reports {current or 'no capabilities'}; "
+            f"Chromium may not list it. Run: {manual}")
 
 
 def reload_vcam_module(device: str | None = None, *,
@@ -396,12 +574,12 @@ def vcam_consumers(device: str | None = None, proc: str = "/proc") -> list[str]:
     return names
 
 
-# The virtual camera keeps one camera-sized mode while the program canvas
-# may be 4K or change while a consumer is watching.  Re-negotiating the
-# loopback device for every canvas change closes the node and leaves apps
-# (Discord) on a dead handle; scale into this fixed mode instead.
-VCAM_MAX_W = 1920
-VCAM_MAX_H = 1080
+# The virtual camera follows the project canvas up to 4K.  It keeps that
+# mode once started; re-negotiating the loopback device for every canvas
+# change closes the node and leaves apps (Discord) on a dead handle.  A 4K
+# canvas therefore gets a real 4K vcam instead of being reduced to 1080p.
+VCAM_MAX_W = 3840
+VCAM_MAX_H = 2160
 
 
 def vcam_output_size(width: int, height: int) -> tuple[int, int]:
@@ -436,7 +614,7 @@ def system_summary() -> dict:
     return {
         "app": APP_NAME,
         "version": VERSION,
-        "python": f"{os.sys.version_info.major}.{os.sys.version_info.minor}.{os.sys.version_info.micro}",
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         "gstreamer": gst.splitlines()[0].strip() if code == 0 and gst else "unavailable",
         "camera": camera_device(),
         "microphone": microphone(),

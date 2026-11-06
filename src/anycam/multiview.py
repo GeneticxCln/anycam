@@ -72,6 +72,20 @@ class SourcePreview:
         self._last = None
 
 
+def source_label(spec) -> str:
+    """A caption for a capture that never shows a camera URL's credentials."""
+    from pathlib import Path
+
+    from . import config
+
+    source = spec.source or "source"
+    if spec.kind == "network":
+        source = config.host_of(spec.source) or "network"
+    elif spec.kind == "video":
+        source = Path(spec.source).name or source
+    return f"{spec.kind}: {source}"
+
+
 class MultiViewDialog(QDialog):
     def __init__(self, pool, parent=None) -> None:
         super().__init__(parent)
@@ -81,10 +95,17 @@ class MultiViewDialog(QDialog):
         grid = QGridLayout()
         layout.addLayout(grid)
         self.previews: list[SourcePreview] = []
-        entries = pool.entries()
+        # Only captures a layer is using now.  The pool also keeps removed
+        # sources open for a quick re-add; those are not on the program.
+        entries = [entry for entry in pool.entries() if entry.refs > 0]
+        if not entries:
+            layout.addWidget(QLabel("No active sources"))
+        # Esc and the window button hide the dialog through reject(), which
+        # does not send a close event; ``finished`` covers every way out.
+        self.finished.connect(self._stop_previews)
         cols = 2 if len(entries) <= 4 else 3
         for i, entry in enumerate(entries):
-            label = QLabel(f"{entry.spec.kind}: {entry.spec.source or 'source'}")
+            label = QLabel(source_label(entry.spec))
             label.setMinimumSize(320, 180)
             label.setStyleSheet("background:#0e1216; border:1px solid #1e2830;")
             label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -97,7 +118,10 @@ class MultiViewDialog(QDialog):
         for sp in self.previews:
             sp.pump()
 
-    def closeEvent(self, event) -> None:
+    def _stop_previews(self, *_args) -> None:
         for sp in self.previews:
             sp.stop()
+
+    def closeEvent(self, event) -> None:
+        self._stop_previews()
         super().closeEvent(event)

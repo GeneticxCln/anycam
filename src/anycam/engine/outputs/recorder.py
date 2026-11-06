@@ -23,6 +23,8 @@ Gst.init(None)
 
 VIDEO_CAPS = "video/x-h264,stream-format=avc,alignment=au"
 AUDIO_CAPS = "audio/mpeg,mpegversion=4,stream-format=raw"
+VIDEO_PARSERS = {"h264": "h264parse", "h265": "h265parse",
+                 "av1": "av1parse"}
 
 
 def _make(factory: str, name: str, **props) -> Gst.Element:
@@ -45,12 +47,19 @@ class Recorder:
         self._video_src: Gst.Element | None = None
         self._audio_src: Gst.Element | None = None
         self._bus: Gst.Bus | None = None
+        self.codec = "h264"
         self._video_step = Gst.SECOND // 30
         self._audio_step = 1024 * Gst.SECOND // 48000
         self._last_in: dict[str, int | None] = {"video": None, "audio": None}
         self._last_out: dict[str, int | None] = {"video": None, "audio": None}
         self._offset: dict[str, int] = {"video": 0, "audio": 0}
         self._eos = False
+        # Frame size of the first video sample.  mp4mux writes one sample
+        # description, so frames of another size (a canvas resized while the
+        # file is open) cannot be added to it; they are counted and dropped,
+        # and the owner starts a new file instead.
+        self.size: tuple[int, int] | None = None
+        self.rejected_frames = 0
 
     @property
     def active(self) -> bool:
@@ -58,16 +67,19 @@ class Recorder:
 
     # ------------------------------------------------------------------ start
     def start(self, path: str, width: int, height: int, fps: int, *,
-              audio: bool = False) -> bool:
+              audio: bool = False, codec: str = "h264") -> bool:
         """Start a session.  Requested pads exist before the first sample."""
         if self.active:
             self.stop()
         self.path = str(path)
         self.error = ""
+        self.codec = codec if codec in VIDEO_PARSERS else "h264"
         self._eos = False
         self._last_in = {"video": None, "audio": None}
         self._last_out = {"video": None, "audio": None}
         self._offset = {"video": 0, "audio": 0}
+        self.size = None
+        self.rejected_frames = 0
         self._video_step = max(1, Gst.SECOND // max(1, int(fps)))
         self._audio_step = 1024 * Gst.SECOND // 48000
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -79,13 +91,15 @@ class Recorder:
         video.set_property("max-buffers", 8)
         video.set_property("block", False)
         video.set_property("leaky-type", 2)
-        parse = _make("h264parse", "record_h264_parse", config_interval=-1)
+        parse_factory = VIDEO_PARSERS[self.codec]
+        parse_props = {"config_interval": -1} if parse_factory != "av1parse" else {}
+        parse = _make(parse_factory, "record_video_parse", **parse_props)
         mux = _make("mp4mux", "record_mux", fragment_duration=500)
         sink = _make("filesink", "record_sink", location=self.path, sync=False)
         for element in (video, parse, mux, sink):
             pipeline.add(element)
         if not video.link(parse):
-            self.error = "could not link recorder video into h264parse"
+            self.error = f"could not link recorder video into {parse_factory}"
             pipeline.set_state(Gst.State.NULL)
             return False
         video_pad = mux.request_pad_simple("video_%u")
@@ -151,6 +165,8 @@ class Recorder:
         buf = sample.get_buffer()
         if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
             return
+        if stream == "video" and not self._accept_size(sample):
+            return
         pts = int(buf.pts)
         dts = int(buf.dts) if buf.dts != Gst.CLOCK_TIME_NONE else None
         duration = (int(buf.duration) if buf.duration not in (0, Gst.CLOCK_TIME_NONE)
@@ -189,6 +205,22 @@ class Recorder:
         except Exception as exc:  # noqa: BLE001
             self.error = f"{stream} push failed: {exc}"
 
+    def _accept_size(self, sample) -> bool:
+        """Whether this frame has the size the file was started with."""
+        caps = sample.get_caps()
+        structure = caps.get_structure(0) if caps is not None and caps.get_size() else None
+        if structure is None or not (structure.has_field("width")
+                                     and structure.has_field("height")):
+            return True
+        size = (int(structure.get_value("width")), int(structure.get_value("height")))
+        if self.size is None:
+            self.size = size
+            return True
+        if size != self.size:
+            self.rejected_frames += 1
+            return False
+        return True
+
     # ------------------------------------------------------------------- stop
     def stop(self) -> dict:
         pipeline = self._pipeline
@@ -221,7 +253,7 @@ class Recorder:
         ok = bool(size > 0 and not self.error
                   and self._last_in.get("video") is not None)
         result = {"path": self.path, "bytes": size, "ok": ok,
-                  "error": self.error}
+                  "error": self.error, "rejected_frames": self.rejected_frames}
         self._clear_runtime()
         return result
 
