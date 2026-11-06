@@ -26,7 +26,10 @@ no Wine.
 
 ## Requirements
 
-Developed on CachyOS (Arch), KDE/Wayland, NVIDIA, GStreamer 1.28.
+Developed on CachyOS (Arch), KDE/Wayland, NVIDIA, GStreamer 1.28. Used by the author with a
+real webcam as a virtual camera in Discord and Telegram, and in other apps that list V4L2
+cameras. The automated tests use synthetic sources and the offscreen GUI; raw measurements
+are in [docs/EVIDENCE.md](docs/EVIDENCE.md).
 
 - Python 3.11+ and GStreamer with `base good bad ugly libav opengl pulse`
 - PyGObject (from your distro, not PyPI)
@@ -89,8 +92,6 @@ permission through the portal.
 
 ## Known limitations
 
-- Not yet re-verified on a real webcam for this release; the pipeline is tested with
-  synthetic sources and the offscreen GUI. See [docs/EVIDENCE.md](docs/EVIDENCE.md).
 - Python effects cost CPU per frame (`scripts/bench-effects.py` measures them). Masks are 2D,
   built from five face landmarks: no depth and no expression tracking.
 - One virtual camera, and one canvas size and FPS for all layers; two filter slots per
