@@ -102,8 +102,6 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           cat > notes.md <<NOTES
-          ## ${GITHUB_REF_NAME}
-
           Linux-native virtual camera studio: cameras, screens, video, overlays, face masks,
           themed frames and animations composed into one picture for Discord, Chrome, OBS and
           recordings.
