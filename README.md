@@ -27,7 +27,11 @@ no Wine.
   - **32 themed frames** (Christmas, Halloween, Cyber HUD, gold, neon, ...) and shaped windows.
   - **42 animations** (snow, hearts, confetti, fireworks, Matrix code, ...) and emoji rain.
     One animation at a time, swapped live; click it again to remove it.
-  - Animated backdrops and 171 bundled Noto emoji.
+  - **Virtual backgrounds** that replace the room behind you (Effects → Portrait: studio,
+    aurora, sunset, ocean, and animated tunnel, starfield, plasma, water), and 171 bundled
+    Noto emoji.
+  - **Stage** tab: static and animated canvas backgrounds around the camera tiles (it frames
+    the camera; it does not hide your room).
 - **AI effects:** ONNX models through onnxruntime, on the CPU by default or the NVIDIA GPU
   (CUDA) when chosen in **Settings → AI effects**. Person cut-out uses the bundled MediaPipe
   model, or Robust Video Matting (soft edges and hair) as a one-click verified download. Slow
@@ -62,7 +66,7 @@ sudo pacman -S --needed python pyside6 python-gobject gst-plugins-{base,good,bad
 ## Install and run
 
 ```bash
-pip install anycam-1.2.0.tar.gz     # from the GitHub release, or from a checkout:
+pip install anycam-1.2.1.tar.gz     # from the GitHub release, or from a checkout:
 ./scripts/setup.sh                  # creates .venv with system site-packages
 ./scripts/anycam-gui                # the studio (or: python -m anycam gui)
 ./scripts/install-desktop.sh        # optional: add it to the app menu
@@ -96,7 +100,7 @@ Keys: `Ctrl+P` preview, `Ctrl+R` record, `Ctrl+Shift+V` virtual camera, `F5` sna
 
 ## Releases
 
-**v1.2.0** is the current release (v1.1.0, v1.0.3, v1.0.2, v1.0.1 and v1.0.0 came before); **Settings → About** shows the version and what
+**v1.2.1** is the current release (v1.2.0, v1.1.0, v1.0.3, v1.0.2, v1.0.1 and v1.0.0 came before); **Settings → About** shows the version and what
 it runs on. Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`: it builds the
 tarball and wheel, checks the bundled assets, smoke-tests a clean install and publishes a
 GitHub Release with `SHA256SUMS`. To release, bump `version` in `pyproject.toml` and
@@ -124,10 +128,6 @@ permission through the portal.
 - **GPU effects:** the CUDA path needs `onnxruntime-gpu` with CUDA and cuDNN, which AnyCam
   does not install. It is covered by tests with a simulated CUDA provider only; it has not
   been run on real CUDA. Robust Video Matting is GPL-3.0, so it is a download, not bundled.
-- **Backdrops vs. virtual backgrounds:** the **Backdrops** tab is a canvas background behind
-  the camera tiles; it does not hide your room. To replace or blur what is behind you, use
-  **Effects → Portrait** (blur, dim, black and white, or a "… backdrop"). The two share
-  names, which is confusing.
 - **Microphone:** noise suppression removes steady noise (fans, hum, hiss), not keyboard
   clicks or voices; there is no echo cancelling. Changing it restarts the canvas, like
   changing the microphone does.

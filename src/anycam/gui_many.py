@@ -260,7 +260,7 @@ class ManyCamWindow(AnyCamWindow):
         side.addTab(self._effects_tab(), "Effects")
         # The backdrops the README lists lived only in the classic window;
         # here _apply_background() crashed on the missing inset checkbox.
-        side.addTab(self._backdrop_tab(), "Backdrops")
+        side.addTab(self._backdrop_tab(), "Stage")
         side.addTab(self._scene_tab(), "Scenes")
         self.side_tabs = side
         body.addWidget(side, 1)

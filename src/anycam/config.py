@@ -15,7 +15,7 @@ from . import privileged
 
 APP_NAME = "AnyCam"
 APP_ID = "anycam"
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 CANVAS_W = 1920
 CANVAS_H = 1080

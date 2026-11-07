@@ -1429,7 +1429,7 @@ class AnyCamWindow(QMainWindow):
         side.addTab(self._scene_tab(), "Scene")
         side.addTab(self._layers_tab(), "Layers")
         side.addTab(self._effects_tab(), "Effects")
-        side.addTab(self._backdrop_tab(), "Backdrop")
+        side.addTab(self._backdrop_tab(), "Stage")
         side.addTab(self._audio_tab(), "Audio")
         side.addTab(self._playlist_tab(), "Playlist")
         side.addTab(self._output_tab(), "Output")
@@ -2537,14 +2537,16 @@ class AnyCamWindow(QMainWindow):
         layout = QVBoxLayout(body)
 
         intro = QLabel(
-            "Backdrops sit behind every capture layer. Static looks are "
-            "generated at the project canvas size; motion looks use live "
-            "GPU 3D shaders when OpenGL is available.")
+            "The stage is the canvas behind your camera tiles: it fills the "
+            "space around them and does not hide your room. To blur or "
+            "replace what is behind you, use Effects → Portrait → Virtual "
+            "background. Static stages are generated at the canvas size; "
+            "animated ones use live GPU 3D shaders when OpenGL is available.")
         intro.setObjectName("muted")
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        static = QGroupBox("Static backgrounds")
+        static = QGroupBox("Static stages")
         static_grid = QGridLayout(static)
         for index, name in enumerate(overlay.BACKGROUND_NAMES):
             button = QPushButton(name)
@@ -2553,7 +2555,7 @@ class AnyCamWindow(QMainWindow):
             static_grid.addWidget(button, index // 2, index % 2)
         layout.addWidget(static)
 
-        motion = QGroupBox("Animated backdrops")
+        motion = QGroupBox("Animated stages")
         motion_grid = QGridLayout(motion)
         for index, (key, spec) in enumerate(ANIMATION_PRESETS.items()):
             button = QPushButton(str(spec["label"]))
@@ -2565,16 +2567,16 @@ class AnyCamWindow(QMainWindow):
         actions = QGroupBox("Composition")
         actions_layout = QVBoxLayout(actions)
         self.inset_on_backdrop = QCheckBox(
-            "Inset cameras when a backdrop is applied")
+            "Inset cameras when a stage is applied")
         self.inset_on_backdrop.setChecked(True)
         actions_layout.addWidget(self.inset_on_backdrop)
         inset = QPushButton("Inset capture layers now")
         inset.clicked.connect(self._inset_capture_layers)
         actions_layout.addWidget(inset)
-        clear = QPushButton("Clear backdrop")
+        clear = QPushButton("Clear stage")
         clear.clicked.connect(self._clear_backdrop)
         actions_layout.addWidget(clear)
-        self.backdrop_status = QLabel("No backdrop selected")
+        self.backdrop_status = QLabel("No stage selected")
         self.backdrop_status.setObjectName("accent")
         self.backdrop_status.setWordWrap(True)
         actions_layout.addWidget(self.backdrop_status)
@@ -2620,13 +2622,13 @@ class AnyCamWindow(QMainWindow):
         height = int(self.project.output.canvas_h)
         path = overlay.render_background(name, width, height)
         layer = Layer(
-            new_id("layer"), "image", f"Backdrop · {name}",
+            new_id("layer"), "image", f"Stage · {name}",
             source=str(path), box=(0.0, 0.0, 1.0, 1.0), z=0,
             role="backdrop",
         )
         self._replace_backdrop(layer)
-        self.backdrop_status.setText(f"Backdrop: {name}")
-        self._status(f"Backdrop: {name}")
+        self.backdrop_status.setText(f"Stage: {name}")
+        self._status(f"Stage: {name}")
 
     def _apply_animation(self, key: str) -> None:
         spec = ANIMATION_PRESETS.get(key, {})
@@ -2638,7 +2640,7 @@ class AnyCamWindow(QMainWindow):
         )
         self._replace_backdrop(layer)
         self.backdrop_status.setText(f"Motion: {label}")
-        self._status(f"Motion backdrop: {label}")
+        self._status(f"Animated stage: {label}")
 
     def _clear_backdrop(self) -> None:
         had_backdrop = bool(self._active_backdrops())
@@ -2646,8 +2648,8 @@ class AnyCamWindow(QMainWindow):
         self._restore_inset_layers()
         if had_backdrop:
             self._mark_dirty()
-        self.backdrop_status.setText("No backdrop selected")
-        self._status("Backdrop cleared")
+        self.backdrop_status.setText("No stage selected")
+        self._status("Stage cleared")
 
     def _inset_capture_layers(self) -> None:
         changed = 0
@@ -2664,7 +2666,7 @@ class AnyCamWindow(QMainWindow):
         self.preview.update()
         self._mark_dirty()
         if changed:
-            self._status(f"Inset {changed} capture layer(s) to reveal the backdrop")
+            self._status(f"Inset {changed} capture layer(s) to reveal the stage")
 
     def _restore_inset_layers(self) -> None:
         """Undo the backdrop inset on layers the user has not moved since."""

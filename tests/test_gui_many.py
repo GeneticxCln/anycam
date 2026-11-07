@@ -893,7 +893,7 @@ def test_sidebar_is_layouts_effects_scenes_and_settings_is_a_window(app):
     try:
         names = [window.side_tabs.tabText(index)
                  for index in range(window.side_tabs.count())]
-        assert names == ["Layouts", "Effects", "Backdrops", "Scenes"]
+        assert names == ["Layouts", "Effects", "Stage", "Scenes"]
         assert window._settings is not None
         assert not window._settings.isVisible()
 
