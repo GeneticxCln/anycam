@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import itertools
 import threading
+import time
 from dataclasses import dataclass
 
 import gi
@@ -24,6 +25,13 @@ from gi.repository import Gst  # noqa: E402
 Gst.init(None)
 
 NO_FILTER = "none"
+
+# A swap waits for a buffer to pass its blocked pad.  A source that produces no
+# buffers (a static screen share, a stalled capture) would wait for ever, so
+# after SWAP_IDLE_AFTER_S the pad is also swapped at an idle moment, and after
+# SWAP_GIVE_UP_S the request is abandoned so later changes are not stuck.
+SWAP_IDLE_AFTER_S = 2.0
+SWAP_GIVE_UP_S = 20.0
 
 
 @dataclass(frozen=True)
@@ -523,6 +531,8 @@ class FilterSlot:
             probe["pad"] = pad
             probe["id"] = pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, on_block)
 
+        started = time.monotonic()
+
         def watchdog() -> None:
             """Re-arm if the probed pad stopped being this slot's real upstream."""
             if done[0]:
@@ -534,6 +544,24 @@ class FilterSlot:
                 except Exception:  # noqa: BLE001 - the old pad may be gone
                     pass
                 arm(current)
+            age = time.monotonic() - started
+            if age >= SWAP_GIVE_UP_S:
+                if once():
+                    try:
+                        probe["pad"].remove_probe(probe["id"])
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if new_runner is not None:
+                        new_runner.stop()
+                    self._finish()      # unblock later requests; nothing changed
+                return
+            if age >= SWAP_IDLE_AFTER_S and not probe.get("idle"):
+                # No buffer came through: relink when the pad is idle instead.
+                probe["idle"] = True
+                try:
+                    probe["pad"].add_probe(Gst.PadProbeType.IDLE, on_block)
+                except Exception:  # noqa: BLE001 - keep waiting for a buffer
+                    probe["idle"] = False
             timer = threading.Timer(0.5, watchdog)
             timer.daemon = True
             timer.start()

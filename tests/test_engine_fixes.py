@@ -193,6 +193,9 @@ def test_detaching_one_of_two_layers_on_a_shared_capture_keeps_the_other_counted
 
 # ------------------------------------------------------------ items 4 and 5: fds
 def test_portal_remote_does_not_leak_a_descriptor():
+    # Engines from earlier tests are collectable now; let them go first, or
+    # the gc.collect() below frees their sockets and the count drops.
+    gc.collect()
     source = os.open(os.devnull, os.O_RDONLY)
     before = open_fd_count() - 1
     fd_list = Gio.UnixFDList.new()

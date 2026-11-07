@@ -262,7 +262,7 @@ class VcamOutput:
             self.error = (
                 f"virtual camera {device} is not available; "
                 f"load v4l2loopback with 'sudo modprobe v4l2loopback "
-                f"video_nr=10 card_label=AnyCam'"
+                f"video_nr=10 card_label=AnyCam exclusive_caps=1'"
             )
             return False
         self.pixel_format = config.vcam_pixel_format(device)

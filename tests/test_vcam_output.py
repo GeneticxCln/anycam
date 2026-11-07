@@ -374,6 +374,7 @@ def test_reload_vcam_module_uses_pkexec_with_chromium_caps(tmp_path,
     monkeypatch.setattr(config.subprocess, "run", fake_run)
     monkeypatch.setattr(config.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None: True)
+    monkeypatch.setattr(config, "other_virtual_cameras", lambda *a, **k: [])
     assert config.reload_vcam_module(str(device)) == ""
     assert calls[0][:2] == ["pkexec", "/bin/sh"]
     command = calls[0][-1]
@@ -392,6 +393,7 @@ def test_reload_vcam_module_reports_when_the_node_is_in_use(tmp_path,
 
     monkeypatch.setattr(config.subprocess, "run", fake_run)
     monkeypatch.setattr(config.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(config, "other_virtual_cameras", lambda *a, **k: [])
     message = config.reload_vcam_module(str(tmp_path / "video10"))
     assert "in use" in message
     assert "sudo modprobe -r v4l2loopback" in message
@@ -537,3 +539,32 @@ def test_refresh_vcam_udev_skips_a_node_chromium_already_lists(monkeypatch):
                         lambda *args, **kwargs: calls.append(args))
     assert config.refresh_vcam_udev("/dev/video10") == ""
     assert calls == []
+
+
+def test_reload_vcam_module_refuses_to_unload_other_virtual_cameras(monkeypatch):
+    """The reload removes every loopback node, not only AnyCam's."""
+    calls = []
+    monkeypatch.setattr(config.subprocess, "run",
+                        lambda cmd, **kw: calls.append(cmd))
+    monkeypatch.setattr(config.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(config, "other_virtual_cameras",
+                        lambda *a, **k: ["/dev/video11 (OBS Virtual Camera)"])
+    message = config.reload_vcam_module("/dev/video10")
+    assert "OBS Virtual Camera" in message
+    assert calls == [], "pkexec must not run when another camera would be lost"
+
+
+def test_other_virtual_cameras_ignores_physical_nodes_and_its_own(tmp_path):
+    virtual = tmp_path / "devices" / "virtual" / "video4linux"
+    physical = tmp_path / "devices" / "pci" / "usb"
+    sysfs = tmp_path / "class"
+    for base, name, label in ((virtual, "video10", "AnyCam"),
+                              (virtual, "video11", "OBS Virtual Camera"),
+                              (physical, "video0", "StreamCam")):
+        node = base / name
+        node.mkdir(parents=True)
+        (node / "name").write_text(label + "\n")
+        (sysfs).mkdir(exist_ok=True)
+        (sysfs / name).symlink_to(node)
+    assert config.other_virtual_cameras("/dev/video10", str(sysfs)) == [
+        "/dev/video11 (OBS Virtual Camera)"]

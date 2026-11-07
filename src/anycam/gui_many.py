@@ -257,6 +257,9 @@ class ManyCamWindow(AnyCamWindow):
         side.setMaximumWidth(440)
         side.addTab(self._layouts_tab(), "Layouts")
         side.addTab(self._effects_tab(), "Effects")
+        # The backdrops the README lists lived only in the classic window;
+        # here _apply_background() crashed on the missing inset checkbox.
+        side.addTab(self._backdrop_tab(), "Backdrops")
         side.addTab(self._scene_tab(), "Scenes")
         self.side_tabs = side
         body.addWidget(side, 1)
@@ -531,6 +534,16 @@ class ManyCamWindow(AnyCamWindow):
         if self._fix_thread is not None and self._fix_thread.is_alive():
             return
         device = self.project.output.vcam_device or config.loopback_device()
+        others = config.other_virtual_cameras(device)
+        if others:
+            # Refuse before touching anything: the reload unloads the whole
+            # module, taking these cameras away from the apps using them.
+            self.diag_chromium.setText(
+                "Chromium/Discord visibility: not reloaded, it would also "
+                "remove " + ", ".join(others))
+            self._status("Reload v4l2loopback manually: other virtual "
+                         "cameras share the module")
+            return
         if self.engine is not None:
             self.engine.detach_vcam()
         self._finish_vcam_output()

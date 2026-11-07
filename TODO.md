@@ -34,7 +34,7 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - [x] Audio tee gets queues when recording and streaming together, so one muxer cannot block the other (B21). Passed 2026-10-31: separate bounded queues feed the MP4 and RTMP muxers.
 - [x] Prefer `rtmp2sink` and fall back to `rtmpsink`; the publish leg stays in its own pipeline. Passed 2026-10-31: `rtmp2sink` selected when installed and the black-hole server gate still passes. Actual `rtmp2sink` delivery has not been re-captured because no RTMP receiver is installed here.
 - [x] Verify a duplicated camera layer shares one capture through the pool (B16) and cover it at the GUI level. Passed 2026-10-31: one pool entry with two references after `duplicate_layer()`; the shared-channel `intervideosrc` name collision is fixed.
-- [x] Resolve the `exclusive_caps=1` documentation contradiction; settle the Chromium/Zoom/Teams compatibility list in M9 (B19). Docs now require the default `exclusive_caps=0`; the browser/meeting matrix remains an M9 hardware task.
+- [x] Resolve the `exclusive_caps=1` documentation contradiction; settle the Chromium/Zoom/Teams compatibility list in M9 (B19). Superseded: Discord and Chromium only list a node loaded with `exclusive_caps=1`, which is what the README, `scripts/enable-v4l2loopback.sh` and the app's setup commands now use. The browser/meeting matrix remains an M9 hardware task.
 
 ## 2. M2 — GPU canvas, transforms, transitions
 
@@ -183,7 +183,7 @@ Design and build order: `docs/PHONE_CAMERA.md`.
 - B48: every camera layer's negotiated mode is kept in the report (`tests/test_source_pool.py::test_report_lists_every_camera_mode`).
 - B41: source-side health counters and `source_health`/`stalled_sources` detect a dead capture (`tests/test_source_pool.py::test_health_flags_a_capture_that_stops`).
 - B17/B18/B20: vcam failures are reported, the explicit device is checked, and the legacy appsrc is bounded (`tests/test_vcam_output.py`).
-- B19: `exclusive_caps=0` is documented as required; the compatibility matrix remains in M9.
+- B19: superseded; `exclusive_caps=1` is the documented setting (Discord and Chromium need it); the compatibility matrix remains in M9.
 - B21: record and RTMP have separate audio queues (`tests/test_m1_outputs.py::test_recording_and_streaming_have_separate_audio_queues`).
 - B12 (partial): Record start/stop and vcam toggles attach/detach valves without rebuilding (`tests/test_gui.py::test_record_toggle_attaches_without_rebuilding`, `test_vcam_output_survives_engine_restarts`); scene/layer changes still rebuild.
 - `rtmp2sink` is preferred when installed, with `rtmpsink` fallback (`tests/test_m1_outputs.py::test_stream_prefers_rtmp2sink`).

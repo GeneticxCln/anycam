@@ -528,11 +528,19 @@ def camera_chain(device: str, width: int, height: int, fps: int, layer=None,
 
 
 
-def _crop_chain(layer, width: int, height: int) -> list[Gst.Element]:
-    """Optional videocrop from a normalised (left, top, right, bottom) crop."""
+def _crop_chain(layer, width: int, height: int,
+                mirrored_after: bool = False) -> list[Gst.Element]:
+    """Optional videocrop from a normalised (left, top, right, bottom) crop.
+
+    ``mirrored_after`` is for chains that crop first and mirror later: the
+    crop is taken from the opposite edge so it matches what the user drew on
+    the mirrored picture (the other chains mirror before cropping).
+    """
     crop = getattr(layer, "crop", None)
     if not crop or not any(v != 0.0 for v in crop):
         return []
+    if mirrored_after and getattr(getattr(layer, "effects", None), "mirror", False):
+        crop = (crop[2], crop[1], crop[0], crop[3])
     # Clamp exactly like geometry.crop_pixels so a 1.0 crop cannot request a
     # zero-pixel frame (videocrop then stalls instead of negotiating).
     left, top, right, bottom = crop_pixels(width, height, crop)
@@ -612,7 +620,7 @@ def image_chain(path: str, width: int, height: int, fps: int, layer=None,
     # for it stretched every photo to the box and applied crop fractions to
     # the wrong dimensions.  Pre-rendered overlays (fit=False) are box-sized.
     src_w, src_h = (_image_pixel_size(source) or (width, height)) if fit else (width, height)
-    chain.add(*_crop_chain(layer, src_w, src_h))
+    chain.add(*_crop_chain(layer, src_w, src_h, mirrored_after=True))
     chain.add(make("imagefreeze"))
     # Overlay images are pre-rendered at box size with their transparency
     # already baked in (fit=False stretches them to the pad, which is what the
@@ -921,7 +929,12 @@ def layer_tail(layer, source_size: tuple[int, int], width: int, height: int,
     tag = re.sub(r"[^A-Za-z0-9_-]", "_", getattr(layer, "id", "") or "layer")
     src = make("intervideosrc", f"src_{channel}_{tag}", channel=channel)
     rate = caps_filter(f"video/x-raw,framerate={fps}/1")
-    chain.add(src, rate, make("videoconvert"))
+    # intervideosrc answers a latency query with a maximum below its minimum,
+    # so the compositor's own query failed on every layer of this kind.  A
+    # small leaky queue gives it a consistent range (and never blocks it).
+    buffer = make("queue", f"q_{channel}_{tag}", leaky=2, max_size_buffers=2,
+                  max_size_bytes=0, max_size_time=200_000_000, silent=True)
+    chain.add(src, buffer, rate, make("videoconvert"))
     _add_effects(chain, layer)
     src_w, src_h = source_size
     chain.add(*_crop_chain(layer, src_w, src_h))

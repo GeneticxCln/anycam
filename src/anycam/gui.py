@@ -1272,6 +1272,15 @@ class AnyCamWindow(QMainWindow):
             self.shortcuts.append(shortcut)
 
     def switch_scene(self, index: int) -> None:
+        combo = getattr(self, "scene_combo", None)
+        if (0 <= index < len(self.project.scenes) and combo is not None
+                and combo.count() == len(self.project.scenes)):
+            # The combo's handler also syncs the layout picker and scene cards
+            # that the shortcut path used to leave stale.
+            if combo.currentIndex() != index:
+                combo.setCurrentIndex(index)
+            self._status(f"Scene: {self.project.scenes[index].name}")
+            return
         if 0 <= index < len(self.project.scenes):
             self._store_playlist_state()
             self._forget_lost_cameras()
@@ -2975,9 +2984,9 @@ class AnyCamWindow(QMainWindow):
         layout = QVBoxLayout(page)
         box = QGroupBox("Canvas")
         grid = QGridLayout(box)
-        self.width_spin = QSpinBox(); self.width_spin.setRange(320, 3840); self.width_spin.setValue(self.project.output.canvas_w)
-        self.height_spin = QSpinBox(); self.height_spin.setRange(240, 2160); self.height_spin.setValue(self.project.output.canvas_h)
-        self.fps_spin = QSpinBox(); self.fps_spin.setRange(1, 60); self.fps_spin.setValue(self.project.output.fps)
+        self.width_spin = QSpinBox(); self.width_spin.setRange(320, 7680); self.width_spin.setValue(self.project.output.canvas_w)
+        self.height_spin = QSpinBox(); self.height_spin.setRange(240, 4320); self.height_spin.setValue(self.project.output.canvas_h)
+        self.fps_spin = QSpinBox(); self.fps_spin.setRange(1, 120); self.fps_spin.setValue(self.project.output.fps)
         # H.264 needs even dimensions: snap instead of letting x264 fail later.
         for spin in (self.width_spin, self.height_spin):
             spin.setSingleStep(2)
@@ -3156,6 +3165,13 @@ class AnyCamWindow(QMainWindow):
             fx.color_effect = choice if choice in EFFECT_STYLES.values() else "none"
         elif attr == "mirror":
             fx.mirror = bool(value)
+            if (layer.kind in ("image", "logo") and any(layer.crop)
+                    and self.engine is not None):
+                # The crop of a picture is rendered into its PNG and depends on
+                # the mirror (left/right swap), so it cannot change live.
+                self._mark_dirty()
+                self.restart_engine()
+                return
         elif attr == "frame_style":
             choice = str(value or "none").lower()
             fx.frame_style = choice if choice in overlay.WINDOW_FRAME_STYLES else "none"
@@ -3459,11 +3475,22 @@ class AnyCamWindow(QMainWindow):
             return
         layer.camera_width, layer.camera_height, layer.camera_fps = values
         self._mark_dirty()
-        if self.engine is not None:
-            self.restart_engine()
+        # Width, height and rate are three fields: rebuild once after the last
+        # change instead of reopening the camera three times in a row.
+        timer = getattr(self, "_camera_mode_timer", None)
+        if timer is None:
+            timer = self._camera_mode_timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(300)
+            timer.timeout.connect(self._apply_camera_mode)
+        timer.start()
         width, height, fps = values
         mode = (f"{width}×{height}" if width and height else "auto size")
         self._status(f"Camera capture: {mode} @ {fps or 'auto'} fps")
+
+    def _apply_camera_mode(self) -> None:
+        if self.engine is not None:
+            self.restart_engine()
 
     # --------------------------------------------------- camera reconnection
     def _missing_camera_layers(self) -> dict[str, str]:
@@ -3908,12 +3935,12 @@ class AnyCamWindow(QMainWindow):
             if not path.exists():
                 self._status(f"Source file not found: {path}")
                 return None
-            if kind == "video":
-                box = (0.62, 0.60, 0.34, 0.34)
-            else:
-                box = (0.04, 0.04, 0.18, 0.18)
+            # A caller's box (a layout slot's "+") wins over the default spot;
+            # overwriting it put "Add image…" from a slot in the corner.
+            default = ((0.62, 0.60, 0.34, 0.34) if kind == "video"
+                       else (0.04, 0.04, 0.18, 0.18))
             layer = Layer(new_id("layer"), kind, path.stem, source=str(path),
-                          box=box, z=0)
+                          box=box or default, z=0)
         elif kind == "network":
             if not source:
                 source, ok = QInputDialog.getText(
@@ -5119,6 +5146,15 @@ class AnyCamWindow(QMainWindow):
             output.stop()
             self._vcam_output = None
         output = VcamOutput()
+        if setup and not Path(device).exists():
+            # The polkit prompt can take a minute; keep the window alive while
+            # it is open instead of freezing the UI thread.
+            problem = self._run_with_ui(lambda: config.ensure_vcam_device(device))
+            if problem:
+                output.error = str(problem)
+                self.log_event(f"virtual camera: {output.error}")
+                self._status(output.error)
+                return False
         if not output.start(device, width, height, fps, setup=setup):
             self.log_event(
                 f"virtual camera: {output.error or 'could not start'}")
@@ -5135,6 +5171,28 @@ class AnyCamWindow(QMainWindow):
         if not self.headless:
             self.ensure_vcam_visible(device)
         return True
+
+    def _run_with_ui(self, function):
+        """Run a blocking call on a thread while Qt keeps handling events."""
+        if self.headless:
+            return function()
+        result: dict = {}
+
+        def work() -> None:
+            try:
+                result["value"] = function()
+            except Exception as exc:  # noqa: BLE001 - reported to the caller
+                result["value"] = f"{exc}"
+
+        thread = threading.Thread(target=work, name="anycam-blocking",
+                                  daemon=True)
+        thread.start()
+        app = QApplication.instance()
+        while thread.is_alive():
+            if app is not None:
+                app.processEvents()
+            thread.join(0.02)
+        return result.get("value")
 
     def _recover_vcam(self) -> bool:
         """Repair a virtual camera that dropped while the canvas kept running.
@@ -5209,11 +5267,25 @@ class AnyCamWindow(QMainWindow):
         self.project.audio.media_file = self.media_edit.text().strip()
         self.preview.canvas_size = (self.project.output.canvas_w,
                                     self.project.output.canvas_h)
+        if self.playlist_ids and self.playlist_index < 0:
+            # The first item is what the preview starts on (it was added
+            # visible).  Leaving the index at -1 made the first timer step
+            # "advance" to that same item, showing it for two intervals.
+            self.playlist_index = 0
+            self.scene.playlist.index = 0
         if self.playlist_index >= 0 and self.playlist_ids:
             for position, layer_id in enumerate(self.playlist_ids):
                 layer = self.scene.layer(layer_id)
                 if layer is not None:
                     layer.visible = position == self.playlist_index
+        if (self.recording and self._recorder is not None
+                and self._recorder.requested_size not in (
+                    None, (self.project.output.canvas_w,
+                           self.project.output.canvas_h))):
+            # The Output tab changed the canvas while recording.  One MP4 has
+            # one picture size, so the rebuilt canvas records to a new file;
+            # feeding it into the old one dropped every frame.
+            self._rotate_recording()
         if self.recording and not self._start_recorder():
             self.recording = False
             self.record_button.setText("Record")
@@ -5241,8 +5313,11 @@ class AnyCamWindow(QMainWindow):
                 vcam=self.vcam_on and vcam_output is not None,
                 vcam_output=vcam_output,
                 preview=True,
+                # A recording that has an audio track keeps it fed (silence if
+                # the microphone is off) so its muxer never waits on a dead pad.
                 audio=(self.audio_on or bool(self.project.audio.media_file)
-                       or bool(self.project.audio.desktop_device)),
+                       or bool(self.project.audio.desktop_device)
+                       or (recorder is not None and recorder.has_audio)),
                 # Only an explicit Go Live publishes; a saved URL is inert.
                 rtmp=self.project.output.rtmp_url if self.live else None,
                 screen_fds=self._screen_fds(),
@@ -5404,6 +5479,14 @@ class AnyCamWindow(QMainWindow):
             if not self._start_recorder():
                 self.recording = False
                 self.record_button.setText("Record")
+                return
+            tap_codec = self.engine.record_codec()
+            if tap_codec is not None and tap_codec != self._recorder.codec:
+                # The encoder in the running canvas was chosen before the
+                # encoder setting changed; only a rebuild can switch codec.
+                self.restart_engine()
+                if self.engine is not None:
+                    self._status(f"Recording to {self._recording_path}")
                 return
             if not self.engine.attach_recorder(self._recorder):
                 self.recording = False

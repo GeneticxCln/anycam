@@ -13,7 +13,7 @@ from pathlib import Path
 
 APP_NAME = "AnyCam"
 APP_ID = "anycam"
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 CANVAS_W = 1920
 CANVAS_H = 1080
@@ -478,6 +478,34 @@ def refresh_vcam_udev(device: str | None = None, *, prompt: bool = True) -> str:
             f"Chromium may not list it. Run: {manual}")
 
 
+def other_virtual_cameras(device: str | None = None,
+                          sysfs: str = "/sys/class/video4linux") -> list[str]:
+    """Virtual camera nodes other than ``device`` (OBS's, another loopback).
+
+    ``modprobe -r v4l2loopback`` removes every device the module created, so
+    reloading it for AnyCam's node would also pull the camera out from under
+    another application.  Virtual nodes live under ``devices/virtual``.
+    """
+    own = Path(device or loopback_device()).name
+    found: list[str] = []
+    try:
+        entries = sorted(Path(sysfs).glob("video*"))
+    except OSError:
+        return found
+    for entry in entries:
+        if entry.name == own:
+            continue
+        try:
+            real = str(entry.resolve())
+            name = (entry / "name").read_text(errors="replace").strip()
+        except OSError:
+            continue
+        if "/devices/virtual/video4linux/" in real:
+            found.append(f"/dev/{entry.name} ({name})" if name
+                         else f"/dev/{entry.name}")
+    return found
+
+
 def reload_vcam_module(device: str | None = None, *,
                        prompt: bool = True) -> str:
     """Reload v4l2loopback with ``exclusive_caps=1`` (Chromium needs it).
@@ -495,6 +523,11 @@ def reload_vcam_module(device: str | None = None, *,
     load = (f"modprobe v4l2loopback video_nr={number} card_label=AnyCam "
             f"exclusive_caps=1")
     manual = f"sudo modprobe -r v4l2loopback && sudo {load}"
+    others = other_virtual_cameras(dev)
+    if others:
+        return ("reloading v4l2loopback would also remove "
+                + ", ".join(others)
+                + "; close the apps using them and reload manually: " + manual)
     if shutil.which("modprobe") is None:
         return f"modprobe is missing; run: {manual}"
     if not prompt or shutil.which("pkexec") is None:

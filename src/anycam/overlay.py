@@ -733,6 +733,12 @@ def render_layer(layer, canvas_w: int, canvas_h: int,
         if not source.exists():
             raise FileNotFoundError(f"overlay asset not found: {source}")
         source_crop = getattr(layer, "crop", (0.0, 0.0, 0.0, 0.0)) if crop is None else crop
+        if getattr(getattr(layer, "effects", None), "mirror", False):
+            # The picture is cropped here but mirrored later in the chain, so
+            # the crop the user drew on the mirrored preview is the opposite
+            # edge of the source (every other layer kind mirrors first).
+            left, top, right, bottom = source_crop
+            source_crop = (right, top, left, bottom)
         return prepare_rgba(source, w, h, source_crop)
     raise ValueError(f"layer {layer.kind} is not an overlay")
 

@@ -18,7 +18,7 @@ from __future__ import annotations
 import itertools
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import gi
 
@@ -48,6 +48,11 @@ CAPTURE_KINDS = ("camera", "test", "video", "network", "screen")
 # released screen capture alive for a moment so the rebuild reuses the running
 # source (and the frame it already has).
 SCREEN_IDLE_GRACE_S = 5.0
+# A removed camera/video/network layer keeps its capture for a while so a quick
+# undo or re-add is a relink.  After this the device is given back; holding a
+# webcam open (LED on, busy for other apps) for the whole session was a leak.
+# Portal screen captures are exempt: a new one means a new picker prompt.
+RETAIN_GRACE_S = 30.0
 
 
 @dataclass(frozen=True)
@@ -87,6 +92,20 @@ class Entry:
     # device/stream must stay open so re-adding the source is a relink, not a
     # new capture (on Wayland a new pipewiresrc means a new portal prompt).
     retained: bool = False
+    # When the last reference was released while retained (expiry clock).
+    retained_since: float = 0.0
+    # Pad probes on this pipeline; their closures hold the entry, so they are
+    # removed at teardown or the dead pipeline is never freed.
+    probes: list = field(default_factory=list)
+
+    def teardown(self) -> None:
+        self.pipeline.set_state(Gst.State.NULL)
+        for pad, probe in self.probes:
+            try:
+                pad.remove_probe(probe)
+            except Exception:  # noqa: BLE001
+                pass
+        self.probes.clear()
 
     def as_dict(self) -> dict:
         return {
@@ -195,6 +214,20 @@ class SourcePool:
         self.log_event = None
 
     # ------------------------------------------------------------------ public
+    def _resolve(self, spec: CaptureSpec) -> CaptureSpec:
+        """The spec whose entry serves ``spec``.
+
+        A camera device can only be opened once.  Two layers on the same node
+        with different requested modes (per-layer size or rate) therefore share
+        the first capture; opening a second pipeline on the busy device failed.
+        """
+        if spec.kind != "camera" or spec in self._entries:
+            return spec
+        for other in self._entries:
+            if other.kind == "camera" and other.source == spec.source:
+                return other
+        return spec
+
     def _note(self, message: str) -> None:
         callback = self.log_event
         if callback is None:
@@ -206,6 +239,7 @@ class SourcePool:
 
     def acquire(self, spec: CaptureSpec) -> Entry:
         self.sweep()
+        spec = self._resolve(spec)
         entry = self._entries.get(spec)
         if entry is None:
             entry = self._build(spec)
@@ -229,14 +263,16 @@ class SourcePool:
         stream must stay alive so adding the source back only relinks it.
         ``stop()`` still releases every retained capture at app exit.
         """
-        entry = self._entries.get(spec)
+        entry = self._entries.get(self._resolve(spec))
         if entry is None:
             return
         entry.retained = True
         entry.idle_since = 0.0
+        entry.retained_since = time.monotonic()
         self._note(f"capture retained for re-add ({entry.channel})")
 
     def release(self, spec: CaptureSpec) -> None:
+        spec = self._resolve(spec)
         entry = self._entries.get(spec)
         if entry is None or entry.refs <= 0:
             # An unmatched release must not drive the count negative: the next
@@ -247,8 +283,9 @@ class SourcePool:
             return
         if entry.retained:
             # The layer was removed, not hidden.  Keep the pipeline PLAYING
-            # (and the device/portal stream open) until the app exits.
+            # (and the device/portal stream open) for the re-add window.
             entry.idle_since = 0.0
+            entry.retained_since = time.monotonic()
             return
         if entry.spec.kind == "screen":
             entry.idle_since = time.monotonic()
@@ -256,7 +293,7 @@ class SourcePool:
                 f"screen capture kept alive for the next rebuild "
                 f"(node {entry.spec.source})")
             return
-        entry.pipeline.set_state(Gst.State.NULL)
+        entry.teardown()
         del self._entries[spec]
 
     def discard(self, spec: CaptureSpec) -> None:
@@ -266,10 +303,11 @@ class SourcePool:
         capture around for a layer that no longer exists.  A capture shared
         with another layer stays alive for its remaining references.
         """
+        spec = self._resolve(spec)
         entry = self._entries.get(spec)
         if entry is None or entry.refs > 0 or entry.retained:
             return
-        entry.pipeline.set_state(Gst.State.NULL)
+        entry.teardown()
         del self._entries[spec]
         self._note(f"capture released on removal ({entry.channel})")
 
@@ -277,11 +315,22 @@ class SourcePool:
         """Tear down screen captures whose rebuild grace has expired."""
         now = time.monotonic()
         for spec, entry in list(self._entries.items()):
-            if entry.retained or entry.refs > 0 or not entry.idle_since:
+            if entry.refs > 0:
+                continue
+            if entry.retained:
+                if (entry.spec.kind == "screen" or not entry.retained_since
+                        or now - entry.retained_since < RETAIN_GRACE_S):
+                    continue
+                entry.teardown()
+                del self._entries[spec]
+                self._note(
+                    f"removed capture released ({entry.channel})")
+                continue
+            if not entry.idle_since:
                 continue
             if now - entry.idle_since < SCREEN_IDLE_GRACE_S:
                 continue
-            entry.pipeline.set_state(Gst.State.NULL)
+            entry.teardown()
             del self._entries[spec]
             self._note(
                 f"idle screen capture released (node {entry.spec.source})")
@@ -294,7 +343,7 @@ class SourcePool:
         computed from it, and the canvas-sized request is only right when the
         camera happens to deliver exactly that mode.
         """
-        entry = self._entries.get(spec)
+        entry = self._entries.get(self._resolve(spec))
         if entry is not None:
             return entry.source_size
         fallback = spec.expected or (max(2, spec.width), max(2, spec.height))
@@ -316,10 +365,14 @@ class SourcePool:
 
     def channel_for(self, spec: CaptureSpec) -> str:
         """Stable channel for a spec, even while its capture is released."""
-        channel = self._channels.get(spec)
+        # Every camera spec on one device shares a channel, so a layer built
+        # before another layer's capture existed still finds the shared feed.
+        key = (CaptureSpec("camera", spec.source) if spec.kind == "camera"
+               else spec)
+        channel = self._channels.get(key)
         if channel is None:
             channel = f"anycam-src-{next(self._counter)}"
-            self._channels[spec] = channel
+            self._channels[key] = channel
         return channel
 
     def start(self) -> None:
@@ -330,11 +383,11 @@ class SourcePool:
     def stop(self) -> None:
         self._started = False
         for entry in list(self._entries.values()):
-            entry.pipeline.set_state(Gst.State.NULL)
+            entry.teardown()
         self._entries.clear()
 
     def entry(self, spec: CaptureSpec) -> Entry | None:
-        return self._entries.get(spec)
+        return self._entries.get(self._resolve(spec))
 
     def entries(self) -> list[Entry]:
         return list(self._entries.values())
@@ -409,7 +462,8 @@ class SourcePool:
                 entry.last_frame = time.monotonic()
                 return Gst.PadProbeReturn.OK
 
-            sink_pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
+            entry.probes.append(
+                (sink_pad, sink_pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)))
         if built.check is not None and built.check_size is not None:
             self._watch_size(built.check, built.check_size, entry)
         if self._started:
@@ -417,7 +471,7 @@ class SourcePool:
         return entry
 
     def _watch_size(self, element: Gst.Element, expected: tuple[int, int],
-                    entry: Entry) -> None:
+                    entry: Entry) -> None:  # probe is tracked on the entry
         pad = element.get_static_pad("src")
         if pad is None:
             return
@@ -443,7 +497,7 @@ class SourcePool:
                 )
             return Gst.PadProbeReturn.OK
 
-        pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
+        entry.probes.append((pad, pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)))
 
     def _elements(self, spec: CaptureSpec) -> _Built:
         if spec.kind == "camera":

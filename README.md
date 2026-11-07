@@ -47,7 +47,7 @@ sudo pacman -S --needed python pyside6 python-gobject gst-plugins-{base,good,bad
 ## Install and run
 
 ```bash
-pip install anycam-1.0.1.tar.gz     # from the GitHub release, or from a checkout:
+pip install anycam-1.0.2.tar.gz     # from the GitHub release, or from a checkout:
 ./scripts/setup.sh                  # creates .venv with system site-packages
 ./scripts/anycam-gui                # the studio (or: python -m anycam gui)
 ./scripts/install-desktop.sh        # optional: add it to the app menu
@@ -78,7 +78,7 @@ Keys: `Ctrl+P` preview, `Ctrl+R` record, `Ctrl+Shift+V` virtual camera, `F5` sna
 
 ## Releases
 
-**v1.0.1** is the current release (v1.0.0 was the first); **Settings → About** shows the version and what
+**v1.0.2** is the current release (v1.0.1 and v1.0.0 came before); **Settings → About** shows the version and what
 it runs on. Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`: it builds the
 tarball and wheel, checks the bundled assets, smoke-tests a clean install and publishes a
 GitHub Release with `SHA256SUMS`. To release, bump `version` in `pyproject.toml` and

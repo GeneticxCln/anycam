@@ -148,8 +148,61 @@ def encoder_plan(preference: str, *, purpose: str = "record") -> EncoderPlan:
 
 
 def recording_codec(preference: str) -> str:
-    """Codec a new persistent recorder must parse for this preference."""
-    return encoder_plan(preference).codec
+    """Codec a new persistent recorder must parse for this preference.
+
+    ``ANYCAM_ENCODER`` overrides the saved setting in the engine, so it has to
+    here too, or the recorder and the encoder disagree about the codec.
+    """
+    return encoder_plan(
+        os.environ.get("ANYCAM_ENCODER", "").strip().lower() or preference
+    ).codec
+
+
+class EncodedFeed:
+    """Push encoded samples into an ``appsrc`` without leaking a delta frame.
+
+    A leaky queue drops whichever frame is oldest, which for H.264 leaves the
+    next frames referring to a picture the decoder never saw.  When the queue is
+    full this drops on a keyframe boundary instead (skipping to the next
+    keyframe) and asks the encoder for one.
+    """
+
+    def __init__(self, appsrc, request_keyframe=None) -> None:
+        self.appsrc = appsrc
+        self.request_keyframe = request_keyframe
+        self.skipping = False
+
+    def push(self, sample) -> None:
+        buf = sample.get_buffer()
+        is_key = buf is None or not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
+        if self.skipping:
+            if not is_key:
+                return
+            self.skipping = False
+        try:
+            level = int(self.appsrc.get_property("current-level-buffers"))
+            limit = int(self.appsrc.get_property("max-buffers"))
+        except (AttributeError, TypeError, ValueError):
+            level, limit = 0, 0
+        if limit and level >= limit:
+            self.skipping = True
+            if self.request_keyframe is not None:
+                try:
+                    self.request_keyframe()
+                except Exception:  # noqa: BLE001 - best effort
+                    pass
+            return
+        self.appsrc.emit("push-sample", sample)
+
+
+def force_keyframe(encoder) -> bool:
+    """Ask ``encoder`` for a keyframe (with fresh headers)."""
+    pad = encoder.get_static_pad("src") if encoder is not None else None
+    if pad is None:
+        return False
+    event = GstVideo.video_event_new_upstream_force_key_unit(
+        Gst.CLOCK_TIME_NONE, True, 0)
+    return bool(pad.send_event(event))
 
 
 @dataclass
@@ -352,6 +405,14 @@ class AnyCamEngine:
         self._rtmp_appsrc: Gst.Element | None = None
         self._rtmp_audio_appsrc: Gst.Element | None = None
         self._rtmp_failed = False
+        self._rtmp_encoder: Gst.Element | None = None
+        self._rtmp_feed: EncodedFeed | None = None
+        self._stopped = False
+        # Every signal handler and pad probe this engine installs.  They point
+        # back at the engine, so until they are removed neither the engine nor
+        # its pipeline can be freed: each rebuild leaked a whole graph.
+        self._signal_handlers: list[tuple[object, int]] = []
+        self._pad_probes: list[tuple[Gst.Pad, int]] = []
         # Source size per layer, for the crop editor's picture rectangle.
         self.layer_sources: dict[str, tuple[int, int]] = {}
         self._record_sink = None
@@ -416,17 +477,62 @@ class AnyCamEngine:
                        for layer in self.scene.layers)
         label.set_property("silent", occupied)
 
-    def _add(self, *elements: Gst.Element) -> None:
+    def _on(self, obj, signal: str, callback, *args) -> int:
+        """``obj.connect`` that is undone when the engine stops."""
+        handler = obj.connect(signal, callback, *args)
+        self._signal_handlers.append((obj, handler))
+        return handler
+
+    def _probe(self, pad: Gst.Pad, mask, callback) -> int:
+        """``pad.add_probe`` that is undone when the engine stops."""
+        probe = pad.add_probe(mask, callback)
+        if probe:
+            self._pad_probes.append((pad, probe))
+        return probe
+
+    def _release_graph(self) -> None:
+        """Drop every hook that keeps this engine and its pipeline alive."""
+        for obj, handler in self._signal_handlers:
+            try:
+                obj.disconnect(handler)
+            except Exception:  # noqa: BLE001 - the object may already be gone
+                pass
+        self._signal_handlers.clear()
+        for pad, probe in self._pad_probes:
+            try:
+                pad.remove_probe(probe)
+            except Exception:  # noqa: BLE001
+                pass
+        self._pad_probes.clear()
+
+    def _add(self, *elements: Gst.Element, sync: bool = True) -> None:
         assert self.pipeline is not None
         for element in elements:
             if not self.pipeline.add(element):
                 raise RuntimeError(
                     f"could not add {element.get_name()} to the canvas pipeline"
                 )
-            try:
-                element.sync_state_with_parent()
-            except Exception:  # noqa: BLE001
-                pass
+            if sync:
+                self._sync_state(element)
+
+    @staticmethod
+    def _sync_state(element: Gst.Element) -> None:
+        try:
+            element.sync_state_with_parent()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _sync_chain(self, chain: SourceChain) -> None:
+        """Start a chain that was added to the pipeline without running.
+
+        On a running canvas an element that starts before it is linked pushes
+        into nothing and posts ``not-linked``, which the GUI treats as a fatal
+        pipeline error (a camera re-attached beside a screen share then looped
+        through rebuilds).  So a live-added chain is linked first and started
+        last, downstream elements before the ones that feed them.
+        """
+        for element in reversed(chain.elements):
+            self._sync_state(element)
 
     def _link(self, elements: list[Gst.Element], skip_from=None) -> None:
         for a, b in zip(elements, elements[1:]):
@@ -455,7 +561,7 @@ class AnyCamEngine:
                 return
             pad.link(sink)
 
-        decode.connect("pad-added", on_pad_added, target)
+        self._on(decode, "pad-added", on_pad_added, target)
 
     def _add_layer(self, layer: Layer, zorder: int) -> None:
         """Build one layer into the canvas; leave no pool reference on failure."""
@@ -602,7 +708,7 @@ class AnyCamEngine:
         self.layer_sources[layer.id] = (tuple(source_size) if source_size
                                         else (box[2], box[3]))
         self.chains.append(chain)
-        self._add(*chain.elements)
+        self._add(*chain.elements, sync=False)
         self._link(chain.elements, skip_from=getattr(chain, "dynamic_from", None))
         self._link_dynamic(chain)
 
@@ -629,9 +735,10 @@ class AnyCamEngine:
                     # Put each arrival on the canvas timeline, before any
                     # queue/GL processing. Preserve the original identity
                     # above so retiming a cached frame cannot fake freshness.
-                    clock = self.pipeline.get_clock()
+                    pipeline = self.pipeline   # None once the engine stopped
+                    clock = pipeline.get_clock() if pipeline is not None else None
                     if clock is not None:
-                        buffer.pts = max(0, clock.get_time() - self.pipeline.get_base_time())
+                        buffer.pts = max(0, clock.get_time() - pipeline.get_base_time())
                         buffer.dts = Gst.CLOCK_TIME_NONE
                     if identity is not None:
                         if identity == screen_identity[0]:
@@ -645,7 +752,7 @@ class AnyCamEngine:
         # that may repeat cached frames at the canvas rate.
         health_pad = (chain.check_element.get_static_pad("src")
                       if layer.kind == "screen" else chain.output_pad)
-        health_pad.add_probe(Gst.PadProbeType.BUFFER, on_source_buffer)
+        self._probe(health_pad, Gst.PadProbeType.BUFFER, on_source_buffer)
         pad = self.compositor.request_pad_simple("sink_%u")
         if pad is None:
             raise RuntimeError("compositor refused a request pad")
@@ -668,7 +775,9 @@ class AnyCamEngine:
             self._pads_with_data.add(layer_id)
             return Gst.PadProbeReturn.OK
 
-        pad.add_probe(Gst.PadProbeType.BUFFER, on_first_buffer)
+        self._probe(pad, Gst.PadProbeType.BUFFER, on_first_buffer)
+        # Linked all the way into the compositor: now it may start.
+        self._sync_chain(chain)
 
     def _record_camera_mode(self, layer_id: str, entry) -> None:
         """Keep one negotiated mode per camera layer, not just the last one."""
@@ -715,7 +824,7 @@ class AnyCamEngine:
                 )
             return Gst.PadProbeReturn.OK
 
-        pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
+        self._probe(pad, Gst.PadProbeType.BUFFER, on_buffer)
 
     def _box_pixels(self, layer: Layer) -> tuple[int, int, int, int]:
         rect = box_pixels(layer, self.canvas_w, self.canvas_h)
@@ -755,6 +864,7 @@ class AnyCamEngine:
         if self._owns_pool:
             self.pool.stop()
         self._close_screen_fds()
+        self._release_graph()
         self.pipeline = None
 
     def _close_screen_fds(self) -> None:
@@ -794,8 +904,12 @@ class AnyCamEngine:
         # ``skip-to-first`` stops it emitting black buffers before the first
         # composited frame has arrived, which otherwise flash on the preview.
         rate = make("videorate", "canvas_rate", skip_to_first=True)
+        # The colour description is pinned.  Left open, it was renegotiated when
+        # a camera joined a running canvas, the encoder then emitted new SPS
+        # headers mid-stream, and the recorder's MP4 came out unreadable.
         canvas_caps = caps_filter(
-            caps_string(self.canvas_w, self.canvas_h, self.fps), "canvas_caps")
+            caps_string(self.canvas_w, self.canvas_h, self.fps) + ",colorimetry=sRGB",
+            "canvas_caps")
         self._add(self.compositor, rate, canvas_caps, self.tee)
         self._link([self.compositor, rate, canvas_caps, self.tee])
         # The compositor must never reach zero pads.  This one is live for the
@@ -830,6 +944,7 @@ class AnyCamEngine:
         if self.want_vcam:
             self._build_vcam()
         if self.recorder is not None:
+            self._bind_recorder()
             self._build_recorder_tap()
         elif self.record_path:
             self._build_recording()
@@ -855,9 +970,9 @@ class AnyCamEngine:
             )
 
         self.bus = self.pipeline.get_bus()
-        self._probe_id = self.compositor.get_static_pad("src").add_probe(
-            Gst.PadProbeType.BUFFER, self._on_compositor_buffer
-        )
+        self._probe_id = self._probe(
+            self.compositor.get_static_pad("src"), Gst.PadProbeType.BUFFER,
+            self._on_compositor_buffer)
         return self
 
     def _on_compositor_buffer(self, _pad, _info):
@@ -918,7 +1033,7 @@ class AnyCamEngine:
         # The streaming thread only stores the newest sample.  Delivery to
         # ``on_frame`` happens from pump() on the caller's thread, which keeps
         # Qt calls on the main thread and works for the headless demo too.
-        sink.connect("new-sample", self._on_preview_sample)
+        self._on(sink, "new-sample", self._on_preview_sample)
         self._appsink = sink
         self._pending_sample = None
 
@@ -1085,7 +1200,7 @@ class AnyCamEngine:
                     pad.link(sink)
                     self._audio_eos_pads.append(pad)
 
-            decode.connect("pad-added", on_pad, conv)
+            self._on(decode, "pad-added", on_pad, conv)
 
         # Give the shared mixer a consumer even in preview-only mode, so its
         # src pad is never unlinked and the audio tee can be tapped later by
@@ -1141,7 +1256,7 @@ class AnyCamEngine:
                            max_buffers=2, drop=True, sync=False)
             self._add(valve, scale, rate, caps, appsink)
             self._link([queue, valve, scale, rate, caps, appsink])
-            appsink.connect("new-sample", self._on_vcam_sample)
+            self._on(appsink, "new-sample", self._on_vcam_sample)
             self._notify_canvas_attached(True)
             self.report.vcam_active = True
             return
@@ -1149,7 +1264,8 @@ class AnyCamEngine:
         if not config.vcam_available(device):
             self.report.vcam_error = (
                 f"virtual camera {device} is not available; load v4l2loopback with "
-                f"'sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam'"
+                "'sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam "
+                "exclusive_caps=1'"
             )
             return
         fmt = config.vcam_pixel_format(device)
@@ -1165,7 +1281,7 @@ class AnyCamEngine:
                        max_buffers=2, drop=True, sync=False)
         self._add(valve, convert, caps, appsink)
         self._link([queue, valve, convert, caps, appsink])
-        appsink.connect("new-sample", self._on_vcam_sample)
+        self._on(appsink, "new-sample", self._on_vcam_sample)
 
         vcam = Gst.Pipeline.new("anycam-vcam")
         appsrc = make("appsrc", "vcam_appsrc",
@@ -1310,7 +1426,8 @@ class AnyCamEngine:
                 return [make("cudaupload", f"{prefix}_cuda_upload")]
             return []
         return [make("videoconvert", f"{prefix}_convert"),
-                caps_filter("video/x-raw,format=I420", f"{prefix}_raw")]
+                # Fixed colorimetry: constant SPS for the whole recording.
+                caps_filter("video/x-raw,format=I420,colorimetry=bt709", f"{prefix}_raw")]
 
     def _build_recorder_tap(self) -> None:
         """Feed encoded samples to the persistent recorder.
@@ -1333,11 +1450,13 @@ class AnyCamEngine:
         plan = self._record_plan or encoder_plan(self._encoder_preference())
         pixel_path = self._encoder_input(hardware, "record")
         parse = self._make_parser(plan, "record_parse_tap")
+        # Encoded frames are never dropped here (the leaky queue in front of
+        # the encoder is where this graph sheds load).
         sink = make("appsink", "record_tap_sink", emit_signals=True,
-                    max_buffers=4, drop=True, sync=False)
+                    max_buffers=16, drop=False, sync=False)
         self._add(valve, *pixel_path, enc, parse, sink)
         self._link([queue, valve, *pixel_path, enc, parse, sink])
-        sink.connect("new-sample", self._on_record_sample)
+        self._on(sink, "new-sample", self._on_record_sample)
 
         tee = self._audio_tee()
         if tee is not None:
@@ -1359,12 +1478,13 @@ class AnyCamEngine:
                 pass
             audio_queue.set_state(Gst.State.PLAYING)
             audio_sink.set_state(Gst.State.PLAYING)
-            audio_sink.connect("new-sample", self._on_record_audio_sample)
+            self._on(audio_sink, "new-sample", self._on_record_audio_sample)
 
     def attach_recorder(self, recorder: Recorder) -> bool:
         """Start feeding the existing canvas into ``recorder`` without a rebuild."""
         self.recorder = recorder
         self.record_path = str(recorder.path)
+        self._bind_recorder()
         if self._recorder_valve is None:
             self._build_recorder_tap()
         else:
@@ -1380,19 +1500,39 @@ class AnyCamEngine:
 
     def _request_record_keyframe(self) -> bool:
         """Ask the recording encoder for a keyframe (with fresh headers)."""
-        encoder = self._record_encoder
-        pad = encoder.get_static_pad("src") if encoder is not None else None
-        if pad is None:
-            return False
-        event = GstVideo.video_event_new_upstream_force_key_unit(
-            Gst.CLOCK_TIME_NONE, True, 0)
-        return bool(pad.send_event(event))
+        return force_keyframe(self._record_encoder)
+
+    def _bind_recorder(self) -> None:
+        """Tell the recorder this canvas is about to feed it.
+
+        A new canvas restarts its timestamps, and the recorder needs to know
+        so video and audio continue from the same point of the file.
+        """
+        recorder = self.recorder
+        if recorder is None:
+            return
+        try:
+            recorder.request_keyframe = self._request_record_keyframe
+        except AttributeError:
+            pass
+        begin = getattr(recorder, "begin_epoch", None)
+        if begin is not None:
+            begin()
+
+    def record_codec(self) -> str | None:
+        """Codec of the recording tap this canvas was built with, if any."""
+        if self._recorder_valve is None or self._record_plan is None:
+            return None
+        return self._record_plan.codec
 
     def detach_recorder(self) -> None:
         """Stop feeding encoded samples to the recorder, leaving the file open."""
         if self._recorder_valve is not None:
             self._recorder_valve.set_property("drop", True)
         self.recorder = None
+        # The file now belongs to whoever owns the recorder.  A stale path made
+        # stop() report it as this engine's own (unfinalised) recording.
+        self.record_path = ""
 
     def _on_record_sample(self, sink):
         sample = sink.emit("pull-sample")
@@ -1492,10 +1632,10 @@ class AnyCamEngine:
         h264 = caps_filter("video/x-h264,stream-format=avc,alignment=au",
                            "rtmp_h264")
         video_sink = make("appsink", "rtmp_video_sink", emit_signals=True,
-                          max_buffers=1, drop=True, sync=False)
+                          max_buffers=8, drop=False, sync=False)
         self._add(*pixel_path, enc, parse, h264, video_sink)
         self._link([queue, *pixel_path, enc, parse, h264, video_sink])
-        video_sink.connect("new-sample", self._on_rtmp_video_sample)
+        self._on(video_sink, "new-sample", self._on_rtmp_video_sample)
         self.report.rtmp_encoder = plan.factory
         self.report.rtmp_encoder_note = plan.note
 
@@ -1514,16 +1654,15 @@ class AnyCamEngine:
             tpad = tee.request_pad_simple("src_%u")
             if tpad is None or tpad.link(audio_queue.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
                 raise RuntimeError("could not tap shared audio for RTMP")
-            audio_sink.connect("new-sample", self._on_rtmp_audio_sample)
+            self._on(audio_sink, "new-sample", self._on_rtmp_audio_sample)
 
         output = Gst.Pipeline.new("anycam-rtmp")
         video_src = make("appsrc", "rtmp_video_src", format=Gst.Format.TIME,
                          is_live=True)
         video_src.set_property(
             "caps", Gst.Caps.from_string("video/x-h264,stream-format=avc,alignment=au"))
-        video_src.set_property("max-buffers", 2)
+        video_src.set_property("max-buffers", 8)
         video_src.set_property("block", False)
-        self._set_leaky(video_src)
         mux = make("flvmux", "rtmp_mux", streamable=True)
         sink = make(sink_factory, "rtmp_sink", location=url, sync=False)
         output.add(video_src)
@@ -1549,12 +1688,15 @@ class AnyCamEngine:
         self._rtmp_pipeline = output
         self._rtmp_bus = output.get_bus()
         self._rtmp_appsrc = video_src
+        self._rtmp_encoder = enc
+        self._rtmp_feed = EncodedFeed(video_src, lambda: force_keyframe(enc))
         self.report.rtmp_url = url
 
     def _on_rtmp_video_sample(self, sink):
         sample = sink.emit("pull-sample")
-        if sample is not None and self._rtmp_appsrc is not None and not self._rtmp_failed:
-            self._rtmp_appsrc.emit("push-sample", sample)
+        feed = self._rtmp_feed
+        if sample is not None and feed is not None and not self._rtmp_failed:
+            feed.push(sample)
         return Gst.FlowReturn.OK
 
     def _on_rtmp_audio_sample(self, sink):
@@ -1589,6 +1731,8 @@ class AnyCamEngine:
         self._rtmp_bus = None
         self._rtmp_appsrc = None
         self._rtmp_audio_appsrc = None
+        self._rtmp_feed = None
+        self._rtmp_encoder = None
 
         def shutdown() -> None:
             try:
@@ -1641,34 +1785,49 @@ class AnyCamEngine:
         """Source size per layer id (crop editor picture geometry)."""
         return dict(self.layer_sources)
 
-    def set_layer_visible(self, layer_id: str, visible: bool) -> None:
-        """Show/hide an already-built layer without rebuilding the graph."""
+    def set_layer_visible(self, layer_id: str, visible: bool) -> bool:
+        """Show/hide an already-built layer without rebuilding the graph.
+
+        Returns False when the layer could not be shown (its device could not
+        be opened).  The source is acquired *before* the layer is made visible,
+        so a failure leaves it cleanly hidden instead of visible with no feed.
+        """
         layer = next((l for l in self.scene.layers if l.id == layer_id), None)
         pad = self._layer_pads.get(layer_id)
         if layer is None or pad is None:
-            return
-        layer.visible = bool(visible)
+            return False
+        visible = bool(visible)
+        spec = self._layer_specs.get(layer_id)
+        if spec is not None and visible and layer_id not in self._layer_acquired:
+            try:
+                entry = self.pool.acquire(spec)
+            except Exception as exc:  # noqa: BLE001 - keep the canvas running
+                layer.visible = False
+                pad.set_property("alpha", 0.0)
+                self.report.media_errors.append(
+                    f"{layer.name}: could not open source ({exc})")
+                print(f"[capture] could not show layer={layer_id}: {exc}",
+                      file=sys.stderr, flush=True)
+                return False
+            self._record_camera_mode(layer_id, entry)
+            self._specs.append(spec)
+            self._layer_acquired.add(layer_id)
+            self.layer_sources[layer_id] = entry.source_size
+        layer.visible = visible
         pad.set_property("alpha", float(clamp(layer.alpha)) if visible else 0.0)
         control = getattr(self._layer_chains.get(layer_id), "control", None)
         if visible and control is not None and hasattr(control, "restart"):
             control.restart()   # a lower third slides in again each time it is shown
-        spec = self._layer_specs.get(layer_id)
-        if spec is not None:
-            if visible and layer_id not in self._layer_acquired:
-                entry = self.pool.acquire(spec)
-                self._record_camera_mode(layer_id, entry)
-                self._specs.append(spec)
-                self._layer_acquired.add(layer_id)
-                self.layer_sources[layer_id] = entry.source_size
-            elif not visible and layer_id in self._layer_acquired:
-                self.pool.release(spec)
-                if spec in self._specs:
-                    self._specs.remove(spec)
-                self._layer_acquired.discard(layer_id)
+        if spec is not None and not visible and layer_id in self._layer_acquired:
+            self.pool.release(spec)
+            if spec in self._specs:
+                self._specs.remove(spec)
+            self._layer_acquired.discard(layer_id)
         # The permanent standby keeps the canvas alive when every scene layer
         # is hidden, so the vcam must never be left frozen on an old frame.
         self._sync_standby_label()
         self.resume_vcam()
+        return True
 
     def resume_vcam(self) -> None:
         """Resume the canvas feed after a source becomes visible again."""
@@ -1872,7 +2031,7 @@ class AnyCamEngine:
         reattached to its still-PLAYING pipewiresrc and compositor pad, so no
         portal picker appears and the virtual camera never stops.
         """
-        if self.pipeline is None or self.compositor is None:
+        if self.pipeline is None or self.compositor is None or self._stopped:
             return False
         if layer.kind == "screen":
             detached = self._detached_screens.get(str(layer.source), [])
@@ -1914,7 +2073,7 @@ class AnyCamEngine:
                         self._layer_last[layer_id] = time.monotonic()
                         return Gst.PadProbeReturn.OK
 
-                    health_pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
+                    self._probe(health_pad, Gst.PadProbeType.BUFFER, on_buffer)
                 print(
                     f"[screen-session] reattached layer={layer.id} "
                     f"node={layer.source} without a portal request",
@@ -2007,6 +2166,9 @@ class AnyCamEngine:
 
     # ------------------------------------------------------------------- run
     def start(self) -> "AnyCamEngine":
+        if self._stopped:
+            raise RuntimeError(
+                "this engine was stopped; create a new AnyCamEngine")
         if self.pipeline is None:
             self.build()
         assert self.pipeline is not None
@@ -2226,6 +2388,12 @@ class AnyCamEngine:
         # streaming thread, and EOS never crosses the inter channel from the
         # capture pipeline.  One event on the compositor's src pad reaches
         # every branch and finalises mp4mux/flvmux.
+        # A closed valve drops events too, EOS included, so a detached recorder
+        # or vcam tap made the wait below run to its full timeout on every
+        # later rebuild.  Nothing consumes those taps any more; let EOS through.
+        for valve in (self._recorder_valve, self._vcam_valve):
+            if valve is not None:
+                valve.set_property("drop", False)
         output_pad = self.compositor.get_static_pad("src") if self.compositor else None
         if output_pad is not None:
             try:
@@ -2263,6 +2431,9 @@ class AnyCamEngine:
             self._vcam_pipeline.set_state(Gst.State.NULL)
             self._vcam_bus = None
         self._teardown_rtmp()
+        # The graph is gone: a late add_layer()/start() must see that.
+        self._stopped = True
+        self._release_graph()
         self.report.frames = stop_frames
         self.report.fps = stop_frames / elapsed if elapsed > 0 else 0.0
         self.report.expected_frames = elapsed * self.fps

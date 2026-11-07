@@ -1702,3 +1702,154 @@ def test_unsaved_layers_are_saved_on_close(app, tmp_path, monkeypatch):
     loaded = Project.load(config.project_path())
     assert any(item.id == layer.id and item.kind == "network"
                for item in loaded.scene.layers)
+
+
+# ----------------------------------------------- 2026-11-07 audit: window fixes
+def test_changing_the_canvas_while_recording_starts_a_new_file(app, tmp_path):
+    """One MP4 has one picture size; the old file silently rejected every frame."""
+    window = _window()
+    window.project.output.record_dir = str(tmp_path)
+    try:
+        window.toggle_record()
+        assert window.recording and window._recorder is not None
+        first = window._recorder
+        assert first.requested_size == (320, 180)
+        window.width_spin.setValue(640)
+        window.height_spin.setValue(360)
+        window.start_engine()
+        assert window.engine is not None, window.statusBar().currentMessage()
+        assert window._recorder is not first, "the recorder kept the old size"
+        assert window._recorder.requested_size == (640, 360)
+        assert window._segment_index == 1
+        assert Path(first.path) in tmp_path.iterdir() or Path(first.path).exists()
+    finally:
+        window.recording = False
+        window.stop_engine()
+        window._finish_recorder()
+        window.close()
+
+
+def test_the_output_tab_accepts_the_rates_and_sizes_the_project_can_hold(app):
+    window = _window()
+    try:
+        assert window.fps_spin.maximum() >= 120
+        assert window.width_spin.maximum() >= 4096
+    finally:
+        window.close()
+
+
+def test_scene_shortcut_runs_the_same_bookkeeping_as_the_scene_picker(app):
+    window = _window()
+    try:
+        window.add_scene()
+        assert window.project.active_scene == window.project.scenes[1].id
+        synced = []
+        original = window._sync_layout_combo
+        window._sync_layout_combo = lambda: (synced.append(True), original())[1]
+        window.switch_scene(0)
+        assert window.project.active_scene == window.project.scenes[0].id
+        assert synced, "the layout picker was left showing the previous scene"
+    finally:
+        window.close()
+
+
+def test_first_playlist_item_is_not_shown_for_two_intervals(app):
+    window = _window()
+    try:
+        first, second = window.scene.layers[0], Layer(
+            "second", "test", "Second", source="smpte", box=(0, 0, 1, 1), z=2)
+        window.scene.add_layer(second)
+        first.visible, second.visible = True, False
+        window.playlist_ids = [first.id, second.id]
+        window.playlist_index = -1
+        window.start_engine()
+        assert window.engine is not None, window.statusBar().currentMessage()
+        assert window.playlist_index == 0, "item 0 is already on screen"
+        window.playlist_interval.setValue(1.0)
+        window._advance_playlist(window.playlist_last + 1.5)
+        assert window.playlist_index == 1
+    finally:
+        window.stop_engine()
+        window.close()
+
+
+def test_a_codec_change_restarts_the_canvas_instead_of_a_broken_attach(app, tmp_path, monkeypatch):
+    monkeypatch.delenv("ANYCAM_ENCODER", raising=False)
+    window = _window()
+    window.project.output.record_dir = str(tmp_path)
+    try:
+        window.project.output.encoder = "cpu"
+        window.start_engine()
+        first = window.engine
+        assert first is not None
+        # Build the recording tap with H.264, then ask for another codec.
+        window.toggle_record()
+        window.toggle_record()                    # stop; the tap stays in place
+        assert first.record_codec() == "h264"
+        monkeypatch.setattr("anycam.gui.recording_codec", lambda _pref: "h265")
+        window.toggle_record()
+        assert window.engine is not first, "the stale H.264 tap was reused"
+    finally:
+        window.recording = False
+        window.stop_engine()
+        window._finish_recorder()
+        window.close()
+
+
+# --------------------------------------------- 2026-11-07 live-check fixes
+def test_add_layer_puts_an_image_into_the_box_it_was_given(app, tmp_path):
+    """A layout slot's "Add image…" landed in the corner: the box was overwritten."""
+    from PIL import Image
+
+    picture = tmp_path / "pic.png"
+    Image.new("RGB", (64, 64), (200, 0, 0)).save(picture)
+    clip = ROOT / "tests" / "data" / "armstrong.jpg"
+    window = _window()
+    try:
+        image = window.add_layer("image", source=str(picture), box=(0.5, 0.0, 0.5, 1.0))
+        assert tuple(image.box) == (0.5, 0.0, 0.5, 1.0)
+        logo = window.add_layer("logo", source=str(clip))
+        assert tuple(logo.box) == (0.04, 0.04, 0.18, 0.18), "the default spot is unchanged"
+    finally:
+        window.close()
+
+
+def test_the_default_window_offers_backdrops(app):
+    from anycam.gui_many import ManyCamWindow
+    from anycam.model import empty_project
+
+    window = ManyCamWindow(empty_project())
+    try:
+        assert hasattr(window, "inset_on_backdrop"), "the Backdrops tab was never built"
+        window.add_layer("test")
+        window._apply_background("Aurora")
+        assert len(window._active_backdrops()) == 1
+        window._clear_backdrop()
+        assert not window._active_backdrops()
+    finally:
+        window.close()
+
+
+def test_changing_camera_width_height_and_rate_rebuilds_once(app, monkeypatch):
+    from types import SimpleNamespace
+
+    window = _window()
+    try:
+        camera = Layer("cam", "camera", "Cam", source="/dev/video0", box=(0, 0, 1, 1))
+        window.scene.add_layer(camera)
+        window._refresh_layers()
+        window.preview.set_selection([camera.id], camera.id)
+        rebuilds = []
+        window.engine = SimpleNamespace(stop=lambda: {})
+        monkeypatch.setattr(window, "restart_engine", lambda: rebuilds.append(1))
+        window.camera_width.setValue(1280)
+        window.camera_height.setValue(720)
+        window.camera_fps.setValue(30)
+        assert (camera.camera_width, camera.camera_height, camera.camera_fps) == (1280, 720, 30)
+        assert not rebuilds, "nothing reopens the camera per field"
+        _wait_for(app, lambda: bool(rebuilds), 2.0)
+        _pump(app, 0.5)
+        assert len(rebuilds) == 1
+    finally:
+        window.engine = None
+        window.close()

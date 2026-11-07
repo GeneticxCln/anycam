@@ -528,6 +528,11 @@ B19: the README now states that v4l2loopback must use the default
 `exclusive_caps=0`; `exclusive_caps=1` prevents simultaneous producer/consumer
 use. The Chromium/Zoom/Teams matrix remains an M9 hardware task.
 
+Superseded later: Discord and Chromium skip a node that advertises output
+capability, so the README, `scripts/enable-v4l2loopback.sh`, and every setup
+command and message in the app use `exclusive_caps=1`. (Two fallback messages
+still omitted it until the 2026-11-07 audit fixes.)
+
 Verification: `QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -m pytest tests -q`
 → 148 collected, 147 passed, 1 hardware-gated multicam skip.
 
