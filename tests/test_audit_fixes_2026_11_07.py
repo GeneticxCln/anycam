@@ -451,3 +451,30 @@ def test_captured_layers_buffer_behind_intervideosrc():
     names = [element.get_factory().get_name() for element in chain.elements[:3]]
     assert names[:2] == ["intervideosrc", "queue"]
     assert chain.elements[1].get_property("leaky").value_nick == "downstream"
+
+
+def test_a_removed_layer_leaves_the_running_canvas():
+    """Removed layers stayed linked to an invisible pad until the next rebuild:
+    ~23 MB per removed animation, 8 GB over the effect catalogue."""
+    project = make_project(pattern("bg", "smpte"))
+    engine = AnyCamEngine(project, preview=True).build()
+    engine.start()
+    try:
+        run_for(engine, 0.5)
+        baseline = engine.pipeline.get_children_count()
+        for index in range(5):
+            layer = Layer(new_id("layer"), "particles", "Snow", source="snow",
+                          box=(0, 0, 1, 1))
+            project.scene.add_layer(layer)
+            assert engine.add_layer(layer)
+            run_for(engine, 0.2)
+            engine.detach_layer(layer.id)
+            project.scene.remove_layer(layer.id)
+        run_for(engine, 0.4)
+        assert engine.pipeline.get_children_count() == baseline
+        assert not engine.report.error
+        frames = engine._frame_count
+        run_for(engine, 0.5)
+        assert engine._frame_count > frames, "the canvas keeps running"
+    finally:
+        engine.stop()

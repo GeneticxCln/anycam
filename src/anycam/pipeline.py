@@ -1956,9 +1956,6 @@ class AnyCamEngine:
         self._layer_acquired.discard(layer_id)
         pad = self._layer_pads.pop(layer_id, None)
         if pad is not None:
-            # Keep the pad linked but invisible.  Releasing a requested pad
-            # while the compositor is PLAYING can make that branch post
-            # not-linked; the next explicit rebuild drops it for real.
             pad.set_property("alpha", 0.0)
         removed = self._layer_chains.pop(layer_id, None)
         # A generated layer (animation, ticker, GIF, drawing) owns a feeder
@@ -1970,12 +1967,65 @@ class AnyCamEngine:
                 hook()
             except Exception:  # noqa: BLE001 - one hook must not block removal
                 pass
+        if removed is not None:
+            self._dispose_chain(removed, pad)
         self._layer_frames.pop(layer_id, None)
         self._layer_last.pop(layer_id, None)
         self._pads_with_data.discard(layer_id)
         self.layer_sources.pop(layer_id, None)
         self._camera_modes.pop(layer_id, None)
         self._sync_standby_label()
+
+    def _dispose_chain(self, chain: SourceChain, pad: Gst.Pad | None) -> None:
+        """Take a removed layer's elements out of the running canvas.
+
+        They used to stay linked to an invisible pad until the next rebuild.
+        Each one holds full-size frame buffers, so toggling animations or
+        adding and removing sources grew memory by ~23 MB a time (the effect
+        catalogue reached 8 GB).  The branch is stopped first, so nothing can
+        push into the pad once it is released (that is what posted
+        not-linked), then unlinked, released and removed.
+        """
+        if self.pipeline is None:
+            return
+        elements = list(chain.elements)
+        members = set(elements)
+        keep_probes = []
+        for probe_pad, probe in self._pad_probes:
+            owner = probe_pad.get_parent_element()
+            if probe_pad is pad or owner in members:
+                try:
+                    probe_pad.remove_probe(probe)
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                keep_probes.append((probe_pad, probe))
+        self._pad_probes = keep_probes
+        keep_handlers = []
+        for obj, handler in self._signal_handlers:
+            if obj in members:
+                try:
+                    obj.disconnect(handler)
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                keep_handlers.append((obj, handler))
+        self._signal_handlers = keep_handlers
+        for element in elements:
+            element.set_state(Gst.State.NULL)
+        if pad is not None and self.compositor is not None:
+            output = chain.tail.get_static_pad("src") if chain.tail else None
+            if output is not None and output.get_peer() is pad:
+                output.unlink(pad)
+            try:
+                self.compositor.release_request_pad(pad)
+            except Exception:  # noqa: BLE001
+                pass
+        for element in elements:
+            if element.get_parent() is self.pipeline:
+                self.pipeline.remove(element)
+        if chain in self.chains:
+            self.chains.remove(chain)
 
     def _detach_screen_layer(self, layer: Layer) -> None:
         """Hide a screen layer while leaving its portal source untouched."""
