@@ -15,7 +15,7 @@ from . import privileged
 
 APP_NAME = "AnyCam"
 APP_ID = "anycam"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 CANVAS_W = 1920
 CANVAS_H = 1080
@@ -35,6 +35,13 @@ def state_dir() -> Path:
 
 def config_dir() -> Path:
     path = _xdg("XDG_CONFIG_HOME", ".config") / APP_ID
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def data_dir() -> Path:
+    """User data that is not configuration (downloaded effect models)."""
+    path = _xdg("XDG_DATA_HOME", ".local/share") / APP_ID
     path.mkdir(parents=True, exist_ok=True)
     return path
 

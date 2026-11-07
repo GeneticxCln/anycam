@@ -8,10 +8,14 @@ and is swapped in live like any other filter.
 
 Heavy frames are handled at reduced size where it does not show (blur, the
 mask) and the worker drops frames rather than stall the canvas when it falls
-behind.
+behind.  The slow, cached work (face detection, person segmentation, the
+blurred background) runs on a :class:`SlowJob` thread beside the frame
+thread: onnxruntime and Pillow release the GIL, so it overlaps for real and a
+frame never waits for a 20 ms detection.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import math
 import threading
 import time
@@ -31,6 +35,69 @@ from . import masks, procedural, segment  # noqa: E402
 Gst.init(None)
 
 
+# --------------------------------------------------------------- slow jobs
+class SlowJob:
+    """One slow job at a time on a worker thread; the frame thread polls it.
+
+    ``submit`` returns False while a job is still running, so a slow machine
+    simply refreshes less often instead of queueing work.  The owner keeps
+    using its newest finished result until the next one arrives.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self._pool: concurrent.futures.ThreadPoolExecutor | None = None
+        self._future: concurrent.futures.Future | None = None
+
+    @property
+    def busy(self) -> bool:
+        return self._future is not None and not self._future.done()
+
+    def submit(self, function, *args) -> bool:
+        if self._future is not None:
+            return False
+        if self._pool is None:
+            self._pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"anycam-{self.name}")
+        self._future = self._pool.submit(function, *args)
+        return True
+
+    def poll(self):
+        """The finished job's result, or None (still running, none, failed)."""
+        future = self._future
+        if future is None or not future.done():
+            return None
+        self._future = None
+        try:
+            return future.result()
+        except Exception:  # noqa: BLE001 - a failed refresh keeps the old result
+            return None
+
+    def wait(self, timeout: float = 2.0):
+        """Block for the running job (tests and shutdown)."""
+        future = self._future
+        if future is None:
+            return None
+        concurrent.futures.wait([future], timeout=timeout)
+        return self.poll()
+
+    def close(self) -> None:
+        pool, self._pool, self._future = self._pool, None, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _reduced(image: Image.Image, longest: int) -> Image.Image:
+    """A cheap box-filtered copy whose longer side is about ``longest``.
+
+    ``Image.reduce`` is an integer box filter, several times cheaper than a
+    bilinear resize of the full frame, and it gives the worker thread its own
+    picture so the frame thread may keep drawing on the original.
+    """
+    factor = max(1, math.ceil(max(image.size) / float(longest)))
+    return image.reduce(factor) if factor > 1 else image.copy()
+
+
 # ------------------------------------------------------------------ tracking
 class TrackedFace:
     """A face smoothed over time: box and landmarks in pixels."""
@@ -47,32 +114,62 @@ class TrackedFace:
 
 
 class FaceTrack:
-    """Detects faces a few times a second and smooths them between frames."""
+    """Detects faces a few times a second and smooths them between frames.
+
+    Detection (YuNet, ~20 ms at 1080p) runs on a :class:`SlowJob`; a frame
+    only merges the newest finished result.  The first detection, and one
+    after the results went stale (a paused source), run immediately so a
+    single frame (a thumbnail) or a jump still gets the face.
+    """
+
+    DETECT_SIZE = 384
 
     def __init__(self, interval: float = 0.1, hold: float = 0.7,
-                 smoothing: float = 0.55) -> None:
+                 smoothing: float = 0.55, asynchronous: bool = True) -> None:
         self.interval, self.hold, self.smoothing = interval, hold, smoothing
         self.faces: list[TrackedFace] = []
         self._last = -1e9
+        self._result_at = -1e9
+        self._job = SlowJob("faces") if asynchronous else None
 
     def update(self, image: Image.Image, now: float) -> list[TrackedFace]:
+        if self._job is not None:
+            done = self._job.poll()
+            if done is not None:
+                self._merge(*done)
         if now - self._last >= self.interval:
-            self._last = now
-            self._detect(image, now)
+            stale = now - self._result_at > self.hold
+            if self._job is None or stale:
+                self._last = now
+                self._detect(image, now)
+            elif not self._job.busy:
+                sample, size = _reduced(image, self.DETECT_SIZE), image.size
+                if self._job.submit(lambda: (self._find(sample), size, now)):
+                    self._last = now
         self.faces = [f for f in self.faces if now - f.seen <= self.hold]
         return self.faces
 
+    def close(self) -> None:
+        if self._job is not None:
+            self._job.close()
+
     def _detect(self, image: Image.Image, now: float) -> None:
+        """Detect on this frame, now (blocking)."""
+        self._merge(self._find(_reduced(image, self.DETECT_SIZE)), image.size, now)
+
+    @staticmethod
+    def _find(sample: Image.Image) -> list | None:
         detector = face_module.shared_detector()
         if detector is None:
+            return None
+        return detector.detect(np.asarray(sample.convert("RGB")),
+                               score_threshold=0.6, top_k=4)
+
+    def _merge(self, found, size: tuple[int, int], now: float) -> None:
+        if found is None:
             return
-        width, height = image.size
-        scale = min(1.0, 384.0 / max(width, height))
-        small = image.convert("RGB")
-        if scale < 1.0:
-            small = small.resize((max(2, int(width * scale)),
-                                  max(2, int(height * scale))), Image.BILINEAR)
-        found = detector.detect(np.asarray(small), score_threshold=0.6, top_k=4)
+        self._result_at = max(self._result_at, now)
+        width, height = size
         previous = list(self.faces)
         updated: list[TrackedFace] = []
         for item in found:
@@ -105,39 +202,105 @@ class PersonMask:
     Uses the segmentation model; without one it falls back to an ellipse built
     from the tracked faces (head and shoulders), and to "everyone" when no
     face is found either, so an effect never blanks the picture.
+
+    With the model, the refresh (segmentation, smoothing and the full-size
+    mask, ~18 ms at 1080p) runs on a :class:`SlowJob`; frames reuse the newest
+    mask.  The first mask, and one after a pause, are computed immediately.
     """
 
-    def __init__(self, interval: float = 0.07) -> None:
+    STALE_S = 0.7
+
+    def __init__(self, interval: float = 0.07, asynchronous: bool = True) -> None:
         self.interval = interval
         self.faces = FaceTrack()
         self._last = -1e9
         self._small: np.ndarray | None = None
         self._full: Image.Image | None = None
+        self._result_at = -1e9
+        self._job = SlowJob("segment") if asynchronous else None
+        self._segmenter: segment.Segmenter | None = None
+        self._generation = -1
+
+    def _seg(self) -> segment.Segmenter:
+        """This mask's segmenter, rebuilt when the model or device changes
+        (RVM is recurrent: each mask keeps its own state)."""
+        if self._segmenter is None or self._generation != segment.generation():
+            self._generation = segment.generation()
+            self._segmenter = segment.segmenter()
+        return self._segmenter
 
     def compute(self, image: Image.Image, now: float) -> Image.Image:
-        """The mask at frame size.  It changes ~14 times a second, so the
-        full-size version (a 4 ms resize at 1080p) is reused between updates."""
+        """The mask at frame size, refreshed ~14 times a second."""
         size = image.size
+        if self._job is not None:
+            done = self._job.poll()
+            if done is not None:
+                small, full, stamp = done
+                self._small, self._result_at = small, stamp
+                self._full = full if full.size == size else None
         if now - self._last >= self.interval or self._small is None:
-            self._last = now
-            self._refresh(image, now)
-            self._full = None
+            background = (self._job is not None and segment.available()
+                          and self._small is not None
+                          and now - self._result_at <= self.STALE_S)
+            if not background:
+                self._last = now
+                self._refresh(image, now)
+                self._result_at = now
+                self._full = None
+            elif not self._job.busy:
+                seg = self._seg()
+                sample = _reduced(image, seg.sample_longest)
+                previous = self._small
+                if self._job.submit(self._work, seg, sample, previous, size, now):
+                    self._last = now
         if self._full is None or self._full.size != size:
-            mask = Image.fromarray((self._small * 255.0).astype(np.uint8), "L")
-            self._full = mask.resize(size, Image.BILINEAR)
+            self._full = self._full_size(self._small, size)
         return self._full
+
+    def close(self) -> None:
+        self.faces.close()
+        if self._job is not None:
+            self._job.close()
+
+    @staticmethod
+    def _full_size(small: np.ndarray, size: tuple[int, int]) -> Image.Image:
+        mask = Image.fromarray((small * 255.0).astype(np.uint8), "L")
+        return mask.resize(size, Image.BILINEAR)
+
+    @staticmethod
+    def _smoothed(alpha: np.ndarray, previous: np.ndarray | None,
+                  sharpen: bool = True) -> np.ndarray:
+        if sharpen:
+            # A probability (MediaPipe): sharpen the soft edge a little, then
+            # smooth over time.
+            alpha = np.clip((alpha - 0.3) / 0.4, 0.0, 1.0)
+            weight = 0.55
+        else:
+            # A real matte (RVM) is already stable between frames.
+            weight = 0.75
+        if previous is None or previous.shape != alpha.shape:
+            return alpha
+        return weight * alpha + (1.0 - weight) * previous
+
+    def _work(self, seg: segment.Segmenter, sample: Image.Image, previous, size, stamp):
+        alpha = seg.alpha(sample)
+        if alpha is None:
+            raise RuntimeError("segmentation failed")
+        small = self._smoothed(alpha, previous, seg.sharpen)
+        return small, self._full_size(small, size), stamp
 
     def _refresh(self, image: Image.Image, now: float) -> None:
         alpha = None
+        seg = None
         if segment.available():
-            rgb = np.asarray(image.convert("RGB").resize(segment.INPUT_SIZE, Image.BILINEAR))
-            alpha = segment.person_alpha(rgb)
+            seg = self._seg()
+            alpha = seg.alpha(_reduced(image, seg.sample_longest))
         if alpha is None:
             alpha = self._from_faces(image, now)
+            same = self._small is not None and self._small.shape == alpha.shape
+            self._small = 0.55 * alpha + 0.45 * self._small if same else alpha
         else:
-            # Sharpen the soft edge a little, then smooth over time.
-            alpha = np.clip((alpha - 0.3) / 0.4, 0.0, 1.0)
-        self._small = alpha if self._small is None else 0.55 * alpha + 0.45 * self._small
+            self._small = self._smoothed(alpha, self._small, seg.sharpen)
 
     def _from_faces(self, image: Image.Image, now: float) -> np.ndarray:
         faces = self.faces.update(image, now)
@@ -171,7 +334,11 @@ class Processor:
         return image
 
     def close(self) -> None:
-        pass
+        # Stop the worker threads of the shared helpers (face tracking, mask).
+        for name in ("faces", "mask"):
+            part = getattr(self, name, None)
+            if part is not None and hasattr(part, "close"):
+                part.close()
 
 
 # ------------------------------------------------------------------ portrait
@@ -185,81 +352,141 @@ def _blurred(image: Image.Image, radius: float) -> Image.Image:
 
 
 class Background(Processor):
-    """Keep the person, change everything behind them."""
+    """Keep the person, change everything behind them.
 
-    def __init__(self, mode: str, amount: float = 0.5, backdrop: str = "") -> None:
+    Per frame this is one RGBA composite (~5 ms at 1080p).  The person mask,
+    the shaded (blurred, dimmed, grey) copy and animated backdrops are made on
+    :class:`SlowJob` threads and reused until the next one is ready; the shade
+    is computed on the reduced picture and enlarged once.
+    """
+
+    def __init__(self, mode: str, amount: float = 0.5, backdrop: str = "",
+                 asynchronous: bool = True) -> None:
         super().__init__(amount)
         self.mode, self.backdrop = mode, backdrop
-        self.mask = PersonMask()
+        self.mask = PersonMask(asynchronous=asynchronous)
         self._generator = None
-        self._cache: tuple | None = None
-        self._shaded: tuple | None = None     # (size, picture, time) of the blurred/dimmed copy
+        self._cache: tuple | None = None      # (size, RGBA picture, time) of the backdrop
+        self._shaded: tuple | None = None     # (size, RGBA picture, time) of the shaded copy
+        self._shade_job = SlowJob("shade") if asynchronous else None
+        self._backdrop_job = SlowJob("backdrop") if asynchronous else None
 
     BACKDROP_FPS = 15.0   # the animated backdrops need no more than this
     SHADE_FPS = 12.0      # a blurred background changes too slowly to need more
+    STALE_S = 0.7         # older than this (a paused source): redo it now
+
+    def _render_backdrop(self, size, now):
+        frame = Image.fromarray(self._generator.frame(now), "RGBA")
+        return size, frame.resize(size, Image.BILINEAR), now
 
     def _backdrop_picture(self, size, now) -> Image.Image:
-        """The replacement backdrop as an RGB picture of ``size``."""
+        """The replacement backdrop as an RGBA picture of ``size``."""
         width, height = size
         if self.backdrop in procedural.GENERATORS:
             if self._generator is None:
                 inner = procedural.internal_size(width, height)
                 self._generator = procedural.GENERATORS[self.backdrop](*inner)
-            if (self._cache is None or self._cache[0] != size
-                    or now - self._cache[2] >= 1.0 / self.BACKDROP_FPS):
-                frame = Image.fromarray(self._generator.frame(now), "RGBA").convert("RGB")
-                self._cache = (size, frame.resize(size, Image.BILINEAR), now)
+            job = self._backdrop_job
+            if job is not None:
+                done = job.poll()
+                if done is not None and done[0] == size:
+                    self._cache = done
+            due = (self._cache is None or self._cache[0] != size
+                   or now - self._cache[2] >= 1.0 / self.BACKDROP_FPS)
+            if due:
+                if (job is None or self._cache is None or self._cache[0] != size
+                        or now - self._cache[2] > self.STALE_S):
+                    self._cache = self._render_backdrop(size, now)
+                elif not job.busy:
+                    job.submit(self._render_backdrop, size, now)
             return self._cache[1]
         if self._cache is None or self._cache[0] != size:
             from . import overlay
 
             path = overlay.render_background(self.backdrop or "Studio", width, height)
             with Image.open(path) as opened:
-                self._cache = (size, opened.convert("RGB"), now)
+                self._cache = (size, opened.convert("RGBA"), now)
         return self._cache[1]
 
     def process(self, image: Image.Image, now: float) -> Image.Image:
-        # RGB is a quarter cheaper than RGBA for every full-frame step below.
-        rgb = image.convert("RGB")
-        mask = self.mask.compute(image, now)
+        rgba = image if image.mode == "RGBA" else image.convert("RGBA")
+        mask = self.mask.compute(rgba, now)
         if self.mode == "replace":
-            background = self._backdrop_picture(image.size, now)
+            background = self._backdrop_picture(rgba.size, now)
         else:
-            # The shaded copy is the expensive part and barely changes between
-            # frames (it is blurred or darkened), so it is reused for ~80 ms.
-            stale = (self._shaded is None or self._shaded[0] != image.size
-                     or now - self._shaded[2] >= 1.0 / self.SHADE_FPS)
-            if stale:
-                self._shaded = (image.size, self._shade(rgb), now)
-            background = self._shaded[1]
-        return Image.composite(rgb, background, mask).convert("RGBA")
+            background = self._shaded_picture(rgba, now)
+        # Straight in RGBA: converting to RGB and back cost ~4 ms a frame.
+        return Image.composite(rgba, background, mask)
 
-    def _shade(self, rgb: Image.Image) -> Image.Image:
+    def _shaded_picture(self, image: Image.Image, now: float) -> Image.Image:
+        size = image.size
+        job = self._shade_job
+        if job is not None:
+            done = job.poll()
+            if done is not None and done[0] == size:
+                self._shaded = done
+        stale = (self._shaded is None or self._shaded[0] != size
+                 or now - self._shaded[2] >= 1.0 / self.SHADE_FPS)
+        if stale:
+            if (job is None or self._shaded is None or self._shaded[0] != size
+                    or now - self._shaded[2] > self.STALE_S):
+                self._shaded = self._shade(self._shade_sample(image), size, now)
+            elif not job.busy:
+                job.submit(self._shade, self._shade_sample(image), size, now)
+        return self._shaded[1]
+
+    @staticmethod
+    def _shade_sample(image: Image.Image) -> Image.Image:
+        factor = max(1, int(image.width // 360))
+        return image.reduce(factor) if factor > 1 else image.copy()
+
+    def _shade(self, small: Image.Image, size, stamp):
+        """Blur/dim/grey the reduced picture, then enlarge it once."""
+        factor = max(1.0, size[0] / max(1, small.width))
+        rgb = small.convert("RGB")
+
+        def blur(radius: float) -> Image.Image:
+            return rgb.filter(ImageFilter.GaussianBlur(max(0.5, radius / factor)))
+
         if self.mode == "blur":
-            return _blurred(rgb, 3.0 + 28.0 * self.amount)
-        if self.mode == "dim":
-            return ImageEnhance.Brightness(_blurred(rgb, 2.0)).enhance(
-                max(0.05, 1.0 - 0.9 * self.amount))
-        gray = ImageOps.grayscale(_blurred(rgb, 3.0)).convert("RGB")
-        return ImageEnhance.Brightness(gray).enhance(1.0 - 0.45 * self.amount)
+            out = blur(3.0 + 28.0 * self.amount)
+        elif self.mode == "dim":
+            out = ImageEnhance.Brightness(blur(2.0)).enhance(max(0.05, 1.0 - 0.9 * self.amount))
+        else:
+            gray = ImageOps.grayscale(blur(3.0)).convert("RGB")
+            out = ImageEnhance.Brightness(gray).enhance(1.0 - 0.45 * self.amount)
+        return size, out.resize(size, Image.BILINEAR).convert("RGBA"), stamp
 
     def set_amount(self, amount: float) -> None:
         super().set_amount(amount)
         self._shaded = None      # the strength changed: shade again next frame
 
+    def close(self) -> None:
+        super().close()
+        for job in (self._shade_job, self._backdrop_job):
+            if job is not None:
+                job.close()
+
 
 class Spotlight(Processor):
     """Darken everything except the person and a soft pool of light on them."""
 
-    def __init__(self, amount: float = 0.6) -> None:
+    def __init__(self, amount: float = 0.6, asynchronous: bool = True) -> None:
         super().__init__(amount)
-        self.mask = PersonMask()
+        self.mask = PersonMask(asynchronous=asynchronous)
+        self._table: tuple[float, list[int]] | None = None
 
     def process(self, image: Image.Image, now: float) -> Image.Image:
-        rgb = image.convert("RGB")
-        mask = self.mask.compute(image, now)
-        dark = ImageEnhance.Brightness(rgb).enhance(max(0.04, 0.85 - 0.8 * self.amount))
-        return Image.composite(rgb, dark, mask).convert("RGBA")
+        rgba = image if image.mode == "RGBA" else image.convert("RGBA")
+        mask = self.mask.compute(rgba, now)
+        factor = max(0.04, 0.85 - 0.8 * self.amount)
+        if self._table is None or self._table[0] != factor:
+            scaled = [min(255, int(i * factor)) for i in range(256)]
+            # Darken colour, keep alpha: a lookup is ~3x cheaper than an
+            # ImageEnhance pass on the full frame.
+            self._table = (factor, scaled * 3 + list(range(256)))
+        dark = rgba.point(self._table[1])
+        return Image.composite(rgba, dark, mask)
 
 
 # --------------------------------------------------------------- face drawing
@@ -371,14 +598,40 @@ def sprite(name: str) -> Image.Image:
     return _sprite_cache[name]
 
 
+# Resized + rotated sprites, keyed by (picture, size, whole degrees).  A head
+# turns slowly, so most frames reuse one; rotating a sprite every frame was
+# ~6 ms each (three per face for the cat).
+_PLACED_LIMIT = 160
+_placed: dict[tuple, Image.Image] = {}
+_placed_lock = threading.Lock()
+
+
+def _placed_picture(key: str, base: Image.Image, width: int, height: int,
+                    angle: float) -> Image.Image:
+    width, height = max(4, width // 2 * 2), max(4, height // 2 * 2)
+    degrees = int(round(angle)) if abs(angle) > 0.5 else 0
+    cache_key = (key, width, height, degrees)
+    with _placed_lock:
+        picture = _placed.pop(cache_key, None)
+        if picture is not None:
+            _placed[cache_key] = picture          # most recent last
+            return picture
+    picture = base.resize((width, height), Image.BILINEAR)
+    if degrees:
+        picture = picture.rotate(degrees, resample=Image.BICUBIC, expand=True)
+    with _placed_lock:
+        _placed[cache_key] = picture
+        while len(_placed) > _PLACED_LIMIT:
+            _placed.pop(next(iter(_placed)))
+    return picture
+
+
 def _emoji_at(canvas: Image.Image, code: str, centre, size: float, angle: float) -> None:
     pic = emoji_module.load(code)
     size = int(size)
     if pic is None or size < 4:
         return
-    pic = pic.resize((size, size), Image.BILINEAR)
-    if abs(angle) > 0.5:
-        pic = pic.rotate(angle, resample=Image.BICUBIC, expand=True)
+    pic = _placed_picture(f"emoji:{code}", pic, size, size, angle)
     canvas.alpha_composite(pic, (int(centre[0] - pic.width / 2), int(centre[1] - pic.height / 2)))
 
 
@@ -387,9 +640,7 @@ def _stamp(canvas: Image.Image, name: str, centre, width: float, angle: float) -
     base = sprite(name)
     width = max(4, int(width))
     height = max(4, int(width * base.height / base.width))
-    picture = base.resize((width, height), Image.BILINEAR)
-    if abs(angle) > 0.5:
-        picture = picture.rotate(angle, resample=Image.BICUBIC, expand=True)
+    picture = _placed_picture(f"sprite:{name}", base, width, height, angle)
     canvas.alpha_composite(
         picture, (int(centre[0] - picture.width / 2), int(centre[1] - picture.height / 2)))
 
@@ -496,8 +747,13 @@ class FaceMask(Processor):
             raise KeyError(key)
         self.key = key
         self.faces = FaceTrack(interval=0.07, smoothing=0.6)
+        self._prerender = SlowJob("mask-anim")
 
     def process(self, image: Image.Image, now: float) -> Image.Image:
+        upcoming = masks.next_template_time(self.key, now)
+        if upcoming is not None and not self._prerender.busy:
+            self._prerender.poll()
+            self._prerender.submit(masks.template, self.key, upcoming)
         faces = self.faces.update(image, now)
         faces = [f for f in faces if len(f.points) >= 5]
         if not faces:
@@ -509,6 +765,10 @@ class FaceMask(Processor):
             mouth = ((mouth_a[0] + mouth_b[0]) / 2, (mouth_a[1] + mouth_b[1]) / 2)
             masks.place(out, self.key, now, left, right, mouth, opacity)
         return out
+
+    def close(self) -> None:
+        super().close()
+        self._prerender.close()
 
 
 # ------------------------------------------------------------------- privacy
@@ -745,14 +1005,17 @@ class ProcessorRunner:
         if not ok:
             return
         try:
-            data = bytes(info.data)[: width * height * 4]
+            # One copy out of the mapped buffer (bytes() then a slice made two).
+            image = Image.frombytes("RGBA", (width, height),
+                                    info.data[: width * height * 4])
         finally:
             buffer.unmap(info)
-        image = Image.frombuffer("RGBA", (width, height), data, "raw", "RGBA", 0, 1)
         result = self.processor.process(image, time.monotonic() - self._started)
         if result.size != (width, height):
             result = result.resize((width, height), Image.BILINEAR)
-        out = Gst.Buffer.new_wrapped(result.convert("RGBA").tobytes())
+        if result.mode != "RGBA":
+            result = result.convert("RGBA")
+        out = Gst.Buffer.new_wrapped(result.tobytes())
         if buffer.duration != Gst.CLOCK_TIME_NONE:
             out.duration = buffer.duration
         self.frames += 1
@@ -768,9 +1031,215 @@ class ProcessorRunner:
         self.processor.close()
 
 
+# ------------------------------------------------- native framing (live)
+# Pillow cannot enlarge a 1080p crop fast enough (a bilinear resize alone is
+# ~21 ms), so the live Zoom and Auto-frame slots crop and scale with
+# GStreamer's videocrop/videoscale.  Python only decides the rectangle.  The
+# Zoom and AutoFrame classes above still draw thumbnails and still pictures.
+def _crop_rect(width: int, height: int, zoom: float,
+               centre: tuple[float, float]) -> tuple[int, int, int, int]:
+    """(left, top, crop_w, crop_h) of a ``zoom`` x crop around ``centre``."""
+    zoom = max(1.0, zoom)
+    crop_w, crop_h = width / zoom, height / zoom
+    left = min(max(centre[0] - crop_w / 2, 0.0), width - crop_w)
+    top = min(max(centre[1] - crop_h / 2, 0.0), height - crop_h)
+    return int(round(left)), int(round(top)), int(round(crop_w)), int(round(crop_h))
+
+
+class _CropControl:
+    """Sets a videocrop's four margins, skipping sub-pixel jitter."""
+
+    def __init__(self, crop: Gst.Element, width: int, height: int) -> None:
+        self.crop, self.width, self.height = crop, width, height
+        self.margins: tuple[int, int, int, int] | None = None
+
+    def apply(self, left: int, top: int, crop_w: int, crop_h: int) -> None:
+        crop_w = max(2, min(self.width, crop_w))
+        crop_h = max(2, min(self.height, crop_h))
+        left = max(0, min(self.width - crop_w, left))
+        top = max(0, min(self.height - crop_h, top))
+        margins = (left, self.width - left - crop_w, top, self.height - top - crop_h)
+        if self.margins is not None and max(
+                abs(a - b) for a, b in zip(margins, self.margins, strict=True)) < 2:
+            return
+        self.margins = margins
+        # Each change renegotiates videocrop -> videoscale; measured at 1080p60
+        # it still holds the full frame rate.
+        for prop, value in zip(("left", "right", "top", "bottom"), margins, strict=True):
+            self.crop.set_property(prop, int(value))
+
+
+class NativeZoom:
+    """Live Zoom: a fixed centre crop that only changes with the slider."""
+
+    def __init__(self, control: _CropControl, amount: float) -> None:
+        self.processor = self
+        self.control = control
+        self.set_amount(amount)
+
+    def set_amount(self, amount: float) -> None:
+        self.amount = max(0.0, min(1.0, float(amount)))
+        width, height = self.control.width, self.control.height
+        self.control.apply(*_crop_rect(width, height, 1.0 + 2.0 * self.amount,
+                                       (width / 2.0, height / 2.0)))
+
+    def stop(self) -> None:
+        pass
+
+
+class NativeAutoFrame:
+    """Live Auto-frame: faces found on a small tap steer a videocrop.
+
+    The picture itself never passes through Python; a control thread reads
+    the newest 15 fps thumbnail, tracks the face and eases the crop at the
+    canvas rate, with the same targets and smoothing as :class:`AutoFrame`.
+    """
+
+    def __init__(self, control: _CropControl, tap, amount: float, fps: int) -> None:
+        self.processor = self
+        self.control, self.tap = control, tap
+        self.amount = max(0.0, min(1.0, float(amount)))
+        self.faces = FaceTrack(interval=0.08, asynchronous=False)
+        self._interval = 1.0 / max(1, int(fps))
+        self._centre: tuple[float, float] | None = None
+        self.zoom = 1.0
+        self._latest: Image.Image | None = None
+        self._started = time.monotonic()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="anycam-fx-autoframe",
+                                        daemon=True)
+        self._thread.start()
+
+    def set_amount(self, amount: float) -> None:
+        self.amount = max(0.0, min(1.0, float(amount)))
+
+    def _pull(self) -> None:
+        try:
+            sample = self.tap.emit("try-pull-sample", 0)
+        except Exception:  # noqa: BLE001 - the element is being torn down
+            return
+        if sample is None:
+            return
+        caps = sample.get_caps().get_structure(0)
+        width, height = int(caps.get_value("width")), int(caps.get_value("height"))
+        buffer = sample.get_buffer()
+        ok, info = buffer.map(Gst.MapFlags.READ)
+        if not ok:
+            return
+        try:
+            self._latest = Image.frombytes("RGBA", (width, height),
+                                           info.data[: width * height * 4])
+        finally:
+            buffer.unmap(info)
+
+    def step(self, now: float) -> None:
+        """One control tick: track, ease, move the crop."""
+        self._pull()
+        width, height = self.control.width, self.control.height
+        target_zoom, target = 1.0, (width / 2.0, height / 2.0)
+        if self._latest is not None:
+            faces = self.faces.update(self._latest, now)
+            if faces:
+                scale = width / self._latest.width
+                main = max(faces, key=lambda f: f.box[2] * f.box[3])
+                face_h = main.box[3] * scale
+                wanted = 0.30 + 0.20 * self.amount      # face height / frame height
+                target_zoom = max(1.0, min(3.0, wanted * height / max(1.0, face_h)))
+                cx, cy = main.centre
+                target = (cx * scale, cy * scale + face_h * 0.25)
+        if self._centre is None:
+            self._centre = target
+        self._centre = (self._centre[0] * 0.9 + target[0] * 0.1,
+                        self._centre[1] * 0.9 + target[1] * 0.1)
+        self.zoom = self.zoom * 0.93 + target_zoom * 0.07
+        self.control.apply(*_crop_rect(width, height, self.zoom, self._centre))
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            started = time.monotonic()
+            try:
+                self.step(started - self._started)
+            except Exception:  # noqa: BLE001 - framing must never stop the video
+                pass
+            self._stop.wait(max(0.0, self._interval - (time.monotonic() - started)))
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.faces.close()
+
+
+def build_framing_bin(name: str, amount: float, bin_name: str, width: int,
+                      height: int, fps: int):
+    """``(bin, runner)`` for a live Zoom or Auto-frame slot (GStreamer scaling)."""
+    def make(factory, element_name=None, **props):
+        element = Gst.ElementFactory.make(factory, element_name)
+        if element is None:
+            raise RuntimeError(f"GStreamer element '{factory}' is not installed")
+        for key, value in props.items():
+            element.set_property(key.replace("_", "-"), value)
+        return element
+
+    def caps(text):
+        return make("capsfilter", caps=Gst.Caps.from_string(text))
+
+    width, height = max(2, int(width)), max(2, int(height))
+    out_caps = (f"video/x-raw,format=RGBA,width={width},height={height},"
+                "pixel-aspect-ratio=1/1")
+    bin_ = Gst.Bin.new(bin_name)
+    crop = make("videocrop", "fx")
+    chain = [crop, make("videoscale"), caps(out_caps)]
+    kind = name.partition(":")[0]
+    if kind == "zoom":
+        elements = chain
+        for element in elements:
+            bin_.add(element)
+        head = crop
+    else:
+        tee = make("tee")
+        main_queue = make("queue", max_size_buffers=2, max_size_bytes=0, max_size_time=0)
+        tap_w = 384
+        tap_h = max(2, int(round(tap_w * height / width)) // 2 * 2)
+        # The tap only needs a few frames a second: drop before scaling down.
+        tap = [make("queue", leaky=2, max_size_buffers=1, max_size_bytes=0,
+                    max_size_time=0),
+               make("videorate", drop_only=True, max_rate=15),
+               make("videoscale"),
+               caps(f"video/x-raw,format=RGBA,width={tap_w},height={tap_h}"),
+               make("appsink", sync=False, drop=True, max_buffers=1)]
+        # Not async: like the processor sink, it sits mid-canvas and must not
+        # hold the pipeline in PAUSED waiting to preroll.
+        tap[-1].set_property("async", False)
+        elements = [tee, main_queue, *chain, *tap]
+        for element in elements:
+            bin_.add(element)
+        tee.link(main_queue)
+        tee.link(tap[0])
+        for first, second in zip(tap, tap[1:]):
+            if not first.link(second):
+                raise RuntimeError("could not link the auto-frame tap")
+        main_queue.link(crop)
+        head = tee
+    for first, second in zip(chain, chain[1:]):
+        if not first.link(second):
+            raise RuntimeError("could not link the framing chain")
+    bin_.add_pad(Gst.GhostPad.new("sink", head.get_static_pad("sink")))
+    bin_.add_pad(Gst.GhostPad.new("src", chain[-1].get_static_pad("src")))
+    control = _CropControl(crop, width, height)
+    if kind == "zoom":
+        runner = NativeZoom(control, amount)
+    else:
+        runner = NativeAutoFrame(control, elements[-1], amount, fps)
+    return bin_, runner
+
+
+NATIVE_FRAMING = ("zoom", "autoframe")
+
+
 def build_processor_bin(name: str, amount: float, bin_name: str, width: int,
                         height: int, fps: int):
     """A bin that runs processor ``name``; returns ``(bin, runner)``."""
+    if name.partition(":")[0] in NATIVE_FRAMING:
+        return build_framing_bin(name, amount, bin_name, width, height, fps)
     processor = make_processor(name, amount)
 
     def make(factory, element_name=None):

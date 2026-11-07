@@ -332,3 +332,61 @@ def test_the_thumbnail_renderer_runs_processors(portrait):
         Effects(filter="sunglasses"), effect_thumbs.default_sample())
     assert plain is not None and glasses is not None
     assert plain.tobytes() != glasses.tobytes()
+
+
+# ------------------------------------------------- native live framing
+def _run_slot(key, portrait, tmp_path, seconds=2.5, amount=0.8):
+    path = tmp_path / "frame.png"
+    portrait.convert("RGB").resize((640, 360)).save(path)
+    pipeline = Gst.parse_launch(
+        f"filesrc location={path} ! pngdec ! imagefreeze is-live=true ! videoconvert ! "
+        "videoscale ! video/x-raw,format=RGBA,width=640,height=360,framerate=30/1 ! "
+        "identity name=src ! appsink name=out sync=true max-buffers=2 drop=true")
+    src, out = pipeline.get_by_name("src"), pipeline.get_by_name("out")
+    src.unlink(out)
+    bin_, runner = effects.build_slot(key, amount, "slot", (640, 360), 30)
+    pipeline.add(bin_)
+    assert src.link(bin_) and bin_.link(out)
+    pipeline.set_state(Gst.State.PLAYING)
+    try:
+        time.sleep(seconds)
+        sample = out.emit("try-pull-sample", Gst.SECOND)
+        error = pipeline.get_bus().pop_filtered(Gst.MessageType.ERROR)
+        assert error is None, error.parse_error()
+        crop = bin_.get_by_name("fx")
+        margins = [crop.get_property(k) for k in ("left", "right", "top", "bottom")]
+        return sample, margins, runner
+    finally:
+        runner.stop()
+        pipeline.set_state(Gst.State.NULL)
+
+
+def test_live_zoom_is_a_native_centre_crop(portrait, tmp_path):
+    sample, margins, runner = _run_slot("zoom", portrait, tmp_path, 1.0, amount=0.5)
+    assert runner.processor is runner and not hasattr(runner, "sink")
+    caps = sample.get_caps().get_structure(0)
+    assert (caps.get_value("width"), caps.get_value("height")) == (640, 360)
+    # 2x zoom: a 320x180 window in the middle.
+    assert margins == [160, 160, 90, 90]
+    runner.set_amount(0.0)
+    assert runner.control.margins == (0, 0, 0, 0)
+
+
+def test_live_auto_frame_closes_in_on_the_face(portrait, tmp_path):
+    sample, margins, runner = _run_slot("auto-frame", portrait, tmp_path, 3.0)
+    caps = sample.get_caps().get_structure(0)
+    assert (caps.get_value("width"), caps.get_value("height")) == (640, 360)
+    assert runner.zoom > 1.15, "the face was found on the tap and the crop eased in"
+    assert sum(margins) > 40
+    assert runner._stop.is_set(), "stopping the slot stops the control thread"
+
+
+def test_crop_control_ignores_sub_pixel_jitter():
+    crop = Gst.ElementFactory.make("videocrop")
+    control = processors._CropControl(crop, 640, 360)
+    control.apply(100, 50, 320, 180)
+    assert control.margins == (100, 220, 50, 130)
+    control.apply(101, 50, 320, 180)          # 1 px: not worth a renegotiation
+    assert control.margins == (100, 220, 50, 130)
+    control.apply(-20, 400, 9999, 180)        # clamped inside the frame
+    assert control.margins == (0, 0, 180, 0)

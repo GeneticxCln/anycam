@@ -73,7 +73,8 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - [ ] Audio from video layers using the reserved `Layer.volume` / `Layer.muted`.
 - [ ] Working media loop and audio playlist.
 - [ ] Virtual microphone as a PipeWire Audio/Source node; monitor output.
-- [ ] Noise suppression (`webrtcdsp` / noise-suppression-for-voice), gate, compressor, EQ presets.
+- [x] Noise suppression and automatic gain (`webrtcdsp`; see PARITY).
+- [ ] Gate, compressor, EQ presets.
 - [ ] Per-source sync offset.
 - [ ] Acceptance: another app can select AnyCam Mic and receive the mix; no gaps across scene changes; live gain changes without clicks.
 

@@ -652,6 +652,20 @@ def template(key: str, t: float) -> Image.Image:
     return cached
 
 
+def next_template_time(key: str, t: float) -> float | None:
+    """When the animated mask ``key`` steps next, if that frame is not cached.
+
+    The frame thread pre-renders it on a worker (the overlays are blurred, ~12
+    ms), so a new animation step never lands on a video frame.
+    """
+    if MASKS[key][3] is None:
+        return None
+    step = int(t * ANIM_FPS) + 1
+    if (key, step % 4096) in _anim_cache:
+        return None
+    return step / ANIM_FPS
+
+
 # --- placing it on a face -------------------------------------------------------------
 
 def _affine(points_img, scale_px: float):

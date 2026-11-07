@@ -1942,3 +1942,74 @@ def test_a_running_canvas_takes_a_phone_layer(app, phone_link):
     finally:
         window.close()
         app.processEvents()
+
+
+def test_microphone_noise_suppression_controls(app):
+    window = _window()
+    try:
+        assert window.denoise_combo.currentData() == window.project.audio.mic_denoise
+        restarts = []
+        window.restart_engine = lambda: restarts.append(True)
+        window.engine = object()  # a running canvas
+        window.project.audio.mic_enabled = True
+        window.denoise_combo.setCurrentIndex(window.denoise_combo.findData("very-high"))
+        assert window.project.audio.mic_denoise == "very-high"
+        window.auto_gain_check.setChecked(True)
+        assert window.project.audio.mic_auto_gain is True
+        assert len(restarts) == 2, "webrtcdsp reads its settings at start: rebuild"
+        window.project.audio.mic_enabled = False
+        window.denoise_combo.setCurrentIndex(window.denoise_combo.findData("off"))
+        assert window.project.audio.mic_denoise == "off"
+        assert len(restarts) == 2, "no rebuild while the microphone is off"
+    finally:
+        window.engine = None
+        window.close()
+        app.processEvents()
+
+
+def test_ai_effects_device_setting(app):
+    from anycam import inference
+
+    window = _window()
+    try:
+        assert window.effects_device_combo.currentData() == "cpu"
+        window.effects_device_combo.setCurrentIndex(
+            window.effects_device_combo.findData("gpu"))
+        assert window.project.output.effects_device == "gpu"
+        assert inference.preference() == "gpu"
+        assert "running on" in window.effects_device_note.text()
+    finally:
+        inference.set_preference("cpu")
+        window.close()
+        app.processEvents()
+
+
+def test_person_cut_out_model_choice_and_download(app, monkeypatch, tmp_path):
+    from anycam import models as model_catalog
+    from anycam import segment
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    window = _window()
+    try:
+        assert window.segmentation_combo.currentData() == "mediapipe"
+        window.segmentation_combo.setCurrentIndex(window.segmentation_combo.findData("rvm"))
+        assert window.project.output.segmentation_model == "rvm"
+        assert not window.model_download_button.isHidden(), "not downloaded yet"
+        assert segment.active_model() == "mediapipe"
+
+        fetched = []
+
+        def fake_download(key, progress=None, timeout=30.0):
+            progress(5, 10)
+            fetched.append(key)
+            return tmp_path / "m.onnx"
+
+        monkeypatch.setattr(model_catalog, "download", fake_download)
+        window._download_rvm()
+        assert _wait_for(app, lambda: window._model_download is None, 5.0)
+        assert fetched == ["rvm"]
+        assert "downloaded" in window.statusBar().currentMessage().lower()
+    finally:
+        segment.set_model("mediapipe")
+        window.close()
+        app.processEvents()

@@ -323,6 +323,11 @@ class AudioConfig:
     # Off unless the user asks for the microphone.  A media bed used to drag
     # the microphone into the graph even when the box was unchecked.
     mic_enabled: bool = False
+    # Voice processing on the microphone (webrtcdsp): stationary-noise
+    # suppression ("off", "low", "moderate", "high", "very-high") and
+    # automatic gain.  Measured on pink noise: -6/-12/-18/-21 dB.
+    mic_denoise: str = "moderate"
+    mic_auto_gain: bool = False
     media_file: str = ""
     media_loop: bool = True      # reserved: the media bed plays once today
     media_gain_db: float = 0.0
@@ -354,6 +359,13 @@ class OutputConfig:
     # H.264 encoder for recordings: auto prefers NVENC when a working NVIDIA
     # driver/plugin is present, nvenc forces it, and cpu forces x264.
     encoder: str = "auto"
+    # Where the AI effects' ONNX models run: "cpu" (default) or "gpu" (CUDA,
+    # only when onnxruntime has the CUDA provider).  ANYCAM_EFFECTS_DEVICE
+    # overrides it.
+    effects_device: str = "cpu"
+    # Person cut-out model: "mediapipe" (bundled) or "rvm" (Robust Video
+    # Matting, used once downloaded from Settings).
+    segmentation_model: str = "mediapipe"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "OutputConfig":

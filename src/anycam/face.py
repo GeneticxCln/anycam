@@ -43,11 +43,12 @@ class FaceDetector:
         if not self._model_path.exists():
             raise FileNotFoundError(f"face model not found: {self._model_path}")
         try:
-            import onnxruntime as ort  # noqa: WPS433
+            import onnxruntime  # noqa: F401, WPS433
         except ImportError as exc:
             raise RuntimeError("onnxruntime is required for face detection") from exc
-        self._session = ort.InferenceSession(str(self._model_path),
-                                             providers=["CPUExecutionProvider"])
+        from . import inference
+
+        self._session = inference.session(self._model_path)
         self._input_name = self._session.get_inputs()[0].name
         self._output_names = [output.name for output in self._session.get_outputs()]
 
@@ -204,3 +205,18 @@ def shared_detector() -> "FaceDetector | None":
             except Exception:  # noqa: BLE001 - optional feature
                 _SHARED["detector"] = None
         return _SHARED["detector"]
+
+
+def reset_shared() -> None:
+    """Drop the shared detector (the effects device changed)."""
+    with _SHARED_LOCK:
+        _SHARED.clear()
+
+
+def _register_reset() -> None:
+    from . import inference
+
+    inference.on_change(reset_shared)
+
+
+_register_reset()

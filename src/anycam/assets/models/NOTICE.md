@@ -16,3 +16,12 @@ Armstrong (public domain in the United States). AnyCam uses it only as the
 preview picture for face and portrait effects when no camera frame exists.
 
 The Apache License 2.0 text is at https://www.apache.org/licenses/LICENSE-2.0.
+
+## Not bundled: optional download
+
+Robust Video Matting (`rvm_mobilenetv3_fp32.onnx`, GPL-3.0,
+https://github.com/PeterL1n/RobustVideoMatting) is **not** part of AnyCam. Its
+licence does not allow bundling it in this MIT package. Settings → AI effects
+can download it from the author's release into `~/.local/share/anycam/models/`
+on request, and checks it against SHA-256
+`88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828`.

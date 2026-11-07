@@ -28,7 +28,15 @@ no Wine.
   - **42 animations** (snow, hearts, confetti, fireworks, Matrix code, ...) and emoji rain.
     One animation at a time, swapped live; click it again to remove it.
   - Animated backdrops and 171 bundled Noto emoji.
+- **AI effects:** ONNX models through onnxruntime, on the CPU by default or the NVIDIA GPU
+  (CUDA) when chosen in **Settings → AI effects**. Person cut-out uses the bundled MediaPipe
+  model, or Robust Video Matting (soft edges and hair) as a one-click verified download. Slow
+  model work runs beside the frame thread, so every effect fits a 1080p60 frame on the
+  reference machine. Add your own segmentation model with `ANYCAM_SEG_MODEL`. See
+  [docs/EFFECT_MODELS.md](docs/EFFECT_MODELS.md).
 - **Outputs:** V4L2 virtual camera, MP4 recording (x264 or NVENC), RTMP, audio mixing.
+- **Microphone:** noise suppression (off/low/moderate/high/very high, moderate by default)
+  and automatic gain through GStreamer's `webrtcdsp`, applied to recordings and streams.
 
 ## Requirements
 
@@ -40,7 +48,8 @@ are in [docs/EVIDENCE.md](docs/EVIDENCE.md).
 - Python 3.11+ and GStreamer with `base good bad ugly libav opengl pulse`
 - PyGObject (from your distro, not PyPI)
 - PySide6 matching your system Qt (`pip install 'anycam[gui]'`), `numpy`, `Pillow`, `psutil`
-- `onnxruntime` for portrait and face effects (`anycam[face]`; the models are bundled)
+- `onnxruntime` for portrait and face effects (`anycam[face]`; the models are bundled), or
+  `onnxruntime-gpu[cuda,cudnn]` instead to run them on an NVIDIA GPU
 - `xdg-desktop-portal` + PipeWire (screen capture), `ffmpeg`, `v4l-utils`
 - `v4l2loopback` for the virtual camera (AnyCam sets it up on first launch, one password)
 
@@ -53,7 +62,7 @@ sudo pacman -S --needed python pyside6 python-gobject gst-plugins-{base,good,bad
 ## Install and run
 
 ```bash
-pip install anycam-1.1.0.tar.gz     # from the GitHub release, or from a checkout:
+pip install anycam-1.2.0.tar.gz     # from the GitHub release, or from a checkout:
 ./scripts/setup.sh                  # creates .venv with system site-packages
 ./scripts/anycam-gui                # the studio (or: python -m anycam gui)
 ./scripts/install-desktop.sh        # optional: add it to the app menu
@@ -87,7 +96,7 @@ Keys: `Ctrl+P` preview, `Ctrl+R` record, `Ctrl+Shift+V` virtual camera, `F5` sna
 
 ## Releases
 
-**v1.1.0** is the current release (v1.0.3, v1.0.2, v1.0.1 and v1.0.0 came before); **Settings → About** shows the version and what
+**v1.2.0** is the current release (v1.1.0, v1.0.3, v1.0.2, v1.0.1 and v1.0.0 came before); **Settings → About** shows the version and what
 it runs on. Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`: it builds the
 tarball and wheel, checks the bundled assets, smoke-tests a clean install and publishes a
 GitHub Release with `SHA256SUMS`. To release, bump `version` in `pyproject.toml` and
@@ -100,12 +109,28 @@ update checks. Privileged changes are the one-time virtual camera setup and, onl
 click **Allow phones**, a ufw rule for TCP 8443; both go through the normal password prompt.
 The phone link runs only after you add a phone (or open a scene with one): HTTPS on your LAN
 address, pairing by single-use QR code, phone secrets stored hashed, video never leaves the
-network. Screen capture asks permission through the portal.
+network. The only internet request AnyCam can make is the optional model download, and
+only when you click **Download** in Settings → AI effects; it fetches the file from the
+model author's GitHub release and checks it against a pinned SHA-256. Screen capture asks
+permission through the portal.
 
 ## Known limitations
 
-- **Effects:** Python effects cost CPU per frame (`scripts/bench-effects.py` measures them).
-  Masks are 2D, built from five face landmarks: no depth and no expression tracking.
+- **Effects:** every effect fits a 1080p60 frame on the reference machine, but they still
+  use CPU, on worker threads as well as per frame (`scripts/bench-effects.py` measures only
+  the per-frame part). Robust Video Matting costs about 10 ms of CPU per refresh, about 14
+  times a second. Live Auto-frame moves a GStreamer crop, which costs extra CPU while you
+  move. Masks are 2D, built from five face landmarks: no depth and no expression tracking.
+- **GPU effects:** the CUDA path needs `onnxruntime-gpu` with CUDA and cuDNN, which AnyCam
+  does not install. It is covered by tests with a simulated CUDA provider only; it has not
+  been run on real CUDA. Robust Video Matting is GPL-3.0, so it is a download, not bundled.
+- **Backdrops vs. virtual backgrounds:** the **Backdrops** tab is a canvas background behind
+  the camera tiles; it does not hide your room. To replace or blur what is behind you, use
+  **Effects → Portrait** (blur, dim, black and white, or a "… backdrop"). The two share
+  names, which is confusing.
+- **Microphone:** noise suppression removes steady noise (fans, hum, hiss), not keyboard
+  clicks or voices; there is no echo cancelling. Changing it restarts the canvas, like
+  changing the microphone does.
 - **Canvas:** one virtual camera, and one canvas size and FPS for all layers; two filter slots
   per layer. A scene change rebuilds the graph (a hard cut) and starts a new recording segment.
 - **Virtual camera:** with `exclusive_caps=1`, Chromium apps list AnyCam only while AnyCam is
@@ -123,12 +148,13 @@ network. Screen capture asks permission through the portal.
   TCP 8443 yourself.
 - **Devices:** a camera that returns under a different `/dev/video*` name must be re-selected.
   Screen share asks the portal chooser each launch, and a static share can show `SLOW`.
-- No NVIDIA Broadcast effects (the SDK is Windows-only); NVENC is used for encoding only.
+- NVIDIA Broadcast and the Maxine SDK are not used (Windows-only app; restrictive SDK
+  licence). The AI effects above run through onnxruntime instead, on the CPU or with CUDA.
 
 ## Develop
 
 ```bash
-.venv/bin/python -m pytest tests     # 740 tests; the GUI and engine tests run offscreen
+.venv/bin/python -m pytest tests     # 763 tests; the GUI and engine tests run offscreen
 ```
 
 ### Reproduce CI locally

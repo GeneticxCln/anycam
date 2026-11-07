@@ -1166,6 +1166,12 @@ class AnyCamWindow(QMainWindow):
         # the virtual camera events they explain (a rebuild that holds the
         # capture also holds the vcam's last frame).
         self._source_pool.log_event = self.log_event
+        from . import inference
+
+        inference.set_preference(self.project.output.effects_device)
+        from . import segment
+
+        segment.set_model(self.project.output.segmentation_model)
         # The phone link (QR pairing + WebRTC from the phone) starts on first
         # use and runs until the window closes, so a paired phone can
         # reconnect at any time.  Its events arrive on network threads.
@@ -2723,6 +2729,25 @@ class AnyCamWindow(QMainWindow):
         self.mic_level_label.setObjectName("accent")
         grid.addWidget(QLabel("Level"), 4, 0)
         grid.addWidget(self.mic_level_label, 4, 1)
+
+        # Voice processing (webrtcdsp): steady background noise such as fans,
+        # hum and hiss.  Applied to recordings and streams.
+        self.denoise_combo = QComboBox()
+        for label, value in (("Off", "off"), ("Low", "low"), ("Moderate", "moderate"),
+                             ("High", "high"), ("Very high", "very-high")):
+            self.denoise_combo.addItem(label, value)
+        index = self.denoise_combo.findData(self.project.audio.mic_denoise)
+        self.denoise_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.denoise_combo.setToolTip(
+            "Removes steady background noise (fans, hum, hiss) from the "
+            "microphone. Higher levels remove more but can colour the voice.")
+        self.denoise_combo.currentIndexChanged.connect(self._mic_processing_changed)
+        grid.addWidget(QLabel("Noise suppression"), 5, 0)
+        grid.addWidget(self.denoise_combo, 5, 1)
+        self.auto_gain_check = QCheckBox("Automatic gain (even out loud and quiet speech)")
+        self.auto_gain_check.setChecked(self.project.audio.mic_auto_gain)
+        self.auto_gain_check.toggled.connect(self._mic_processing_changed)
+        grid.addWidget(self.auto_gain_check, 6, 0, 1, 2)
         layout.addWidget(box)
 
         layout.addStretch(1)
@@ -2749,6 +2774,17 @@ class AnyCamWindow(QMainWindow):
             self.restart_engine()
         self._status("Desktop audio off" if not device
                      else f"Desktop audio: {device}")
+
+    def _mic_processing_changed(self, *_args) -> None:
+        self.project.audio.mic_denoise = self.denoise_combo.currentData() or "off"
+        self.project.audio.mic_auto_gain = self.auto_gain_check.isChecked()
+        self._mark_dirty()
+        # webrtcdsp reads its settings when it starts: rebuild to apply.
+        if self.engine is not None and self.project.audio.mic_enabled:
+            self.restart_engine()
+        level = self.denoise_combo.currentText()
+        self._status(f"Noise suppression: {level}"
+                     + (" · automatic gain" if self.project.audio.mic_auto_gain else ""))
 
     def _toggle_audio(self, enabled: bool) -> None:
         self.audio_on = enabled
@@ -3038,6 +3074,50 @@ class AnyCamWindow(QMainWindow):
         encoder_note.setWordWrap(True)
         encoder_grid.addWidget(encoder_note, 1, 0, 1, 2)
         layout.addWidget(encoder_box)
+
+        effects_box = QGroupBox("AI effects")
+        effects_grid = QGridLayout(effects_box)
+        self.effects_device_combo = QComboBox()
+        self.effects_device_combo.addItem("CPU (default)", "cpu")
+        self.effects_device_combo.addItem("NVIDIA GPU (CUDA)", "gpu")
+        chosen = self.effects_device_combo.findData(self.project.output.effects_device)
+        self.effects_device_combo.setCurrentIndex(chosen if chosen >= 0 else 0)
+        self.effects_device_combo.currentIndexChanged.connect(self._effects_device_changed)
+        effects_grid.addWidget(QLabel("Run models on"), 0, 0)
+        effects_grid.addWidget(self.effects_device_combo, 0, 1)
+        self.effects_device_note = QLabel()
+        self.effects_device_note.setObjectName("muted")
+        self.effects_device_note.setWordWrap(True)
+        effects_grid.addWidget(self.effects_device_note, 1, 0, 1, 2)
+        self._update_effects_device_note()
+
+        from . import models as model_catalog
+
+        rvm = model_catalog.CATALOG["rvm"]
+        self.segmentation_combo = QComboBox()
+        self.segmentation_combo.addItem("Standard (MediaPipe, built in)", "mediapipe")
+        self.segmentation_combo.addItem("High quality (Robust Video Matting)", "rvm")
+        chosen = self.segmentation_combo.findData(self.project.output.segmentation_model)
+        self.segmentation_combo.setCurrentIndex(chosen if chosen >= 0 else 0)
+        self.segmentation_combo.currentIndexChanged.connect(self._segmentation_changed)
+        effects_grid.addWidget(QLabel("Person cut-out"), 2, 0)
+        effects_grid.addWidget(self.segmentation_combo, 2, 1)
+        self.model_download_button = QPushButton(
+            f"Download ({rvm.size / 1e6:.0f} MB)")
+        self.model_download_button.clicked.connect(self._download_rvm)
+        effects_grid.addWidget(self.model_download_button, 2, 2)
+        self.segmentation_note = QLabel()
+        self.segmentation_note.setObjectName("muted")
+        self.segmentation_note.setWordWrap(True)
+        self.segmentation_note.setTextFormat(Qt.TextFormat.RichText)
+        self.segmentation_note.setOpenExternalLinks(True)
+        effects_grid.addWidget(self.segmentation_note, 3, 0, 1, 3)
+        self._model_download: dict | None = None
+        self._model_download_timer = QTimer(self)
+        self._model_download_timer.setInterval(150)
+        self._model_download_timer.timeout.connect(self._poll_model_download)
+        self._update_segmentation_note()
+        layout.addWidget(effects_box)
 
         screen_box = QGroupBox("Screen capture")
         screen_grid = QGridLayout(screen_box)
@@ -4699,6 +4779,115 @@ class AnyCamWindow(QMainWindow):
     def _even(value: int) -> int:
         """Round down to an even size (H.264 cannot encode odd frames)."""
         return max(2, int(value) - int(value) % 2)
+
+    def _update_effects_device_note(self) -> None:
+        from . import inference
+
+        cuda = inference.gpu_available()
+        self.effects_device_note.setText(
+            f"Now running on: {inference.describe()}. Background, face and "
+            "mask effects use these models; the GPU is shared with the canvas "
+            "and the encoder, so the CPU is the default."
+            + ("" if cuda else
+               " To use the GPU, replace onnxruntime with onnxruntime-gpu and "
+               "its CUDA/cuDNN libraries: pip uninstall onnxruntime && "
+               "pip install 'onnxruntime-gpu[cuda,cudnn]'."))
+
+    def _update_segmentation_note(self) -> None:
+        from . import models as model_catalog
+
+        rvm = model_catalog.CATALOG["rvm"]
+        have = model_catalog.model_path("rvm") is not None
+        wanted = self.segmentation_combo.currentData() == "rvm"
+        downloading = self._model_download is not None
+        self.model_download_button.setVisible(wanted and not have)
+        self.model_download_button.setEnabled(not downloading)
+        if not wanted:
+            text = ("MediaPipe selfie segmentation, bundled with AnyCam "
+                    "(Apache-2.0). Fast; edges are softer.")
+        elif have:
+            text = (f"In use: {rvm.label}. Soft edges and hair, stable between "
+                    f"frames. Licence {rvm.license}, from "
+                    f"<a href='{rvm.source}'>its author</a>.")
+        else:
+            text = (f"{rvm.note} Click Download to fetch it once "
+                    f"({rvm.size / 1e6:.0f} MB from <a href='{rvm.source}'>"
+                    "github.com/PeterL1n</a>, checked against a pinned SHA-256). "
+                    "Until then the standard model is used.")
+        if downloading:
+            done, total = self._model_download.get("progress", (0, rvm.size))
+            text = f"Downloading… {done / 1e6:.1f} / {total / 1e6:.0f} MB"
+        self.segmentation_note.setText(text)
+
+    def _segmentation_changed(self, _index: int = 0) -> None:
+        from . import segment
+
+        value = str(self.segmentation_combo.currentData() or "mediapipe")
+        self.project.output.segmentation_model = value
+        self._mark_dirty()
+        segment.set_model(value)
+        self._update_segmentation_note()
+        self.log_event(f"person cut-out model: chosen {value}, "
+                       f"in use {segment.active_model()}")
+        self._status(f"Person cut-out: {self.segmentation_combo.currentText()}"
+                     + ("" if segment.active_model() == value else
+                        " (download it to use it)"))
+
+    def _download_rvm(self) -> None:
+        """Fetch the RVM model on a thread; the UI polls for progress."""
+        from . import models as model_catalog
+
+        if self._model_download is not None:
+            return
+        state: dict = {"progress": (0, model_catalog.CATALOG["rvm"].size)}
+        self._model_download = state
+
+        def work() -> None:
+            try:
+                model_catalog.download(
+                    "rvm", progress=lambda done, total: state.__setitem__(
+                        "progress", (done, total)))
+                state["ok"] = True
+            except Exception as exc:  # noqa: BLE001 - shown to the user
+                state["error"] = str(exc)
+            state["finished"] = True
+
+        threading.Thread(target=work, name="anycam-model-download", daemon=True).start()
+        self._model_download_timer.start()
+        self._update_segmentation_note()
+
+    def _poll_model_download(self) -> None:
+        from . import segment
+
+        state = self._model_download
+        if state is None:
+            self._model_download_timer.stop()
+            return
+        if not state.get("finished"):
+            self._update_segmentation_note()
+            return
+        self._model_download_timer.stop()
+        self._model_download = None
+        if state.get("ok"):
+            segment.reset()          # pick the new model up on the next refresh
+            self._status("Robust Video Matting downloaded and in use")
+            self.log_event("model rvm downloaded and verified")
+        else:
+            error = state.get("error", "unknown error")
+            self._status(f"Model download failed: {error}")
+            self.log_event(f"model rvm download failed: {error}")
+        self._update_segmentation_note()
+
+    def _effects_device_changed(self, _index: int = 0) -> None:
+        from . import inference
+
+        value = str(self.effects_device_combo.currentData() or "cpu")
+        self.project.output.effects_device = value
+        self._mark_dirty()
+        inference.set_preference(value)
+        self._update_effects_device_note()
+        self.log_event(f"AI effects device: {inference.describe()}")
+        self._status(f"AI effects run on: {inference.describe()}")
 
     def _encoder_changed(self, _index: int = 0) -> None:
         value = str(self.encoder_combo.currentData() or "auto").lower()

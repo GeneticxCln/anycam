@@ -23,21 +23,31 @@ from anycam import effect_thumbs, effects, processors  # noqa: E402
 
 
 def bench(spec, size, frames: int, fps: int) -> tuple[float, float]:
-    """(mean, worst) milliseconds per frame.  The mean is the sustained cost: an
-    effect that refreshes a cache every few frames has a cheap median but a
-    costlier average, and the average decides whether it keeps up."""
+    """(mean, worst) milliseconds per frame on the frame thread.  The mean is
+    the sustained cost: an effect that refreshes a cache every few frames has a
+    cheap median but a costlier average, and the average decides whether it
+    keeps up.  Work on the effects' worker threads (detection, segmentation,
+    shading) overlaps with frames and is not counted here."""
     sample = effect_thumbs.default_sample(size).convert("RGBA")
     processor = processors.make_processor(spec.processor, spec.default)
-    for step in range(4):                      # warm the models and caches
+    warm = 4
+    for step in range(warm):                   # warm the models and caches
         processor.process(sample.copy(), step / fps)
     times = []
     for step in range(frames):
         picture = sample.copy()
         started = time.perf_counter()
-        # Advance the clock by one real frame: the effects cache work for a
-        # fraction of a second, so a longer step would overstate their cost.
-        processor.process(picture, 1.0 + step / fps)
+        # Advance the clock by one real frame and keep it continuous: the
+        # effects cache work for a fraction of a second (some on worker
+        # threads), so a jump would force a blocking refresh no live stream
+        # ever sees, and a longer step would overstate their cost.
+        processor.process(picture, (warm + step) / fps)
         times.append((time.perf_counter() - started) * 1000.0)
+        # Real frames arrive one frame time apart; the worker threads use
+        # that gap.  Sleep the rest of the frame so they get it here too.
+        left = 1.0 / fps - (time.perf_counter() - started)
+        if left > 0:
+            time.sleep(left)
     processor.close()
     return statistics.fmean(times), max(times)
 
@@ -56,6 +66,10 @@ def main() -> int:
     print(f"{'effect':<24}" + "".join(f"{w}x{h:<19}" for w, h in sizes))
     slow = []
     for spec in specs:
+        if spec.processor.partition(":")[0] in processors.NATIVE_FRAMING:
+            # Live, these crop and scale in GStreamer; Python only steers.
+            print(f"{spec.label:<24}native GStreamer crop/scale in live use (not Python)")
+            continue
         cells = []
         for size in sizes:
             ms, worst = bench(spec, size, args.frames, args.fps)
