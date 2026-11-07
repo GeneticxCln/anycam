@@ -36,7 +36,7 @@ from .model import (Effects, Layer, Project, Scene, camera_grid_scene,
                     default_project, new_id, two_camera_scene)
 from .engine.outputs.recorder import Recorder
 from .engine.outputs.vcam import VcamOutput
-from .pipeline import AnyCamEngine, nvenc_available, recording_codec
+from .pipeline import AnyCamEngine, nvenc_available, recording_codec, va_present
 from .phone_dialog import PhoneEvents, PhonePairDialog
 from .pool import SCREEN_IDLE_GRACE_S, SourcePool
 from . import animated, effect_thumbs, effects as effect_library
@@ -1189,6 +1189,10 @@ class AnyCamWindow(QMainWindow):
         self._phone_dialog: PhonePairDialog | None = None
         self._phone_events = PhoneEvents(self)
         self._phone_events.event.connect(self._on_phone_event)
+        # Desktop integration (tray icon, portal global shortcuts); started by
+        # run_gui for the real window, never for tests or screenshots.
+        self._tray = None
+        self._global_shortcuts = None
         self.recording = False
         self._recorder: Recorder | None = None
         self._recording_path = ""
@@ -3069,12 +3073,20 @@ class AnyCamWindow(QMainWindow):
         encoder_grid = QGridLayout(encoder_box)
         self.encoder_combo = QComboBox()
         for label, value in (
-            ("Auto (NVENC H.264 when available)", "auto"),
+            ("Auto (NVENC, then VA-API, then x264)", "auto"),
             ("NVIDIA NVENC H.264", "nvenc"),
             ("NVIDIA NVENC H.265 (HEVC)", "nvenc_h265"),
             ("NVIDIA NVENC AV1", "nvenc_av1"),
+            ("Intel/AMD VA-API H.264", "vaapi"),
+            ("Intel/AMD VA-API H.265 (HEVC)", "vaapi_h265"),
+            ("Intel/AMD VA-API AV1", "vaapi_av1"),
             ("CPU x264", "cpu"),
         ):
+            # VA-API choices only where the encoders are installed.
+            if value.startswith("vaapi"):
+                codec = {"vaapi": "h264", "vaapi_h265": "h265", "vaapi_av1": "av1"}[value]
+                if not va_present(codec):
+                    continue
             self.encoder_combo.addItem(label, value)
         saved_encoder = str(self.project.output.encoder or "auto").lower()
         chosen = self.encoder_combo.findData(saved_encoder)
@@ -3200,6 +3212,11 @@ class AnyCamWindow(QMainWindow):
             chip.setObjectName("accent")
             grid4.addWidget(chip, row, 0)
             grid4.addWidget(QLabel(what), row, 1)
+        self.global_shortcuts_label = QLabel()
+        self.global_shortcuts_label.setObjectName("muted")
+        self.global_shortcuts_label.setWordWrap(True)
+        grid4.addWidget(self.global_shortcuts_label, len(keys), 0, 1, 2)
+        self._update_global_shortcuts_label()
         layout.addWidget(box4)
 
         save = QPushButton("Save project")
@@ -5740,6 +5757,118 @@ class AnyCamWindow(QMainWindow):
             self._thumb_timer.start()
         return super().eventFilter(watched, event)
 
+    # ---------------------------------------------------- desktop integration
+    def start_desktop_integration(self) -> None:
+        """A tray icon and global shortcuts through the portal, when present."""
+        from PySide6.QtWidgets import QSystemTrayIcon
+
+        from . import shortcuts
+
+        if self._tray is None and QSystemTrayIcon.isSystemTrayAvailable():
+            icon = self.windowIcon()
+            if icon.isNull():
+                icon = QIcon.fromTheme("camera-web", QIcon.fromTheme("camera-video"))
+            tray = QSystemTrayIcon(icon, self)
+            tray.setToolTip("AnyCam")
+            menu = QMenu(self)
+            menu.aboutToShow.connect(lambda: self._fill_tray_menu(menu))
+            self._fill_tray_menu(menu)
+            tray.setContextMenu(menu)
+            tray.activated.connect(self._tray_activated)
+            tray.show()
+            self._tray = tray
+        if self._global_shortcuts is None:
+            self._global_shortcuts = shortcuts.GlobalShortcuts(
+                self._on_global_shortcut, log=self.log_event,
+                on_state=self._update_global_shortcuts_label)
+            self._global_shortcuts.start()
+        self._update_global_shortcuts_label()
+
+    def _stop_desktop_integration(self) -> None:
+        tray, self._tray = self._tray, None
+        if tray is not None:
+            tray.hide()
+            tray.deleteLater()
+        keys, self._global_shortcuts = self._global_shortcuts, None
+        if keys is not None:
+            keys.close()
+
+    def _tray_activated(self, reason) -> None:
+        from PySide6.QtWidgets import QSystemTrayIcon
+
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._toggle_window_visible()
+
+    def _toggle_window_visible(self) -> None:
+        if self.isVisible() and not self.isMinimized():
+            self.hide()
+        else:
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+
+    def _fill_tray_menu(self, menu: QMenu) -> None:
+        """Rebuilt each time it opens, so the checks and scenes are current."""
+        menu.clear()
+        shown = self.isVisible() and not self.isMinimized()
+        menu.addAction("Hide AnyCam" if shown else "Show AnyCam",
+                       self._toggle_window_visible)
+        menu.addSeparator()
+        for label, checked, slot in (
+                ("Virtual camera", self.vcam_on, self.toggle_vcam),
+                ("Record", self.recording, self.toggle_record),
+                ("Mute microphone", bool(self.project.audio.mic_muted), self.toggle_mic_mute)):
+            action = menu.addAction(label, slot)
+            action.setCheckable(True)
+            action.setChecked(bool(checked))
+        scenes = menu.addMenu("Scenes")
+        for index, scene in enumerate(self.project.scenes):
+            action = scenes.addAction(scene.name, lambda i=index: self.switch_scene(i))
+            action.setCheckable(True)
+            action.setChecked(scene.id == self.project.active_scene)
+        menu.addSeparator()
+        menu.addAction("Quit AnyCam", self.close)
+
+    def _on_global_shortcut(self, shortcut: str) -> None:
+        """A portal global shortcut, pressed while any app has focus."""
+        self.log_event(f"global shortcut: {shortcut}")
+        if shortcut.startswith("scene-") and shortcut[6:].isdigit():
+            index = int(shortcut[6:]) - 1
+            if 0 <= index < len(self.project.scenes):
+                self.switch_scene(index)
+        elif shortcut in ("scene-next", "scene-previous"):
+            ids = [scene.id for scene in self.project.scenes]
+            if ids:
+                current = ids.index(self.project.active_scene) if self.project.active_scene in ids else 0
+                step = 1 if shortcut == "scene-next" else -1
+                self.switch_scene((current + step) % len(ids))
+        elif shortcut == "mute":
+            self.toggle_mic_mute()
+        elif shortcut == "record":
+            self.toggle_record()
+        elif shortcut == "vcam":
+            self.toggle_vcam()
+        self._update_global_shortcuts_label()
+
+    def _update_global_shortcuts_label(self) -> None:
+        label = getattr(self, "global_shortcuts_label", None)
+        if label is None:
+            return
+        keys = self._global_shortcuts
+        if keys is None:
+            text = "Global shortcuts: not started."
+        elif keys.state == "bound":
+            text = ("Global shortcuts (work while other apps have focus): Ctrl+Alt+1…9 "
+                    "scenes, Ctrl+Alt+N / P next / previous scene, Ctrl+Alt+M mute, "
+                    "Ctrl+Alt+R record, Ctrl+Alt+V virtual camera. Change them in "
+                    "your desktop's shortcut settings.")
+        elif keys.state == "binding":
+            text = "Global shortcuts: waiting for the desktop to confirm them…"
+        else:
+            text = f"Global shortcuts unavailable ({keys.state.removeprefix('failed: ')}); "\
+                   "the shortcuts above work while AnyCam has focus."
+        label.setText(text)
+
     # ------------------------------------------------------------- phone link
     def _phone_link(self, *, quiet: bool = False):
         """The running phone link, started on first use (None if it cannot)."""
@@ -5820,6 +5949,7 @@ class AnyCamWindow(QMainWindow):
         self._finish_recorder()
         self._finish_vcam_output()
         self._stop_phone_link()
+        self._stop_desktop_integration()
         self._source_pool.stop()
         self._save_if_needed()
         self._close_screen_sessions()
@@ -5846,6 +5976,7 @@ class AnyCamWindow(QMainWindow):
         self._finish_recorder()
         self._finish_vcam_output()
         self._stop_phone_link()
+        self._stop_desktop_integration()
         self._source_pool.stop()
         self._save_if_needed()
         self._close_screen_sessions()

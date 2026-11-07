@@ -25,6 +25,9 @@ gui = ["PySide6>=6.6"]
 dev = ["pytest>=8", "pytest-timeout>=2"]
 # Powers the bundled YuNet face overlay; install with `pip install -e '.[face]'`.
 face = ["onnxruntime>=1.16"]
+# Phone camera: in-process TLS certificate and QR code (otherwise the openssl
+# and qrencode commands are used).
+phone = ["cryptography>=42", "segno>=1.6"]
 
 [project.scripts]
 anycam = "anycam.__main__:main"

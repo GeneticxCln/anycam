@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 from collections import deque
 import os
+import functools
 import shutil
 import subprocess
 import sys
@@ -18,7 +19,7 @@ import psutil
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstVideo", "1.0")
-from gi.repository import Gst, GstVideo  # noqa: E402
+from gi.repository import GLib, Gst, GstVideo  # noqa: E402
 
 from . import config, overlay
 from .geometry import box_pixels, clamp
@@ -52,6 +53,14 @@ def encoder_bitrate(codec: str, width: int, height: int) -> int:
     pixels = max(1, int(width)) * max(1, int(height))
     scale = max(1.0, (pixels / (1920 * 1080)) ** 0.75)
     return max(1000, int(round(base * scale / 1000.0)) * 1000)
+# VA-API (Intel, AMD) through the ``va`` plugin of gst-plugins-bad.  The old
+# gstreamer-vaapi elements (vaapih264enc ...) are deprecated and not used.
+VA_FACTORIES = {"h264": ("vah264enc", "vah264lpenc"),
+                "h265": ("vah265enc", "vah265lpenc"),
+                "av1": ("vaav1enc", "vaav1lpenc")}
+_VA_ALIASES = {"vaapi", "va", "vaapi_h264", "va_h264"}
+_VA_H265_ALIASES = {"vaapi_h265", "va_h265", "vaapi_hevc"}
+_VA_AV1_ALIASES = {"vaapi_av1", "va_av1"}
 _CPU_ENCODERS = {"cpu", "x264", "software", "0", "false", "off"}
 _H265_ALIASES = {"h265", "hevc", "nvh265", "nvenc_h265", "nvenc_hevc",
                  "hevc_nvenc"}
@@ -80,6 +89,47 @@ def nvenc_available(codec: str = "h264") -> bool:
     return probe.returncode == 0 and bool(probe.stdout.strip())
 
 
+@functools.lru_cache(maxsize=None)
+def _va_encodes(factory: str) -> bool:
+    """A real VA-API encode of a few frames (cached).
+
+    A present element proves nothing: a missing or broken VA driver only fails
+    once frames arrive.  This runs once per encoder per session.
+    """
+    if Gst.ElementFactory.find(factory) is None:
+        return False
+    upload = "vapostproc ! " if Gst.ElementFactory.find("vapostproc") else (
+        "videoconvert ! video/x-raw,format=NV12 ! ")
+    try:
+        pipeline = Gst.parse_launch(
+            "videotestsrc num-buffers=5 ! video/x-raw,width=320,height=240,framerate=30/1 ! "
+            f"{upload}{factory} ! fakesink")
+    except GLib.Error:
+        return False
+    bus = pipeline.get_bus()
+    pipeline.set_state(Gst.State.PLAYING)
+    try:
+        message = bus.timed_pop_filtered(
+            5 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+    finally:
+        pipeline.set_state(Gst.State.NULL)
+    return message is not None and message.type == Gst.MessageType.EOS
+
+
+def va_factory(codec: str) -> str:
+    """The first VA-API encoder for ``codec`` that really encodes, or ""."""
+    for factory in VA_FACTORIES.get(codec, ()):
+        if _va_encodes(factory):
+            return factory
+    return ""
+
+
+def va_present(codec: str = "h264") -> bool:
+    """Cheap check (no probe): is any VA-API encoder for ``codec`` installed?"""
+    return any(Gst.ElementFactory.find(name) is not None
+               for name in VA_FACTORIES.get(codec, ()))
+
+
 @dataclass(frozen=True)
 class EncoderPlan:
     """One H.26x/AV1 decision shared by recording and RTMP."""
@@ -94,11 +144,15 @@ class EncoderPlan:
 
 def _requested_codec(preference: str) -> str:
     preference = (preference or "auto").strip().lower()
-    if preference in _H265_ALIASES:
+    if preference in _H265_ALIASES or preference in _VA_H265_ALIASES:
         return "h265"
-    if preference in _AV1_ALIASES:
+    if preference in _AV1_ALIASES or preference in _VA_AV1_ALIASES:
         return "av1"
     return "h264"
+
+
+def _wants_va(preference: str) -> bool:
+    return preference in _VA_ALIASES | _VA_H265_ALIASES | _VA_AV1_ALIASES
 
 
 def encoder_plan(preference: str, *, purpose: str = "record") -> EncoderPlan:
@@ -123,22 +177,44 @@ def encoder_plan(preference: str, *, purpose: str = "record") -> EncoderPlan:
         "h265": ["h265", "h264"],
         "av1": ["av1", "h265", "h264"],
     }[effective]
-    for codec in candidates:
+
+    def nvenc(codec: str) -> EncoderPlan | None:
         if (not nvenc_available(codec)
                 or Gst.ElementFactory.find(ENCODER_PARSERS[codec]) is None):
-            continue
+            return None
         note = f"{ENCODER_LABELS[codec]} NVENC · "
         note += ("CUDA upload" if Gst.ElementFactory.find("cudaupload")
                  else "RGBA upload")
-        if purpose == "rtmp" and requested != "h264":
-            note = f"RTMP/FLV uses H.264 · {note}"
-        elif codec != effective:
-            note = f"{ENCODER_LABELS[effective]} unavailable · {note}"
-        return EncoderPlan(
-            codec, ENCODER_FACTORIES[codec], True, ENCODER_PARSERS[codec],
-            ENCODER_BITRATES[codec], note)
+        return EncoderPlan(codec, ENCODER_FACTORIES[codec], True,
+                           ENCODER_PARSERS[codec], ENCODER_BITRATES[codec], note)
 
-    note = "NVENC unavailable · CPU x264"
+    def vaapi(codec: str) -> EncoderPlan | None:
+        if Gst.ElementFactory.find(ENCODER_PARSERS[codec]) is None:
+            return None
+        factory = va_factory(codec)
+        if not factory:
+            return None
+        return EncoderPlan(codec, factory, True, ENCODER_PARSERS[codec],
+                           ENCODER_BITRATES[codec],
+                           f"{ENCODER_LABELS[codec]} VA-API ({factory})")
+
+    # Auto and NVENC choices try NVENC first, then VA-API (Intel/AMD); a
+    # VA-API choice tries VA-API first.  x264 is the last resort.
+    families = (vaapi, nvenc) if _wants_va(preference) else (nvenc, vaapi)
+    for codec in candidates:
+        for family in families:
+            plan = family(codec)
+            if plan is None:
+                continue
+            note = plan.note
+            if purpose == "rtmp" and requested != "h264":
+                note = f"RTMP/FLV uses H.264 · {note}"
+            elif codec != effective:
+                note = f"{ENCODER_LABELS[effective]} unavailable · {note}"
+            return EncoderPlan(plan.codec, plan.factory, True, plan.parser,
+                               plan.bitrate, note)
+
+    note = "No hardware encoder · CPU x264"
     if effective != "h264":
         note = f"{ENCODER_LABELS[effective]} unavailable · " + note
     elif purpose == "rtmp" and requested != "h264":
@@ -1451,6 +1527,18 @@ class AnyCamEngine:
         bitrate = plan.bitrate
         if purpose == "rtmp":
             bitrate = encoder_bitrate(plan.codec, self.canvas_w, self.canvas_h)
+        if plan.hardware and plan.factory.startswith("va"):
+            # VA-API encoders: constant bitrate, a keyframe every 2 s, and the
+            # fastest target usage (live, like NVENC's zerolatency/p4).
+            encoder = make(plan.factory, name)
+            for prop, value in (("bitrate", bitrate), ("rate-control", "cbr"),
+                                ("key-int-max", 60), ("target-usage", 7)):
+                if encoder.find_property(prop) is not None:
+                    try:
+                        encoder.set_property(prop, value)
+                    except (TypeError, ValueError):
+                        pass
+            return encoder
         if plan.hardware:
             return make(plan.factory, name, bitrate=bitrate,
                         zerolatency=True, preset="p4")
@@ -1474,7 +1562,7 @@ class AnyCamEngine:
         return self._make_encoder(plan, "record_encoder"), plan.hardware
 
     @staticmethod
-    def _encoder_input(hardware: bool, prefix: str) -> list[Gst.Element]:
+    def _encoder_input(hardware: bool, prefix: str, factory: str = "") -> list[Gst.Element]:
         """Keep compositor RGBA out of the CPU format-conversion path.
 
         ``nvh264enc`` accepts system RGBA directly.  When CUDA is present,
@@ -1482,6 +1570,13 @@ class AnyCamEngine:
         consumes it there, avoiding ``videoconvert`` and an I420 copy.  x264
         still needs the explicit CPU I420 conversion.
         """
+        if hardware and factory.startswith("va"):
+            # VA-API: vapostproc uploads and converts on the GPU; without it,
+            # convert to NV12 on the CPU (what the encoders accept).
+            if Gst.ElementFactory.find("vapostproc") is not None:
+                return [make("vapostproc", f"{prefix}_va_upload")]
+            return [make("videoconvert", f"{prefix}_convert"),
+                    caps_filter("video/x-raw,format=NV12", f"{prefix}_nv12")]
         if hardware:
             if Gst.ElementFactory.find("cudaupload") is not None:
                 return [make("cudaupload", f"{prefix}_cuda_upload")]
@@ -1509,7 +1604,7 @@ class AnyCamEngine:
         enc, hardware = self._make_record_encoder()
         self._record_encoder = enc
         plan = self._record_plan or encoder_plan(self._encoder_preference())
-        pixel_path = self._encoder_input(hardware, "record")
+        pixel_path = self._encoder_input(hardware, "record", plan.factory)
         parse = self._make_parser(plan, "record_parse_tap")
         # Encoded frames are never dropped here (the leaky queue in front of
         # the encoder is where this graph sheds load).
@@ -1611,7 +1706,7 @@ class AnyCamEngine:
         queue = self._branch("record")
         enc, hardware = self._make_record_encoder()
         plan = self._record_plan or encoder_plan(self._encoder_preference())
-        pixel_path = self._encoder_input(hardware, "record")
+        pixel_path = self._encoder_input(hardware, "record", plan.factory)
         parse = self._make_parser(plan, "record_parse")
         # Buffer encoded video while mux waits for the first audio buffer, so a
         # slow microphone wake-up cannot block the tee and starve the preview.
@@ -1687,7 +1782,7 @@ class AnyCamEngine:
         queue = self._branch("rtmp")
         # Downstream leak: the encoder can never push back into the compositor.
         queue.set_property("leaky", 2)
-        pixel_path = self._encoder_input(plan.hardware, "rtmp")
+        pixel_path = self._encoder_input(plan.hardware, "rtmp", plan.factory)
         enc = self._make_encoder(plan, "rtmp_encoder", purpose="rtmp")
         parse = self._make_parser(plan, "rtmp_parse")
         h264 = caps_filter("video/x-h264,stream-format=avc,alignment=au",

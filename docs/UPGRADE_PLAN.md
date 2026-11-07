@@ -8,6 +8,18 @@ says what AnyCam does today (checked against the code and the reference machine 
 Reference machine: CachyOS, KDE/Wayland (kinetic-we), NVIDIA RTX 4060 Ti, GStreamer 1.28,
 PipeWire 1.6.10, Vesktop (Electron 44).
 
+## Progress
+
+| Item | Status |
+|---|---|
+| 3.1 In-process TLS (`cryptography`, `openssl` fallback) | **Done.** Tested with and without the package; CI runs both |
+| 3.2 firewalld over D-Bus | **Done.** Tested against a simulated system bus; not yet run on a real firewalld |
+| 4 VA-API encoders (`va` plugin, real-encode probe) | **Done.** Plan logic tested with simulated elements; not yet run on Intel/AMD |
+| 5b Tray icon and portal global shortcuts | **Done.** Portal flow tested with a simulated bus; KDE offers GlobalShortcuts v2 on the reference machine |
+| 5a Screencast restore token on KDE | **Waiting for a check on screen**: does a second launch skip the chooser? |
+| 3.3 Next free port when 8443 is taken | Open |
+| Phase B (PipeWire camera), C, D | Open |
+
 ## Summary
 
 | # | Upgrade | Today | Value | Effort | Risk | Order |

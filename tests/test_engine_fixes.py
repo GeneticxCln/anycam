@@ -283,3 +283,79 @@ def test_hidden_camera_tail_uses_the_real_mode_not_the_canvas_size(monkeypatch):
         assert engine.pool.entries() == []  # hidden: nothing was opened
     finally:
         engine.pool.stop()
+
+
+# ------------------------------------------------------------- VA-API encoders
+def _fake_elements(monkeypatch, present):
+    import anycam.pipeline as pipeline_module
+
+    real_find = pipeline_module.Gst.ElementFactory.find
+
+    def find(name):
+        if name in present:
+            return object()
+        if name.startswith(("va", "nvh", "nvav")):
+            return None
+        return real_find(name)
+
+    monkeypatch.setattr(pipeline_module.Gst.ElementFactory, "find", staticmethod(find))
+    return pipeline_module
+
+
+def test_auto_uses_vaapi_on_intel_or_amd_when_nvenc_is_missing(monkeypatch):
+    pipeline_module = _fake_elements(monkeypatch, {"vah264enc", "vah265enc"})
+    monkeypatch.setattr(pipeline_module, "nvenc_available", lambda codec="h264": False)
+    monkeypatch.setattr(pipeline_module, "_va_encodes", lambda factory: factory in ("vah264enc", "vah265enc"))
+    plan = pipeline_module.encoder_plan("auto")
+    assert (plan.factory, plan.codec, plan.hardware) == ("vah264enc", "h264", True)
+    assert "VA-API" in plan.note
+    assert pipeline_module.encoder_plan("vaapi_h265").factory == "vah265enc"
+    av1 = pipeline_module.encoder_plan("vaapi_av1")
+    assert av1.factory == "vah265enc" and "AV1 unavailable" in av1.note
+    assert pipeline_module.encoder_plan("vaapi", purpose="rtmp").codec == "h264"
+
+
+def test_nvenc_stays_first_and_a_broken_va_driver_falls_back(monkeypatch):
+    pipeline_module = _fake_elements(monkeypatch, {"vah264enc", "nvh264enc"})
+    monkeypatch.setattr(pipeline_module, "nvenc_available", lambda codec="h264": codec == "h264")
+    monkeypatch.setattr(pipeline_module, "_va_encodes", lambda factory: True)
+    assert pipeline_module.encoder_plan("auto").factory == "nvh264enc"
+    assert pipeline_module.encoder_plan("vaapi").factory == "vah264enc", "an explicit choice wins"
+    monkeypatch.setattr(pipeline_module, "nvenc_available", lambda codec="h264": False)
+    monkeypatch.setattr(pipeline_module, "_va_encodes", lambda factory: False)  # driver broken
+    plan = pipeline_module.encoder_plan("auto")
+    assert plan.factory == "x264enc" and "No hardware encoder" in plan.note
+
+
+def test_a_va_encoder_gets_live_settings_and_a_gpu_upload(monkeypatch):
+    import anycam.pipeline as pipeline_module
+
+    if Gst.ElementFactory.find("vah264enc") is None:
+        pytest.skip("no VA-API encoder on this machine (covered by the plan tests)")
+    plan = pipeline_module.EncoderPlan("h264", "vah264enc", True, "h264parse", 12000, "")
+    from anycam.demo import build_demo_project
+
+    engine = AnyCamEngine(build_demo_project("testsrc", 320, 180, 30))
+    encoder = engine._make_encoder(plan, "enc")
+    assert encoder.get_property("bitrate") == 12000
+    names = [e.get_factory().get_name()
+             for e in AnyCamEngine._encoder_input(True, "rec", "vah264enc")]
+    assert names[0] in ("vapostproc", "videoconvert")
+
+
+def test_the_va_input_path_without_vapostproc_converts_to_nv12(monkeypatch):
+    pipeline_module = _fake_elements(monkeypatch, {"vah264enc"})
+    elements = AnyCamEngine._encoder_input(True, "rec", "vah264enc")
+    names = [e.get_factory().get_name() for e in elements]
+    assert names == ["videoconvert", "capsfilter"]
+    assert "NV12" in elements[1].get_property("caps").to_string()
+    nvenc = [e.get_factory().get_name() for e in AnyCamEngine._encoder_input(True, "rec", "nvh264enc")]
+    assert "videoconvert" not in nvenc, "NVENC keeps its zero-conversion path"
+
+
+def test_the_real_va_probe_is_false_without_va_elements():
+    import anycam.pipeline as pipeline_module
+
+    if Gst.ElementFactory.find("vah264enc") is not None:
+        pytest.skip("VA-API present: the probe result depends on the driver")
+    assert pipeline_module.va_factory("h264") == ""

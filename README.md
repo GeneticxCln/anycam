@@ -15,9 +15,11 @@ no Wine.
 - **Phone camera:** **Add → Phone camera (QR code)** shows a QR code; scan it with the
   phone, accept the one-time certificate warning, allow the camera, and the phone streams
   into the scene over WebRTC. Local network only, no app to install; a paired phone
-  reconnects by opening the page again. If ufw blocks the port, **Allow phones** in the same
-  dialog opens it with one password prompt. Needs `openssl` and `qrencode` (or the `segno`
-  Python package). See [docs/PHONE_CAMERA.md](docs/PHONE_CAMERA.md).
+  reconnects by opening the page again. If ufw or firewalld blocks the port, **Allow phones**
+  in the same dialog opens it with one password prompt (firewalld over D-Bus). The TLS
+  certificate and QR code come from the `cryptography` and `segno` packages
+  (`anycam[phone]`), or else the `openssl` and `qrencode` commands. See
+  [docs/PHONE_CAMERA.md](docs/PHONE_CAMERA.md).
 - **Effects browser:** thumbnails drawn through the real pipeline, applied live with no
   rebuild; two stacking filter slots; copy, paste, clear.
   - About 70 filters and effects: colour looks, distortions, retro TV, touch-up, background
@@ -40,7 +42,12 @@ no Wine.
   model work runs beside the frame thread, so every effect fits a 1080p60 frame on the
   reference machine. Add your own segmentation model with `ANYCAM_SEG_MODEL`. See
   [docs/EFFECT_MODELS.md](docs/EFFECT_MODELS.md).
-- **Outputs:** V4L2 virtual camera, MP4 recording (x264 or NVENC), RTMP, audio mixing.
+- **Outputs:** V4L2 virtual camera, MP4 recording (x264, NVENC, or VA-API on Intel/AMD), RTMP,
+  audio mixing. Auto picks NVENC, then VA-API, then x264, after a real test encode.
+- **Desktop:** a tray icon (show/hide, virtual camera, record, mute, scenes) and global
+  shortcuts that work while other apps have focus, through the desktop portal (KDE,
+  Hyprland): Ctrl+Alt+1…9 scenes, Ctrl+Alt+N/P next/previous, Ctrl+Alt+M mute, Ctrl+Alt+R
+  record, Ctrl+Alt+V virtual camera.
 - **Microphone:** noise suppression (off/low/moderate/high/very high, moderate by default)
   and automatic gain through GStreamer's `webrtcdsp`, applied to recordings and streams.
 
@@ -112,7 +119,8 @@ GitHub Release with `SHA256SUMS`. To release, bump `version` in `pyproject.toml`
 
 Everything stays local: recordings go to `~/Videos/AnyCam/`, with no telemetry, accounts or
 update checks. Privileged changes are the one-time virtual camera setup and, only if you
-click **Allow phones**, a ufw rule for TCP 8443; both go through the normal password prompt.
+click **Allow phones**, a ufw or firewalld rule for TCP 8443; both go through the normal
+password prompt.
 The phone link runs only after you add a phone (or open a scene with one): HTTPS on your LAN
 address, pairing by single-use QR code, phone secrets stored hashed, video never leaves the
 network. The only internet request AnyCam can make is the optional model download, and
@@ -146,8 +154,12 @@ permission through the portal.
   browsers are untested. Video is decoded on the CPU. Paired phones cannot be removed from
   the UI yet (delete `~/.local/state/anycam/phones.json`), and the phone remote control is
   not built.
-- **Firewall:** only ufw is opened automatically. With firewalld or plain nftables, allow
-  TCP 8443 yourself.
+- **Firewall:** ufw and firewalld are opened automatically. With plain nftables or another
+  firewall, allow TCP 8443 yourself.
+- **VA-API and firewalld:** both are covered by tests with simulated elements and a simulated
+  D-Bus; neither has been run on real Intel/AMD hardware or a real firewalld yet.
+- **Global shortcuts:** need the portal's GlobalShortcuts (KDE, Hyprland); elsewhere only the
+  in-window shortcuts work.
 - **Devices:** a camera that returns under a different `/dev/video*` name must be re-selected.
   Screen share asks the portal chooser each launch, and a static share can show `SLOW`.
 - NVIDIA Broadcast and the Maxine SDK are not used (Windows-only app; restrictive SDK

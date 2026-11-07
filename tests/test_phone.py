@@ -326,3 +326,123 @@ def test_a_missing_password_agent_is_recognised():
     assert no_agent("Error creating textual authentication agent: Error opening current "
                     "controlling terminal for the process (`/dev/tty'): No such device or address")
     assert not no_agent("Error executing command as another user: Not authorized")
+
+
+# ------------------------------------------------------------ certificates
+def test_the_certificate_is_made_in_process_when_cryptography_is_there(tmp_path, monkeypatch):
+    pytest.importorskip("cryptography")
+    from anycam.phone import tls
+
+    monkeypatch.setattr(tls.shutil, "which", lambda name: None)   # no openssl at all
+    cert, key = tls.ensure_certificate(tmp_path / "c", host="192.168.1.20")
+    assert (key.stat().st_mode & 0o777) == 0o600
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)                            # a usable pair
+    from cryptography import x509
+
+    parsed = x509.load_pem_x509_certificate(cert.read_bytes())
+    names = parsed.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert "192.168.1.20" in [str(ip) for ip in names.get_values_for_type(x509.IPAddress)]
+    assert len(tls.fingerprint(cert).split(":")) == 32
+
+
+def test_without_cryptography_the_openssl_command_is_used(tmp_path, monkeypatch):
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is not installed")
+    from anycam.phone import tls
+
+    monkeypatch.setattr(tls, "_create_with_cryptography", lambda *a, **k: False)
+    cert, key = tls.ensure_certificate(tmp_path / "c")
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    assert (key.stat().st_mode & 0o777) == 0o600
+
+
+def test_with_neither_the_error_says_what_to_install(tmp_path, monkeypatch):
+    from anycam.phone import tls
+
+    monkeypatch.setattr(tls, "_create_with_cryptography", lambda *a, **k: False)
+    monkeypatch.setattr(tls.shutil, "which", lambda name: None)
+    with pytest.raises(RuntimeError, match="cryptography"):
+        tls.ensure_certificate(tmp_path / "c")
+
+
+# --------------------------------------------------------------- firewalld
+class _FakeFirewalld:
+    """A system bus stand-in that answers like firewalld and records calls."""
+
+    def __init__(self, open_ports=(), fail=None):
+        self.open_ports = set(open_ports)
+        self.calls = []
+        self.fail = fail or {}
+
+    def call_sync(self, name, path, interface, method, params, reply_type, flags,
+                  timeout, cancellable):
+        from gi.repository import GLib
+
+        args = params.unpack() if params is not None else ()
+        self.calls.append((path, interface, method, args, int(flags)))
+        if method in self.fail:
+            raise RuntimeError(self.fail[method])
+        if method == "NameHasOwner":
+            return GLib.Variant("(b)", (True,))
+        if method == "getZoneOfInterface":
+            return GLib.Variant("(s)", ("home",))
+        if method == "getDefaultZone":
+            return GLib.Variant("(s)", ("public",))
+        if method == "queryPort":
+            return GLib.Variant("(b)", (args[1] in self.open_ports,))
+        if method == "addPort" and interface.endswith(".zone") and len(args) == 4:
+            self.open_ports.add(args[1])
+            return GLib.Variant("(s)", (args[0],))
+        if method == "getZoneByName":
+            return GLib.Variant("(o)", ("/org/fedoraproject/FirewallD1/config/zone/3",))
+        return None
+
+
+def test_firewalld_is_queried_and_opened_over_dbus(monkeypatch):
+    from anycam.phone import firewall
+
+    bus = _FakeFirewalld()
+    monkeypatch.setattr(firewall, "_bus", lambda: bus)
+    monkeypatch.setattr(firewall, "_interface_of", lambda host: "wlan0")
+    assert firewall.backend() == "firewalld"
+    assert firewall.blocks(8443, "192.168.1.20")
+    assert firewall.firewalld_allow(8443, "192.168.1.20") == ""
+    assert not firewall.blocks(8443, "192.168.1.20")
+    methods = [(call[2], call[3]) for call in bus.calls]
+    assert ("getZoneOfInterface", ("wlan0",)) in methods
+    assert ("addPort", ("home", "8443", "tcp", 0)) in methods, "runtime rule"
+    assert ("addPort", ("8443", "tcp")) in methods, "permanent rule on the zone config"
+    interactive = [call for call in bus.calls if call[2] == "addPort"]
+    assert all(call[4] != 0 for call in interactive), "polkit may prompt for these"
+
+
+def test_firewalld_already_open_is_fine_and_refusal_is_reported(monkeypatch):
+    from anycam.phone import firewall
+
+    monkeypatch.setattr(firewall, "_interface_of", lambda host: "")
+    bus = _FakeFirewalld(fail={"addPort": "ALREADY_ENABLED: 8443:tcp"})
+    monkeypatch.setattr(firewall, "_bus", lambda: bus)
+    assert firewall.firewalld_allow(8443) == ""
+    bus = _FakeFirewalld(fail={"addPort": "org.fedoraproject.FirewallD1.NotAuthorized"})
+    monkeypatch.setattr(firewall, "_bus", lambda: bus)
+    reason = firewall.firewalld_allow(8443)
+    assert "NotAuthorized" in reason and firewall.auth_missing(reason)
+
+
+def test_without_firewalld_ufw_is_used(monkeypatch):
+    from anycam.phone import firewall
+
+    monkeypatch.setattr(firewall, "firewalld_running", lambda: False)
+    monkeypatch.setattr(firewall.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert firewall.backend() == "ufw"
+    monkeypatch.setattr(firewall.shutil, "which", lambda name: None)
+    monkeypatch.setattr(firewall, "UFW_DIR", firewall.Path("/nonexistent"))
+    assert firewall.backend() == ""
+
+
+def test_the_real_system_bus_check_never_raises():
+    from anycam.phone import firewall
+
+    assert firewall.firewalld_running() in (True, False)

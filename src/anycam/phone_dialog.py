@@ -92,8 +92,13 @@ class PhonePairDialog(QDialog):
         bar.addWidget(self.firewall_button)
         layout.addWidget(self.firewall_bar)
         self._firewall_process: QProcess | None = None
-        self.firewall_bar.setVisible(firewall.ufw_blocks(self.port)
-                                     and firewall.allow_command(self.port) is not None)
+        self._firewall_job: dict | None = None
+        self._firewall_timer = QTimer(self)
+        self._firewall_timer.setInterval(150)
+        self._firewall_timer.timeout.connect(self._poll_firewalld)
+        self.host = str(getattr(service, "host", "") or "")
+        self.firewall_backend = firewall.backend()
+        self.firewall_bar.setVisible(firewall.blocks(self.port, self.host))
         self.status = QLabel("Waiting for the phone…")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
@@ -114,7 +119,10 @@ class PhonePairDialog(QDialog):
         self.refresh_code()
 
     def allow_through_firewall(self, *, retried: bool = False) -> None:
-        """Open the phone port in ufw; the desktop asks for the password."""
+        """Open the phone port; the desktop asks for the password."""
+        if self.firewall_backend == "firewalld":
+            self._allow_with_firewalld(retried)
+            return
         command = firewall.allow_command(self.port)
         if command is None or self._firewall_process is not None:
             return
@@ -163,6 +171,47 @@ class PhonePairDialog(QDialog):
         else:
             message = f"Could not change the firewall: {output or f'exit {code}'}. Try again:"
         self.firewall_text.setText(message)
+
+    def _allow_with_firewalld(self, retried: bool) -> None:
+        """firewalld over D-Bus on a thread; polkit shows the password prompt."""
+        if self._firewall_job is not None:
+            return
+        self.firewall_button.setEnabled(False)
+        self.firewall_text.setText("Enter your password in the system prompt…")
+        job: dict = {"retried": retried}
+        self._firewall_job = job
+
+        def work() -> None:
+            job["error"] = firewall.firewalld_allow(self.port, self.host)
+            job["done"] = True
+
+        import threading
+
+        threading.Thread(target=work, name="anycam-firewalld", daemon=True).start()
+        self.log(f"firewall: firewalld addPort {self.port}/tcp")
+        self._firewall_timer.start()
+
+    def _poll_firewalld(self) -> None:
+        job = self._firewall_job
+        if job is None or not job.get("done"):
+            return
+        self._firewall_timer.stop()
+        self._firewall_job = None
+        error = job.get("error", "")
+        self.log(f"firewall: firewalld result: {error or 'ok'}")
+        if not error and not firewall.firewalld_blocks(self.port, self.host):
+            self.firewall_bar.setVisible(False)
+            self.status.setText("Phones are allowed through the firewall. Scan the code now.")
+            return
+        agent = firewall.installed_agent()
+        if firewall.auth_missing(error) and agent and not job.get("retried"):
+            # Same as with ufw: no polkit agent in this session; start it.
+            self.firewall_text.setText("Starting the system password prompt…")
+            QProcess.startDetached(agent, [])
+            QTimer.singleShot(2500, lambda: self.allow_through_firewall(retried=True))
+            return
+        self.firewall_button.setEnabled(True)
+        self.firewall_text.setText(f"Could not change the firewall: {error}. Try again:")
 
     def refresh_code(self) -> None:
         link = self.service.pairing_url()

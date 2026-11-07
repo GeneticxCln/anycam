@@ -47,7 +47,7 @@ jobs:
           /usr/bin/python3 -m pip install --break-system-packages --upgrade pip
           /usr/bin/python3 -m pip install --break-system-packages \
             "PySide6-Essentials>=6.6" numpy Pillow psutil pytest pytest-timeout \
-            onnxruntime
+            onnxruntime cryptography
 
       - name: Compile sources
         run: /usr/bin/python3 -m compileall -q src tests

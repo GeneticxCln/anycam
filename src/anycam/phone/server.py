@@ -220,7 +220,7 @@ class PhoneService:
         if self._httpd is not None:
             return
         host = self.requested_host or lan_address()
-        cert, key = ensure_certificate(self.cert_dir)
+        cert, key = ensure_certificate(self.cert_dir, host)
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
         context.load_cert_chain(cert, key)

@@ -1097,6 +1097,8 @@ def run_gui(project: Project | None = None) -> int:
         window.note_vcam_consumers()
         window.ensure_vcam_visible()
     QTimer.singleShot(200, window._autostart_preview)
+    # Tray icon and portal global shortcuts (both skipped where unavailable).
+    QTimer.singleShot(500, window.start_desktop_integration)
     code = app.exec()
     os._exit(code if code is not None else 0)
 

@@ -2013,3 +2013,32 @@ def test_person_cut_out_model_choice_and_download(app, monkeypatch, tmp_path):
         segment.set_model("mediapipe")
         window.close()
         app.processEvents()
+
+
+def test_allow_phones_uses_firewalld_over_dbus(app, monkeypatch):
+    from anycam.phone import firewall
+    from anycam.phone_dialog import PhonePairDialog
+
+    state = {"open": False}
+    monkeypatch.setattr(firewall, "backend", lambda: "firewalld")
+    monkeypatch.setattr(firewall, "blocks", lambda port, host="": not state["open"])
+    monkeypatch.setattr(firewall, "firewalld_blocks", lambda port, host="": not state["open"])
+    calls = []
+
+    def allow(port, host=""):
+        calls.append((port, host))
+        state["open"] = True
+        return ""
+
+    monkeypatch.setattr(firewall, "firewalld_allow", allow)
+    service = type("Service", (), {"port": 8443, "host": "192.168.1.20", "fingerprint": "AA",
+                                   "pairing_url": lambda self: "https://192.168.1.20:8443/#pair=x",
+                                   "page_url": lambda self: "https://192.168.1.20:8443/"})()
+    dialog = PhonePairDialog(service)
+    try:
+        assert not dialog.firewall_bar.isHidden()
+        dialog.allow_through_firewall()
+        assert _wait_for(app, lambda: dialog.firewall_bar.isHidden(), 5.0)
+        assert calls == [(8443, "192.168.1.20")]
+    finally:
+        dialog.close()
