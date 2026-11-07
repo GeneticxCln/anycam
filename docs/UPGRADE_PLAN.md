@@ -15,10 +15,13 @@ PipeWire 1.6.10, Vesktop (Electron 44).
 | 3.1 In-process TLS (`cryptography`, `openssl` fallback) | **Done.** Tested with and without the package; CI runs both |
 | 3.2 firewalld over D-Bus | **Done.** Tested against a simulated system bus; not yet run on a real firewalld |
 | 4 VA-API encoders (`va` plugin, real-encode probe) | **Done.** Plan logic tested with simulated elements; not yet run on Intel/AMD |
-| 5b Tray icon and portal global shortcuts | **Done.** Portal flow tested with a simulated bus; KDE offers GlobalShortcuts v2 on the reference machine |
+| 5b Tray icon and portal global shortcuts | **Done.** Portal flow tested with a simulated bus; on KDE all 14 shortcuts bound after the user accepted the dialog |
 | 5a Screencast restore token on KDE | **Waiting for a check on screen**: does a second launch skip the chooser? |
 | 3.3 Next free port when 8443 is taken | Open |
-| Phase B (PipeWire camera), C, D | Open |
+| 1.1 PipeWire camera spike | **Done**, findings below |
+| 1.2–1.3, 1.5 PipeWire camera output and setting | **Done.** "Publish as: loopback / PipeWire / both"; loopback stays the default |
+| 1.4 Live rename of the node | Open (the name is fixed to "AnyCam") |
+| Phase C, D | Open |
 
 ## Summary
 
@@ -68,6 +71,32 @@ module, and the name can change at runtime. Two caveats the proposal leaves out:
    `pipewiresink` allows it, otherwise with a quick restart of that output only.
 5. Keep v4l2loopback as the compatibility path: it is still the only thing `/dev/video*`
    clients can open.
+
+**Spike results (2026-11-07, reference machine).**
+
+* A `pipewiresink mode=provide` stream with `media.class=Video/Source`, `media.role=Camera`
+  appears in `pw-dump` next to the StreamCam with the same class and role, and a separate
+  process reads frames from it. A reader with no caps at all (ANY) never negotiates; every
+  reader that asks for raw video does, within 0.3 s.
+* Camera portal: WirePlumber's `find-portal-access.lua` grants a sandboxed app that was
+  allowed the camera access to every node matching `media.role=Camera` and
+  `media.class=Video/Source`. The AnyCam node is treated exactly like the hardware webcam.
+  Non-sandboxed clients get all nodes.
+* Headless runs with throwaway profiles. Firefox 159 by default lists only
+  "Logitech StreamCam" (V4L2); with `media.webrtc.camera.allow-pipewire=true` it lists
+  "AnyCam" and reads 1280×720 frames from it. Chrome 157 is the same: off by default, and
+  with `--enable-features=WebRtcPipeWireCamera` it lists "AnyCam" and reads frames.
+  Vesktop is Chromium-based, and its Arch launcher reads `~/.config/vesktop-flags.conf`;
+  it has not been tested.
+* Not tested: a Flatpak browser, GNOME/niri portals.
+
+**What was built.** The PipeWire sink is a branch of the existing `VcamOutput` pipeline, not
+a second output class. It reuses the ready card, the last-frame hold through rebuilds and the
+one GPU/CPU conversion. With both outputs on, a `tee` with a small leaky queue per branch
+keeps a stalled reader on one side from holding up the other. "Both" falls back to the
+loopback when PipeWire refuses, and to the PipeWire node when the loopback is missing. With
+PipeWire only, the root setup is never offered. Because browsers have PipeWire cameras off by
+default, the default stays the loopback, not "both" as first planned.
 
 **Done when:** Firefox and at least one Chromium app pick "AnyCam" from PipeWire with no root
 setup on a fresh user account; the output survives canvas rebuilds like the loopback does;

@@ -497,14 +497,25 @@ class ManyCamWindow(AnyCamWindow):
             return
         device = self.project.output.vcam_device or config.loopback_device()
         output = getattr(self, "_vcam_output", None)
+        backend = getattr(output, "backend", "v4l2") if output is not None else "v4l2"
         if output is not None and output.active:
             path = {"gpu": "GPU (glcolorconvert)",
                     "cpu": "CPU (videoconvert)"}.get(
                         getattr(output, "conversion", ""), "converting")
+            where = {"v4l2": device, "pipewire": "PipeWire node “AnyCam”",
+                     "both": f"{device} + PipeWire node “AnyCam”"}.get(backend, device)
             self.diag_state.setText(
-                f"Virtual camera: {device} · running · {path}")
+                f"Virtual camera: {where} · running · {path}")
         else:
             self.diag_state.setText(f"Virtual camera: {device} · stopped")
+        if output is not None and output.active and backend == "pipewire":
+            # No loopback in use: its driver state is irrelevant here.
+            self.diag_chromium.setText(
+                "Chromium/Discord visibility: PipeWire camera only — listed by "
+                "apps with PipeWire cameras enabled.")
+            if hasattr(self, "diag_fix"):
+                self.diag_fix.setVisible(False)
+            return
         caps = config.vcam_exclusive_caps()
         if caps is None:
             self.diag_chromium.setText(

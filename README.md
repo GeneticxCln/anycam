@@ -42,7 +42,8 @@ no Wine.
   model work runs beside the frame thread, so every effect fits a 1080p60 frame on the
   reference machine. Add your own segmentation model with `ANYCAM_SEG_MODEL`. See
   [docs/EFFECT_MODELS.md](docs/EFFECT_MODELS.md).
-- **Outputs:** V4L2 virtual camera, MP4 recording (x264, NVENC, or VA-API on Intel/AMD), RTMP,
+- **Outputs:** V4L2 virtual camera, optionally also (or instead) a PipeWire camera node,
+  MP4 recording (x264, NVENC, or VA-API on Intel/AMD), RTMP,
   audio mixing. Auto picks NVENC, then VA-API, then x264, after a real test encode.
 - **Desktop:** a tray icon (show/hide, virtual camera, record, mute, scenes) and global
   shortcuts that work while other apps have focus, through the desktop portal (KDE,
@@ -97,6 +98,15 @@ If the session has no polkit agent running (some compositors never start one), A
 the installed one for the prompt. **Settings → Diagnostics** shows the state and repeats the
 setup; `scripts/enable-v4l2loopback.sh` does the same from a terminal.
 
+**PipeWire camera (optional).** **Settings → Video output → Publish as** can also publish
+the camera as a PipeWire node named "AnyCam", or publish only that node. The node needs no
+driver, no root and no setup, and it is offered through the camera portal like a real
+webcam. Browsers only list PipeWire cameras with their PipeWire camera switch on: Firefox
+`about:config` → `media.webrtc.camera.allow-pipewire`, Chrome and Chromium-based apps
+`--enable-features=WebRtcPipeWireCamera` (Vesktop reads extra flags from
+`~/.config/vesktop-flags.conf`). Apps that only open `/dev/video*` never see it, so the
+loopback device stays the default.
+
 ### Recording and streaming
 
 ```bash
@@ -146,7 +156,9 @@ permission through the portal.
 - **Virtual camera:** with `exclusive_caps=1`, Chromium apps list AnyCam only while AnyCam is
   running. An app that was already open when AnyCam started may need its camera list
   reopened. The setup will not reload the driver while another app's v4l2loopback camera
-  (OBS, for example) exists, or while an app has the camera open.
+  (OBS, for example) exists, or while an app has the camera open. The PipeWire camera is
+  listed only by apps with PipeWire camera support switched on; Firefox 159 and Chrome 157
+  have it off by default. Its name is fixed ("AnyCam").
 - **Phone camera:** video only (no phone audio). The phone shows a certificate warning the
   first time, and again whenever its browser forgets the exception: the certificate is
   self-signed because a LAN address cannot get a public one. Same Wi-Fi only, with no
@@ -168,7 +180,7 @@ permission through the portal.
 ## Develop
 
 ```bash
-.venv/bin/python -m pytest tests     # 763 tests; the GUI and engine tests run offscreen
+.venv/bin/python -m pytest tests     # 899 tests; the GUI and engine tests run offscreen
 ```
 
 ### Reproduce CI locally

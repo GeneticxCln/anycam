@@ -35,7 +35,7 @@ from .layouts import GRID_KINDS, LAYOUT_PRESETS, arrange, layout_preset
 from .model import (Effects, Layer, Project, Scene, camera_grid_scene,
                     default_project, new_id, two_camera_scene)
 from .engine.outputs.recorder import Recorder
-from .engine.outputs.vcam import VcamOutput
+from .engine.outputs.vcam import VcamOutput, pipewire_available
 from .pipeline import AnyCamEngine, nvenc_available, recording_codec, va_present
 from .phone_dialog import PhoneEvents, PhonePairDialog
 from .pool import SCREEN_IDLE_GRACE_S, SourcePool
@@ -3189,12 +3189,29 @@ class AnyCamWindow(QMainWindow):
         self.vcam_edit.textChanged.connect(lambda *_: self._mark_dirty())
         grid2.addWidget(QLabel("Device"), 0, 0)
         grid2.addWidget(self.vcam_edit, 0, 1)
-        self.vcam_note = QLabel(
-            "Run scripts/enable-v4l2loopback.sh once (needs sudo). "
-            "The camera source itself is chosen in Sources or the + menu.")
+        self.vcam_backend_combo = QComboBox()
+        for label, value in (
+            ("Loopback device: every app (default)", "v4l2"),
+            ("PipeWire camera: no driver, PipeWire-aware apps only", "pipewire"),
+            ("Both", "both"),
+        ):
+            self.vcam_backend_combo.addItem(label, value)
+        if not pipewire_available():
+            for row in (1, 2):
+                item = self.vcam_backend_combo.model().item(row)
+                if item is not None:
+                    item.setEnabled(False)
+        backend_index = self.vcam_backend_combo.findData(self._vcam_backend())
+        self.vcam_backend_combo.setCurrentIndex(max(0, backend_index))
+        self.vcam_backend_combo.currentIndexChanged.connect(
+            self._vcam_backend_changed)
+        grid2.addWidget(QLabel("Publish as"), 1, 0)
+        grid2.addWidget(self.vcam_backend_combo, 1, 1)
+        self.vcam_note = QLabel()
         self.vcam_note.setObjectName("muted")
         self.vcam_note.setWordWrap(True)
-        grid2.addWidget(self.vcam_note, 1, 0, 1, 2)
+        grid2.addWidget(self.vcam_note, 2, 0, 1, 2)
+        self._update_vcam_note()
         layout.addWidget(box2)
 
         box4 = QGroupBox("Shortcuts")
@@ -5109,6 +5126,11 @@ class AnyCamWindow(QMainWindow):
         self.encoder_combo.setCurrentIndex(
             encoder_index if encoder_index >= 0 else 0)
         self.encoder_combo.blockSignals(False)
+        backend_index = self.vcam_backend_combo.findData(self._vcam_backend())
+        self.vcam_backend_combo.blockSignals(True)
+        self.vcam_backend_combo.setCurrentIndex(max(0, backend_index))
+        self.vcam_backend_combo.blockSignals(False)
+        self._update_vcam_note()
         for edit, value in ((self.vcam_edit, self.project.output.vcam_device),
                             (self.rtmp_edit, self.project.output.rtmp_url),
                             (self.media_edit, self.project.audio.media_file)):
@@ -5306,10 +5328,65 @@ class AnyCamWindow(QMainWindow):
         output = VcamOutput()
         if not output.start(device, self.project.output.canvas_w,
                             self.project.output.canvas_h,
-                            self.project.output.fps):
+                            self.project.output.fps,
+                            backend=self._vcam_backend()):
             return False
         self._vcam_output = output
+        self._note_vcam_backend(output)
         return True
+
+    def _vcam_backend(self) -> str:
+        backend = str(getattr(self.project.output, "vcam_backend", "v4l2"))
+        return backend if backend in ("v4l2", "pipewire", "both") else "v4l2"
+
+    def _note_vcam_backend(self, output: VcamOutput) -> None:
+        """Log what is published, and why a requested PipeWire node is not."""
+        if getattr(output, "publishes_pipewire", False):
+            self.log_event("virtual camera: PipeWire camera node “AnyCam” published")
+        if getattr(output, "pipewire_error", ""):
+            self.log_event(f"virtual camera: no PipeWire node ({output.pipewire_error})")
+        self._update_vcam_note()
+
+    def _update_vcam_note(self) -> None:
+        note = getattr(self, "vcam_note", None)
+        if note is None:
+            return
+        backend = self._vcam_backend()
+        output = getattr(self, "_vcam_output", None)
+        parts = []
+        if backend in ("v4l2", "both"):
+            parts.append("The loopback device is set up automatically on first "
+                         "launch (one password prompt) and works in every app.")
+        if backend in ("pipewire", "both"):
+            parts.append("The PipeWire camera needs no driver, but browsers list "
+                         "it only with PipeWire cameras enabled: Firefox "
+                         "about:config media.webrtc.camera.allow-pipewire, "
+                         "Chrome/Discord/Vesktop --enable-features=WebRtcPipeWireCamera.")
+        if output is not None and output.active and getattr(output, "pipewire_error", ""):
+            parts.append(f"PipeWire camera not published: {output.pipewire_error}.")
+        parts.append("The camera source itself is chosen in Sources or the + menu.")
+        note.setText(" ".join(parts))
+
+    def _vcam_backend_changed(self) -> None:
+        """Republish the virtual camera on the chosen backend(s) right away."""
+        value = str(self.vcam_backend_combo.currentData() or "v4l2")
+        if value == self._vcam_backend():
+            return
+        self.project.output.vcam_backend = value
+        self._mark_dirty()
+        output = self._vcam_output
+        if output is not None and output.active:
+            if self.engine is not None:
+                self.engine.detach_vcam()
+            self._finish_vcam_output()
+            if value in ("v4l2", "both"):
+                self.setup_vcam_if_needed()
+            if self.hold_vcam_device() and self.vcam_on and self.engine is not None:
+                self.engine.attach_vcam(self._vcam_output)
+            if getattr(self._vcam_output, "publishes_v4l2", False):
+                self.ensure_vcam_visible()
+        self._update_vcam_note()
+        self._status(f"Virtual camera: {self.vcam_backend_combo.currentText()}")
 
     def setup_vcam_if_needed(self) -> bool:
         """Offer the one-time system setup that makes Discord see AnyCam.
@@ -5318,6 +5395,9 @@ class AnyCamWindow(QMainWindow):
         One password prompt installs the driver settings permanently; every
         later launch is ready with no prompt.  True when the camera is ready.
         """
+        if self._vcam_backend() == "pipewire":
+            # A PipeWire node needs no kernel module and no root.
+            return True
         dev = self.project.output.vcam_device or config.loopback_device()
         reason = config.vcam_setup_needed(dev)
         if not reason:
@@ -5360,6 +5440,8 @@ class AnyCamWindow(QMainWindow):
         though the module parameter is correct.  This runs once per device and
         only asks for authorization when the cached value is actually wrong.
         """
+        if self._vcam_backend() == "pipewire":
+            return
         dev = (device or self.project.output.vcam_device
                or config.loopback_device())
         if dev in self._vcam_udev_attempted:
@@ -5467,7 +5549,10 @@ class AnyCamWindow(QMainWindow):
         fps = self.project.output.fps
         output = self._vcam_output
         if output is not None and output.active:
-            if not output.error and output.device == device:
+            matches = getattr(output, "matches", None)
+            serves = (matches(device, self._vcam_backend()) if callable(matches)
+                      else output.device == device)
+            if not output.error and serves:
                 # Keep the node open while the canvas changes.  OBS's Linux
                 # virtual camera is a separate output with one fixed mode;
                 # reopening v4l2sink for every canvas resize kills the handle
@@ -5486,13 +5571,17 @@ class AnyCamWindow(QMainWindow):
             output.stop()
             self._vcam_output = None
         output = VcamOutput()
-        if setup and not Path(device).exists():
+        backend = self._vcam_backend()
+        if setup and backend != "pipewire" and not Path(device).exists():
             # Creating the device asks polkit, which can take a minute; run the
             # start off the UI thread so the window stays alive meanwhile.
             started = self._run_with_ui(
-                lambda: output.start(device, width, height, fps, setup=True))
+                lambda: output.start(device, width, height, fps, setup=True,
+                                     backend=backend))
         else:
-            started = output.start(device, width, height, fps, setup=setup)
+            started = output.start(device, width, height, fps,
+                                   setup=setup and backend != "pipewire",
+                                   backend=backend)
         if not started:
             self.log_event(
                 f"virtual camera: {output.error or 'could not start'}")
@@ -5506,7 +5595,8 @@ class AnyCamWindow(QMainWindow):
             self.log_event(
                 f"virtual camera: canvas {width}×{height} scaled to "
                 f"{out_w}×{out_h}")
-        if not self.headless:
+        self._note_vcam_backend(output)
+        if not self.headless and getattr(output, "publishes_v4l2", True):
             self.ensure_vcam_visible(device)
         return True
 

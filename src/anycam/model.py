@@ -348,6 +348,11 @@ class OutputConfig:
     canvas_h: int = 1080
     fps: int = 60
     vcam_device: str = "/dev/video10"
+    # Where the virtual camera is published: "v4l2" (the loopback device,
+    # which every app can open), "pipewire" (a PipeWire camera node: no
+    # driver or root, but only apps with PipeWire camera support list it) or
+    # "both".
+    vcam_backend: str = "v4l2"
     # Portal screen captures: automatic follows the compositor's orientation
     # tag.  rotate-180 / vertical-flip / none are explicit corrections for a
     # share that is wrong.
@@ -376,6 +381,8 @@ class OutputConfig:
             output.canvas_w, output.canvas_h = defaults.canvas_w, defaults.canvas_h
         if output.fps < 1:
             output.fps = defaults.fps
+        if output.vcam_backend not in ("v4l2", "pipewire", "both"):
+            output.vcam_backend = defaults.vcam_backend
         return output
 
 

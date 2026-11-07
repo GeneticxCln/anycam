@@ -9,6 +9,14 @@ A loopback node only starts streaming once its writer has pushed a buffer, and
 a node with no active stream fails a consumer's open with ``EIO``.  AnyCam
 therefore opens this pipeline at launch and repeats a static "ready" card until
 the canvas feeds real frames (and again whenever it stops feeding them).
+
+The same converted frames can also be published as a PipeWire camera node
+(``pipewiresink``, ``media.class=Video/Source``, ``media.role=Camera``).  That
+needs no kernel module and no root, but browsers only list PipeWire cameras
+with their PipeWire camera switch on (Firefox
+``media.webrtc.camera.allow-pipewire``, Chromium ``WebRtcPipeWireCamera``),
+and ``/dev/video*``-only apps never see it.  So the loopback stays the default
+and the PipeWire node is an extra or alternative output.
 """
 from __future__ import annotations
 
@@ -39,6 +47,29 @@ GL_ELEMENTS = ("glupload", "glcolorconvert", "gldownload")
 # A broken GL context can still accept PLAYING, so the probe waits for one
 # buffer to reach the sink before the GPU path is trusted.
 GL_PROBE_S = 2.0
+# Where the virtual camera is published: the v4l2loopback device, a PipeWire
+# camera node, or both from the one converted stream.
+BACKENDS = ("v4l2", "pipewire", "both")
+PIPEWIRE_NODE_NAME = "anycam"
+PIPEWIRE_DESCRIPTION = "AnyCam"
+
+
+def pipewire_available() -> bool:
+    """True when this GStreamer build can publish a PipeWire node."""
+    return Gst.ElementFactory.find("pipewiresink") is not None
+
+
+def pipewire_stream_properties(description: str = PIPEWIRE_DESCRIPTION) -> Gst.Structure:
+    """The node properties that make PipeWire (and its camera portal) treat
+    the stream as a camera.  WirePlumber grants portal camera access by
+    exactly ``media.class=Video/Source`` plus ``media.role=Camera``."""
+    props = Gst.Structure.new_empty("props")
+    for key, value in (("media.class", "Video/Source"),
+                       ("media.role", "Camera"),
+                       ("node.name", PIPEWIRE_NODE_NAME),
+                       ("node.description", description)):
+        props.set_value(key, value)
+    return props
 
 
 def _make(factory: str, name: str, **props) -> Gst.Element:
@@ -195,6 +226,12 @@ class VcamOutput:
 
     def __init__(self) -> None:
         self.device = ""
+        # What is actually published: "v4l2", "pipewire" or "both".  It can
+        # be narrower than what was asked for when one side is unavailable.
+        self.backend = "v4l2"
+        # Why a requested PipeWire node is not published (empty when it is
+        # or was not asked for).
+        self.pipewire_error = ""
         self.pixel_format = "YUY2"
         self.width = 0
         self.height = 0
@@ -210,6 +247,8 @@ class VcamOutput:
         self._appsrc: Gst.Element | None = None
         self._bus: Gst.Bus | None = None
         self._sink: Gst.Element | None = None
+        self._pipewire_sink: Gst.Element | None = None
+        self._sink_for_probe: Gst.Element | None = None
         self._idle_bytes = b""
         self._idle_thread: threading.Thread | None = None
         self._idle_stop = threading.Event()
@@ -239,17 +278,57 @@ class VcamOutput:
     def active(self) -> bool:
         return self._pipeline is not None
 
+    @property
+    def publishes_v4l2(self) -> bool:
+        return self.active and self.backend in ("v4l2", "both")
+
+    @property
+    def publishes_pipewire(self) -> bool:
+        return self.active and self.backend in ("pipewire", "both")
+
+    def matches(self, device: str, backend: str) -> bool:
+        """Whether this running output already serves ``device``/``backend``.
+
+        A "both" request that fell back to one side counts as served:
+        restarting would only fail the same way again.
+        """
+        if backend == "both":
+            if self.backend == "pipewire":
+                return True
+            return self.device == device
+        if backend == "pipewire":
+            return self.backend == "pipewire"
+        return self.backend == "v4l2" and self.device == device
+
     def start(self, device: str, width: int, height: int, fps: int,
-              setup: bool = False) -> bool:
+              setup: bool = False, backend: str = "v4l2") -> bool:
         if self.active:
             self.stop()
+        if backend not in BACKENDS:
+            backend = "v4l2"
         # One fixed camera mode, like OBS's v4l2sink output.  The canvas may
         # resize or switch layouts while this node is open; the tap scales
         # into this mode rather than reopening (and killing) the device.
         width, height = config.vcam_output_size(width, height)
         self.device = device
         self.error = ""
+        self.pipewire_error = ""
         self._error_from_push = False
+        wants_pipewire = backend in ("pipewire", "both")
+        if wants_pipewire and not pipewire_available():
+            self.pipewire_error = ("GStreamer's PipeWire plugin (pipewiresink) "
+                                   "is not installed")
+            if backend == "pipewire":
+                self.error = f"PipeWire camera unavailable: {self.pipewire_error}"
+                return False
+            backend = "v4l2"
+        if backend == "pipewire":
+            self.device = ""
+            self.backend = "pipewire"
+            # YUY2 in the loopback's colorimetry: the same conversion either
+            # way, and a raw format every PipeWire camera client reads.
+            self.pixel_format = "YUY2"
+            return self._start_chain(width, height, fps)
         if setup:
             # The user just asked for the virtual camera: bring the loopback
             # device up (pkexec/polkit prompt) instead of telling them to run
@@ -259,13 +338,39 @@ class VcamOutput:
                 self.error = problem
                 return False
         if not config.vcam_available(device):
-            self.error = (
+            missing = (
                 f"virtual camera {device} is not available; "
                 f"load v4l2loopback with 'sudo modprobe v4l2loopback "
                 f"video_nr=10 card_label=AnyCam exclusive_caps=1'"
             )
+            if backend == "both":
+                # No loopback (not set up, or a Flatpak): the PipeWire node
+                # alone still gives PipeWire-aware apps a camera.
+                print(f"[vcam] {missing}; publishing the PipeWire camera only",
+                      file=sys.stderr, flush=True)
+                self.device = ""
+                self.backend = "pipewire"
+                self.pixel_format = "YUY2"
+                return self._start_chain(width, height, fps)
+            self.error = missing
             return False
+        self.backend = backend
         self.pixel_format = config.vcam_pixel_format(device)
+        if self._start_chain(width, height, fps):
+            return True
+        if backend == "both":
+            # The PipeWire side refused to start (no daemon, no session):
+            # keep the loopback camera rather than losing both.
+            self.pipewire_error = self.error or "the PipeWire node did not start"
+            print(f"[vcam] PipeWire camera unavailable ({self.pipewire_error}); "
+                  "publishing the loopback device only", file=sys.stderr, flush=True)
+            self.error = ""
+            self.backend = "v4l2"
+            return self._start_chain(width, height, fps)
+        return False
+
+    def _start_chain(self, width: int, height: int, fps: int) -> bool:
+        """Convert once and start the sink(s) for ``self.backend``."""
         self.width, self.height, self.fps = int(width), int(height), int(fps)
         # The canvas hands us RGBA, so convert exactly once -- here -- into the
         # format the driver advertises.  Converting in the canvas tap as well
@@ -331,16 +436,39 @@ class VcamOutput:
                 elements.append(_make("videoconvert", "vcam_convert"))
             fixed = _make("capsfilter", "vcam_caps")
             fixed.set_property("caps", Gst.Caps.from_string(self.sink_caps))
-            sink = _make("v4l2sink", "vcam_sink", device=self.device,
-                         sync=False)
-            elements.extend([fixed, sink])
-            for element in elements:
+            elements.append(fixed)
+            sinks = self._make_sinks()
+            for element in elements + [e for branch in sinks for e in branch]:
                 pipeline.add(element)
+            if len(sinks) == 1:
+                elements.extend(sinks[0])
+            else:
+                # Both outputs from one conversion.  Each branch has its own
+                # small leaky queue so a stalled reader on one side cannot
+                # hold up the other.
+                tee = _make("tee", "vcam_tee")
+                pipeline.add(tee)
+                elements.append(tee)
+                for index, branch in enumerate(sinks):
+                    queue = _make("queue", f"vcam_queue_{index}",
+                                  max_size_buffers=2, max_size_time=0,
+                                  max_size_bytes=0)
+                    queue.set_property("leaky", 2)
+                    pipeline.add(queue)
+                    branch.insert(0, queue)
+                    if not tee.link(queue):
+                        raise RuntimeError("could not link the vcam tee")
+                    for first, second in zip(branch, branch[1:]):
+                        if not first.link(second):
+                            raise RuntimeError(
+                                f"could not link {first.get_name()} into "
+                                f"{second.get_name()}")
             for first, second in zip(elements, elements[1:]):
                 if not first.link(second):
                     raise RuntimeError(
                         f"could not link {first.get_name()} into "
                         f"{second.get_name()}")
+            sink = self._sink_for_probe
         except Exception as exc:  # noqa: BLE001
             pipeline.set_state(Gst.State.NULL)
             self.error = f"virtual camera pipeline failed: {exc}"
@@ -364,6 +492,27 @@ class VcamOutput:
         self._teardown_pipeline()
         self.error = ""
         return False
+
+    def _make_sinks(self) -> list[list[Gst.Element]]:
+        """One element list per published output, in link order."""
+        sinks: list[list[Gst.Element]] = []
+        self._pipewire_sink = None
+        self._sink_for_probe = None
+        if self.backend in ("v4l2", "both"):
+            v4l2 = _make("v4l2sink", "vcam_sink", device=self.device, sync=False)
+            sinks.append([v4l2])
+            self._sink_for_probe = v4l2
+        if self.backend in ("pipewire", "both"):
+            pipewire = _make("pipewiresink", "vcam_pipewire_sink", sync=False)
+            # provide: AnyCam is the producer and consumers connect to it.
+            pipewire.set_property("mode", 2)
+            pipewire.set_property("client-name", PIPEWIRE_DESCRIPTION)
+            pipewire.set_property("stream-properties", pipewire_stream_properties())
+            sinks.append([pipewire])
+            self._pipewire_sink = pipewire
+            if self._sink_for_probe is None:
+                self._sink_for_probe = pipewire
+        return sinks
 
     def _first_frame_flows(self) -> bool:
         """Push one card frame and verify the GPU chain reaches the sink."""
@@ -652,8 +801,8 @@ class VcamOutput:
         except Exception:
             pass
         pipeline.set_state(Gst.State.NULL)
-        result = {"device": self.device, "ok": not self.error,
-                  "error": self.error}
+        result = {"device": self.device, "backend": self.backend,
+                  "ok": not self.error, "error": self.error}
         self._clear()
         return result
 
@@ -668,3 +817,4 @@ class VcamOutput:
         self._appsrc = None
         self._bus = None
         self._sink = None
+        self._pipewire_sink = None

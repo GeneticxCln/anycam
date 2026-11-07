@@ -1246,7 +1246,7 @@ def test_vcam_toggle_starts_the_preview_it_needs(app, monkeypatch):
             self.error = ""
             self.pixel_format = "YUY2"
 
-        def start(self, device, width, height, fps, setup=False):
+        def start(self, device, width, height, fps, setup=False, backend="v4l2"):
             self.device = device
             self.active = True
             return True
@@ -1287,7 +1287,7 @@ def test_vcam_output_survives_engine_restarts(app, monkeypatch):
             self.stopped = False
             created.append(self)
 
-        def start(self, device, width, height, fps, setup=False):
+        def start(self, device, width, height, fps, setup=False, backend="v4l2"):
             self.device = device
             self.width, self.height, self.fps = width, height, fps
             self.setup = setup
@@ -1347,7 +1347,7 @@ def test_vcam_sink_error_is_rebuilt_not_turned_off(app, monkeypatch):
             self.pixel_format = "YUY2"
             created.append(self)
 
-        def start(self, device, width, height, fps, setup=False):
+        def start(self, device, width, height, fps, setup=False, backend="v4l2"):
             self.device = device
             self.width, self.height, self.fps = width, height, fps
             if len(created) == 1:
