@@ -177,7 +177,14 @@ def choose_from_modes(modes: list[CameraMode], width: int, height: int, fps: int
     """
     if not modes:
         return CameraMode("MJPG", width, height, fps)
-    pool = _closest_size(modes, width, height) or modes
+    # A size only counts when the camera delivers it at a usable rate.  The
+    # Logitech StreamCam lists 2304x1296 as YUYV at 5 fps; preferring the
+    # largest size made a 1440p or 4K canvas run the camera at 5 fps.
+    usable = [m for m in modes if m.fps >= min(fps, 24)]
+    if not usable:
+        fastest = max(m.fps for m in modes)
+        usable = [m for m in modes if m.fps == fastest]
+    pool = _closest_size(usable, width, height) or usable
     exact = [m for m in pool if m.fps == fps]
     if exact:
         return sorted(exact, key=lambda m: _format_rank(m.pixel_format))[0]

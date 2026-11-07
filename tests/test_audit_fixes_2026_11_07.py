@@ -531,3 +531,23 @@ def test_a_different_mode_or_a_failed_camera_is_reopened(monkeypatch):
         assert shared.entry(small) is None, "a failed capture is not kept"
     finally:
         shared.stop()
+
+
+def test_a_large_canvas_never_picks_a_slideshow_camera_mode():
+    """The StreamCam lists 2304x1296 only as YUYV at 5 fps; a 1440p or 4K
+    canvas picked it (largest size) and ran the camera at 5 fps."""
+    from anycam.sources import CameraMode, choose_from_modes
+
+    modes = [CameraMode(fmt, w, h, rate)
+             for fmt in ("MJPG", "YUYV") for (w, h) in ((1280, 720), (1920, 1080))
+             for rate in (5, 15, 30, 60) if not (fmt == "YUYV" and rate == 60)]
+    modes.append(CameraMode("YUYV", 2304, 1296, 5))
+    for canvas, rate in (((3840, 2160), 30), ((2560, 1440), 60), ((3840, 2160), 60)):
+        chosen = choose_from_modes(modes, canvas[0], canvas[1], rate)
+        assert (chosen.width, chosen.height, chosen.fps) == (1920, 1080, rate), chosen
+        assert chosen.pixel_format == "MJPG"
+    # Asking for the big mode at its own rate still gets it.
+    assert choose_from_modes(modes, 2304, 1296, 5).width == 2304
+    # Resolution still beats rate when 60 is asked of a 1080p30 camera.
+    slow = [CameraMode("MJPG", 1920, 1080, 30), CameraMode("MJPG", 1280, 720, 60)]
+    assert choose_from_modes(slow, 1920, 1080, 60).height == 1080
