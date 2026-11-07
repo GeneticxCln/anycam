@@ -29,6 +29,7 @@ jobs:
             gstreamer1.0-x gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
             gstreamer1.0-libav gstreamer1.0-pipewire \
+            gir1.2-gst-plugins-bad-1.0 gstreamer1.0-nice openssl qrencode \
             ffmpeg libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 \
             libxcb-cursor0 libxcb-xinerama0
 
@@ -95,6 +96,7 @@ jobs:
             gstreamer1.0-x gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
             gstreamer1.0-libav gstreamer1.0-pipewire \
+            gir1.2-gst-plugins-bad-1.0 gstreamer1.0-nice openssl qrencode \
             ffmpeg libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 \
             libxcb-cursor0 libxcb-xinerama0
 

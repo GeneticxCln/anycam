@@ -26,6 +26,7 @@ gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
 from . import config
+from .phone import PHONE_SIZE, phone_channel
 from .sources import (
     TEST_PATTERNS,
     _gst_raw_format,
@@ -41,7 +42,7 @@ from .sources import (
     video_size,
 )
 
-CAPTURE_KINDS = ("camera", "test", "video", "network", "screen")
+CAPTURE_KINDS = ("camera", "test", "video", "network", "screen", "phone")
 # A canvas rebuild releases every capture and immediately acquires it again.
 # Re-creating a screencast's pipewiresrc on a static window gives the rebuilt
 # canvas no frames until the window repaints, which is a black screen.  Keep a
@@ -199,6 +200,10 @@ def capture_spec(layer, canvas_w: int, canvas_h: int, fps: int, *,
         return CaptureSpec("video", layer.source, canvas_w, canvas_h, fps)
     if kind == "network":
         return CaptureSpec("network", layer.source, canvas_w, canvas_h, fps)
+    if kind == "phone":
+        # A paired phone always arrives letterboxed into PHONE_SIZE, so the
+        # layer's crop and fit hold across rotations and reconnects.
+        return CaptureSpec("phone", layer.source, PHONE_SIZE[0], PHONE_SIZE[1], fps)
     pattern = str(getattr(layer, "source", "") or "").strip().lower()
     if pattern not in TEST_PATTERNS:
         pattern = "ball"
@@ -531,6 +536,8 @@ class SourcePool:
             return self._network(spec)
         if spec.kind == "screen":
             return self._screen(spec)
+        if spec.kind == "phone":
+            return self._phone(spec)
         raise RuntimeError(f"no capture pipeline for layer kind '{spec.kind}'")
 
     @staticmethod
@@ -607,6 +614,24 @@ class SourcePool:
                         f"framerate={spec.fps}/1"),
         ]
         return _Built(elements, (width, height), dynamic_from=decode)
+
+    @staticmethod
+    def _phone(spec: CaptureSpec) -> _Built:
+        """Read a paired phone's channel (fed by ``anycam.phone.webrtc``).
+
+        Until the phone connects, and a second after it goes away, the channel
+        gives black frames; the canvas never waits on the network.
+        """
+        width, height = spec.width or PHONE_SIZE[0], spec.height or PHONE_SIZE[1]
+        elements: list[Gst.Element] = [
+            make("intervideosrc", channel=phone_channel(spec.source), timeout=Gst.SECOND),
+            caps_filter(f"video/x-raw,format=I420,width={width},height={height},"
+                        f"framerate={spec.fps}/1"),
+            make("videoconvert"),
+            caps_filter(f"video/x-raw,format=RGBA,width={width},height={height},"
+                        f"framerate={spec.fps}/1"),
+        ]
+        return _Built(elements, (width, height))
 
     @staticmethod
     def _screen(spec: CaptureSpec) -> _Built:

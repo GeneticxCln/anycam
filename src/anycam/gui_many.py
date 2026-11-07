@@ -75,6 +75,7 @@ def _scene_pixmap(scene, width: int = 84, height: int = 48) -> QPixmap:
         "camera": QColor("#5eead4"),
         "screen": QColor("#7aa2f7"),
         "network": QColor("#f6c177"),
+        "phone": QColor("#f6c177"),
         "video": QColor("#bb9af7"),
         "test": QColor("#9ece6a"),
         "image": QColor("#7dcfff"),
@@ -443,8 +444,9 @@ class ManyCamWindow(AnyCamWindow):
         layout.addWidget(self.diag_chromium)
         self.diag_fix = QPushButton("Fix Discord visibility")
         self.diag_fix.setToolTip(
-            "Reload v4l2loopback with exclusive_caps=1 so Discord, Vesktop "
-            "and Chrome list the camera")
+            "One-time setup (asks for your password): permanent driver "
+            "settings with exclusive_caps=1 so Discord, Vesktop and Chrome "
+            "list the camera")
         self.diag_fix.clicked.connect(self.fix_vcam_visibility)
         self.diag_fix.hide()
         layout.addWidget(self.diag_fix)
@@ -506,22 +508,20 @@ class ManyCamWindow(AnyCamWindow):
                 sysname = device.rsplit("/", 1)[-1]
                 self.diag_chromium.setText(
                     "Chromium/Discord visibility: NOT listed — udev still "
-                    "reports video output. AnyCam refreshes this at launch; "
-                    "if it persists: sudo udevadm trigger --action=change "
-                    f"--sysname-match={sysname}")
+                    f"reports video output for {sysname}. Click the button "
+                    "below to set the camera up.")
             else:
                 self.diag_chromium.setText(
                     "Chromium/Discord visibility: listed (exclusive_caps=1).")
         else:
             self.diag_chromium.setText(
-                "Chromium/Discord visibility: NOT listed — the module was "
-                "loaded with exclusive_caps=0. Close AnyCam and Discord, then: "
-                "sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback "
-                "video_nr=10 card_label=AnyCam exclusive_caps=1")
+                "Chromium/Discord visibility: NOT listed — the driver was "
+                "loaded with exclusive_caps=0. Click the button below to set "
+                "the camera up (one password prompt).")
         if hasattr(self, "diag_fix"):
-            # Only an action when the loaded module is the wrong one: reloading
-            # a correct module would interrupt the camera for no benefit.
-            self.diag_fix.setVisible(caps is False)
+            # Only an action while the setup is incomplete: a correct module
+            # is never reloaded (that would interrupt the camera).
+            self.diag_fix.setVisible(bool(config.vcam_setup_needed(device)))
 
     def fix_vcam_visibility(self) -> None:
         """Reload v4l2loopback so Chromium lists the camera, then re-hold it.
@@ -554,7 +554,7 @@ class ManyCamWindow(AnyCamWindow):
 
         def run() -> None:
             try:
-                result["error"] = config.reload_vcam_module(device)
+                result["error"] = config.setup_vcam_system(device)
             except Exception as exc:  # noqa: BLE001 - diagnostics must not crash
                 result["error"] = str(exc)
 
@@ -570,6 +570,13 @@ class ManyCamWindow(AnyCamWindow):
         self.diag_fix.setEnabled(True)
         error = str(self._fix_result.get("error") or "")
         held = self.hold_vcam_device()
+        if held and not error:
+            # Re-announce the reloaded node with the idle card flowing, so
+            # Chromium apps list it straight away.
+            self.feed_held_vcam()
+            self._vcam_udev_attempted.discard(
+                self.project.output.vcam_device or config.loopback_device())
+            self.ensure_vcam_visible()
         if not error and self.engine is not None and self.vcam_on and held:
             if not self.engine.attach_vcam(self._vcam_output):
                 self._status(self.engine.report.vcam_error
@@ -582,7 +589,7 @@ class ManyCamWindow(AnyCamWindow):
                 f"Chromium/Discord visibility: reload failed — {error}")
             self._status("Could not reload v4l2loopback for Discord")
             return
-        self._status("v4l2loopback reloaded: Discord and Chrome can list AnyCam")
+        self._status("Virtual camera set up: Discord and Chrome can list AnyCam")
         self.note_vcam_consumers()
 
     def measure_vcam_cost(self) -> None:
@@ -799,7 +806,8 @@ class ManyCamWindow(AnyCamWindow):
         for label, kind in (("Add camera…", "camera"),
                             ("Add video…", "video"),
                             ("Add image…", "image"),
-                            ("Add phone URL…", "network"),
+                            ("Add phone camera (QR code)…", "phone"),
+                            ("Add network stream URL…", "network"),
                             ("Add test pattern", "test")):
             action = menu.addAction(label)
             action.setData(f"add:{kind}")
@@ -1024,6 +1032,9 @@ def run_gui(project: Project | None = None) -> int:
         serve_instance_requests(instance_server, window)
     app.aboutToQuit.connect(window.shutdown)
     window.show()
+    # The driver must be right before the node is held: the one-time setup
+    # may reload v4l2loopback, which needs the device closed.
+    window.setup_vcam_if_needed()
     # Hold the loopback node from launch: apps that remember "AnyCam" must be
     # able to select it before the first source starts the preview, and an
     # open that already failed needs its re-select hint.

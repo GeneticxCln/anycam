@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111318">
+<title>AnyCam phone camera</title>
+<style>
+  :root { color-scheme: dark; --bg: #111318; --panel: #1b1e26; --text: #e8e9ee;
+          --muted: #9aa0ad; --accent: #6aa5ff; --ok: #4fd18b; --bad: #ff6b6b; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+               font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #stage { position: relative; flex: 1; min-height: 0; background: #000; }
+  video { width: 100%; height: 100%; object-fit: contain; background: #000; }
+  #status { position: absolute; left: 12px; right: 12px; top: 12px; padding: 8px 12px;
+            border-radius: 10px; background: rgba(17,19,24,.78); font-size: 15px; }
+  #status .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+                 margin-right: 8px; background: var(--muted); vertical-align: middle; }
+  #status.live .dot { background: var(--ok); }
+  #status.error .dot { background: var(--bad); }
+  #bar { display: flex; gap: 10px; padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+         background: var(--panel); flex-wrap: wrap; }
+  button, select { flex: 1; min-width: 0; min-height: 48px; border: 0; border-radius: 10px;
+                   background: #2a2f3b; color: var(--text); font: inherit; padding: 0 12px; }
+  button.primary { background: var(--accent); color: #0b1020; font-weight: 600; }
+  button:disabled { opacity: .45; }
+  #intro { padding: 24px; max-width: 34rem; margin: auto; }
+  #intro h1 { font-size: 22px; margin: 0 0 12px; }
+  #intro p { color: var(--muted); margin: 0 0 10px; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+  <div id="intro" hidden>
+    <h1>AnyCam phone camera</h1>
+    <p id="intro-text">In AnyCam choose <b>Add → Phone camera</b> and scan the QR code with this phone.</p>
+  </div>
+  <div id="stage">
+    <video id="preview" autoplay muted playsinline></video>
+    <div id="status"><span class="dot"></span><span id="status-text">Starting…</span></div>
+  </div>
+  <div id="bar">
+    <button id="toggle" class="primary">Start</button>
+    <button id="flip">Flip camera</button>
+    <select id="quality" aria-label="Quality">
+      <option value="720">720p</option>
+      <option value="1080">1080p</option>
+    </select>
+  </div>
+  <script src="phone.js"></script>
+</body>
+</html>

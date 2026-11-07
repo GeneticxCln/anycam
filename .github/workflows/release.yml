@@ -53,7 +53,8 @@ jobs:
           for pattern in "assets/emoji/1f384.png" "assets/emoji/SHA256.json" \
                          "assets/models/selfie_segmentation_landscape.onnx" \
                          "assets/models/yunet.onnx" "assets/sample-portrait.jpg" \
-                         "anycam/frames.py" "anycam/masks.py" "anycam/particles.py"; do
+                         "anycam/frames.py" "anycam/masks.py" "anycam/particles.py" \
+                         "anycam/phone/static/index.html" "anycam/phone/static/phone.js"; do
             tar -tzf "$tarball" | grep -q "$pattern" || { echo "::error::$pattern missing from the tarball"; exit 1; }
             unzip -l "$wheel" | grep -q "$pattern" || { echo "::error::$pattern missing from the wheel"; exit 1; }
           done

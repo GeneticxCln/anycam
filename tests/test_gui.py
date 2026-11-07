@@ -1853,3 +1853,92 @@ def test_changing_camera_width_height_and_rate_rebuilds_once(app, monkeypatch):
     finally:
         window.engine = None
         window.close()
+
+
+# ------------------------------------------------------------ phone camera
+@pytest.fixture
+def phone_link(monkeypatch, tmp_path):
+    """The window's phone link on loopback with throwaway pairing state."""
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl is not installed")
+    from anycam.phone import server
+
+    def local_service(on_event=None):
+        return server.PhoneService(state_dir=tmp_path / "state",
+                                   cert_dir=tmp_path / "cert", host="127.0.0.1",
+                                   port=0, on_event=on_event)
+
+    monkeypatch.setattr(server, "default_service", local_service)
+    return local_service
+
+
+def test_add_phone_camera_shows_a_qr_and_adds_the_phone_that_streams(app, phone_link):
+    from PySide6.QtCore import QTimer
+
+    from anycam.phone_dialog import PhonePairDialog
+
+    window = _window()
+    seen: list[PhonePairDialog] = []
+    logged: list[str] = []
+    window.log_event = lambda message: logged.append(message)
+    try:
+        def phone_arrives():
+            dialog = window._phone_dialog
+            assert dialog is not None, "the QR dialog is open"
+            seen.append(dialog)
+            service = window._phone_service
+            token = dialog.service.pairing_url().split("#pair=", 1)[1]
+            device, _secret = service.pairing.pair(token, "Pixel 8")
+            # Events come from network threads in real use.
+            service.emit("paired", device)
+            service.emit("connecting", device)
+            service.emit("streaming", device)
+
+        QTimer.singleShot(200, phone_arrives)
+        before = len(window.scene.layers)
+        layer = window.add_layer("phone")
+        assert seen and seen[0].qr.pixmap() is not None or "QR" in seen[0].qr.text()
+        assert layer is not None and layer.kind == "phone"
+        assert layer.name == "Pixel 8"
+        assert layer.source.startswith("phone-")
+        assert len(window.scene.layers) == before + 1
+        assert any("Pixel 8 is live" in line for line in logged)
+        # The same phone again (it reconnected) is not added twice.
+        assert window.add_layer("phone", layer.source) is layer
+        assert len(window.scene.layers) == before + 1
+    finally:
+        window.close()
+        app.processEvents()
+    assert window._phone_service is None, "closing the window stops the phone link"
+
+
+def test_cancelling_the_phone_dialog_adds_nothing(app, phone_link):
+    from PySide6.QtCore import QTimer
+
+    window = _window()
+    try:
+        QTimer.singleShot(200, lambda: window._phone_dialog.reject())
+        before = len(window.scene.layers)
+        assert window.add_layer("phone") is None
+        assert len(window.scene.layers) == before
+        assert window._phone_service is not None and window._phone_service.running
+    finally:
+        window.close()
+        app.processEvents()
+
+
+def test_a_running_canvas_takes_a_phone_layer(app, phone_link):
+    window = _window()
+    try:
+        window.start_engine()
+        assert window.engine is not None
+        layer = window.add_layer("phone", "phone-canvas1")
+        assert layer is not None
+        assert _wait_for(app, lambda: any(
+            entry.spec.kind == "phone" and entry.spec.source == "phone-canvas1"
+            for entry in window._source_pool.entries()), 5.0)
+        assert window._phone_service is not None, \
+            "a scene with a phone keeps the link listening for it"
+    finally:
+        window.close()
+        app.processEvents()

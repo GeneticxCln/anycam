@@ -568,3 +568,108 @@ def test_other_virtual_cameras_ignores_physical_nodes_and_its_own(tmp_path):
         (sysfs / name).symlink_to(node)
     assert config.other_virtual_cameras("/dev/video10", str(sysfs)) == [
         "/dev/video11 (OBS Virtual Camera)"]
+
+
+# ------------------------------------------- one-time virtual camera setup
+def test_setup_is_needed_until_the_driver_is_right_and_permanent(tmp_path, monkeypatch):
+    device = tmp_path / "video10"
+    device.write_text("")
+    state = {"caps": False, "permanent": False, "writable": False}
+    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None: state["caps"])
+    monkeypatch.setattr(config, "_vcam_configured_permanently",
+                        lambda *a, **k: state["permanent"])
+    monkeypatch.setattr(config.os, "access", lambda path, mode: state["writable"])
+    assert "exclusive_caps=1" in config.vcam_setup_needed(str(device))
+    state["caps"] = True
+    assert "permanent" in config.vcam_setup_needed(str(device))
+    state["permanent"] = True
+    assert "cannot tell apps" in config.vcam_setup_needed(str(device))
+    state["writable"] = True
+    assert config.vcam_setup_needed(str(device)) == ""
+    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None: None)
+    assert "not loaded" in config.vcam_setup_needed(str(device))
+
+
+def test_the_effective_exclusive_caps_is_the_last_one_modprobe_reads():
+    eff = config._effective_exclusive_caps
+    assert eff("options snd_hda_intel power_save=0\n") is None
+    assert eff("# options v4l2loopback exclusive_caps=1\n") is None
+    assert eff("options v4l2loopback video_nr=10 exclusive_caps=1\n") is True
+    # The stale file that broke the first setup: read after AnyCam's, so 0 won.
+    assert eff("options v4l2loopback video_nr=10 card_label=AnyCam exclusive_caps=1\n"
+               "options v4l2loopback video_nr=10 card_label=AnyCam exclusive_caps=0\n") is False
+    assert eff("options v4l2loopback exclusive_caps=Y,Y\n") is True
+
+
+def test_overriding_files_are_named(tmp_path, monkeypatch):
+    (tmp_path / "zz-other.conf").write_text("options v4l2loopback exclusive_caps=0\n")
+    (tmp_path / "fine.conf").write_text("options v4l2loopback exclusive_caps=1\n")
+    monkeypatch.setattr(config, "VCAM_MODPROBE_CONF", tmp_path / "anycam.conf")
+    (tmp_path / "anycam.conf").write_text("options v4l2loopback exclusive_caps=0\n")
+    assert config.vcam_caps_overrides((str(tmp_path),)) == [str(tmp_path / "zz-other.conf")]
+
+
+def test_setup_writes_permanent_settings_with_one_prompt(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(config.subprocess, "run", fake_run)
+    monkeypatch.setattr(config.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None: False)
+    monkeypatch.setattr(config, "other_virtual_cameras", lambda *a, **k: [])
+    monkeypatch.setattr(config, "vcam_setup_needed", lambda device=None: "")
+    assert config.setup_vcam_system("/dev/video10") == ""
+    assert len(calls) == 1 and calls[0][:3] == ["pkexec", "/bin/sh", "-c"]
+    script = calls[0][3]
+    assert "options v4l2loopback video_nr=10 card_label=AnyCam exclusive_caps=1" in script
+    assert str(config.VCAM_MODULES_LOAD) in script
+    assert 'ATTR{name}=="AnyCam"' in script and "chmod 0664" in script
+    assert "modprobe -r v4l2loopback" in script
+    assert "cat > /etc/modprobe.d/anycam.conf" in script, "AnyCam's own file is replaced"
+    assert subprocess.run(["sh", "-n", "-c", script]).returncode == 0
+
+
+def test_setup_reports_a_camera_still_in_use(monkeypatch):
+    monkeypatch.setattr(config.subprocess, "run", lambda cmd, **kw:
+                        subprocess.CompletedProcess(cmd, config.VCAM_SETUP_BUSY, "", ""))
+    monkeypatch.setattr(config.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None: False)
+    monkeypatch.setattr(config, "other_virtual_cameras", lambda *a, **k: [])
+    message = config.setup_vcam_system("/dev/video10")
+    assert "has the virtual camera open" in message
+
+
+def test_setup_refuses_to_remove_another_apps_virtual_camera(monkeypatch):
+    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None: False)
+    monkeypatch.setattr(config, "other_virtual_cameras",
+                        lambda *a, **k: ["/dev/video11 (OBS Virtual Camera)"])
+    monkeypatch.setattr(config.subprocess, "run", lambda *a, **k: pytest.fail("ran"))
+    assert "OBS Virtual Camera" in config.setup_vcam_system("/dev/video10")
+
+
+def test_a_missing_password_agent_is_started_and_asked_again(monkeypatch):
+    from anycam import privileged
+
+    results = [subprocess.CompletedProcess(
+        [], 127, "", "Error creating textual authentication agent: no tty"),
+        subprocess.CompletedProcess([], 0, "", "")]
+    started = []
+    monkeypatch.setattr(privileged.subprocess, "run", lambda cmd, **kw: results.pop(0))
+    monkeypatch.setattr(privileged.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(privileged, "installed_agent", lambda: "/usr/lib/agent")
+    monkeypatch.setattr(privileged, "start_agent", started.append)
+    monkeypatch.setattr(privileged, "AGENT_START_S", 0)
+    assert privileged.run_as_root(["true"]).returncode == 0
+    assert started == ["/usr/lib/agent"]
+
+
+def test_refresh_uses_the_writable_uevent_before_asking_for_root(monkeypatch):
+    caps = iter([":video_output:", ":capture:"])
+    monkeypatch.setattr(config, "vcam_udev_capabilities", lambda dev=None: next(caps))
+    monkeypatch.setattr(config, "trigger_vcam_uevent", lambda dev=None: True)
+    monkeypatch.setattr(config.subprocess, "run", lambda *a, **k: pytest.fail("asked for root"))
+    monkeypatch.setattr(config.shutil, "which", lambda name: f"/usr/bin/{name}")
+    assert config.refresh_vcam_udev("/dev/video10") == ""

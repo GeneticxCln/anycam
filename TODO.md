@@ -111,7 +111,7 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 
 Design and build order: `docs/PHONE_CAMERA.md`.
 
-- [ ] Local HTTPS + WebRTC page with QR pairing; several phones as sources.
+- [x] Local HTTPS + WebRTC page with QR pairing; several phones as sources (camera half; see docs/PHONE_CAMERA.md §0).
 - [ ] Phone remote / stream deck for switching presets.
 - [ ] Local-network only, authenticated per device, no cloud.
 - [ ] Acceptance: two Android phones work as source and remote; an unpaired device receives nothing. Needs the user's phones.

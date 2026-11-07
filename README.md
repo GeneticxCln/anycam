@@ -12,6 +12,12 @@ no Wine.
 - **Sources:** cameras (per-layer size and FPS), screen share (xdg-desktop-portal), image,
   video, RTSP/HTTP, text, ticker, lower third, animated GIF, drawing. Drag, resize, crop,
   snap, undo/redo, scenes, layouts, multi-view.
+- **Phone camera:** **Add → Phone camera (QR code)** shows a QR code; scan it with the
+  phone, accept the one-time certificate warning, allow the camera, and the phone streams
+  into the scene over WebRTC. Local network only, no app to install; a paired phone
+  reconnects by opening the page again. If ufw blocks the port, **Allow phones** in the same
+  dialog opens it with one password prompt. Needs `openssl` and `qrencode` (or the `segno`
+  Python package). See [docs/PHONE_CAMERA.md](docs/PHONE_CAMERA.md).
 - **Effects browser:** thumbnails drawn through the real pipeline, applied live with no
   rebuild; two stacking filter slots; copy, paste, clear.
   - About 70 filters and effects: colour looks, distortions, retro TV, touch-up, background
@@ -36,7 +42,7 @@ are in [docs/EVIDENCE.md](docs/EVIDENCE.md).
 - PySide6 matching your system Qt (`pip install 'anycam[gui]'`), `numpy`, `Pillow`, `psutil`
 - `onnxruntime` for portrait and face effects (`anycam[face]`; the models are bundled)
 - `xdg-desktop-portal` + PipeWire (screen capture), `ffmpeg`, `v4l-utils`
-- `v4l2loopback` (root, once) for the virtual camera
+- `v4l2loopback` for the virtual camera (AnyCam sets it up on first launch, one password)
 
 ```bash
 sudo pacman -S --needed python pyside6 python-gobject gst-plugins-{base,good,bad,ugly} \
@@ -47,7 +53,7 @@ sudo pacman -S --needed python pyside6 python-gobject gst-plugins-{base,good,bad
 ## Install and run
 
 ```bash
-pip install anycam-1.0.3.tar.gz     # from the GitHub release, or from a checkout:
+pip install anycam-1.1.0.tar.gz     # from the GitHub release, or from a checkout:
 ./scripts/setup.sh                  # creates .venv with system site-packages
 ./scripts/anycam-gui                # the studio (or: python -m anycam gui)
 ./scripts/install-desktop.sh        # optional: add it to the app menu
@@ -57,14 +63,17 @@ Headless demo, no window: `./scripts/demo.sh` (or `python -m anycam demo --help`
 
 ### Virtual camera
 
-```bash
-sudo modprobe v4l2loopback video_nr=10 card_label=AnyCam exclusive_caps=1
-v4l2-ctl --list-devices             # expect "AnyCam" at /dev/video10
-```
+On first launch AnyCam offers a one-time setup (one password prompt). It writes
+`/etc/modprobe.d/anycam.conf` (`video_nr=10 card_label=AnyCam exclusive_caps=1`),
+`/etc/modules-load.d/anycam.conf` (load at boot) and `/etc/udev/rules.d/70-anycam-vcam.rules`,
+then reloads the driver. `exclusive_caps=1` is what Discord, Vesktop and Chrome need to
+list the camera; the udev rule lets AnyCam re-announce the device without root each time it
+starts writing. After that, opening AnyCam is enough: the camera is held from launch with a
+standby picture and follows the preview. Remove the three files to undo.
 
-`exclusive_caps=1` is required for Discord and Chromium apps to list the camera. Then press
-**Virtual cam** in the window. **Settings → Diagnostics** says whether the module is set up
-for Chromium. `scripts/enable-v4l2loopback.sh` reloads a module loaded with other options.
+If the session has no polkit agent running (some compositors never start one), AnyCam starts
+the installed one for the prompt. **Settings → Diagnostics** shows the state and repeats the
+setup; `scripts/enable-v4l2loopback.sh` does the same from a terminal.
 
 ### Recording and streaming
 
@@ -78,7 +87,7 @@ Keys: `Ctrl+P` preview, `Ctrl+R` record, `Ctrl+Shift+V` virtual camera, `F5` sna
 
 ## Releases
 
-**v1.0.3** is the current release (v1.0.2, v1.0.1 and v1.0.0 came before); **Settings → About** shows the version and what
+**v1.1.0** is the current release (v1.0.3, v1.0.2, v1.0.1 and v1.0.0 came before); **Settings → About** shows the version and what
 it runs on. Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`: it builds the
 tarball and wheel, checks the bundled assets, smoke-tests a clean install and publishes a
 GitHub Release with `SHA256SUMS`. To release, bump `version` in `pyproject.toml` and
@@ -87,23 +96,39 @@ GitHub Release with `SHA256SUMS`. To release, bump `version` in `pyproject.toml`
 ## Privacy
 
 Everything stays local: recordings go to `~/Videos/AnyCam/`, with no telemetry, accounts or
-update checks. The only privileged change is loading `v4l2loopback`. Screen capture asks
-permission through the portal.
+update checks. Privileged changes are the one-time virtual camera setup and, only if you
+click **Allow phones**, a ufw rule for TCP 8443; both go through the normal password prompt.
+The phone link runs only after you add a phone (or open a scene with one): HTTPS on your LAN
+address, pairing by single-use QR code, phone secrets stored hashed, video never leaves the
+network. Screen capture asks permission through the portal.
 
 ## Known limitations
 
-- Python effects cost CPU per frame (`scripts/bench-effects.py` measures them). Masks are 2D,
-  built from five face landmarks: no depth and no expression tracking.
-- One virtual camera, and one canvas size and FPS for all layers; two filter slots per
-  layer. A scene change rebuilds the graph (a hard cut) and starts a new recording segment.
-- A camera that returns under a different `/dev/video*` name must be re-selected.
-- Screen share asks the portal chooser each launch; a static share can show `SLOW`.
+- **Effects:** Python effects cost CPU per frame (`scripts/bench-effects.py` measures them).
+  Masks are 2D, built from five face landmarks: no depth and no expression tracking.
+- **Canvas:** one virtual camera, and one canvas size and FPS for all layers; two filter slots
+  per layer. A scene change rebuilds the graph (a hard cut) and starts a new recording segment.
+- **Virtual camera:** with `exclusive_caps=1`, Chromium apps list AnyCam only while AnyCam is
+  running. An app that was already open when AnyCam started may need its camera list
+  reopened. The setup will not reload the driver while another app's v4l2loopback camera
+  (OBS, for example) exists, or while an app has the camera open.
+- **Phone camera:** video only (no phone audio). The phone shows a certificate warning the
+  first time, and again whenever its browser forgets the exception: the certificate is
+  self-signed because a LAN address cannot get a public one. Same Wi-Fi only, with no
+  internet relay. Tested on one Android phone (Pixel 10) in Chrome; other phones and
+  browsers are untested. Video is decoded on the CPU. Paired phones cannot be removed from
+  the UI yet (delete `~/.local/state/anycam/phones.json`), and the phone remote control is
+  not built.
+- **Firewall:** only ufw is opened automatically. With firewalld or plain nftables, allow
+  TCP 8443 yourself.
+- **Devices:** a camera that returns under a different `/dev/video*` name must be re-selected.
+  Screen share asks the portal chooser each launch, and a static share can show `SLOW`.
 - No NVIDIA Broadcast effects (the SDK is Windows-only); NVENC is used for encoding only.
 
 ## Develop
 
 ```bash
-.venv/bin/python -m pytest tests     # 676 tests; the GUI and engine tests run offscreen
+.venv/bin/python -m pytest tests     # 740 tests; the GUI and engine tests run offscreen
 ```
 
 ### Reproduce CI locally
@@ -121,6 +146,7 @@ docker run --rm -it -v "$PWD:/src" -w /src ubuntu:24.04 bash -c '
     gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-x \
     gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
     gstreamer1.0-plugins-ugly gstreamer1.0-libav ffmpeg \
+    gir1.2-gst-plugins-bad-1.0 gstreamer1.0-nice openssl qrencode \
     libegl1 libgl1 libxkbcommon0 libxkbcommon-x11-0 \
     libxcb-cursor0 libxcb-xinerama0 &&
   gst-inspect-1.0 textoverlay &&

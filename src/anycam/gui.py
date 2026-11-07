@@ -37,6 +37,7 @@ from .model import (Effects, Layer, Project, Scene, camera_grid_scene,
 from .engine.outputs.recorder import Recorder
 from .engine.outputs.vcam import VcamOutput
 from .pipeline import AnyCamEngine, nvenc_available, recording_codec
+from .phone_dialog import PhoneEvents, PhonePairDialog
 from .pool import SCREEN_IDLE_GRACE_S, SourcePool
 from . import animated, effect_thumbs, effects as effect_library
 from . import emoji as emoji_library, frames as frames_library, particles as particles_library
@@ -1165,6 +1166,13 @@ class AnyCamWindow(QMainWindow):
         # the virtual camera events they explain (a rebuild that holds the
         # capture also holds the vcam's last frame).
         self._source_pool.log_event = self.log_event
+        # The phone link (QR pairing + WebRTC from the phone) starts on first
+        # use and runs until the window closes, so a paired phone can
+        # reconnect at any time.  Its events arrive on network threads.
+        self._phone_service = None
+        self._phone_dialog: PhonePairDialog | None = None
+        self._phone_events = PhoneEvents(self)
+        self._phone_events.event.connect(self._on_phone_event)
         self.recording = False
         self._recorder: Recorder | None = None
         self._recording_path = ""
@@ -1446,7 +1454,8 @@ class AnyCamWindow(QMainWindow):
             ("Add image…", "image"),
             ("Add native desktop share…", "screen"),
             ("Add a different desktop share…", "screen-new"),
-            ("Add phone URL…", "network"),
+            ("Add phone camera (QR code)…", "phone"),
+            ("Add network stream URL…", "network"),
             ("Add text…", "text"),
             ("Add scrolling ticker…", "ticker"),
             ("Add lower third…", "lower_third"),
@@ -1718,7 +1727,8 @@ class AnyCamWindow(QMainWindow):
         sources = (("Camera", "camera"), ("Test pattern", "test"),
                    ("Text", "text"), ("Logo", "logo"),
                    ("Image", "image"), ("Video file", "video"),
-                   ("Screen", "screen"), ("Network URL", "network"),
+                   ("Screen", "screen"), ("Phone camera", "phone"),
+                   ("Network URL", "network"),
                    ("Ticker", "ticker"), ("Lower third", "lower_third"),
                    ("Animated GIF", "gif"))
         for index, (label, kind) in enumerate(sources):
@@ -1744,7 +1754,7 @@ class AnyCamWindow(QMainWindow):
     EFFECT_CATEGORIES = ("Looks", "Portrait", "Face", "Masks", "Framing", "Distort",
                          "Retro TV", "Touch-up", "Frames", "Shapes",
                          *FRAME_GROUPS, "Animations", "Emoji rain")
-    _CAPTURE_KINDS = ("camera", "screen", "video", "network", "test")
+    _CAPTURE_KINDS = ("camera", "screen", "video", "network", "phone", "test")
 
     def _effects_tab(self) -> QWidget:
         page = QWidget()
@@ -2636,7 +2646,7 @@ class AnyCamWindow(QMainWindow):
     def _inset_capture_layers(self) -> None:
         changed = 0
         for layer in self.scene.layers:
-            if layer.kind not in ("camera", "screen", "video", "network", "test"):
+            if layer.kind not in self._CAPTURE_KINDS:
                 continue
             x, y, w, h = layer.box
             box = (x + w * 0.055, y + h * 0.055, w * 0.89, h * 0.89)
@@ -3941,6 +3951,27 @@ class AnyCamWindow(QMainWindow):
                        else (0.04, 0.04, 0.18, 0.18))
             layer = Layer(new_id("layer"), kind, path.stem, source=str(path),
                           box=box or default, z=0)
+        elif kind == "phone":
+            if not source:
+                if self.headless:
+                    return None
+                paired = self._pair_phone()
+                if paired is None:
+                    return None
+                source, name = paired
+            else:
+                # A phone layer needs the link listening so the phone can
+                # (re)connect, however the layer got here.
+                self._phone_link(quiet=True)
+                name = self._phone_name(source)
+            for existing in self.scene.layers:
+                if existing.kind == "phone" and existing.source == source:
+                    # The phone is already in this scene; it just reconnected.
+                    self.preview.select_layer(existing.id)
+                    self._status(f"{existing.name} is connected")
+                    return existing
+            layer = Layer(new_id("layer"), "phone", name, source=source,
+                          box=box or (0.0, 0.0, 1.0, 1.0), z=0)
         elif kind == "network":
             if not source:
                 source, ok = QInputDialog.getText(
@@ -5011,6 +5042,46 @@ class AnyCamWindow(QMainWindow):
         self._vcam_output = output
         return True
 
+    def setup_vcam_if_needed(self) -> bool:
+        """Offer the one-time system setup that makes Discord see AnyCam.
+
+        Runs at launch, before the device is held (a reload needs it closed).
+        One password prompt installs the driver settings permanently; every
+        later launch is ready with no prompt.  True when the camera is ready.
+        """
+        dev = self.project.output.vcam_device or config.loopback_device()
+        reason = config.vcam_setup_needed(dev)
+        if not reason:
+            return True
+        self.log_event(f"virtual camera setup needed: {reason}")
+        if self.headless:
+            return False
+        answer = QMessageBox.question(
+            self, "Set up the virtual camera",
+            "Discord, Vesktop, Chrome and other apps cannot see AnyCam's "
+            f"virtual camera yet: {reason}.\n\n"
+            "AnyCam can fix this once, for good. It installs the camera "
+            "driver settings and reloads the driver; your password is asked "
+            "one time. After that the camera is ready whenever AnyCam is "
+            "open.\n\nSet it up now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if answer != QMessageBox.StandardButton.Yes:
+            self._status("Virtual camera not set up: Discord will not list AnyCam")
+            return False
+        self._status("Setting up the virtual camera…")
+        try:
+            error = self._run_with_ui(lambda: config.setup_vcam_system(dev))
+        except Exception as exc:  # noqa: BLE001 - shown to the user
+            error = str(exc)
+        if error:
+            self.log_event(f"virtual camera setup failed: {error}")
+            QMessageBox.warning(self, "Virtual camera", f"The setup did not finish:\n{error}")
+            return False
+        self.log_event("virtual camera set up permanently (exclusive_caps=1)")
+        self._status("Virtual camera ready: select AnyCam in Discord")
+        return True
+
     def ensure_vcam_visible(self, device: str | None = None) -> None:
         """Make Chromium-based apps list the node AnyCam is feeding.
 
@@ -5254,6 +5325,10 @@ class AnyCamWindow(QMainWindow):
         if missing:
             self._lost_cameras.update(missing)
             self._camera_watch.start()
+        if any(layer.kind == "phone" for scene in self.project.scenes
+               for layer in scene.layers):
+            # A saved scene with a phone: listen so the phone can reconnect.
+            self._phone_link(quiet=True)
         if not self._ensure_screen_sessions():
             return
         self.project.output.canvas_w = self._even(self.width_spin.value())
@@ -5413,6 +5488,73 @@ class AnyCamWindow(QMainWindow):
             self._thumb_timer.start()
         return super().eventFilter(watched, event)
 
+    # ------------------------------------------------------------- phone link
+    def _phone_link(self, *, quiet: bool = False):
+        """The running phone link, started on first use (None if it cannot)."""
+        if self._phone_service is not None and self._phone_service.running:
+            return self._phone_service
+        from .phone.server import default_service
+
+        service = self._phone_service or default_service(
+            on_event=self._phone_events.event.emit)
+        try:
+            service.start()
+        except Exception as exc:  # noqa: BLE001 - shown to the user
+            self.log_event(f"phone link: {exc}")
+            if quiet or self.headless:
+                self._status(f"Phone link unavailable: {exc}")
+            else:
+                QMessageBox.warning(self, "Phone camera", f"The phone link could not start:\n{exc}")
+            return None
+        self._phone_service = service
+        self.log_event(f"phone link listening on {service.page_url()}")
+        return service
+
+    def _stop_phone_link(self) -> None:
+        service, self._phone_service = self._phone_service, None
+        if service is not None:
+            service.stop()
+
+    def _phone_name(self, device: str) -> str:
+        service = self._phone_service
+        if service is not None:
+            return service.pairing.name(device)
+        from .phone.auth import Pairing
+
+        return Pairing(config.state_dir() / "phones.json").name(device)
+
+    def _pair_phone(self) -> tuple[str, str] | None:
+        """Show the QR code until a phone streams; its ``(device, name)``."""
+        service = self._phone_link()
+        if service is None:
+            return None
+        dialog = PhonePairDialog(service, self, log=self.log_event)
+        self._phone_dialog = dialog
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            self._phone_dialog = None
+        if not accepted or not dialog.device:
+            return None
+        return dialog.device, dialog.device_name or dialog.device
+
+    def _on_phone_event(self, event: str, device: str, detail: str) -> None:
+        """Phone-link events, delivered on the UI thread."""
+        if self._phone_dialog is not None:
+            self._phone_dialog.on_phone_event(event, device, detail)
+        name = self._phone_name(device) if event == "failed" else detail
+        message = {
+            "paired": f"Phone paired: {name}",
+            "connecting": f"{name} is connecting…",
+            "streaming": f"{name} is live",
+            "stopped": f"{name} stopped its camera",
+            "disconnected": f"{name} disconnected",
+            "failed": f"{name} could not connect: {detail}",
+        }.get(event)
+        if message:
+            self.log_event(f"phone {device}: {message}")
+            self._status(message)
+
     def closeEvent(self, event) -> None:
         """Finalise the recording and persist edits before the process exits."""
         self._stop_thumbnails()
@@ -5425,6 +5567,7 @@ class AnyCamWindow(QMainWindow):
             self.stop_engine()
         self._finish_recorder()
         self._finish_vcam_output()
+        self._stop_phone_link()
         self._source_pool.stop()
         self._save_if_needed()
         self._close_screen_sessions()
@@ -5450,6 +5593,7 @@ class AnyCamWindow(QMainWindow):
             self.stop_engine()
         self._finish_recorder()
         self._finish_vcam_output()
+        self._stop_phone_link()
         self._source_pool.stop()
         self._save_if_needed()
         self._close_screen_sessions()

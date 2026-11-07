@@ -189,6 +189,8 @@ def test_diagnostics_fix_button_reloads_and_reholds_the_device(app, monkeypatch)
     caps = {"value": False}
     monkeypatch.setattr(many.config, "vcam_exclusive_caps",
                         lambda path=None: caps["value"])
+    monkeypatch.setattr(many.config, "vcam_setup_needed",
+                        lambda device=None: "" if caps["value"] else "exclusive_caps=0")
     window = _window(empty_project(), app)
     try:
         window._vcam_output = Held()
@@ -200,7 +202,7 @@ def test_diagnostics_fix_button_reloads_and_reholds_the_device(app, monkeypatch)
         caps["value"] = True
         monkeypatch.setattr(many.config, "other_virtual_cameras",
                             lambda *a, **k: [])
-        monkeypatch.setattr(many.config, "reload_vcam_module",
+        monkeypatch.setattr(many.config, "setup_vcam_system",
                             lambda device=None: calls.append(device) or "")
         window.fix_vcam_visibility()
         assert window._fix_thread is not None
@@ -228,8 +230,8 @@ def test_diagnostics_fix_button_surfaces_an_authorization_failure(app,
         monkeypatch.setattr(many.config, "other_virtual_cameras",
                             lambda *a, **k: [])
         monkeypatch.setattr(
-            many.config, "reload_vcam_module",
-            lambda device=None: "authorization was cancelled. Run: sudo")
+            many.config, "setup_vcam_system",
+            lambda device=None: "setup failed: the password prompt was cancelled (authorization)")
         window._refresh_diag_state()
         window.fix_vcam_visibility()
         window._fix_thread.join(5)

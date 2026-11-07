@@ -11,9 +11,11 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import privileged
+
 APP_NAME = "AnyCam"
 APP_ID = "anycam"
-VERSION = "1.0.3"
+VERSION = "1.1.0"
 
 CANVAS_W = 1920
 CANVAS_H = 1080
@@ -371,12 +373,10 @@ def ensure_vcam_device(device: str | None = None, *, prompt: bool = True) -> str
             or shutil.which("modprobe") is None):
         return f"{dev} is missing; load v4l2loopback first: {manual}"
     try:
-        result = subprocess.run(
-            ["pkexec", "modprobe", "v4l2loopback", f"video_nr={number}",
-             "card_label=AnyCam", "exclusive_caps=1"],
-            capture_output=True, text=True, timeout=60,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:  # noqa: BLE001
+        result = privileged.run_as_root(
+            ["modprobe", "v4l2loopback", f"video_nr={number}",
+             "card_label=AnyCam", "exclusive_caps=1"], timeout=60)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:  # noqa: BLE001
         return f"could not set up the virtual camera: {exc}"
     # The device node can take a moment to appear after the module loads.
     for _ in range(40):
@@ -443,6 +443,14 @@ def refresh_vcam_udev(device: str | None = None, *, prompt: bool = True) -> str:
     current = vcam_udev_capabilities(dev)
     if current is not None and "capture" in current:
         return ""
+    if trigger_vcam_uevent(dev):
+        # The setup's udev rule lets the desktop user announce the change
+        # without root; udev re-reads the capabilities asynchronously.
+        for _ in range(40):
+            current = vcam_udev_capabilities(dev)
+            if current is not None and "capture" in current:
+                return ""
+            time.sleep(0.05)
     match = re.search(r"video(\d+)$", dev)
     if match is None:
         return f"virtual camera device {dev} is not a video node"
@@ -454,12 +462,10 @@ def refresh_vcam_udev(device: str | None = None, *, prompt: bool = True) -> str:
     if not prompt or shutil.which("pkexec") is None:
         return f"refreshing Chromium visibility needs root; run: {manual}"
     try:
-        result = subprocess.run(
-            ["pkexec", "udevadm", "trigger", "--action=change",
-             "--sysname-match", f"video{number}"],
-            capture_output=True, text=True, timeout=60, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        result = privileged.run_as_root(
+            ["udevadm", "trigger", "--action=change",
+             "--sysname-match", f"video{number}"], timeout=60)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         return f"could not refresh Chromium visibility: {exc}"
     if result.returncode != 0:
         lines = (result.stderr or result.stdout or "").strip().splitlines()
@@ -533,14 +539,12 @@ def reload_vcam_module(device: str | None = None, *,
     if not prompt or shutil.which("pkexec") is None:
         return f"reloading needs root; run: {manual}"
     try:
-        result = subprocess.run(
+        result = privileged.run_as_root(
             # One prompt for the unload and the load: pkexec authorises the
             # shell, which runs both steps only if the unload succeeds.
-            ["pkexec", "/bin/sh", "-c",
-             f"modprobe -r v4l2loopback && {load}"],
-            capture_output=True, text=True, timeout=120,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:  # noqa: BLE001
+            ["/bin/sh", "-c", f"modprobe -r v4l2loopback && {load}"],
+            timeout=120)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:  # noqa: BLE001
         return f"could not reload v4l2loopback: {exc}"
     if result.returncode != 0:
         lines = (result.stderr or result.stdout or "").strip().splitlines()
@@ -556,6 +560,170 @@ def reload_vcam_module(device: str | None = None, *,
         time.sleep(0.05)
     return (f"v4l2loopback reloaded but {dev} still reports "
             f"exclusive_caps={vcam_exclusive_caps()}. Run: {manual}")
+
+
+# ------------------------------------------------- one-time system setup
+# AnyCam's own files (the names scripts/enable-v4l2loopback.sh and older
+# instructions used too, so the setup replaces a stale exclusive_caps=0).
+VCAM_MODPROBE_CONF = Path("/etc/modprobe.d/anycam.conf")
+VCAM_MODULES_LOAD = Path("/etc/modules-load.d/anycam.conf")
+VCAM_UDEV_RULE = Path("/etc/udev/rules.d/70-anycam-vcam.rules")
+# Exit code of the setup script when the config is installed but the module
+# could not be reloaded because something still has the camera open.
+VCAM_SETUP_BUSY = 3
+# Exit code when the module reloaded but something else forced
+# exclusive_caps back to 0 (another modprobe.d file).
+VCAM_SETUP_OVERRIDDEN = 4
+
+VCAM_SETUP_SCRIPT = r"""set -e
+# Files an earlier AnyCam build of this setup wrote under another name.
+rm -f /etc/modprobe.d/anycam-v4l2loopback.conf /etc/modules-load.d/anycam-v4l2loopback.conf
+cat > {modprobe} <<'ANYCAM'
+# Written by AnyCam: one virtual camera that Chromium apps (Discord,
+# Vesktop, Chrome) can list.  exclusive_caps=1 is the part they need.
+options v4l2loopback video_nr={number} card_label=AnyCam exclusive_caps=1
+ANYCAM
+cat > {modules} <<'ANYCAM'
+# Written by AnyCam: load the virtual camera driver at boot.
+v4l2loopback
+ANYCAM
+cat > {rule} <<'ANYCAM'
+# Written by AnyCam: with exclusive_caps=1 the camera only offers capture
+# while AnyCam writes to it, but udev remembers the capabilities from boot.
+# Let the video group re-announce the device so apps see AnyCam without root.
+ACTION=="add", SUBSYSTEM=="video4linux", ATTR{{name}}=="AnyCam", RUN+="/bin/sh -c 'chgrp video /sys%p/uevent; chmod 0664 /sys%p/uevent'"
+ANYCAM
+udevadm control --reload || true
+caps=$(cut -c1 /sys/module/v4l2loopback/parameters/exclusive_caps 2>/dev/null || true)
+if [ "$caps" != "Y" ]; then
+  if [ -d /sys/module/v4l2loopback ] && ! modprobe -r v4l2loopback; then
+    exit {busy}
+  fi
+  modprobe v4l2loopback
+  udevadm settle --timeout=5 || true
+fi
+uevent=/sys/class/video4linux/video{number}/uevent
+if [ -e "$uevent" ]; then
+  chgrp video "$uevent" && chmod 0664 "$uevent"
+fi
+caps=$(cut -c1 /sys/module/v4l2loopback/parameters/exclusive_caps 2>/dev/null || true)
+[ "$caps" = "Y" ] || exit {overridden}
+"""
+
+
+def trigger_vcam_uevent(device: str | None = None) -> bool:
+    """Ask udev to re-read the node's capabilities, without root.
+
+    Works once the setup's udev rule made the node's ``uevent`` writable for
+    the video group.  Chromium apps re-list cameras on that change event.
+    """
+    path = Path("/sys/class/video4linux") / Path(device or loopback_device()).name / "uevent"
+    try:
+        path.write_text("change\n")
+    except OSError:
+        return False
+    return True
+
+
+def _effective_exclusive_caps(config_text: str) -> bool | None:
+    """exclusive_caps as modprobe will apply it: the last value given wins."""
+    value: bool | None = None
+    for line in config_text.splitlines():
+        line = line.split("#", 1)[0]
+        if line.split()[:2] != ["options", "v4l2loopback"]:
+            continue
+        for match in re.finditer(r"\bexclusive_caps=([^\s,]+)", line):
+            value = match.group(1).upper() in ("1", "Y", "YES", "TRUE")
+    return value
+
+
+def _vcam_configured_permanently() -> bool:
+    """modprobe's effective config loads v4l2loopback with exclusive_caps=1."""
+    code, out = run(["modprobe", "-c"]) if shutil.which("modprobe") else (1, "")
+    if code != 0:
+        return False
+    return _effective_exclusive_caps(out) is True
+
+
+def vcam_caps_overrides(dirs: tuple[str, ...] = ("/etc/modprobe.d", "/usr/lib/modprobe.d",
+                                                 "/run/modprobe.d")) -> list[str]:
+    """Config files other than AnyCam's that set exclusive_caps to 0."""
+    found: list[str] = []
+    for directory in dirs:
+        try:
+            files = sorted(Path(directory).glob("*.conf"))
+        except OSError:
+            continue
+        for conf in files:
+            if conf == VCAM_MODPROBE_CONF:
+                continue
+            try:
+                text = conf.read_text(errors="replace")
+            except OSError:
+                continue
+            if _effective_exclusive_caps(text) is False:
+                found.append(str(conf))
+    return found
+
+
+def vcam_setup_needed(device: str | None = None) -> str:
+    """Why the one-time virtual camera setup is still needed ("" if done)."""
+    dev = device or loopback_device()
+    caps = vcam_exclusive_caps()
+    if caps is None or not Path(dev).exists():
+        return "the virtual camera driver is not loaded"
+    if caps is not True:
+        return "the driver is loaded without exclusive_caps=1, so Chromium apps skip it"
+    if not _vcam_configured_permanently():
+        return "the driver settings are not permanent (lost at the next reboot)"
+    uevent = Path("/sys/class/video4linux") / Path(dev).name / "uevent"
+    if not os.access(uevent, os.W_OK):
+        return "AnyCam cannot tell apps that the camera is ready"
+    return ""
+
+
+def setup_vcam_system(device: str | None = None) -> str:
+    """Install the virtual camera permanently with one password prompt.
+
+    Writes the modprobe and boot configs and the udev rule, then reloads
+    v4l2loopback with ``exclusive_caps=1`` if it was loaded without it.  The
+    caller must have closed its own handles on the device.  Returns "" on
+    success, a reason otherwise.
+    """
+    dev = device or loopback_device()
+    match = re.search(r"video(\d+)$", dev)
+    if match is None:
+        return f"virtual camera device {dev} is not a video node"
+    number = match.group(1)
+    if vcam_exclusive_caps() is not True:
+        others = other_virtual_cameras(dev)
+        if others:
+            return ("setting up AnyCam's camera would remove "
+                    + ", ".join(others) + "; close the apps using them first")
+    script = VCAM_SETUP_SCRIPT.format(
+        modprobe=VCAM_MODPROBE_CONF, modules=VCAM_MODULES_LOAD,
+        rule=VCAM_UDEV_RULE, number=number, busy=VCAM_SETUP_BUSY,
+        overridden=VCAM_SETUP_OVERRIDDEN)
+    try:
+        result = privileged.run_as_root(["/bin/sh", "-c", script])
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        return f"could not set up the virtual camera: {exc}"
+    if result.returncode == VCAM_SETUP_BUSY:
+        return ("the settings are installed, but another app (Discord, a browser) "
+                "has the virtual camera open, so the driver could not be "
+                "reloaded. Close its camera and try again, or reboot")
+    if result.returncode == VCAM_SETUP_OVERRIDDEN:
+        overrides = vcam_caps_overrides()
+        return ("the driver was reloaded but another setting forces "
+                "exclusive_caps=0" + (": " + ", ".join(overrides) if overrides else "")
+                + ". Remove that line and run the setup again")
+    if result.returncode != 0:
+        return f"setup failed: {privileged.failure_reason(result)}"
+    for _ in range(60):
+        if not vcam_setup_needed(dev):
+            return ""
+        time.sleep(0.05)
+    return f"setup ran but {vcam_setup_needed(dev)}"
 
 
 def vcam_available(device: str | None = None) -> bool:

@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 # Layers that can fill a layout slot.  Overlays (text, logo, playlist) keep
 # their own position, so a title stays a title.
-GRID_KINDS = ("camera", "screen", "video", "network", "test")
+GRID_KINDS = ("camera", "screen", "video", "network", "phone", "test")
 
 # Gutter between adjacent slots, as a fraction of the canvas.
 GRID_GAP = 0.012
