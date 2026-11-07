@@ -5147,15 +5147,13 @@ class AnyCamWindow(QMainWindow):
             self._vcam_output = None
         output = VcamOutput()
         if setup and not Path(device).exists():
-            # The polkit prompt can take a minute; keep the window alive while
-            # it is open instead of freezing the UI thread.
-            problem = self._run_with_ui(lambda: config.ensure_vcam_device(device))
-            if problem:
-                output.error = str(problem)
-                self.log_event(f"virtual camera: {output.error}")
-                self._status(output.error)
-                return False
-        if not output.start(device, width, height, fps, setup=setup):
+            # Creating the device asks polkit, which can take a minute; run the
+            # start off the UI thread so the window stays alive meanwhile.
+            started = self._run_with_ui(
+                lambda: output.start(device, width, height, fps, setup=True))
+        else:
+            started = output.start(device, width, height, fps, setup=setup)
+        if not started:
             self.log_event(
                 f"virtual camera: {output.error or 'could not start'}")
             self._status(output.error or "Virtual camera could not start")
@@ -5181,8 +5179,8 @@ class AnyCamWindow(QMainWindow):
         def work() -> None:
             try:
                 result["value"] = function()
-            except Exception as exc:  # noqa: BLE001 - reported to the caller
-                result["value"] = f"{exc}"
+            except Exception as exc:  # noqa: BLE001 - re-raised on the UI thread
+                result["error"] = exc
 
         thread = threading.Thread(target=work, name="anycam-blocking",
                                   daemon=True)
@@ -5192,6 +5190,8 @@ class AnyCamWindow(QMainWindow):
             if app is not None:
                 app.processEvents()
             thread.join(0.02)
+        if "error" in result:
+            raise result["error"]
         return result.get("value")
 
     def _recover_vcam(self) -> bool:
