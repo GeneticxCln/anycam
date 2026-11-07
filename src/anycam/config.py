@@ -398,7 +398,8 @@ def ensure_vcam_device(device: str | None = None, *, prompt: bool = True) -> str
 
 
 def vcam_exclusive_caps(
-        path: str | None = "/sys/module/v4l2loopback/parameters/exclusive_caps"
+        path: str | None = "/sys/module/v4l2loopback/parameters/exclusive_caps",
+        device: str | None = None,
 ) -> bool | None:
     """Whether the loaded module announces capture-only, as Chromium needs.
 
@@ -413,7 +414,21 @@ def vcam_exclusive_caps(
         values = Path(path).read_text()
     except OSError:
         return None
-    return values.split(",")[0].strip() == "Y"
+    flags = [value.strip() for value in values.split(",")]
+    # The parameter is one value per device, in creation order.  AnyCam's
+    # node is not always the module's first device: find its slot through
+    # video_nr, and fall back to the first value only when it is not listed.
+    index = 0
+    match = re.search(r"video(\d+)$", str(device or loopback_device()))
+    if match is not None:
+        try:
+            numbers = [value.strip() for value in
+                       (Path(path).parent / "video_nr").read_text().split(",")]
+        except OSError:
+            numbers = []
+        if match.group(1) in numbers:
+            index = numbers.index(match.group(1))
+    return index < len(flags) and flags[index] == "Y"
 
 
 def vcam_udev_capabilities(device: str | None = None) -> str | None:

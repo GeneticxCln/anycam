@@ -13,6 +13,7 @@ import itertools
 
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -374,9 +375,18 @@ def apply_effects(elements: dict, fx: Effects) -> None:
         frame_width = max(1, min(48, int(_effect_number(
             getattr(fx, "frame_width", 6), 6))))
         frame_matte = str(getattr(fx, "frame_matte", "#0b0d10") or "#0b0d10")
-        path = overlay.render_window_frame(
-            width, height, frame_style, frame_color, frame_width,
-            matte=frame_matte)
+        try:
+            path = overlay.render_window_frame(
+                width, height, frame_style, frame_color, frame_width,
+                matte=frame_matte)
+        except Exception as exc:  # noqa: BLE001 - a frame must never stop the canvas
+            # This runs inside the chain build: an exception here aborted
+            # "Could not start the pipeline", on every launch, because the
+            # effect is saved in the project.  Show the layer unframed.
+            print(f"[frame] could not draw {frame_style} at {width}x{height}: {exc}",
+                  file=sys.stderr, flush=True)
+            frame_style = "none"
+            path = overlay.render_window_frame(width, height, "none")
         frame.set_property("location", str(path))
         # A transparent PNG plus alpha=0 is a true bypass for the common case.
         frame.set_property("alpha", 0.0 if frame_style == "none" else 1.0)
@@ -442,6 +452,9 @@ def cropped_size(layer, width: int, height: int) -> tuple[int, int]:
     return max(1, width - left - right), max(1, height - top - bottom)
 
 
+SCALE_THREADS = min(4, max(1, (os.cpu_count() or 2) // 4))
+
+
 def _fit_letterbox(chain: SourceChain, src_w: int, src_h: int,
                    width: int, height: int, rate: bool = True) -> Rect:
     """Scale a source to fit inside the box, preserving its aspect ratio.
@@ -454,7 +467,10 @@ def _fit_letterbox(chain: SourceChain, src_w: int, src_h: int,
     changed shape without a rebuild.  The bands are now transparent.
     """
     rect = fit_contain(src_w, src_h, width, height)
-    chain.add(make("videoscale"))
+    # Several threads: a camera shrunk into a box (a stage insets it) is a
+    # full-frame resample at the canvas rate; on one thread it saturated a
+    # core and the layer's leaky queue dropped frames (visible lag).
+    chain.add(make("videoscale", n_threads=SCALE_THREADS))
     chain.add(caps_filter(
         f"video/x-raw,format=RGBA,width={rect.w},height={rect.h}"))
     if rate:
@@ -622,6 +638,19 @@ def image_chain(path: str, width: int, height: int, fps: int, layer=None,
     else:
         decoder = make("decodebin")
         chain.dynamic_from = decoder
+    if (layer is not None and getattr(layer, "role", "") == "backdrop" and not fit
+            and (getattr(layer, "effects", None) or Effects()) == Effects()):
+        # A stage never changes and has no effect rack: scale it once and
+        # repeat the finished frame.  With imagefreeze early, the fit, effect
+        # rack, filter slots and overlay re-ran on the same 1080p picture 60
+        # times a second (a third of a core, and lag on the camera).
+        tail = caps_filter(caps_string(int(width), int(height), fps))
+        chain.add(decoder, make("videoconvert"), make("videoscale", n_threads=SCALE_THREADS),
+                  caps_filter(f"video/x-raw,format=RGBA,width={int(width)},height={int(height)}"),
+                  make("imagefreeze"), tail)
+        chain.tail = tail
+        chain.source_size = (int(width), int(height))
+        return chain
     chain.add(decoder, make("videoconvert"))
     # A raw image is cropped and fitted by its own size.  Taking the box size
     # for it stretched every photo to the box and applied crop fractions to
@@ -670,6 +699,11 @@ def network_chain(uri: str, width: int, height: int, fps: int, layer=None,
     # us otherwise, treat the canvas as the source so crop fractions stay a
     # fraction of a normal 1080p feed rather than of the (much smaller) box.
     source_w, source_h = source_size or (width, height)
+    # Bring the stream to that size first (letterboxed, square pixels), so the
+    # crop below really is a fraction of the frame it cuts.  Cropping the raw
+    # stream by canvas-sized pixel counts was wrong for any other size.
+    chain.add(make("videoscale", n_threads=SCALE_THREADS), caps_filter(
+        f"video/x-raw,format=RGBA,width={source_w},height={source_h},pixel-aspect-ratio=1/1"))
     chain.add(*_crop_chain(layer, source_w, source_h))
     cropped_w, cropped_h = cropped_size(layer, source_w, source_h)
     fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height)

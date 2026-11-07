@@ -123,6 +123,14 @@ EFFECT_PRESETS: dict[str, dict[str, float]] = {
 }
 
 
+# Phrases a disconnected or wedged camera produces.  An error from another
+# element (an encoder, the virtual camera's writer) has none of them, so a
+# camera node that happens to be missing does not turn it into a disconnect.
+_CAMERA_LOSS = re.compile(
+    r"no such device|device (?:gone|disconnected|not found|busy|removed)"
+    r"|error reading from device|could not read from resource")
+
+
 class LayoutHistory:
     """Snapshot-based undo/redo for a scene's layers.
 
@@ -473,6 +481,8 @@ class PreviewWidget(QWidget):
         for layer in reversed(self.scene.ordered()):
             if layer.kind == "drawing":
                 continue   # full-canvas and on top: it must not swallow clicks
+            if getattr(layer, "role", "") == "backdrop":
+                continue   # the stage is behind everything: never picked by a click
             if self.box_rect(layer).contains(pos):
                 return layer
         return None
@@ -2656,6 +2666,13 @@ class AnyCamWindow(QMainWindow):
         for layer in self.scene.layers:
             if layer.kind not in self._CAPTURE_KINDS:
                 continue
+            previous = self._backdrop_insets.get(layer.id)
+            if previous is not None and all(
+                    abs(a - b) < 1e-6 for a, b in zip(layer.box, previous[1])):
+                # Already inset and not moved since: insetting again would
+                # record the inset box as the "original" and Clear stage could
+                # no longer restore the real one.
+                continue
             x, y, w, h = layer.box
             box = (x + w * 0.055, y + h * 0.055, w * 0.89, h * 0.89)
             self._backdrop_insets[layer.id] = (tuple(layer.box), box)
@@ -3219,8 +3236,10 @@ class AnyCamWindow(QMainWindow):
             return selected
         for kinds in (self._CAPTURE_KINDS, ("image",)):
             # Live sources first; a still image only when it is the picture.
+            # Never the stage: it is a background, not the picture.
             main = [layer for layer in self.scene.layers
-                    if layer.visible and layer.kind in kinds]
+                    if layer.visible and layer.kind in kinds
+                    and getattr(layer, "role", "") != "backdrop"]
             if main:
                 return max(main, key=lambda layer: layer.z)
         return selected
@@ -3230,8 +3249,12 @@ class AnyCamWindow(QMainWindow):
         if self.engine is None:
             return
         apply = getattr(self.engine, "set_layer_effects", None)
-        if apply is not None:
-            apply(layer.id, layer.effects)
+        if apply is not None and not apply(layer.id, layer.effects):
+            if (getattr(layer, "role", "") == "backdrop"
+                    and layer.id in getattr(self.engine, "_layer_chains", {})):
+                # This layer was built without a live effect rack (a stage's
+                # fast path): rebuild so the effect is not silently dropped.
+                self.restart_engine()
         self.preview.update()
 
     def _set_effect(self, attr: str, value) -> None:
@@ -3607,8 +3630,11 @@ class AnyCamWindow(QMainWindow):
         if not cameras:
             return {}
         text = message.lower()
+        # Match the device as a whole name: "/dev/video1" is a substring of
+        # "/dev/video10" (the virtual camera), which swapped a healthy camera
+        # for a placeholder whenever the vcam reported an error.
         explicit = {layer_id: device for layer_id, device in cameras.items()
-                    if device.lower() in text}
+                    if re.search(re.escape(device.lower()) + r"(?![\w.-])", text)}
         if explicit:
             return explicit
         # Pool errors name their capture channel; blame only the cameras that
@@ -3631,9 +3657,16 @@ class AnyCamWindow(QMainWindow):
 
     def _handle_pipeline_error(self, message: str) -> None:
         """Treat an unplugged or wedged camera as a temporary loss."""
-        missing = self._missing_camera_layers()
-        if not missing:
-            missing = self._camera_error_layers(message)
+        # Blame cameras only when the error is about a camera.  A camera node
+        # that happens to be missing used to turn every error (an encoder, the
+        # virtual camera) into "camera disconnected" and an immediate rebuild,
+        # which repeated as long as the real error did.
+        blamed = self._camera_error_layers(message)
+        absent = self._missing_camera_layers()
+        text = message.lower()
+        about_cameras = (bool(blamed) or "v4l2src" in text
+                         or (bool(absent) and _CAMERA_LOSS.search(text) is not None))
+        missing = {**(absent if about_cameras else {}), **blamed}
         if not missing:
             self._status(message)
             self.stop_engine()
@@ -3949,6 +3982,12 @@ class AnyCamWindow(QMainWindow):
         self._mark_dirty()
         if self.engine is not None:
             self.restart_engine()
+        # The deleted scene's screen shares: end their portal captures once
+        # the canvas no longer uses them (they used to run until exit).
+        # _close_screen_session keeps a session another layer still shares.
+        for layer in removed.layers:
+            if layer.kind == "screen":
+                self._close_screen_session(layer.id)
 
     def add_layer(self, kind: str, source: str = "",
                   box: tuple[float, float, float, float] | None = None) -> Layer | None:
@@ -5076,6 +5115,28 @@ class AnyCamWindow(QMainWindow):
         self.media_gain_slider.setValue(int(self.project.audio.media_gain_db))
         self.media_gain_slider.blockSignals(False)
         self.media_gain_label.setText(f"{self.project.audio.media_gain_db:+.0f} dB")
+        for combo, value in ((self.denoise_combo, self.project.audio.mic_denoise),
+                             (self.effects_device_combo, self.project.output.effects_device),
+                             (self.segmentation_combo, self.project.output.segmentation_model)):
+            index = combo.findData(value)
+            combo.blockSignals(True)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+            combo.blockSignals(False)
+        self.auto_gain_check.blockSignals(True)
+        self.auto_gain_check.setChecked(bool(self.project.audio.mic_auto_gain))
+        self.auto_gain_check.blockSignals(False)
+        from . import inference, segment
+
+        inference.set_preference(self.project.output.effects_device)
+        segment.set_model(self.project.output.segmentation_model)
+        self._update_effects_device_note()
+        self._update_segmentation_note()
+        # State that belonged to the project that was open before.
+        self._backdrop_insets.clear()
+        self._lost_cameras.clear()
+        self.preview.canvas_size = (self.project.output.canvas_w,
+                                    self.project.output.canvas_h)
+        self._sync_output_controls()
         self._sync_editor_controls()
         repaired = (f" · repaired: {'; '.join(project.load_warnings[:2])}"
                     if project.load_warnings else "")

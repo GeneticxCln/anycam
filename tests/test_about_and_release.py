@@ -104,5 +104,6 @@ def test_the_release_workflow_builds_a_tarball_and_publishes_on_a_version_tag():
 
 def test_the_emoji_and_models_are_declared_as_package_data():
     data = tomllib.loads((ROOT / "pyproject.toml").read_text())["tool"]["setuptools"]["package-data"]["anycam"]
-    for pattern in ("assets/emoji/*.png", "assets/models/*.onnx", "assets/*.jpg", "ui/*.qss"):
+    for pattern in ("assets/emoji/*.png", "assets/models/*.onnx", "assets/*.jpg",
+                    "phone/static/*.html", "phone/static/*.js"):
         assert pattern in data, pattern

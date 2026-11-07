@@ -115,6 +115,13 @@ def _is_legacy_default(project: Project) -> bool:
             and scene.layers[2].source == "LIVE")
 
 
+def _overlap(a, b) -> float:
+    """Area shared by two (x, y, w, h) boxes."""
+    width = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+    height = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+    return max(0.0, width) * max(0.0, height)
+
+
 class ManyCamWindow(AnyCamWindow):
     # ------------------------------------------------------------------- ui
     def _load_saved_project(self) -> Project:
@@ -712,7 +719,11 @@ class ManyCamWindow(AnyCamWindow):
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
-        self._current_layout_key = self.scene.layout or "full"
+        # A project or preset can name a layout this build does not know (a
+        # newer build, a hand edit): show it as the single layout instead of
+        # failing to build the window.
+        self._current_layout_key = (self.scene.layout if layout_preset(self.scene.layout)
+                                    else "full")
         grid = QGridLayout()
         grid.setSpacing(6)
         self.layout_buttons: dict[str, QToolButton] = {}
@@ -734,7 +745,10 @@ class ManyCamWindow(AnyCamWindow):
             grid.addWidget(button, index // 2, index % 2)
         layout.addLayout(grid)
         layout.addStretch(1)
-        self.layout_buttons[self._current_layout_key].setChecked(True)
+        button = (self.layout_buttons.get(self._current_layout_key)
+                  or self.layout_buttons.get("full"))
+        if button is not None:
+            button.setChecked(True)
         self._layout_group.idClicked.connect(self._layout_clicked)
         return page
 
@@ -750,23 +764,39 @@ class ManyCamWindow(AnyCamWindow):
     def _sync_layout_controls(self) -> None:
         if not hasattr(self, "layout_buttons"):
             return
-        if self.scene.layout:
+        if layout_preset(self.scene.layout):
             self._current_layout_key = self.scene.layout
         button = self.layout_buttons.get(self._current_layout_key)
         if button is not None:
             button.setChecked(True)
 
     def _slot_layers(self, preset) -> dict[int, Layer]:
-        """Which layer occupies each slot of ``preset`` right now."""
+        """Which layer occupies each slot of ``preset`` right now.
+
+        A layer sitting exactly on a slot owns it.  Every other visible
+        source still owns a slot: the free one it overlaps most, else the
+        first free one.  So moving or resizing a source with the mouse (or a
+        stage insetting it) never makes its slot look empty; a slot shows "+"
+        only when there are fewer sources than slots.
+        """
         wanted = {tuple(round(value, 6) for value in box): index
                   for index, box in enumerate(preset.boxes)}
         slots: dict[int, Layer] = {}
+        loose: list[Layer] = []
         for layer in sorted(self.scene.layers, key=lambda item: item.z):
             if not layer.visible or layer.kind not in GRID_KINDS:
                 continue
             index = wanted.get(tuple(round(value, 6) for value in layer.box))
             if index is not None and index not in slots:
                 slots[index] = layer
+            else:
+                loose.append(layer)
+        for layer in loose:
+            free = [index for index in range(len(preset.boxes)) if index not in slots]
+            if not free:
+                break
+            best = max(free, key=lambda index: _overlap(layer.box, preset.boxes[index]))
+            slots[best] = layer
         return slots
 
     def _slot_context_menu(self, button: QPushButton, position) -> None:
@@ -777,7 +807,9 @@ class ManyCamWindow(AnyCamWindow):
         """
         local = QPointF(button.mapTo(self.preview, position))
         layer = self.preview.layer_at(local)
-        if layer is not None:
+        # A full-canvas overlay (particles) is not "a layer under the +";
+        # forwarding to it hid the slot menu whenever one was active.
+        if layer is not None and layer.kind != "particles":
             self._preview_context_menu(layer.id, button.mapToGlobal(position))
             return
         for candidate, box in self._stage_slots:
@@ -924,6 +956,26 @@ class ManyCamWindow(AnyCamWindow):
             return
         preset = self._active_layout()
         assigned = self._slot_layers(preset)
+        empty = [index for index in range(len(preset.boxes)) if index not in assigned]
+        sources = [layer for layer in self.scene.layers if layer.kind in GRID_KINDS]
+        if empty and sources:
+            # A slot shows "+" although sources exist: record why, so a slot
+            # that wrongly looks empty can be traced from Diagnostics.
+            insets = getattr(self, "_backdrop_insets", {})
+            message = (
+                f"layout {preset.key}: empty slot(s) {empty} with sources "
+                + "; ".join(
+                    f"{layer.kind} {layer.name!r} visible={layer.visible} "
+                    f"box={tuple(round(v, 3) for v in layer.box)}"
+                    + (f" inset-from={tuple(round(v, 3) for v in insets[layer.id][0])}"
+                       if layer.id in insets else "")
+                    for layer in sources))
+            # Slots refresh often; only log when the picture changes.
+            if message != getattr(self, "_last_slot_message", ""):
+                self._last_slot_message = message
+                self.log_event(message)
+        else:
+            self._last_slot_message = ""
         for index, box in enumerate(preset.boxes):
             if index in assigned:
                 continue

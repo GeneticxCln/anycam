@@ -30,8 +30,10 @@ no Wine.
   - **Virtual backgrounds** that replace the room behind you (Effects → Portrait: studio,
     aurora, sunset, ocean, and animated tunnel, starfield, plasma, water), and 171 bundled
     Noto emoji.
-  - **Stage** tab: static and animated canvas backgrounds around the camera tiles (it frames
-    the camera; it does not hide your room).
+  - **Stage** tab: 19 static and 17 animated canvas backgrounds around the camera tiles
+    (gradients, film grain, frosted glass, blueprint, topography, terrazzo; mesh glow, liquid
+    chrome, thermal, bokeh, cosmos, fireflies, pixel grid, sine waves, wireframe, halftone,
+    VHS, digital rain, ...). It frames the camera; it does not hide your room.
 - **AI effects:** ONNX models through onnxruntime, on the CPU by default or the NVIDIA GPU
   (CUDA) when chosen in **Settings → AI effects**. Person cut-out uses the bundled MediaPipe
   model, or Robust Video Matting (soft edges and hair) as a one-click verified download. Slow
@@ -194,7 +196,8 @@ report no cameras, no loopback node, no audio sources and no desktop portal. CI 
 variants — `test` on the bare runner and `test-no-hardware` with the switch on — so a masked
 local run has a reference for its pass/skip list.
 
-More: [PARITY.md](PARITY.md) (feature matrix), [TODO.md](TODO.md), [docs/](docs/) (evidence,
+More: [PARITY.md](PARITY.md) (feature matrix), [TODO.md](TODO.md),
+[docs/UPGRADE_PLAN.md](docs/UPGRADE_PLAN.md) (native Linux upgrade plan), [docs/](docs/) (evidence,
 regressions, phone camera), and the `NOTICE.md` files in `src/anycam/assets/models/` and
 `src/anycam/assets/emoji/` (third-party assets and licences).
 

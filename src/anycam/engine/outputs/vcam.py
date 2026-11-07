@@ -297,6 +297,10 @@ class VcamOutput:
             self._start_idle_feed()
             return True
         if self._build_pipeline(use_gl=False):
+            # A failed GPU attempt may have left its error behind.  The CPU
+            # chain works, and push_sample drops every frame while ``error``
+            # is set, so a stale GPU error left the camera dead.
+            self.error = ""
             self._start_idle_feed()
             return True
         return False

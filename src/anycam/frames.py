@@ -132,7 +132,10 @@ def _emoji_border(canvas: Image.Image, codes: list[str], band: int, size: float 
 # --- themes -------------------------------------------------------------------
 
 def _band_size(w: int, h: int, thickness: int) -> int:
-    return max(8, int(min(w, h) * 0.012 * max(1, thickness)) + 6)
+    # Capped well inside half the short side: at thickness 48 on 1080p the
+    # band was 628 px, the inner rectangle inverted and Pillow raised.
+    return max(8, min(int(min(w, h) * 0.012 * max(1, thickness)) + 6,
+                      int(min(w, h) * 0.35)))
 
 
 def christmas(w, h, thickness, _color):

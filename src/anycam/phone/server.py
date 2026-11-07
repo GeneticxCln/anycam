@@ -295,9 +295,17 @@ class PhoneService:
             receiver.stop()
             raise
         session = secrets.token_urlsafe(12)
+        # Swap under the lock and stop whatever was replaced: two offers from
+        # one phone at once both passed _drop() above, and the second
+        # assignment overwrote the first receiver, which kept running untracked.
         with self._lock:
+            replaced = self.receivers.get(device)
             self.receivers[device] = receiver
+            for key in [key for key, value in self._sessions.items() if value == device]:
+                del self._sessions[key]
             self._sessions[session] = device
+        if replaced is not None and replaced is not receiver:
+            replaced.stop()
         self.emit("connecting", device)
         return session, answer
 

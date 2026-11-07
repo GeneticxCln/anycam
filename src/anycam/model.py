@@ -580,7 +580,14 @@ def save_scene_preset(scene: Scene, directory: str | Path) -> Path:
     # or produce an unusable filename.
     safe = re.sub(r"[^a-z0-9._-]+", "-", scene.name.strip().lower()).strip("-.") or "scene"
     path = directory / f"{safe}.anycam-scene.json"
-    path.write_text(json.dumps(scene.to_dict(), indent=2) + "\n")
+    # Layer sources can carry credentials (rtsp://user:pass@...): owner-only
+    # and atomic, exactly like Project.save, never world-readable or torn.
+    temp = path.with_name(path.name + ".tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps(scene.to_dict(), indent=2) + "\n")
+    os.chmod(temp, 0o600)
+    os.replace(temp, path)
     return path
 
 

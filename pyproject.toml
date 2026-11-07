@@ -38,4 +38,4 @@ addopts = "-q"
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.setuptools.package-data]
-anycam = ["ui/*.qss", "phone/static/*.html", "phone/static/*.js", "assets/*.png", "assets/*.jpg", "assets/models/*.onnx", "assets/models/*.md", "assets/emoji/*.png", "assets/emoji/*.json", "assets/emoji/*.md"]
+anycam = ["phone/static/*.html", "phone/static/*.js", "assets/*.png", "assets/*.jpg", "assets/models/*.onnx", "assets/models/*.md", "assets/emoji/*.png", "assets/emoji/*.json", "assets/emoji/*.md"]

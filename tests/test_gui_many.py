@@ -15,7 +15,7 @@ pytest.importorskip("PySide6")
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint
+from PySide6.QtCore import QPoint, QPointF
 from PySide6.QtGui import QContextMenuEvent, QImage
 from PySide6.QtWidgets import QApplication
 
@@ -990,15 +990,21 @@ def test_plus_overlay_forwards_right_click_to_a_layer_under_it(app):
         image = QImage(640, 360, QImage.Format.Format_RGBA8888)
         image.fill(0)
         window.preview.set_image(image)
-        window._position_stage_slots(force=True)
-
+        window.apply_layout("grid-2x2")
+        preset = window._active_layout()
         layer = window.scene.layers[0]
-        button = window.stage_add_buttons[0]
+        # A source dragged across two cells: it keeps cell 1, and the free
+        # cell 2's + now lies over its right half.
+        layer.box = (0.3, 0.1, 0.4, 0.3)
+        window._refresh_stage_slots()
+        window._position_stage_slots(force=True)
+        button = next(btn for btn, box in window._stage_slots if box == preset.boxes[1])
         seen: list[str] = []
         window._preview_context_menu = (
             lambda layer_id, _pos: seen.append(layer_id))
 
-        target = window.preview.box_rect(layer).center().toPoint()
+        rect = window.preview.box_rect(layer)
+        target = QPointF(rect.left() + rect.width() * 0.8, rect.center().y()).toPoint()
         window._slot_context_menu(button, button.mapFrom(window.preview, target))
         assert seen == [layer.id]
     finally:
@@ -1208,5 +1214,80 @@ def test_launch_refreshes_udev_so_chromium_lists_anycam(app, monkeypatch):
         window._vcam_udev_poll()
         assert calls == ["/dev/video10"]
         assert "announced to Chromium" in window.diag_log.toPlainText()
+    finally:
+        _close(window, app)
+
+
+def test_a_stage_inset_does_not_turn_a_filled_slot_into_a_plus(app):
+    """Single layout + camera, then a stage, then another stage: no "+".
+
+    The stage insets the camera ~5% so the stage shows around it.  The slot
+    match compared exact boxes, so the inset camera no longer "filled" its
+    slot and the add button came back over it after the next refresh.
+    """
+    from anycam import overlay
+
+    window = _window(empty_project(), app)
+    try:
+        layer = window.add_layer("test", box=(0.0, 0.0, 1.0, 1.0))
+        assert layer is not None
+        window._refresh_stage_slots()
+        assert window.stage_add_buttons == []
+        first, second = overlay.BACKGROUND_NAMES[:2]
+        window._apply_background(first)
+        assert layer.box != (0.0, 0.0, 1.0, 1.0), "the camera was inset"
+        window._refresh_stage_slots()
+        assert window.stage_add_buttons == []
+        window._apply_background(second)
+        window._refresh_stage_slots()
+        assert window.stage_add_buttons == [], "swapping stages must not free the slot"
+        window._clear_backdrop()
+        window._refresh_stage_slots()
+        assert layer.box == (0.0, 0.0, 1.0, 1.0)
+        assert window.stage_add_buttons == []
+    finally:
+        _close(window, app)
+
+
+def test_moving_or_resizing_the_only_source_does_not_bring_back_a_plus(app):
+    """The live trace: single layout, camera dragged smaller into a corner.
+
+    A slot counted as filled only when a layer sat exactly on it, so resizing
+    the camera made the one slot look empty and a canvas-sized "+" covered the
+    picture.  A moved layer still owns the slot it overlaps most.
+    """
+    window = _window(empty_project(), app)
+    try:
+        layer = window.add_layer("test", box=(0.0, 0.0, 1.0, 1.0))
+        window._refresh_stage_slots()
+        assert window.stage_add_buttons == []
+        layer.box = (0.0, 0.516, 0.442, 0.374)          # resized with the mouse
+        window._refresh_stage_slots()
+        assert window.stage_add_buttons == []
+        layer.box = (0.766, 0.673, 0.217, 0.327)        # and moved to a corner
+        window._refresh_stage_slots()
+        assert window.stage_add_buttons == []
+    finally:
+        _close(window, app)
+
+
+def test_a_moved_source_keeps_its_slot_and_only_free_slots_get_a_plus(app):
+    window = _window(empty_project(), app)
+    try:
+        window.apply_layout("grid-2x2")
+        preset = window._active_layout()
+        first = window.add_layer("test", box=preset.boxes[0])
+        second = window.add_layer("test", box=preset.boxes[3])
+        window._refresh_stage_slots()
+        assert len(window.stage_add_buttons) == 2
+        # Drag the second source a little off its cell: it still owns cell 4.
+        x, y, w, h = preset.boxes[3]
+        second.box = (x + 0.03, y + 0.02, w * 0.8, h * 0.8)
+        window._refresh_stage_slots()
+        assert len(window.stage_add_buttons) == 2
+        slots = window._slot_layers(preset)
+        assert slots[0] is first and slots[3] is second
+        free = sorted(box for _button, box in window._stage_slots)
+        assert free == sorted([preset.boxes[1], preset.boxes[2]])
     finally:
         _close(window, app)

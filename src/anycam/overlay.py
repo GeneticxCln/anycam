@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import random
 import re
+import sys
 import time
 from pathlib import Path
 
@@ -325,15 +326,28 @@ def render_window_frame(
     """
     width, height = max(8, int(width)), max(8, int(height))
     style = style if style in WINDOW_FRAME_STYLES else "rounded"
-    thickness = max(1, min(48, int(thickness)))
+    # The border must fit the box: a thick border on a small tile made the
+    # inner rectangles invert and Pillow raised "y1 must be >= y0", which
+    # aborted the whole canvas build (and every launch, as it is saved).
+    thickness = max(1, min(48, int(thickness), min(width, height) // 12))
     rgba = parse_color(color, (94, 234, 208, 255))
     matte_rgba = parse_color(matte, (11, 13, 16, 255))
     image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    if style == "none":
+    if style == "none" or min(width, height) < 32:
+        # Nothing to draw, or a tile too small to show a frame at all.
         pass
     elif style in _themes().THEMES:
-        image = _themes().render(style, width, height, thickness, color)
+        try:
+            image = _themes().render(style, width, height, thickness, color)
+        except ValueError as exc:
+            # A themed painter that cannot fit this box must not take the
+            # layer down with it: fall back to a plain border.
+            print(f"[frame] {style} at {width}x{height}: {exc}; using a plain border",
+                  file=sys.stderr, flush=True)
+            margin = max(1, thickness // 2 + 1)
+            draw.rectangle([margin, margin, width - margin - 1, height - margin - 1],
+                           outline=rgba, width=thickness)
     elif style in SHAPED_FRAME_STYLES:
         image = _shaped_window(width, height, style, rgba, matte_rgba, thickness)
     elif style == "vignette":
@@ -407,9 +421,22 @@ def render_window_frame(
     return out
 
 
+def _stages_revision() -> str:
+    """A short hash of ``stages.py``: any painter change renders anew."""
+    from . import stages
+
+    try:
+        return hashlib.sha1(Path(stages.__file__).read_bytes()).hexdigest()[:8]
+    except OSError:
+        return "0"
+
+
 BACKGROUND_NAMES = (
     "Aurora", "Midnight", "Sunset", "Studio", "Ocean",
     "Neon Grid", "Bokeh", "Carbon", "Paper", "Vignette",
+    # Textures, light and structure (anycam.stages).
+    "Film Grain", "Focal Glow", "Frosted Glass", "Blueprint", "Topography",
+    "Split Tone", "Concrete", "Fluted Glass", "Terrazzo",
 )
 
 
@@ -418,6 +445,23 @@ def render_background(name: str, width: int, height: int,
     """Render a fast, cached static backdrop at the project canvas size."""
     width, height = max(64, int(width)), max(64, int(height))
     name = name if name in BACKGROUND_NAMES else "Studio"
+    from . import stages
+
+    if name in stages.STATIC:
+        if out is None:
+            slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+            # The painters' code is part of the key: a cache keyed by name and
+            # size kept serving the old picture after a painter changed.
+            out = (config.cache_dir() / "backgrounds"
+                   / f"{slug}-{width}x{height}-{_stages_revision()}.png")
+        out = Path(out)
+        if not out.exists():
+            out.parent.mkdir(parents=True, exist_ok=True)
+            picture = stages.STATIC[name](width, height)
+            tmp = out.with_suffix(".tmp.png")
+            picture.convert("RGB").save(tmp)
+            tmp.replace(out)
+        return out
     palettes = {
         "Aurora": ((8, 20, 35), (24, 82, 92), (94, 234, 208)),
         "Midnight": ((3, 7, 18), (13, 27, 50), (79, 111, 178)),
@@ -471,7 +515,8 @@ def render_background(name: str, width: int, height: int,
         image = Image.alpha_composite(image, edge)
     if out is None:
         slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-        out = config.cache_dir() / "backgrounds" / f"{slug}-{width}x{height}.png"
+        revision = hashlib.sha1(render_background.__code__.co_code).hexdigest()[:8]
+        out = config.cache_dir() / "backgrounds" / f"{slug}-{width}x{height}-{revision}.png"
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     image.convert("RGB").save(out)

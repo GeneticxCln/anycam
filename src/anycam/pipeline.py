@@ -727,6 +727,7 @@ class AnyCamEngine:
                 id=layer.id, kind="image", name=layer.name, source=str(png),
                 box=layer.box, crop=(0.0, 0.0, 0.0, 0.0), alpha=layer.alpha,
                 z=layer.z, visible=layer.visible, effects=layer.effects,
+                role=layer.role,
             )
             # The PNG already encodes the intended aspect (transparent padding
             # included); fitting it again would add black bars over the video.

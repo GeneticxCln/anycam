@@ -595,8 +595,12 @@ class SourcePool:
             make("videoconvert"),
             make("videoscale"),
             make("videorate"),
+            # Square pixels: without them videoscale meets a different-shaped
+            # target by changing the pixel aspect ratio, which the compositor
+            # ignores, so a 4:3 stream came out stretched to 16:9.  With
+            # pixel-aspect-ratio=1/1 it is letterboxed instead.
             caps_filter(f"video/x-raw,format=RGBA,width={width},height={height},"
-                        f"framerate={spec.fps}/1"),
+                        f"pixel-aspect-ratio=1/1,framerate={spec.fps}/1"),
         ]
         return _Built(elements, (width, height), dynamic_from=decode)
 
@@ -610,8 +614,12 @@ class SourcePool:
             make("videoconvert"),
             make("videoscale"),
             make("videorate"),
+            # Square pixels: without them videoscale meets a different-shaped
+            # target by changing the pixel aspect ratio, which the compositor
+            # ignores, so a 4:3 stream came out stretched to 16:9.  With
+            # pixel-aspect-ratio=1/1 it is letterboxed instead.
             caps_filter(f"video/x-raw,format=RGBA,width={width},height={height},"
-                        f"framerate={spec.fps}/1"),
+                        f"pixel-aspect-ratio=1/1,framerate={spec.fps}/1"),
         ]
         return _Built(elements, (width, height), dynamic_from=decode)
 
@@ -679,7 +687,10 @@ class SourcePool:
             # Do not pin a framerate here.  On niri's DMA-BUF stream a final
             # framerate cap makes the capture emit one frame and then stall;
             # the canvas layer_tail already owns the output rate.
-            caps_filter(f"video/x-raw,format=RGBA,width={expected[0]},height={expected[1]}"),
+            # Square pixels (see _network): a share whose size the portal did
+            # not report is letterboxed into the canvas, not stretched.
+            caps_filter(f"video/x-raw,format=RGBA,width={expected[0]},height={expected[1]},"
+                        "pixel-aspect-ratio=1/1"),
         ])
         # Only probe the size when the portal actually reported one.  With an
         # unknown (0x0) size, the stream is legitimately larger than the
