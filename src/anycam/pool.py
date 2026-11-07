@@ -167,8 +167,15 @@ def capture_spec(layer, canvas_w: int, canvas_h: int, fps: int, *,
     kind = layer.kind
     if kind == "camera":
         width, height, rate = camera_capture_request(layer, canvas_w, canvas_h, fps)
-        return CaptureSpec("camera", layer.source or config.camera_device(),
-                           width, height, rate)
+        device = layer.source or config.camera_device()
+        # Key the capture by the mode the camera will really use, not by the
+        # request: a 1080p camera runs the same mode under a 1080p and a 4K
+        # canvas, and a different key reopened the device on every resize.
+        modes = camera_modes(device)
+        if modes:
+            mode = choose_from_modes(modes, width, height, rate)
+            width, height, rate = mode.width, mode.height, mode.fps
+        return CaptureSpec("camera", device, width, height, rate)
     if kind == "screen":
         node = None
         if layer.source:
@@ -214,18 +221,25 @@ class SourcePool:
         self.log_event = None
 
     # ------------------------------------------------------------------ public
-    def _resolve(self, spec: CaptureSpec) -> CaptureSpec:
+    def _resolve(self, spec: CaptureSpec, *, claim: bool = False) -> CaptureSpec:
         """The spec whose entry serves ``spec``.
 
         A camera device can only be opened once.  Two layers on the same node
         with different requested modes (per-layer size or rate) therefore share
         the first capture; opening a second pipeline on the busy device failed.
+        When acquiring (``claim``), an *unused* capture of another mode on the
+        device (kept alive for a rebuild, or retained for a re-add) is closed
+        instead, so a deliberate mode change takes effect.
         """
         if spec.kind != "camera" or spec in self._entries:
             return spec
-        for other in self._entries:
-            if other.kind == "camera" and other.source == spec.source:
+        for other, entry in list(self._entries.items()):
+            if other.kind != "camera" or other.source != spec.source:
+                continue
+            if not claim or entry.refs > 0:
                 return other
+            entry.teardown()
+            del self._entries[other]
         return spec
 
     def _note(self, message: str) -> None:
@@ -239,16 +253,21 @@ class SourcePool:
 
     def acquire(self, spec: CaptureSpec) -> Entry:
         self.sweep()
-        spec = self._resolve(spec)
+        spec = self._resolve(spec, claim=True)
         entry = self._entries.get(spec)
+        if entry is not None and entry.error and entry.refs == 0:
+            # A capture that failed is never handed out again (a camera that
+            # errored must be reopened, not reused from the rebuild grace).
+            entry.teardown()
+            del self._entries[spec]
+            entry = None
         if entry is None:
             entry = self._build(spec)
             self._entries[spec] = entry
             if self._started:
                 entry.pipeline.set_state(Gst.State.PLAYING)
-        elif entry.refs == 0 and entry.idle_since and spec.kind == "screen":
-            self._note(
-                f"screen capture reused after a rebuild (node {spec.source})")
+        elif entry.refs == 0 and entry.idle_since:
+            self._note(f"{spec.kind} capture reused after a rebuild ({entry.channel})")
         elif entry.refs == 0 and entry.retained:
             self._note(f"capture reused after re-add ({entry.channel})")
         entry.idle_since = 0.0
@@ -271,7 +290,10 @@ class SourcePool:
         entry.retained_since = time.monotonic()
         self._note(f"capture retained for re-add ({entry.channel})")
 
-    def release(self, spec: CaptureSpec) -> None:
+    def release(self, spec: CaptureSpec, *, linger: bool = False) -> None:
+        """Drop one reference.  ``linger`` (a canvas rebuild) keeps an unused
+        camera running for a moment so the rebuilt canvas takes it over
+        instead of closing and reopening the device."""
         spec = self._resolve(spec)
         entry = self._entries.get(spec)
         if entry is None or entry.refs <= 0:
@@ -287,11 +309,11 @@ class SourcePool:
             entry.idle_since = 0.0
             entry.retained_since = time.monotonic()
             return
-        if entry.spec.kind == "screen":
+        if entry.spec.kind == "screen" or (
+                linger and entry.spec.kind == "camera" and not entry.error):
             entry.idle_since = time.monotonic()
-            self._note(
-                f"screen capture kept alive for the next rebuild "
-                f"(node {entry.spec.source})")
+            self._note(f"{entry.spec.kind} capture kept alive for the next rebuild "
+                       f"({entry.channel})")
             return
         entry.teardown()
         del self._entries[spec]
@@ -332,8 +354,7 @@ class SourcePool:
                 continue
             entry.teardown()
             del self._entries[spec]
-            self._note(
-                f"idle screen capture released (node {entry.spec.source})")
+            self._note(f"idle {entry.spec.kind} capture released ({entry.channel})")
 
     def probe_size(self, spec: CaptureSpec) -> tuple[int, int]:
         """The native frame size a capture for ``spec`` will have.

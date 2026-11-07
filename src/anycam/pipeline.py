@@ -2470,7 +2470,8 @@ class AnyCamEngine:
             if setter is not None:
                 setter(False)
         for spec in self._specs:
-            self.pool.release(spec)
+            # A rebuild follows: let the next canvas take the camera over.
+            self.pool.release(spec, linger=True)
         self._specs.clear()
         self._layer_acquired.clear()
         if self._owns_pool:

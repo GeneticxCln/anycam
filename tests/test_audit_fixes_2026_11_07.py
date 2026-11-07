@@ -478,3 +478,56 @@ def test_a_removed_layer_leaves_the_running_canvas():
         assert engine._frame_count > frames, "the canvas keeps running"
     finally:
         engine.stop()
+
+
+# ------------------------------------------- camera reuse across rebuilds
+def _fake_camera(monkeypatch):
+    from anycam.sources import CameraMode
+
+    modes = [CameraMode("MJPG", 1920, 1080, 30), CameraMode("MJPG", 1280, 720, 30)]
+    monkeypatch.setattr("anycam.pool.camera_modes", lambda device: modes)
+    monkeypatch.setattr("anycam.pool.camera_probe_error", lambda device: "")
+
+
+def test_a_camera_capture_is_keyed_by_the_mode_it_really_uses(monkeypatch):
+    """A 1080p camera runs the same mode under 1080p and 4K canvases; keying by
+    the request reopened the device on every resize."""
+    from anycam.pool import capture_spec
+
+    _fake_camera(monkeypatch)
+    layer = Layer("cam", "camera", "Cam", source="/dev/video77")
+    assert capture_spec(layer, 1920, 1080, 30) == capture_spec(layer, 3840, 2160, 30)
+
+
+def test_a_rebuild_takes_the_running_camera_over(monkeypatch):
+    _fake_camera(monkeypatch)
+    shared = SourcePool()
+    spec = CaptureSpec("camera", "/dev/video77", 1920, 1080, 30)
+    try:
+        first = shared.acquire(spec)
+        shared.release(spec, linger=True)             # what engine.stop() does
+        assert shared.entry(spec) is first and first.idle_since
+        assert shared.acquire(spec) is first, "the device was reopened"
+        shared.release(spec)                          # hiding a layer
+        assert shared.entry(spec) is None, "hiding must still free the device"
+    finally:
+        shared.stop()
+
+
+def test_a_different_mode_or_a_failed_camera_is_reopened(monkeypatch):
+    _fake_camera(monkeypatch)
+    shared = SourcePool()
+    big = CaptureSpec("camera", "/dev/video77", 1920, 1080, 30)
+    small = CaptureSpec("camera", "/dev/video77", 1280, 720, 30)
+    try:
+        first = shared.acquire(big)
+        shared.release(big, linger=True)
+        second = shared.acquire(small)
+        assert second is not first and big not in shared._entries, \
+            "a deliberate mode change must take effect"
+        assert not first.probes, "the old capture was torn down"
+        second.error = "device gone"
+        shared.release(small, linger=True)
+        assert shared.entry(small) is None, "a failed capture is not kept"
+    finally:
+        shared.stop()
