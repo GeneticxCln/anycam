@@ -16,7 +16,8 @@ no Wine.
   phone, accept the one-time certificate warning, allow the camera, and the phone streams
   into the scene over WebRTC. Local network only, no app to install; a paired phone
   reconnects by opening the page again. If ufw or firewalld blocks the port, **Allow phones**
-  in the same dialog opens it with one password prompt (firewalld over D-Bus). The TLS
+  in the same dialog opens it with one password prompt (firewalld over D-Bus, so far tested
+  against a simulated firewalld). The TLS
   certificate and QR code come from the `cryptography` and `segno` packages
   (`anycam[phone]`), or else the `openssl` and `qrencode` commands. See
   [docs/PHONE_CAMERA.md](docs/PHONE_CAMERA.md).
@@ -43,7 +44,7 @@ no Wine.
   reference machine. Add your own segmentation model with `ANYCAM_SEG_MODEL`. See
   [docs/EFFECT_MODELS.md](docs/EFFECT_MODELS.md).
 - **Outputs:** V4L2 virtual camera, optionally also (or instead) a PipeWire camera node,
-  MP4 recording (x264, NVENC, or VA-API on Intel/AMD), RTMP,
+  MP4 recording (x264, NVENC, or VA-API on Intel/AMD, so far tested with simulated hardware), RTMP,
   audio mixing. Auto picks NVENC, then VA-API, then x264, after a real test encode.
 - **Desktop:** a tray icon (show/hide, virtual camera, record, mute, scenes) and global
   shortcuts that work while other apps have focus, through the desktop portal (KDE,
@@ -158,9 +159,7 @@ permission through the portal.
 
 - **Effects:** every effect fits a 1080p60 frame on the reference machine, but they still
   use CPU, on worker threads as well as per frame (`scripts/bench-effects.py` measures only
-  the per-frame part). On the reference machine with the camera at 1080p60 (GPU canvas,
-  whole process): about 1.7 cores with a virtual background and 2.3 with a mask, against
-  1.2 without effects. Robust Video Matting costs about 10 ms of CPU per refresh, about 14
+  the per-frame part). Robust Video Matting costs about 10 ms of CPU per refresh, about 14
   times a second. Live Auto-frame moves a GStreamer crop, which costs extra CPU while you
   move. Masks are 2D, built from five face landmarks: no depth and no expression tracking.
 - **GPU effects:** the CUDA path needs `onnxruntime-gpu` with CUDA and cuDNN, which AnyCam
@@ -174,9 +173,8 @@ permission through the portal.
 - **Virtual camera:** with `exclusive_caps=1`, Chromium apps list AnyCam only while AnyCam is
   running. An app that was already open when AnyCam started may need its camera list
   reopened. The setup will not reload the driver while another app's v4l2loopback camera
-  (OBS, for example) exists, or while an app has the camera open. The PipeWire camera is
-  listed only by apps with PipeWire camera support switched on; Firefox 159 and Chrome 157
-  have it off by default. Its name is fixed ("AnyCam").
+  (OBS, for example) exists, or while an app has the camera open. The optional PipeWire
+  camera is listed only by apps with PipeWire camera support switched on.
 - **Phone camera:** video only (no phone audio). The phone shows a certificate warning the
   first time, and again whenever its browser forgets the exception: the certificate is
   self-signed because a LAN address cannot get a public one. Same Wi-Fi only, with no
@@ -186,10 +184,6 @@ permission through the portal.
   not built.
 - **Firewall:** ufw and firewalld are opened automatically. With plain nftables or another
   firewall, allow TCP 8443 yourself.
-- **VA-API and firewalld:** both are covered by tests with simulated elements and a simulated
-  D-Bus; neither has been run on real Intel/AMD hardware or a real firewalld yet.
-- **Global shortcuts:** need the portal's GlobalShortcuts (KDE, Hyprland); elsewhere only the
-  in-window shortcuts work.
 - **Devices:** a camera that returns under a different `/dev/video*` name must be re-selected.
   Screen share asks the portal chooser each launch, and a static share can show `SLOW`.
 - NVIDIA Broadcast and the Maxine SDK are not used (Windows-only app; restrictive SDK
