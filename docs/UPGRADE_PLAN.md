@@ -24,7 +24,16 @@ PipeWire 1.6.10, Vesktop (Electron 44).
 | 2a.1 Packaging check for `qml6glsink` | **Done.** Usable only with the distribution's PySide6 (same Qt as `gst-plugin-qml6`); pip's bundles its own Qt and the plugin refuses to load. The reference machine now uses `pyside6` 6.12.0 from pacman |
 | 2a.2 GPU preview (`qml6glsink` in a `QQuickWidget`) | **Done, optional.** Used when the plugin loads, CPU preview otherwise. Window thread median 40–47% → 18–20%; 15% target met in some samples, with periodic spikes still unexplained |
 | 2a.3 Cheaper CPU preview (the fallback) | **Done.** Frames capped at 960×540 and following the widget, bilinear paint, zero-copy QImage: GUI-thread Python work down ~25–30% |
-| Phase D | Open |
+| Hardware MJPEG decode (`nvjpegdec`) | **Not possible with the StreamCam.** NVDEC decodes only 4:2:0 JPEG; the camera sends 4:2:2 MJPEG and has no H.264. `jpegdec` stays: 34% of a core at 1080p60 including RGBA conversion, the cheapest option measured |
+| D.1 Where the CPU goes now | **Done**, findings under 2b |
+| D.2 GL canvas prototype (`glvideomixer`) | **Done: passes the gate on a synthetic scene.** Mixing ~120–140% → ~35–40% of a core; pixels match |
+| D.2 GL canvas in AnyCam | **Done, automatic with CPU fallback.** Settings → Canvas; `ANYCAM_CANVAS` override; a failed GPU start retries on the CPU |
+| D small fixes | **Done.** Native frame counter (no Python on every canvas frame), the first-buffer probe removes itself, empty Drawing layers are left out (engine on the saved scene 240–250% → 217%) |
+| Effects CPU (found while testing D) | **Fixed.** ONNX Runtime sessions used one thread per CPU with idle threads busy-spinning: a virtual background cost ~460% of a core, a mask ~530%. Two threads with spinning off: ~166% and ~234%, models still 1.4 ms and 4.9 ms per run |
+| Looks swapping (found while testing D) | **Fixed.** A film style stayed on through every later look, "Original" included; Looks tiles now replace each other |
+| Looks froze the camera (found while testing D) | **Fixed, two causes.** A colour look adds ~14 ms per 1080p frame in `videobalance`. (1) The frame overlay (`gdkpixbufoverlay`, QoS on) then dropped every camera frame; QoS is now off for every filter AnyCam creates (sinks untouched). (2) On the GPU canvas, `glvideomixer` dropped the late camera frames and repeated its last one: frames flowed at 60/s but the picture stood still, in the preview and the virtual camera. The GPU mixer now has 33 ms of extra latency (10 ms still froze, 20 ms did not). Found with a tracer in the user's own session, then reproduced with the real startup on the saved scene |
+| Effect tiles froze the window (found while testing D) | **Fixed.** Tiles were rendered two per tick on the GUI thread (~220 ms per mask), blocking the window and, through the GIL, the effect threads. Now one background thread, and tiles of the built-in sample are cached on disk |
+| D.3 Colour rack in GL shaders, D.4 CUDA interop | Open (D.4 still gated on a measurement) |
 
 ## Summary
 
@@ -208,6 +217,33 @@ opt-in (`inference.py`).
 4. Only then: a CUDA–GL interop spike for feeding segmentation from GPU memory, gated on a real
    measurement showing the Host→Device copy matters. The bundled models take 256×144 input, so
    the copy is small today.
+
+**Research results (2026-11-08, reference machine).**
+
+* AnyCam's engine on the saved scene (StreamCam inset with a frame, plus an empty Drawing
+  layer, 1080p60, image preview, no virtual camera) costs 240–250% of a core. Per thread:
+  camera decode 44% (`jpegdec`, the cheapest option; see the MJPEG row), the camera layer's
+  convert and scale 23%, the image preview branch 19%, and mixing about 90–120% (the
+  `compositor:src` thread plus about 11 GLib pool threads at 7–12% each).
+* The **empty Drawing layer costs ~35% of a core** (250% → 213% without it): a full-canvas
+  transparent layer blended 60 times a second while drawing nothing.
+* The compositor's `max-threads` makes no measurable difference (auto, 1, 2, 4: 240–250%).
+* `GST_PERFORMANCE` was not needed. A gdb stack sample found the `compositor:src` thread
+  waiting for Python's GIL in `_on_compositor_buffer`, the frame-count pad probe: every
+  canvas frame enters Python. Signal-based gdb sampling missed short worker bursts, so the
+  per-thread numbers come from `/proc`.
+* Prototype with the same three 1080p60 RGBA inputs (full-frame background, inset picture,
+  full-frame overlay): CPU `compositor` 150–170% of a core for the whole process against
+  65–71% for `glupload` → `glvideomixer` → one `gldownload` (61% without the download); the
+  sources alone cost 32%. That puts mixing at ~120–140% against ~35–40%. Each `glupload`
+  needs the same `identity drop-allocation=true` as the GPU preview, or NVIDIA leaves the
+  textures black.
+* Pixels: CPU and GL output differ by 0.4/255 on average. The pixels off by more than 2
+  (3.8%) are all inside the scaled inset: the test pattern's per-frame random noise patch,
+  plus scaling-filter differences at edges.
+* `glvideomixer` pads have every property AnyCam's layout uses (`xpos`, `ypos`, `width`,
+  `height`, `alpha`, `zorder`, `sizing-policy`), plus GPU `crop-*`. AnyCam does not use the
+  compositor-only `operator` or `max-last-buffer-repeat`.
 
 **Done when:** a camera + stage + text scene at 1080p60 runs with at least 40% less total CPU
 on the GL canvas, output pixels match the CPU canvas within tolerance, and every scene still

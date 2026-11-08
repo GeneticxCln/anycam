@@ -465,7 +465,15 @@ def test_removing_an_animation_stops_its_feeder_thread_and_the_canvas_stays_live
 
 
 def _preview_pixels(win):
-    image = win.preview.image.convertToFormat(win.preview.image.Format.Format_RGB888)
+    # The preview frame follows the widget's shown size, and clicking in the
+    # effects browser can shift the layout by a few pixels between two
+    # captures; compare at one fixed size.
+    from PySide6.QtCore import Qt
+
+    image = win.preview.image.scaled(
+        480, 270, Qt.AspectRatioMode.IgnoreAspectRatio,
+        Qt.TransformationMode.SmoothTransformation)
+    image = image.convertToFormat(image.Format.Format_RGB888)
     raw = np.frombuffer(image.constBits(), dtype=np.uint8)
     return raw.reshape(image.height(), image.bytesPerLine())[:, :image.width() * 3].astype(int)
 

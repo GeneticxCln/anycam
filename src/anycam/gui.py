@@ -1322,6 +1322,9 @@ class AnyCamWindow(QMainWindow):
         self._recorder: Recorder | None = None
         self._recording_path = ""
         self._vcam_output: VcamOutput | None = None
+        # Set when a GPU canvas graph failed to start; the session stays on
+        # the CPU compositor until the setting is changed.
+        self._gpu_canvas_failed = False
         self.vcam_on = False
         # Last vcam error already reported, and the throttle for repairing a
         # dead v4l2sink without rebuilding the canvas on every tick.
@@ -2345,10 +2348,14 @@ class AnyCamWindow(QMainWindow):
         layout.addWidget(self.effect_note)
 
         self._thumb_sample_image = None
+        self._thumb_sample_default = True
         self._thumb_cache: dict[tuple, QPixmap] = {}
+        # Tiles still to show, the first one possibly being drawn by the
+        # background renderer (effect_thumbs.TileRenderer).
         self._thumb_queue: list[tuple] = []
+        self._thumb_renderer = effect_thumbs.TileRenderer()
         self._thumb_timer = QTimer(self)
-        self._thumb_timer.setInterval(15)
+        self._thumb_timer.setInterval(30)
         self._thumb_timer.timeout.connect(self._render_pending_thumbs)
         self._effect_entries: list[dict] = []
         self._populate_effect_grid()
@@ -2377,14 +2384,20 @@ class AnyCamWindow(QMainWindow):
         """The tiles of one category: label, what they set, how they preview."""
         entries: list[dict] = []
         if category == "Looks":
+            # One look at a time: a colour preset clears the film style and a
+            # film style resets the colour sliders.  Applying only the clicked
+            # tile's own fields left an earlier Sepia on through every later
+            # look, "Original" included, so swapping looked broken.
+            neutral = dict(EFFECT_PRESETS["Original"])
             for name, values in EFFECT_PRESETS.items():
+                look = {**values, "color_effect": "none"}
                 entries.append({"label": name, "kind": "look",
-                                "apply": dict(values), "preview": dict(values)})
+                                "apply": look, "preview": dict(look)})
             for label, value in EFFECT_STYLES.items():
                 if value != "none":
+                    film = {**neutral, "color_effect": value}
                     entries.append({"label": label, "kind": "film",
-                                    "apply": {"color_effect": value},
-                                    "preview": {"color_effect": value}})
+                                    "apply": film, "preview": dict(film)})
         elif category in effect_library.FILTER_CATEGORIES:
             entries.append({"label": "No filter", "kind": "filter",
                             "apply": {"filter": "none"}, "preview": {}})
@@ -2442,8 +2455,9 @@ class AnyCamWindow(QMainWindow):
 
     def _effect_entry_matches(self, entry: dict, fx: Effects) -> bool:
         apply = entry["apply"]
-        if entry["kind"] == "look":
-            return all(abs(float(getattr(fx, key)) - float(value)) < 1e-4
+        if entry["kind"] in ("look", "film"):
+            return all((getattr(fx, key) == value) if isinstance(value, str)
+                       else abs(float(getattr(fx, key)) - float(value)) < 1e-4
                        for key, value in apply.items())
         if entry["kind"] == "particles":
             current = self._animation_layers()
@@ -2457,6 +2471,8 @@ class AnyCamWindow(QMainWindow):
 
     def _thumb_sample(self):
         if self._thumb_sample_image is None:
+            image = getattr(self.preview, "image", None)
+            self._thumb_sample_default = image is None or image.isNull()
             self._thumb_sample_image = self._current_picture_sample()
         return self._thumb_sample_image
 
@@ -2479,6 +2495,7 @@ class AnyCamWindow(QMainWindow):
                                 else self._effect_catalog(category))
         self.effect_grid.clear()
         self._thumb_queue.clear()
+        self._thumb_renderer.forget()
         sample_id = id(self._thumb_sample_image)
         for index, entry in enumerate(self._effect_entries):
             item = QListWidgetItem(entry["label"])
@@ -2501,43 +2518,46 @@ class AnyCamWindow(QMainWindow):
         self._select_current_effect_tile()
 
     def _render_pending_thumbs(self) -> None:
-        """Draw a couple of tiles per tick so the window stays responsive.
+        """Show finished tiles and hand the next one to the background renderer.
 
+        The GUI thread only turns a finished picture into an icon; drawing a
+        tile (up to ~220 ms for a mask) happens on the renderer's thread.
         Only while the grid is on screen: tiles for a tab nobody opened (or a
-        window that has closed) are not worth the GUI thread's time, and the
-        queue is picked up again when the grid is shown.
+        window that has closed) are not worth the work, and the queue is
+        picked up again when the grid is shown.
         """
+        finished = self._thumb_renderer.take()
+        if finished is not None:
+            token, picture = finished
+            if self._thumb_queue and self._thumb_queue[0] is token:
+                self._thumb_queue.pop(0)
+                item, category, entry, sample_id = token
+                if picture is not None:
+                    width, height = picture.size
+                    image = QImage(picture.tobytes(), width, height, width * 3,
+                                   QImage.Format.Format_RGB888).copy()
+                    pixmap = QPixmap.fromImage(image)
+                    self._thumb_cache[(category, entry["label"], sample_id)] = pixmap
+                    try:
+                        item.setIcon(QIcon(pixmap))
+                    except RuntimeError:
+                        pass  # the list was repopulated while this tile was drawn
         if not self.effect_grid.isVisible():
             self._thumb_timer.stop()
             return
-        for _ in range(2):
-            if not self._thumb_queue:
-                self._thumb_timer.stop()
-                return
-            item, category, entry, sample_id = self._thumb_queue.pop(0)
-            try:
-                if entry.get("particles"):
-                    picture = effect_thumbs.particle_thumbnail(
-                        entry["particles"], self._thumb_sample())
-                else:
-                    fx = Effects(**entry["preview"])
-                    picture = effect_thumbs.render_thumbnail(fx, self._thumb_sample())
-            except Exception:  # noqa: BLE001 - a tile without a preview is fine
-                picture = None
-            if picture is None:
-                continue
-            width, height = picture.size
-            image = QImage(picture.tobytes(), width, height, width * 3,
-                           QImage.Format.Format_RGB888).copy()
-            pixmap = QPixmap.fromImage(image)
-            self._thumb_cache[(category, entry["label"], sample_id)] = pixmap
-            try:
-                item.setIcon(QIcon(pixmap))
-            except RuntimeError:
-                pass  # the list was repopulated while this tile was queued
+        if not self._thumb_queue:
+            self._thumb_timer.stop()
+            return
+        if not self._thumb_renderer.busy:
+            token = self._thumb_queue[0]
+            _item, category, entry, _sample_id = token
+            sample = self._thumb_sample()
+            self._thumb_renderer.submit(token, category, entry, sample,
+                                        self._thumb_sample_default)
 
     def _refresh_effect_previews(self) -> None:
-        self._thumb_sample_image = self._current_picture_sample()
+        self._thumb_sample_image = None
+        self._thumb_sample()
         self._thumb_cache.clear()
         self._populate_effect_grid()
 
@@ -3339,6 +3359,23 @@ class AnyCamWindow(QMainWindow):
         grid2.addWidget(self.vcam_note, 2, 0, 1, 2)
         self._update_vcam_note()
         layout.addWidget(box2)
+
+        perf_box = QGroupBox("Canvas")
+        perf_grid = QGridLayout(perf_box)
+        self.canvas_combo = QComboBox()
+        self.canvas_combo.addItem("Automatic (GPU when it works)", "auto")
+        self.canvas_combo.addItem("CPU", "cpu")
+        index = self.canvas_combo.findData(self.project.output.canvas_backend)
+        self.canvas_combo.setCurrentIndex(max(0, index))
+        self.canvas_combo.currentIndexChanged.connect(self._canvas_backend_changed)
+        perf_grid.addWidget(QLabel("Mix layers on"), 0, 0)
+        perf_grid.addWidget(self.canvas_combo, 0, 1)
+        self.canvas_note = QLabel()
+        self.canvas_note.setObjectName("muted")
+        self.canvas_note.setWordWrap(True)
+        perf_grid.addWidget(self.canvas_note, 1, 0, 1, 2)
+        self._update_canvas_note()
+        layout.addWidget(perf_box)
 
         box4 = QGroupBox("Shortcuts")
         grid4 = QGridLayout(box4)
@@ -5252,6 +5289,10 @@ class AnyCamWindow(QMainWindow):
         self.encoder_combo.setCurrentIndex(
             encoder_index if encoder_index >= 0 else 0)
         self.encoder_combo.blockSignals(False)
+        canvas_index = self.canvas_combo.findData(self.project.output.canvas_backend)
+        self.canvas_combo.blockSignals(True)
+        self.canvas_combo.setCurrentIndex(max(0, canvas_index))
+        self.canvas_combo.blockSignals(False)
         backend_index = self.vcam_backend_combo.findData(self._vcam_backend())
         self.vcam_backend_combo.blockSignals(True)
         self.vcam_backend_combo.setCurrentIndex(max(0, backend_index))
@@ -5886,6 +5927,7 @@ class AnyCamWindow(QMainWindow):
                 preview_target=self.preview.display_size(),
                 preview_gl_sink=(self._attach_gpu_preview
                                  if self.preview.video_view is not None else None),
+                canvas=self._canvas_choice(),
                 skip_layers=set(self._lost_cameras),
                 pool=self._source_pool,
                 on_frame=self._on_frame,
@@ -5896,6 +5938,8 @@ class AnyCamWindow(QMainWindow):
                 self.log_event("preview: GPU preview did not start; using the image preview")
                 self.preview.disable_gpu()
             self.preview.set_gpu_live(gpu)
+            self._update_canvas_note()
+            self.log_event(f"canvas: {self.engine.canvas_backend.upper()} canvas")
             self.preview.layer_sizes = self.engine.source_sizes()
             if self.vcam_on and not self.engine.report.vcam_active:
                 # The held output exists but this canvas has no tap: reattach
@@ -5903,7 +5947,20 @@ class AnyCamWindow(QMainWindow):
                 self._vcam_retry_at = 0.0
                 self._recover_vcam()
         except Exception as exc:  # noqa: BLE001
+            failed = self.engine
             self.engine = None
+            if (failed is not None and getattr(failed, "canvas_backend", "") == "gpu"
+                    and not getattr(self, "_gpu_canvas_failed", False)):
+                # The GPU canvas passed its probe but this graph did not start:
+                # keep the user's canvas working on the CPU compositor.
+                self._gpu_canvas_failed = True
+                self.log_event(f"canvas: GPU canvas failed ({exc}); using the CPU compositor")
+                try:
+                    failed.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.start_engine()
+                return
             # A failed rebuild must not leave the Record button armed with a
             # recorder writing in the background.
             if self.recording or self._recorder is not None:
@@ -6187,6 +6244,9 @@ class AnyCamWindow(QMainWindow):
         queue = getattr(self, "_thumb_queue", None)
         if queue is not None:
             queue.clear()
+        renderer = getattr(self, "_thumb_renderer", None)
+        if renderer is not None:
+            renderer.forget()
 
     def shutdown(self) -> None:
         """Backstop for QApplication.aboutToQuit and headless teardown."""
@@ -6395,6 +6455,51 @@ class AnyCamWindow(QMainWindow):
             return
         self._pending_frame = (width, height, stride, raw, fmt)
         self.frame_ready.emit()
+
+    def _canvas_choice(self) -> str:
+        """"gpu" or "cpu" for the next engine (see OutputConfig.canvas_backend)."""
+        from .pipeline import canvas_requested
+
+        forced = canvas_requested()
+        if forced:
+            return forced
+        if getattr(self, "_gpu_canvas_failed", False):
+            return "cpu"
+        return "cpu" if self.project.output.canvas_backend == "cpu" else "gpu"
+
+    def _canvas_backend_changed(self) -> None:
+        value = str(self.canvas_combo.currentData() or "auto")
+        if value == self.project.output.canvas_backend:
+            return
+        self.project.output.canvas_backend = value
+        self._gpu_canvas_failed = False
+        self._mark_dirty()
+        self._update_canvas_note()
+        if self.engine is not None:
+            self.restart_engine()
+
+    def _update_canvas_note(self) -> None:
+        note = getattr(self, "canvas_note", None)
+        if note is None:
+            return
+        from .pipeline import canvas_requested, gl_canvas_problem
+
+        engine = getattr(self, "engine", None)
+        built = getattr(engine, "canvas_backend", "") if engine is not None else ""
+        if canvas_requested():
+            text = f"ANYCAM_CANVAS={canvas_requested()} overrides this setting."
+        elif self.project.output.canvas_backend == "cpu":
+            text = "Layers are mixed on the CPU (the compositor element)."
+        elif getattr(self, "_gpu_canvas_failed", False):
+            text = "The GPU canvas failed to start this session; using the CPU."
+        elif gl_canvas_problem():
+            text = f"GPU canvas unavailable ({gl_canvas_problem()}); using the CPU."
+        else:
+            text = ("Layers are uploaded and mixed on the GPU; one download feeds "
+                    "recording and the virtual camera.")
+        if built:
+            text += f" Running: {built.upper()} canvas."
+        note.setText(text)
 
     def _setup_preview_output(self) -> None:
         """Resize following and the GPU preview, for either window's preview."""

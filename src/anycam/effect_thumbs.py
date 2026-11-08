@@ -146,3 +146,106 @@ def particle_thumbnail(source: str, sample: Image.Image,
     picture = sample.convert("RGBA").resize(size, Image.BILINEAR)
     picture.alpha_composite(layer)
     return picture.convert("RGB")
+
+
+# --------------------------------------------------------------- tile rendering
+# A tile costs up to ~220 ms (a mask: face detection plus drawing, through a
+# whole GStreamer pipeline).  Rendered two per 15 ms tick on the GUI thread,
+# opening the Masks tab blocked the window and, through Python's GIL, the
+# effect threads too: the camera froze for ~0.5 s at a time for seconds.
+# Tiles are now drawn on one background thread with a pause between them,
+# and tiles of the built-in sample are kept on disk across sessions.
+TILE_PAUSE_S = 0.03
+_TILE_CACHE_VERSION = 1
+
+
+def _tile_cache_path(category: str, entry: dict):
+    import hashlib
+    import json
+
+    from . import __version__, config
+
+    key = json.dumps({
+        "v": _TILE_CACHE_VERSION, "app": __version__, "size": THUMB_SIZE,
+        "frames": [THUMB_FRAMES, MOTION_FRAMES], "category": category,
+        "label": entry.get("label"), "preview": entry.get("preview"),
+        "particles": entry.get("particles"),
+    }, sort_keys=True, default=str)
+    folder = config.cache_dir() / "effect-thumbs"
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder / f"{hashlib.sha1(key.encode()).hexdigest()}.png"
+
+
+def tile_picture(category: str, entry: dict, sample: Image.Image,
+                 sample_is_default: bool) -> Image.Image | None:
+    """The tile's picture; from the disk cache when the sample is the built-in one."""
+    path = _tile_cache_path(category, entry) if sample_is_default else None
+    if path is not None and path.is_file():
+        try:
+            with Image.open(path) as cached:
+                return cached.convert("RGB")
+        except OSError:
+            pass
+    if entry.get("particles"):
+        picture = particle_thumbnail(entry["particles"], sample)
+    else:
+        picture = render_thumbnail(Effects(**entry["preview"]), sample)
+    if picture is not None and path is not None:
+        try:
+            temporary = path.with_suffix(".tmp")
+            picture.convert("RGB").save(temporary, "PNG")
+            temporary.replace(path)
+        except OSError:
+            pass
+    return picture
+
+
+class TileRenderer:
+    """One background thread drawing tiles, one at a time."""
+
+    def __init__(self) -> None:
+        import concurrent.futures
+
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="anycam-thumbs")
+        self.future = None
+        self.token = None
+
+    @property
+    def busy(self) -> bool:
+        return self.future is not None and not self.future.done()
+
+    def submit(self, token, category: str, entry: dict, sample: Image.Image,
+               sample_is_default: bool) -> None:
+        import time
+
+        def job():
+            try:
+                return tile_picture(category, entry, sample, sample_is_default)
+            except Exception:  # noqa: BLE001 - a tile without a preview is fine
+                return None
+            finally:
+                # Leave the GIL to the live effect threads between tiles.
+                time.sleep(TILE_PAUSE_S)
+
+        self.token = token
+        self.future = self._pool.submit(job)
+
+    def take(self):
+        """``(token, picture)`` once the current tile is drawn, else None."""
+        if self.future is None or not self.future.done():
+            return None
+        future, token = self.future, self.token
+        self.future = self.token = None
+        try:
+            return token, future.result()
+        except Exception:  # noqa: BLE001
+            return token, None
+
+    def forget(self) -> None:
+        """Drop the tile in flight (its grid was repopulated)."""
+        self.future = self.token = None
+
+    def stop(self) -> None:
+        self.forget()
+        self._pool.shutdown(wait=False, cancel_futures=True)

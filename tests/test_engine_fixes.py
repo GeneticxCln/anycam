@@ -211,7 +211,10 @@ def test_portal_remote_does_not_leak_a_descriptor():
     os.close(fd)
     fd_list = connection = None  # drop the list's own copy of the descriptor
     gc.collect()
-    assert open_fd_count() == before
+    # A leak raises the count.  It may also drop: GL contexts of engines from
+    # earlier tests (GPU canvas) finish closing on GStreamer's GL thread after
+    # the gc.collect() above.
+    assert open_fd_count() <= before
 
 
 def test_engine_closes_screen_fds_when_the_build_fails():

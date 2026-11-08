@@ -245,7 +245,9 @@ def _make(factory: str, name: str | None = None) -> Gst.Element:
     element = Gst.ElementFactory.make(factory, name)
     if element is None:
         raise RuntimeError(f"GStreamer element '{factory}' is not installed")
-    return element
+    from .sources import no_qos  # QoS dropping froze live layers (see there)
+
+    return no_qos(element)
 
 
 def _caps(text: str) -> Gst.Element:

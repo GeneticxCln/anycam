@@ -82,6 +82,13 @@ machine at 1080p60 that halved the window thread (median 40–47% → 18–20% o
 saved 50–70% of a core overall. The log says `preview: GPU preview (qml6glsink)` when it is
 in use. `ANYCAM_PREVIEW=image` forces the CPU preview.
 
+**GPU canvas.** **Settings → Canvas → Mix layers on: Automatic** mixes the layers with
+`glvideomixer` when a test frame through upload, mix and download comes back right;
+otherwise, or with **CPU**, the `compositor` element does it as before. Layer effects
+still run on the CPU before each layer is uploaded, and one download feeds recording, the
+virtual camera and RTMP. If a GPU canvas fails to start, AnyCam switches to the CPU for the
+rest of the session. `ANYCAM_CANVAS=cpu|gpu` overrides the setting.
+
 ## Install and run
 
 ```bash
@@ -151,7 +158,9 @@ permission through the portal.
 
 - **Effects:** every effect fits a 1080p60 frame on the reference machine, but they still
   use CPU, on worker threads as well as per frame (`scripts/bench-effects.py` measures only
-  the per-frame part). Robust Video Matting costs about 10 ms of CPU per refresh, about 14
+  the per-frame part). On the reference machine with the camera at 1080p60 (GPU canvas,
+  whole process): about 1.7 cores with a virtual background and 2.3 with a mask, against
+  1.2 without effects. Robust Video Matting costs about 10 ms of CPU per refresh, about 14
   times a second. Live Auto-frame moves a GStreamer crop, which costs extra CPU while you
   move. Masks are 2D, built from five face landmarks: no depth and no expression tracking.
 - **GPU effects:** the CUDA path needs `onnxruntime-gpu` with CUDA and cuDNN, which AnyCam

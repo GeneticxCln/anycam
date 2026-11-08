@@ -371,6 +371,10 @@ class OutputConfig:
     # Person cut-out model: "mediapipe" (bundled) or "rvm" (Robust Video
     # Matting, used once downloaded from Settings).
     segmentation_model: str = "mediapipe"
+    # Where layers are mixed: "auto" (GPU glvideomixer when a test frame
+    # passes, else CPU) or "cpu" (the compositor element).  ANYCAM_CANVAS
+    # overrides it.
+    canvas_backend: str = "auto"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "OutputConfig":
@@ -383,6 +387,8 @@ class OutputConfig:
             output.fps = defaults.fps
         if output.vcam_backend not in ("v4l2", "pipewire", "both"):
             output.vcam_backend = defaults.vcam_backend
+        if output.canvas_backend not in ("auto", "cpu"):
+            output.canvas_backend = defaults.canvas_backend
         return output
 
 

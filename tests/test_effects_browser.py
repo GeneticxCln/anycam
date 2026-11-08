@@ -47,8 +47,11 @@ def make_window(app, count=1):
 
 
 def close(window, app):
-    window.engine = None
+    # Stop the engine for real: dropping the reference left its pipeline
+    # PLAYING, and at interpreter exit an appsink called into a half torn-down
+    # Python (SIGSEGV after the tests had passed, exit status 139).
     window._persist = False
+    window.shutdown()
     window.close()
     app.processEvents()
 
@@ -167,8 +170,11 @@ def test_effects_from_different_categories_stack(app):
         show_category(window, "Shapes")
         click_tile(window, "Heart window")
         fx = layer.effects
-        assert fx.filter == "bulge"
-        assert fx.color_effect == "sepia"          # film look kept by a colour look
+        assert fx.filter == "bulge"               # other categories stack
+        # Within Looks one look at a time (2026-11-08): keeping the film look
+        # under a colour look left Sepia on through every later look, which
+        # users saw as swapping not working.
+        assert fx.color_effect == "none"
         assert fx.saturation == 0.0               # Noir's values
         assert fx.frame_style == "heart"
     finally:

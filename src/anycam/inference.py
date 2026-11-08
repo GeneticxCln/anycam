@@ -86,6 +86,27 @@ def providers() -> list:
     return ["CPUExecutionProvider"]
 
 
+# Threads per session.  The effect models are small (256x144 person cut-out,
+# face detection), so one or two threads keep up; ONNX Runtime's default is a
+# pool the size of the CPU whose idle threads busy-spin between runs.  Measured
+# on a 16-thread machine at 1080p60: a virtual background cost ~460% of a core,
+# almost all of it seven spinning pool threads.
+INTRA_OP_THREADS = 2
+
+
+def session_options():
+    """Small thread pools that sleep instead of spinning while idle."""
+    import onnxruntime as ort
+
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = INTRA_OP_THREADS
+    options.inter_op_num_threads = 1
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+    return options
+
+
 def session(path: str | Path):
     """An onnxruntime session on the chosen device (CPU on any failure)."""
     import onnxruntime as ort
@@ -93,11 +114,13 @@ def session(path: str | Path):
     wanted = providers()
     if wanted != ["CPUExecutionProvider"]:
         try:
-            return ort.InferenceSession(str(path), providers=wanted)
+            return ort.InferenceSession(str(path), sess_options=session_options(),
+                                        providers=wanted)
         except Exception as exc:  # noqa: BLE001 - CUDA libraries missing or broken
             print(f"[effects] CUDA session for {Path(path).name} failed, using the "
                   f"CPU: {exc}", file=sys.stderr, flush=True)
-    return ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    return ort.InferenceSession(str(path), sess_options=session_options(),
+                                providers=["CPUExecutionProvider"])
 
 
 def device_of(session) -> str:

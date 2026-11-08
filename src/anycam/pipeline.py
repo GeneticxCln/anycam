@@ -410,6 +410,77 @@ def mic_dsp_elements(audio, prefix: str = "mic_dsp") -> list[Gst.Element]:
     ]
 
 
+# Extra aggregation latency of the GPU canvas (see where it is set).
+GL_MIXER_LATENCY_NS = 33_000_000
+
+
+def canvas_requested() -> str:
+    """``ANYCAM_CANVAS``: "cpu", "gpu" or "" (no override)."""
+    value = os.environ.get("ANYCAM_CANVAS", "").strip().lower()
+    return value if value in ("cpu", "gpu") else ""
+
+
+@functools.lru_cache(maxsize=1)
+def gl_canvas_problem() -> str:
+    """Why the GL canvas cannot run here; empty when a real frame made it.
+
+    The elements being installed is not enough: a GL context can fail, and on
+    NVIDIA an upload can silently produce black textures.  So one small
+    frame goes through upload -> glvideomixer -> download and its colour is
+    checked.
+    """
+    for factory in ("glvideomixer", "glupload", "gldownload"):
+        if Gst.ElementFactory.find(factory) is None:
+            return f"{factory} is not installed"
+    try:
+        pipeline = Gst.parse_launch(
+            "videotestsrc num-buffers=4 pattern=red ! "
+            "video/x-raw,format=RGBA,width=64,height=64,framerate=30/1 ! "
+            "identity drop-allocation=true ! glupload ! glvideomixer ! "
+            "gldownload ! video/x-raw,format=RGBA,width=64,height=64 ! "
+            "appsink name=probe sync=false")
+    except GLib.Error as exc:
+        return f"GL canvas probe could not be built: {exc.message}"
+    sink = pipeline.get_by_name("probe")
+    pipeline.set_state(Gst.State.PLAYING)
+    sample = last = None
+    try:
+        for _ in range(4):
+            sample = sink.emit("try-pull-sample", 3 * Gst.SECOND)
+            if sample is None:
+                break
+            last = sample
+        if last is None:
+            message = pipeline.get_bus().pop_filtered(Gst.MessageType.ERROR)
+            return ("GL canvas probe produced no frame"
+                    + (f": {message.parse_error()[0].message}" if message else ""))
+        buf = last.get_buffer()
+        ok, info = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return "GL canvas probe frame could not be read"
+        try:
+            centre = bytes(info.data)[(32 * 64 + 32) * 4:(32 * 64 + 32) * 4 + 3]
+        finally:
+            buf.unmap(info)
+        if not (centre[0] > 200 and centre[1] < 60 and centre[2] < 60):
+            return f"GL canvas probe frame came out wrong (centre {tuple(centre)})"
+        return ""
+    finally:
+        pipeline.set_state(Gst.State.NULL)
+
+
+def _empty_drawing(layer: Layer) -> bool:
+    """A drawing layer with no strokes (nothing to composite)."""
+    if layer.kind != "drawing":
+        return False
+    from . import animated
+
+    try:
+        return not animated.parse_strokes(layer.source)
+    except Exception:  # noqa: BLE001 - unreadable strokes: keep the layer
+        return False
+
+
 class AnyCamEngine:
     """Build and run one scene as a GStreamer compositor graph.
 
@@ -435,6 +506,7 @@ class AnyCamEngine:
         preview_crop_layer: str = "",
         preview_target: tuple[int, int] | None = None,
         preview_gl_sink: Callable[[Gst.Element], bool] | None = None,
+        canvas: str | None = None,
         skip_layers: set[str] | None = None,
         pool: SourcePool | None = None,
         on_frame: Callable | None = None,
@@ -479,10 +551,15 @@ class AnyCamEngine:
         # so it can be pointed at the window's video item.  False from it (or
         # no qml6glsink) falls back to the appsink preview.
         self.preview_gl_sink = preview_gl_sink
+        # "gpu": layers are uploaded and mixed by glvideomixer, one download
+        # feeds every output.  "cpu": the compositor element.  None follows
+        # ANYCAM_CANVAS (default CPU, so direct engine users keep the
+        # established path).  ``canvas_backend`` is what was actually built.
+        requested = canvas if canvas in ("cpu", "gpu") else (canvas_requested() or "cpu")
+        self.canvas = requested
+        self.canvas_backend = ""
         # "gpu" (qml6glsink) or "image" (appsink -> QImage) once built.
         self.preview_backend = ""
-        # Frames that reached the GPU preview's sink.
-        self.preview_gl_frames = 0
         self.canvas_w = int(project.output.canvas_w)
         self.canvas_h = int(project.output.canvas_h)
         self.fps = int(project.output.fps)
@@ -532,6 +609,7 @@ class AnyCamEngine:
         self._record_plan: EncoderPlan | None = None
         self._vcam_valve: Gst.Element | None = None
         self._probe_id = 0
+        self._frame_counter = None
         self._frame_count = 0
         self._start_time = 0.0
         self._proc = psutil.Process()
@@ -575,6 +653,24 @@ class AnyCamEngine:
         self._audio_eos_pads: list[Gst.Pad] = []
 
     # ------------------------------------------------------------------ build
+    def _link_to_mixer(self, chain: SourceChain, pad: Gst.Pad):
+        """Link a chain's output into a mixer pad, uploading it for the GPU canvas.
+
+        The upload elements join the chain, so state sync, disposal and probe
+        cleanup treat them like the rest of the layer.  identity drops the
+        allocation query: glupload's udmabuf pool is imported as EGLImages,
+        which NVIDIA rejects (the texture stays black).
+        """
+        if self.canvas_backend == "gpu":
+            no_pool = make("identity", None, drop_allocation=True)
+            upload = make("glupload")
+            self._add(no_pool, upload)
+            chain.add(no_pool, upload)
+            if not (chain.tail.link(no_pool) and no_pool.link(upload)):
+                raise RuntimeError("could not upload a layer to the GPU canvas")
+            chain.tail = upload
+        return chain.output_pad.link(pad)
+
     def _build_background(self) -> None:
         """Create the one compositor pad that is never removed."""
         assert self.compositor is not None
@@ -592,7 +688,7 @@ class AnyCamEngine:
         pad.set_property("height", self.canvas_h)
         pad.set_property("zorder", 0)
         pad.set_property("alpha", 1.0)
-        if chain.output_pad.link(pad) != Gst.PadLinkReturn.OK:
+        if self._link_to_mixer(chain, pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError("could not link the AnyCam standby background")
         self._background_pad = pad
         print(
@@ -908,16 +1004,20 @@ class AnyCamEngine:
         # lets a live move/resize or layout change skip a canvas rebuild.
         pad.set_property("sizing-policy", "keep-aspect-ratio")
         pad.set_property("alpha", float(clamp(layer.alpha)) if layer.visible else 0.0)
-        if chain.output_pad.link(pad) != Gst.PadLinkReturn.OK:
+        if self._link_to_mixer(chain, pad) != Gst.PadLinkReturn.OK:
             raise RuntimeError(f"could not link {layer.name} into the compositor")
         self._layer_pads[layer.id] = pad
         self._layer_chains[layer.id] = chain
 
         def on_first_buffer(_pad, _info, layer_id=layer.id):
             self._pads_with_data.add(layer_id)
-            return Gst.PadProbeReturn.OK
+            # Only the first buffer matters; staying installed made every
+            # frame of every layer take Python's GIL for nothing.
+            return Gst.PadProbeReturn.REMOVE
 
-        self._probe(pad, Gst.PadProbeType.BUFFER, on_first_buffer)
+        # Not tracked in _pad_probes: it removes itself after one buffer, and
+        # removing it again at shutdown warned "has no probe with id".
+        pad.add_probe(Gst.PadProbeType.BUFFER, on_first_buffer)
         # Linked all the way into the compositor: now it may start.
         self._sync_chain(chain)
 
@@ -1039,7 +1139,24 @@ class AnyCamEngine:
         # canvas would never start.  It is not needed for a dead capture
         # either: the aggregator stops waiting for the silent pad on its own
         # and the remaining pads keep rendering.
-        self.compositor = make("compositor", "compositor", background="black", ignore_inactive_pads=False)
+        use_gpu = self.canvas == "gpu" and not gl_canvas_problem()
+        if self.canvas == "gpu" and not use_gpu:
+            print(f"[canvas] GPU canvas unavailable ({gl_canvas_problem()}); using the CPU compositor",
+                  file=sys.stderr, flush=True)
+        self.canvas_backend = "gpu" if use_gpu else "cpu"
+        if use_gpu:
+            # Same pad properties as compositor (xpos/ypos/width/height/alpha/
+            # zorder/sizing-policy); mixing ~120-140% of a core -> ~35-40%
+            # at 1080p60 including the uploads and the one download.
+            self.compositor = make("glvideomixer", "compositor", background="black")
+            # Room for a layer whose effects add processing time.  With none,
+            # a colour look (~14 ms per 1080p frame in videobalance) made the
+            # camera's frames late, glvideomixer dropped every one of them and
+            # kept showing its last frame: frames flowed at 60/s but the camera
+            # froze.  10 ms was not enough, 20 ms was; 33 ms leaves headroom.
+            self.compositor.set_property("latency", GL_MIXER_LATENCY_NS)
+        else:
+            self.compositor = make("compositor", "compositor", background="black", ignore_inactive_pads=False)
         self.tee = make("tee", "output")
         # A canvas-wide rate element keeps the composited timestamps monotonic
         # for h264parse/qtmux (two inter sources can start at the same PTS).
@@ -1052,8 +1169,16 @@ class AnyCamEngine:
         canvas_caps = caps_filter(
             caps_string(self.canvas_w, self.canvas_h, self.fps) + ",colorimetry=sRGB",
             "canvas_caps")
-        self._add(self.compositor, rate, canvas_caps, self.tee)
-        self._link([self.compositor, rate, canvas_caps, self.tee])
+        mixed = [self.compositor]
+        if use_gpu:
+            # One download: recorder, virtual camera, RTMP and the preview all
+            # take system-memory RGBA from the tee as before.
+            mixed += [caps_filter(
+                f"video/x-raw(memory:GLMemory),format=RGBA,width={self.canvas_w},"
+                f"height={self.canvas_h},framerate={self.fps}/1", "canvas_gl_caps"),
+                make("gldownload", "canvas_download")]
+        self._add(*mixed, rate, canvas_caps, self.tee)
+        self._link([*mixed, rate, canvas_caps, self.tee])
         # The compositor must never reach zero pads.  This one is live for the
         # whole canvas lifetime and sits behind every scene layer.
         self._build_background()
@@ -1065,6 +1190,11 @@ class AnyCamEngine:
         # non-camera layers are left out of the graph.
         layers = [layer for layer in layers
                   if layer.kind == "camera" or layer.id not in self.skip_layers]
+        # An empty drawing is a full-canvas transparent layer blended every
+        # frame for nothing (measured ~35% of a core at 1080p60).  The first
+        # stroke cannot reach a layer that is not built, and the GUI already
+        # rebuilds when set_layer_strokes() reports that.
+        layers = [layer for layer in layers if not _empty_drawing(layer)]
         # zorder 0 belongs to the permanent standby; scene layers start at 1
         # so hiding/removing them can never expose a padless graph.  A failure
         # here is cleaned up by build(), which releases only this engine's
@@ -1112,14 +1242,45 @@ class AnyCamEngine:
             )
 
         self.bus = self.pipeline.get_bus()
-        self._probe_id = self._probe(
-            self.compositor.get_static_pad("src"), Gst.PadProbeType.BUFFER,
-            self._on_compositor_buffer)
+        self._build_frame_counter()
         return self
 
-    def _on_compositor_buffer(self, _pad, _info):
-        self._frame_count += 1
-        return Gst.PadProbeReturn.OK
+    def _build_frame_counter(self) -> None:
+        """Count canvas frames without entering Python per frame.
+
+        A pad probe here made every canvas frame take Python's GIL; a gdb
+        sample caught the compositor thread waiting for it while the GUI held
+        it.  A fakesink straight on the output tee (no queue, no thread)
+        counts in C; ``_frame_count`` reads its ``stats`` when sampled.
+        """
+        assert self.tee is not None
+        sink = make("fakesink", "frame_counter", sync=False,
+                    enable_last_sample=False, silent=True)
+        sink.set_property("async", False)
+        self._add(sink)
+        tee_pad = self.tee.request_pad_simple("src_%u")
+        if tee_pad is None or tee_pad.link(sink.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+            raise RuntimeError("could not attach the canvas frame counter")
+        self._frame_counter = sink
+
+    @staticmethod
+    def _rendered(sink) -> int:
+        if sink is None:
+            return 0
+        try:
+            return int(sink.get_property("stats").get_value("rendered") or 0)
+        except Exception:  # noqa: BLE001 - a disposed sink counts nothing
+            return 0
+
+    @property
+    def _frame_count(self) -> int:
+        """Canvas frames since the last reset (start)."""
+        return self._frame_base + self._rendered(self._frame_counter) - self._frame_zero
+
+    @_frame_count.setter
+    def _frame_count(self, value: int) -> None:
+        self._frame_zero = self._rendered(getattr(self, "_frame_counter", None))
+        self._frame_base = int(value)
 
     def _branch(self, name: str, max_buffers: int = 4,
                 max_time_ns: int = 200_000_000) -> Gst.Element:
@@ -1213,15 +1374,15 @@ class AnyCamEngine:
         convert = make("glcolorconvert", "preview_gl_convert")
         self._add(no_pool, upload, convert, sink)
         self._link([queue, no_pool, upload, convert, sink])
-        self._probe(sink.get_static_pad("sink"), Gst.PadProbeType.BUFFER,
-                    self._on_gl_preview_buffer)
+        self._preview_gl_sink_element = sink
         self._appsink = None
         self._pending_sample = None
         return True
 
-    def _on_gl_preview_buffer(self, _pad, _info):
-        self.preview_gl_frames += 1
-        return Gst.PadProbeReturn.OK
+    @property
+    def preview_gl_frames(self) -> int:
+        """Frames the GPU preview's sink rendered (read from its stats)."""
+        return self._rendered(getattr(self, "_preview_gl_sink_element", None))
 
     def _build_image_preview(self) -> None:
         # One buffered frame, leaking downstream instead of blocking: when the

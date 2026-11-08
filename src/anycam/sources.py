@@ -28,13 +28,29 @@ from .effects import FilterSlot, SwapGate
 from .model import Effects
 
 
+def no_qos(element: Gst.Element) -> Gst.Element:
+    """Turn off QoS frame dropping on a filter or converter (not on sinks).
+
+    Upstream of a live mixer QoS only does harm.  The mixer reports late input
+    and QoS-enabled transforms start discarding frames to catch up.  A colour
+    look adds ~14 ms per frame on the source thread; that made the frame
+    overlay (gdkpixbufoverlay) drop every camera frame, 60 in and 0 out, for
+    as long as the look was on: the camera froze.
+    """
+    factory = element.get_factory()
+    klass = factory.get_metadata("klass") if factory is not None else ""
+    if "Sink" not in (klass or "") and element.find_property("qos") is not None:
+        element.set_property("qos", False)
+    return element
+
+
 def make(factory: str, name: str | None = None, **props) -> Gst.Element:
     element = Gst.ElementFactory.make(factory, name)
     if element is None:
         raise RuntimeError(f"GStreamer element '{factory}' is not installed")
     for key, value in props.items():
         element.set_property(key.replace("_", "-"), value)
-    return element
+    return no_qos(element)
 
 
 def make_optional(factory: str, name: str | None = None, **props) -> Gst.Element:
@@ -234,9 +250,13 @@ def _loopback_mode(device: str, width: int, height: int, fps: int) -> CameraMode
 def jpeg_decoder():
     """Pick the MJPG decoder.
 
-    nvjpegdec is installed here but rejects the StreamCam's MJPG frames
-    ("No valid frames decoded before end of stream"), so software jpegdec is
-    the safe default.  Set ANYCAM_JPEG_DECODER=nv to opt in on other cameras.
+    nvjpegdec (NVDEC) only decodes 4:2:0 JPEG, and UVC webcams such as the
+    StreamCam send 4:2:2 MJPEG: it fails with "no valid frames found" (checked
+    2026-11-08 with GStreamer 1.28 and driver 615: the same frame re-encoded
+    4:2:0 decodes, 4:2:2 does not).  jpegdec is also the cheapest CPU choice
+    measured: 34% of a core for 1080p60 decode plus RGBA conversion, against
+    61% for avdec_mjpeg; idct-method=ifast saved nothing.  Set
+    ANYCAM_JPEG_DECODER=nv to opt in on a camera that sends 4:2:0.
     """
     choice = os.environ.get("ANYCAM_JPEG_DECODER", "auto").lower()
     if choice in ("nv", "nvjpeg") and Gst.ElementFactory.find("nvjpegdec"):
