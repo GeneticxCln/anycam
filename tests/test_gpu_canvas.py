@@ -334,3 +334,66 @@ def test_a_colour_look_keeps_the_gpu_canvas_moving():
     before, after = _distinct_frames_with_a_look()
     assert before > 20
     assert after > 20, f"only {after} distinct pictures in 1.5 s with a colour look on"
+
+
+# ----------------------------------------------- colour step as a GPU shader
+def _look_frame(canvas: str, look: dict):
+    import numpy as np
+
+    frames = []
+
+    def on_frame(sample):
+        buf = sample.get_buffer()
+        caps = sample.get_caps().get_structure(0)
+        w, h = caps.get_value("width"), caps.get_value("height")
+        ok, info = buf.map(Gst.MapFlags.READ)
+        frames.append(np.frombuffer(bytes(info.data), np.uint8)[:w * h * 4].reshape(h, w, 4).copy())
+        buf.unmap(info)
+
+    layer = Layer("bg", "test", "BG", source="smpte", box=(0, 0, 1, 1), z=1)
+    for key, value in look.items():
+        setattr(layer.effects, key, value)
+    engine = AnyCamEngine(_project(layer), preview=True, preview_target=(640, 360),
+                          on_frame=on_frame, canvas=canvas).build()
+    engine.start()
+    try:
+        _run(engine, 1.5)
+        rack = engine._layer_chains["bg"].effects
+    finally:
+        engine.stop()
+    picture = frames[-1][..., :3].astype(int)
+    h, w = picture.shape[:2]
+    # smpte's random-noise block (bottom right, bottom left when mirrored).
+    picture[int(h * 0.75):, :] = 0
+    return picture, rack
+
+
+@needs_gl_canvas
+@pytest.mark.parametrize("look", [
+    dict(brightness=0.0, contrast=1.35, saturation=0.0, hue=0.0),        # Noir
+    dict(brightness=0.03, contrast=1.05, saturation=1.12, hue=-0.035),   # Warm
+    dict(brightness=0.0, contrast=1.0, saturation=1.0, hue=0.0, mirror=True),
+])
+def test_a_look_on_the_gpu_canvas_matches_the_cpu_canvas(look):
+    import numpy as np
+
+    cpu, _ = _look_frame("cpu", look)
+    gpu, rack = _look_frame("gpu", look)
+    # The GPU did the work: the CPU colour step and mirror stayed neutral.
+    assert rack["balance"].get_property("contrast") == 1.0
+    assert rack["balance"].get_property("saturation") == 1.0
+    assert rack["videoflip"].get_property("video-direction").value_nick == "identity"
+    difference = np.abs(cpu - gpu)
+    assert difference.mean() < 2.0, difference.mean()
+
+
+@needs_gl_canvas
+def test_the_colour_step_returns_to_the_cpu_when_a_filter_follows_it():
+    """A filter, frame, film style or chroma key comes after the colour step;
+    running it on the GPU after them would change the picture."""
+    _, rack = _look_frame("gpu", dict(contrast=1.35, saturation=0.0, filter="blur"))
+    assert rack["balance"].get_property("contrast") == pytest.approx(1.35)
+    assert rack["balance"].get_property("saturation") == 0.0
+    uniforms = rack["gl_balance"].get_property("uniforms")
+    assert uniforms.get_value("contrast") == pytest.approx(1.0)
+    assert uniforms.get_value("saturation") == pytest.approx(1.0)

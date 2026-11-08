@@ -262,7 +262,7 @@ def _set(element: Gst.Element, prop: str, value) -> None:
 
 
 def build_slot(key: str, amount: float, name: str, size: tuple[int, int] | None = None,
-               fps: int = 30):
+               fps: int = 30, live: bool = False):
     """``(bin, runner)`` applying filter ``key``; ``runner`` is None unless the
     filter is a Python processor, which owns a worker thread to stop later."""
     spec = FILTERS.get(key)
@@ -271,7 +271,7 @@ def build_slot(key: str, amount: float, name: str, size: tuple[int, int] | None 
 
         width, height = size or (320, 180)
         return processors.build_processor_bin(
-            spec.processor, amount, name, width, height, fps)
+            spec.processor, amount, name, width, height, fps, live=live)
     return _build_element_bin(key, amount, name, size), None
 
 
@@ -378,7 +378,10 @@ class FilterSlot:
     def __init__(self, key: str = NO_FILTER, amount: float = 0.5,
                  chain_elements: list | None = None,
                  size: tuple[int, int] | None = None, fps: int = 30,
-                 gate: SwapGate | None = None) -> None:
+                 gate: SwapGate | None = None, live: bool = False) -> None:
+        # A live source (camera, screen, phone, network): processors take the
+        # newest frame instead of pushing back on it.
+        self.live = bool(live)
         self.key = normalize_filter(key)
         self.amount = float(amount)
         self._gate = gate
@@ -395,7 +398,7 @@ class FilterSlot:
     def _new_bin(self, key: str, amount: float):
         return build_slot(
             key, amount, f"filter_slot_{next(FilterSlot._names)}_{key}",
-            self.size, self.fps)
+            self.size, self.fps, live=self.live)
 
     def close(self) -> None:
         """Stop a processor's worker thread (the canvas is going away)."""

@@ -101,7 +101,14 @@ def test_swapping_looks_reaches_the_running_pipeline(window):
         _click(win, app, label)
         rack = win.engine._layer_chains[layer_id].effects
         assert rack["style"].get_property("preset").value_nick == preset, label
-        assert rack["balance"].get_property("saturation") == pytest.approx(saturation), label
+        # On the GPU canvas a plain colour look runs in the GPU shader and the
+        # CPU element stays neutral; either way the value must be applied once.
+        cpu = rack["balance"].get_property("saturation")
+        gpu = (rack["gl_balance"].get_property("uniforms").get_value("saturation")
+               if "gl_balance" in rack else 1.0)
+        applied = gpu if abs(cpu - 1.0) < 1e-6 else cpu
+        assert applied == pytest.approx(saturation, abs=1e-5), label
+        assert abs(cpu - 1.0) < 1e-6 or abs(gpu - 1.0) < 1e-6, f"{label}: applied twice"
     win.stop_engine()
 
 
@@ -236,3 +243,71 @@ def test_a_colour_look_keeps_the_layer_flowing():
         assert out[0] - before > 30, f"only {out[0] - before} frames in 1.5 s with a look on"
     finally:
         engine.stop()
+
+
+# ----------------------------------------- processors on live sources
+def _queue_and_sink(bin_):
+    queue = next(e for e in bin_.children if e.get_factory().get_name() == "queue")
+    sink = next(e for e in bin_.children if e.get_factory().get_name() == "appsink")
+    return queue, sink
+
+
+@pytest.mark.parametrize("live", [True, False])
+def test_a_processor_takes_the_newest_frame_from_a_live_source_only(live):
+    """Back-pressure from a busy mask blocked the camera thread: camera frames
+    were dropped, videorate duplicated (394 in 7 s) and the mask showed 7-19
+    pictures a second.  A frozen image still needs the back-pressure."""
+    from anycam import processors
+
+    bin_, runner = processors.build_processor_bin("mask:robot", 0.85, f"slot_{live}",
+                                                  320, 180, 30, live=live)
+    try:
+        queue, sink = _queue_and_sink(bin_)
+        assert (queue.get_property("leaky").value_nick == "downstream") is live
+        assert sink.get_property("drop") is live
+    finally:
+        runner.stop()
+
+
+def test_camera_layers_get_live_slots_and_images_do_not():
+    from anycam.model import Layer
+    from anycam.sources import LIVE_KINDS, SourceChain, _finish_chain
+
+    assert {"camera", "screen", "phone", "network"} <= LIVE_KINDS
+    assert "image" not in LIVE_KINDS and "test" not in LIVE_KINDS
+    for kind, expected in (("camera", True), ("image", False)):
+        chain = SourceChain()
+        chain.effects = {}
+        _finish_chain(chain, 320, 180, 30, layer=Layer("l", kind, "L"))
+        assert chain.effects["slot"].live is expected
+        assert chain.effects["slot2"].live is expected
+        for cleanup in chain.cleanup:
+            cleanup()
+
+
+# --------------------------------------------- videorate on live sources
+def test_live_sources_get_a_drop_only_videorate():
+    """With an effect slower than the frame rate, a duplicating videorate fed
+    the source thread copies of the same frame: Distort showed 4 new frames in
+    2 s (51 out).  A live source may only drop; the mixer repeats by itself."""
+    from anycam.sources import SourceChain, _fit_letterbox
+
+    for live in (True, False):
+        chain = SourceChain()
+        _fit_letterbox(chain, 1920, 1080, 960, 540, live=live)
+        rate = next(e for e in chain.elements if e.get_factory().get_name() == "videorate")
+        assert rate.get_property("drop-only") is live
+
+
+@pytest.mark.parametrize("kind, live", [("camera", True), ("network", True),
+                                        ("image", False), ("test", False)])
+def test_the_layer_tail_marks_live_kinds(kind, live):
+    from anycam.model import Layer
+    from anycam.sources import layer_tail
+
+    chain = layer_tail(Layer("l", kind, "L"), (1920, 1080), 960, 540, 30, "test-channel")
+    rates = [e for e in chain.elements if e.get_factory().get_name() == "videorate"]
+    assert rates, "no videorate in the tail"
+    assert all(rate.get_property("drop-only") is live for rate in rates)
+    for cleanup in chain.cleanup:
+        cleanup()

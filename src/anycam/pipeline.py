@@ -23,12 +23,13 @@ from gi.repository import GLib, Gst, GstVideo  # noqa: E402
 
 from . import config, overlay
 from .geometry import box_pixels, clamp
-from .model import Layer, Project, Scene
+from .model import Effects, Layer, Project, Scene
 from .engine.outputs.recorder import Recorder
 from .engine.outputs.vcam import VcamOutput
 from .pool import CAPTURE_KINDS, CaptureSpec, SourcePool, capture_spec
-from .sources import (SourceChain, apply_effects, background_chain, build_chain,
-                      caps_filter, caps_string, image_chain, layer_tail, make)
+from .sources import (LIVE_KINDS, SourceChain, apply_effects, background_chain,
+                      build_chain, caps_filter, caps_string, gl_rack_elements,
+                      image_chain, layer_tail, make)
 
 Gst.init(None)
 
@@ -653,7 +654,7 @@ class AnyCamEngine:
         self._audio_eos_pads: list[Gst.Pad] = []
 
     # ------------------------------------------------------------------ build
-    def _link_to_mixer(self, chain: SourceChain, pad: Gst.Pad):
+    def _link_to_mixer(self, chain: SourceChain, pad: Gst.Pad, layer: Layer | None = None):
         """Link a chain's output into a mixer pad, uploading it for the GPU canvas.
 
         The upload elements join the chain, so state sync, disposal and probe
@@ -669,6 +670,17 @@ class AnyCamEngine:
             if not (chain.tail.link(no_pool) and no_pool.link(upload)):
                 raise RuntimeError("could not upload a layer to the GPU canvas")
             chain.tail = upload
+            gl_rack = gl_rack_elements() if chain.effects.get("balance") is not None else None
+            if gl_rack:
+                # The colour step and mirror as shaders (see apply_effects).
+                shader, flip = gl_rack["gl_balance"], gl_rack["gl_flip"]
+                self._add(shader, flip)
+                chain.add(shader, flip)
+                if not (upload.link(shader) and shader.link(flip)):
+                    raise RuntimeError("could not add the GPU colour step")
+                chain.tail = flip
+                chain.effects.update(gl_rack)
+                apply_effects(chain.effects, getattr(layer, "effects", None) or Effects())
         return chain.output_pad.link(pad)
 
     def _build_background(self) -> None:
@@ -952,6 +964,8 @@ class AnyCamEngine:
 
         screen_identity = [None]
 
+        retime = self.canvas_backend == "gpu" and layer.kind in LIVE_KINDS
+
         def on_source_buffer(_pad, _info, layer_id=layer.id):
             # PipeWire's SPA header sequence is carried in buffer.offset.
             # Some producers send PTS=0 for every frame, so timestamps alone
@@ -982,6 +996,20 @@ class AnyCamEngine:
                         if identity == screen_identity[0]:
                             return Gst.PadProbeReturn.OK
                         screen_identity[0] = identity
+            elif retime:
+                # GPU canvas: the frame leaves the CPU chain now.  Its capture
+                # timestamp is older by however long the effects took, and
+                # glvideomixer drops a frame it considers late and repeats its
+                # last one: a Distort filter (tens of ms per 1080p frame) froze
+                # the camera completely.  Stamped with the time it is ready, it
+                # is never late.  The compositor shows late frames, so the CPU
+                # canvas keeps the capture time.
+                buffer = _info.get_buffer()
+                pipeline = self.pipeline
+                clock = pipeline.get_clock() if pipeline is not None else None
+                if buffer is not None and clock is not None:
+                    buffer.pts = max(0, clock.get_time() - pipeline.get_base_time())
+                    buffer.dts = Gst.CLOCK_TIME_NONE
             self._layer_frames[layer_id] = self._layer_frames.get(layer_id, 0) + 1
             self._layer_last[layer_id] = time.monotonic()
             return Gst.PadProbeReturn.OK
@@ -1004,7 +1032,7 @@ class AnyCamEngine:
         # lets a live move/resize or layout change skip a canvas rebuild.
         pad.set_property("sizing-policy", "keep-aspect-ratio")
         pad.set_property("alpha", float(clamp(layer.alpha)) if layer.visible else 0.0)
-        if self._link_to_mixer(chain, pad) != Gst.PadLinkReturn.OK:
+        if self._link_to_mixer(chain, pad, layer) != Gst.PadLinkReturn.OK:
             raise RuntimeError(f"could not link {layer.name} into the compositor")
         self._layer_pads[layer.id] = pad
         self._layer_chains[layer.id] = chain
@@ -1170,13 +1198,18 @@ class AnyCamEngine:
             caps_string(self.canvas_w, self.canvas_h, self.fps) + ",colorimetry=sRGB",
             "canvas_caps")
         mixed = [self.compositor]
+        self._gl_tee = None
         if use_gpu:
-            # One download: recorder, virtual camera, RTMP and the preview all
-            # take system-memory RGBA from the tee as before.
+            # One download: recorder, virtual camera, RTMP and an image preview
+            # take system-memory RGBA from the tee as before.  A GPU preview
+            # takes the mixed texture from the GL tee before the download.
+            self._gl_tee = make("tee", "canvas_gl_tee")
+            gl_queue = make("queue", "canvas_download_queue", max_size_buffers=2,
+                            max_size_time=0, max_size_bytes=0)
             mixed += [caps_filter(
                 f"video/x-raw(memory:GLMemory),format=RGBA,width={self.canvas_w},"
                 f"height={self.canvas_h},framerate={self.fps}/1", "canvas_gl_caps"),
-                make("gldownload", "canvas_download")]
+                self._gl_tee, gl_queue, make("gldownload", "canvas_download")]
         self._add(*mixed, rate, canvas_caps, self.tee)
         self._link([*mixed, rate, canvas_caps, self.tee])
         # The compositor must never reach zero pads.  This one is live for the
@@ -1367,6 +1400,23 @@ class AnyCamEngine:
             attached = False
         if not attached:
             return False
+        if getattr(self, "_gl_tee", None) is not None:
+            # GPU canvas: the mixed texture goes straight to the preview, with
+            # no download and no second upload.  Sinks start first, so the
+            # mixer's GL context is created shared with Qt's.
+            queue = make("queue", "queue_preview", max_size_buffers=1,
+                         max_size_time=0, max_size_bytes=0)
+            queue.set_property("leaky", 2)
+            self._add(queue, sink)
+            tee_pad = self._gl_tee.request_pad_simple("src_%u")
+            if tee_pad is None or tee_pad.link(queue.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+                raise RuntimeError("could not branch the GPU preview off the GL canvas")
+            self._link([queue, sink])
+            self._branch_count += 1
+            self._preview_gl_sink_element = sink
+            self._appsink = None
+            self._pending_sample = None
+            return True
         queue = self._branch("preview", max_buffers=1, max_time_ns=0)
         queue.set_property("leaky", 2)
         no_pool = make("identity", "preview_no_pool", drop_allocation=True)

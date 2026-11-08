@@ -119,7 +119,8 @@ def test_the_gpu_branch_uploads_without_the_udmabuf_pool():
         handed.append(sink)
         return True
 
-    engine = AnyCamEngine(_project(), preview=True, preview_gl_sink=attach).build()
+    engine = AnyCamEngine(_project(), preview=True, preview_gl_sink=attach,
+                          canvas="cpu").build()
     try:
         assert engine.preview_backend == "gpu"
         assert engine._appsink is None
@@ -218,3 +219,25 @@ def test_the_overlay_draws_marks_only_for_the_gpu_view(app, monkeypatch):
     overlay.render(target)
     assert calls == [1]
     widget.close()
+
+
+@needs_qml6glsink
+def test_on_the_gpu_canvas_the_preview_takes_the_mixed_texture_directly():
+    """No download and second upload: the preview hangs off the GL tee."""
+    from anycam import pipeline
+
+    if pipeline.gl_canvas_problem():
+        pytest.skip("no working GL canvas here")
+    handed = []
+    engine = AnyCamEngine(_project(), preview=True, canvas="gpu",
+                          preview_gl_sink=lambda sink: handed.append(sink) or True).build()
+    try:
+        assert engine.canvas_backend == "gpu" and engine.preview_backend == "gpu"
+        children = {child.get_name(): child for child in engine.pipeline.children}
+        assert "preview_gl_upload" not in children and "preview_no_pool" not in children
+        queue = children["queue_preview"]
+        upstream = queue.get_static_pad("sink").get_peer().get_parent_element()
+        assert upstream is children["canvas_gl_tee"]
+        assert queue.get_static_pad("src").get_peer().get_parent_element() is handed[0]
+    finally:
+        engine.stop()

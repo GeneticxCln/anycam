@@ -41,6 +41,10 @@ def no_qos(element: Gst.Element) -> Gst.Element:
     klass = factory.get_metadata("klass") if factory is not None else ""
     if "Sink" not in (klass or "") and element.find_property("qos") is not None:
         element.set_property("qos", False)
+    if isinstance(element, Gst.Bin):
+        # glvideoflip and friends are bins around a QoS-enabled transform.
+        for child in element.children:
+            no_qos(child)
     return element
 
 
@@ -349,23 +353,112 @@ def _effects_chain(layer) -> dict[str, Gst.Element]:
     return elements
 
 
+# videobalance's own maths as a fragment shader (BT.601 studio-range matrices,
+# luma contrast around 16 plus brightness, chroma hue rotation and saturation,
+# with its clamps and rounding).  glcolorbalance uses different contrast maths
+# (Noir came out ~10/255 off); this matches videobalance within ~1/255.
+BALANCE_SHADER = """
+#ifdef GL_ES
+precision highp float;
+#endif
+varying vec2 v_texcoord;
+uniform sampler2D tex;
+uniform float brightness;
+uniform float contrast;
+uniform float saturation;
+uniform float hue;
+void main () {
+  vec4 c = texture2D(tex, v_texcoord);
+  vec3 rgb = c.rgb * 255.0;
+  float y  = clamp( 0.256816*rgb.r + 0.504154*rgb.g + 0.0979137*rgb.b + 16.0, 0.0, 255.0);
+  float cb = clamp(-0.148246*rgb.r - 0.29102*rgb.g  + 0.439266*rgb.b + 128.0, 0.0, 255.0);
+  float cr = clamp( 0.439271*rgb.r - 0.367833*rgb.g - 0.071438*rgb.b + 128.0, 0.0, 255.0);
+  y = clamp(floor(16.0 + (y - 16.0) * contrast + brightness * 255.0 + 0.5), 0.0, 255.0);
+  float i = cb - 128.0;
+  float j = cr - 128.0;
+  float hc = cos(3.14159265 * hue);
+  float hs = sin(3.14159265 * hue);
+  float u = clamp(floor(128.0 + (i * hc + j * hs) * saturation + 0.5), 0.0, 255.0);
+  float v = clamp(floor(128.0 + (-i * hs + j * hc) * saturation + 0.5), 0.0, 255.0);
+  vec3 o;
+  o.r = 1.16438*(y-16.0) + 1.59603*(v-128.0);
+  o.g = 1.16438*(y-16.0) - 0.391762*(u-128.0) - 0.812968*(v-128.0);
+  o.b = 1.16438*(y-16.0) + 2.01723*(u-128.0);
+  gl_FragColor = vec4(clamp(o / 255.0, 0.0, 1.0), c.a);
+}
+"""
+
+
+def gl_rack_elements() -> dict[str, Gst.Element] | None:
+    """GPU colour balance and mirror for a layer on the GPU canvas, or None."""
+    if (Gst.ElementFactory.find("glshader") is None
+            or Gst.ElementFactory.find("glvideoflip") is None):
+        return None
+    shader = make("glshader")
+    shader.set_property("fragment", BALANCE_SHADER)
+    flip = make("glvideoflip", video_direction="identity")
+    _set_balance_uniforms(shader, 0.0, 1.0, 1.0, 0.0)
+    return {"gl_balance": shader, "gl_flip": flip}
+
+
+def _set_balance_uniforms(shader: Gst.Element, brightness: float, contrast: float,
+                          saturation: float, hue: float) -> None:
+    from gi.repository import GObject
+
+    # glshader only takes float uniforms; doubles were ignored (all zero: black).
+    uniforms = Gst.Structure.new_empty("uniforms")
+    for key, value in (("brightness", brightness), ("contrast", contrast),
+                       ("saturation", saturation), ("hue", hue)):
+        typed = GObject.Value(GObject.TYPE_FLOAT)
+        typed.set_float(float(value))
+        uniforms.set_value(key, typed)
+    shader.set_property("uniforms", uniforms)
+
+
+def gpu_colour_is_equivalent(fx: Effects) -> bool:
+    """Whether the colour step can run after the upload without changing the
+    picture: nothing order-sensitive follows it in the CPU rack (a filter or
+    processor, a frame, a film style, the chroma key)."""
+    return (str(getattr(fx, "filter", "none") or "none") == "none"
+            and str(getattr(fx, "filter2", "none") or "none") == "none"
+            and str(getattr(fx, "frame_style", "none") or "none") == "none"
+            and str(getattr(fx, "color_effect", "none") or "none") == "none"
+            and not bool(getattr(fx, "chroma_enabled", False)))
+
+
 def apply_effects(elements: dict, fx: Effects) -> None:
     """Apply an Effects model to a live rack without renegotiating the graph."""
     if not elements:
         return
+    brightness = max(-1.0, min(1.0, _effect_number(getattr(fx, "brightness", 0.0), 0.0)))
+    # videobalance advertises 0..2 for contrast/saturation.  The old GUI
+    # offered 300%, which is outside the element range and could fail at
+    # runtime, so both the clamp and the panel range now stop at 200%.
+    contrast = max(0.0, min(2.0, _effect_number(getattr(fx, "contrast", 1.0), 1.0)))
+    saturation = max(0.0, min(2.0, _effect_number(getattr(fx, "saturation", 1.0), 1.0)))
+    hue = max(-1.0, min(1.0, _effect_number(getattr(fx, "hue", 0.0), 0.0)))
+    mirror = bool(getattr(fx, "mirror", False))
+    # On the GPU canvas the colour step and the mirror run as shaders after the
+    # upload whenever that gives the same picture: a colour look on the CPU
+    # cost ~13 ms per 1080p frame on the source thread.  Otherwise the CPU
+    # elements do it, as on the CPU canvas.
+    gpu = elements.get("gl_balance") is not None and gpu_colour_is_equivalent(fx)
+    gl_balance = elements.get("gl_balance")
+    if gl_balance is not None:
+        if gpu:
+            _set_balance_uniforms(gl_balance, brightness, contrast, saturation, hue)
+        else:
+            _set_balance_uniforms(gl_balance, 0.0, 1.0, 1.0, 0.0)
+    gl_flip = elements.get("gl_flip")
+    if gl_flip is not None:
+        gl_flip.set_property("video-direction", "horiz" if gpu and mirror else "identity")
     balance = elements.get("balance")
     if balance is not None:
-        balance.set_property("brightness", max(-1.0, min(1.0, _effect_number(
-            getattr(fx, "brightness", 0.0), 0.0))))
-        # videobalance advertises 0..2 for contrast/saturation.  The old GUI
-        # offered 300%, which is outside the element range and could fail at
-        # runtime, so both the clamp and the panel range now stop at 200%.
-        balance.set_property("contrast", max(0.0, min(2.0, _effect_number(
-            getattr(fx, "contrast", 1.0), 1.0))))
-        balance.set_property("saturation", max(0.0, min(2.0, _effect_number(
-            getattr(fx, "saturation", 1.0), 1.0))))
-        balance.set_property("hue", max(-1.0, min(1.0, _effect_number(
-            getattr(fx, "hue", 0.0), 0.0))))
+        neutral = gpu
+        balance.set_property("brightness", 0.0 if neutral else brightness)
+        balance.set_property("contrast", 1.0 if neutral else contrast)
+        balance.set_property("saturation", 1.0 if neutral else saturation)
+        balance.set_property("hue", 0.0 if neutral else hue)
 
     for slot_key, attr in (("slot", "filter"), ("slot2", "filter2")):
         slot = elements.get(slot_key)
@@ -376,7 +469,7 @@ def apply_effects(elements: dict, fx: Effects) -> None:
     flip = elements.get("videoflip")
     if flip is not None:
         flip.set_property("video-direction",
-                          "horiz" if bool(getattr(fx, "mirror", False)) else "identity")
+                          "horiz" if mirror and not gpu else "identity")
 
     style = elements.get("style")
     if style is not None:
@@ -476,7 +569,8 @@ SCALE_THREADS = min(4, max(1, (os.cpu_count() or 2) // 4))
 
 
 def _fit_letterbox(chain: SourceChain, src_w: int, src_h: int,
-                   width: int, height: int, rate: bool = True) -> Rect:
+                   width: int, height: int, rate: bool = True,
+                   live: bool = False) -> Rect:
     """Scale a source to fit inside the box, preserving its aspect ratio.
 
     The chain outputs only the fitted picture (the returned rectangle's size).
@@ -494,8 +588,19 @@ def _fit_letterbox(chain: SourceChain, src_w: int, src_h: int,
     chain.add(caps_filter(
         f"video/x-raw,format=RGBA,width={rect.w},height={rect.h}"))
     if rate:
-        chain.add(make("videorate"))
+        # A live source must not be padded with duplicates.  When an effect
+        # made the source thread slower than the frame rate, videorate filled
+        # the gaps with copies, the thread spent its time on those, the source
+        # queue dropped the real frames, and a Distort filter showed 4 new
+        # frames in 2 s (51 frames out, 47 of them copies).  The mixer repeats
+        # a layer's last frame by itself; videorate only drops for a live one.
+        chain.add(make("videorate", drop_only=bool(live)))
     return rect
+
+
+# Sources that pace themselves (a clock-driven capture), as opposed to a
+# frozen image or a generated card that must be paced by back-pressure.
+LIVE_KINDS = frozenset({"camera", "screen", "phone", "network"})
 
 
 def _finish_chain(chain: SourceChain, width: int, height: int, fps: int, *,
@@ -508,15 +613,18 @@ def _finish_chain(chain: SourceChain, width: int, height: int, fps: int, *,
         # fitted size.  It is a pass-through until a filter is chosen.
         fx = getattr(layer, "effects", None) or Effects()
         gate = SwapGate()    # the two slots must not swap at the same time
+        live = getattr(layer, "kind", "") in LIVE_KINDS
         slot = FilterSlot(getattr(fx, "filter", "none"),
                           getattr(fx, "filter_amount", 0.5), chain.elements,
-                          size=(int(width), int(height)), fps=int(fps), gate=gate)
+                          size=(int(width), int(height)), fps=int(fps), gate=gate,
+                          live=live)
         chain.add(slot.element)
         chain.effects["slot"] = slot
         chain.cleanup.append(slot.close)
         slot2 = FilterSlot(getattr(fx, "filter2", "none"),
                            getattr(fx, "filter2_amount", 0.5), chain.elements,
-                           size=(int(width), int(height)), fps=int(fps), gate=gate)
+                           size=(int(width), int(height)), fps=int(fps), gate=gate,
+                           live=live)
         chain.add(slot2.element)
         chain.effects["slot2"] = slot2
         chain.cleanup.append(slot2.close)
@@ -561,7 +669,8 @@ def camera_chain(device: str, width: int, height: int, fps: int, layer=None,
     # Crop percentages apply to the camera frame, not the compositor box.
     chain.add(*_crop_chain(layer, mode.width, mode.height))
     cropped_w, cropped_h = cropped_size(layer, mode.width, mode.height)
-    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height)
+    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height,
+                            live=getattr(layer, "kind", "") in LIVE_KINDS)
     _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
     chain.camera_mode = mode
     chain.capture_request = (cap_w, cap_h, cap_fps)
@@ -726,7 +835,8 @@ def network_chain(uri: str, width: int, height: int, fps: int, layer=None,
         f"video/x-raw,format=RGBA,width={source_w},height={source_h},pixel-aspect-ratio=1/1"))
     chain.add(*_crop_chain(layer, source_w, source_h))
     cropped_w, cropped_h = cropped_size(layer, source_w, source_h)
-    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height)
+    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height,
+                            live=getattr(layer, "kind", "") in LIVE_KINDS)
     _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
     chain.dynamic_from = decode
     chain.pause_elements.append(decode)
@@ -1000,7 +1110,8 @@ def layer_tail(layer, source_size: tuple[int, int], width: int, height: int,
     src_w, src_h = source_size
     chain.add(*_crop_chain(layer, src_w, src_h))
     cropped_w, cropped_h = cropped_size(layer, src_w, src_h)
-    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height)
+    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height,
+                            live=getattr(layer, "kind", "") in LIVE_KINDS)
     _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
     chain.source_size = (src_w, src_h)
     return chain

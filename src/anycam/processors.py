@@ -1236,7 +1236,7 @@ NATIVE_FRAMING = ("zoom", "autoframe")
 
 
 def build_processor_bin(name: str, amount: float, bin_name: str, width: int,
-                        height: int, fps: int):
+                        height: int, fps: int, live: bool = False):
     """A bin that runs processor ``name``; returns ``(bin, runner)``."""
     if name.partition(":")[0] in NATIVE_FRAMING:
         return build_framing_bin(name, amount, bin_name, width, height, fps)
@@ -1250,15 +1250,22 @@ def build_processor_bin(name: str, amount: float, bin_name: str, width: int,
 
     bin_ = Gst.Bin.new(bin_name)
     queue = make("queue")
-    # Not leaky: a full queue pushes back on the source instead of dropping, so
-    # an unpaced source cannot run away (see ProcessorRunner._run).
+    # An unpaced source (a frozen image) must feel back-pressure or it runs
+    # away (see ProcessorRunner._run), so the queue is not leaky for it.  A live
+    # source paces itself, and back-pressure there blocked the camera thread
+    # whenever the worker fell behind: camera frames were dropped upstream,
+    # videorate filled the gaps with duplicates, the worker spent its time on
+    # those, and a mask showed 7-19 different pictures a second.  For a live
+    # source the worker takes the newest frame instead.
     queue.set_property("max-size-buffers", 2)
     queue.set_property("max-size-bytes", 0)
     queue.set_property("max-size-time", 0)
+    if live:
+        queue.set_property("leaky", 2)
     sink = make("appsink")
     sink.set_property("sync", False)
     sink.set_property("max-buffers", 1)
-    sink.set_property("drop", False)
+    sink.set_property("drop", bool(live))
     sink.set_property("emit-signals", True)   # for the eos signal only
     # Not async: this sink sits in the middle of the canvas.  Waiting to preroll
     # it kept a pipeline that was *built* with a processor in PAUSED forever,
