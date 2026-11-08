@@ -43,7 +43,8 @@ def test_screen_session_close_is_idempotent_without_a_connection():
     session = ScreenSession("", -1, [ScreenStream(3, 640, 360)])
     session.close()
     session.close()
-    assert session.node_id == 3
+    # A closed session must not look reusable (it has no stream any more).
+    assert session.node_id == -1
     assert session.fd == -1
 
 

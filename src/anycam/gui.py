@@ -4344,7 +4344,15 @@ class AnyCamWindow(QMainWindow):
                     # A fresh portal remote is required for every consumer.
                     fd = session.take_remote() if session is not None else -1
                 except Exception as exc:  # noqa: BLE001 - surface, do not kill UI
-                    self._status(f"Screen capture unavailable: {exc}")
+                    # Take the layer out again: left in the scene, every later
+                    # start failed on it ("Could not start the pipeline").
+                    self._screen_sessions.pop(layer.id, None)
+                    if self._last_screen_session is session:
+                        self._last_screen_session = None
+                    if self.scene.layer(layer.id) is not None:
+                        self.scene.remove_layer(layer.id)
+                    self._refresh_layers()
+                    self._status(f"Screen capture unavailable: {exc}. Add the share again.")
                     return layer
                 attached = self.engine.add_layer(
                     layer, screen_fd=fd, screen_size=size)
@@ -4492,6 +4500,8 @@ class AnyCamWindow(QMainWindow):
             return
         if not any(other is session for other in self._screen_sessions.values()):
             session.close()
+            if self._last_screen_session is session:
+                self._last_screen_session = None
 
     def _close_screen_sessions(self) -> None:
         sessions = list(self._screen_sessions.values())
@@ -5905,8 +5915,9 @@ class AnyCamWindow(QMainWindow):
         # window is drawn over the picture it is actually trimming.
         crop_preview = self.preview.selected_id if self.preview.edit_mode == "crop" else ""
         self._crop_preview_layer_id = crop_preview
+        candidate = None
         try:
-            self.engine = AnyCamEngine(
+            candidate = AnyCamEngine(
                 self.project,
                 recorder=recorder,
                 # Without an owned output the engine would build its own
@@ -5931,12 +5942,24 @@ class AnyCamWindow(QMainWindow):
                 skip_layers=set(self._lost_cameras),
                 pool=self._source_pool,
                 on_frame=self._on_frame,
-            ).build()
+            )
+            # Kept before build(): a GPU graph that fails while it is being
+            # built (a glupload or GL tee link) must still reach the CPU
+            # fallback below, which needs the engine to know its canvas.
+            self.engine = candidate.build()
             self.engine.start()
             gpu = getattr(self.engine, "preview_backend", "") == "gpu"
             if self.preview.video_view is not None and not gpu:
-                self.log_event("preview: GPU preview did not start; using the image preview")
-                self.preview.disable_gpu()
+                if not self.preview.video_view.isVisible():
+                    # Built while the window was hidden (tray, or a shortcut
+                    # or tray action triggered a rebuild): the GPU view had
+                    # no GL context to share.  That is not a failure of the
+                    # GPU preview; rebuild with it once the window shows.
+                    self._gpu_preview_pending = True
+                    self.log_event("preview: window hidden; GPU preview resumes when it is shown")
+                else:
+                    self.log_event("preview: GPU preview did not start; using the image preview")
+                    self.preview.disable_gpu()
             self.preview.set_gpu_live(gpu)
             self._update_canvas_note()
             self.log_event(f"canvas: {self.engine.canvas_backend.upper()} canvas")
@@ -5947,7 +5970,7 @@ class AnyCamWindow(QMainWindow):
                 self._vcam_retry_at = 0.0
                 self._recover_vcam()
         except Exception as exc:  # noqa: BLE001
-            failed = self.engine
+            failed = self.engine if self.engine is not None else candidate
             self.engine = None
             if (failed is not None and getattr(failed, "canvas_backend", "") == "gpu"
                     and not getattr(self, "_gpu_canvas_failed", False)):
@@ -6456,6 +6479,21 @@ class AnyCamWindow(QMainWindow):
         self._pending_frame = (width, height, stride, raw, fmt)
         self.frame_ready.emit()
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if getattr(self, "_gpu_preview_pending", False) and self.engine is not None:
+            # The canvas was rebuilt while hidden, so it runs the image preview
+            # behind the GPU view.  Rebuild once the view has been shown and
+            # rendered, so the GPU preview takes over again.
+            self._gpu_preview_pending = False
+            QTimer.singleShot(150, self._resume_gpu_preview)
+
+    def _resume_gpu_preview(self) -> None:
+        if (self.engine is not None and self.preview.video_view is not None
+                and self.preview.video_view.isVisible()
+                and getattr(self.engine, "preview_backend", "") != "gpu"):
+            self.restart_engine()
+
     def _canvas_choice(self) -> str:
         """"gpu" or "cpu" for the next engine (see OutputConfig.canvas_backend)."""
         from .pipeline import canvas_requested
@@ -6819,7 +6857,23 @@ def serve_instance_requests(server: QLocalServer, window) -> None:
     server.newConnection.connect(on_connection)
 
 
+def _register_freeze_dump() -> None:
+    """``kill -USR1 <pid>`` writes every thread's Python stack to stderr.
+
+    A frozen window cannot be inspected with gdb without root on systems with
+    ``ptrace_scope=1``; this needs neither and changes nothing else.
+    """
+    try:
+        import faulthandler
+        import signal
+
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+    except (AttributeError, ValueError, OSError, RuntimeError):
+        pass        # no usable stderr (e.g. started without a terminal)
+
+
 def run_gui(project: Project | None = None) -> int:
+    _register_freeze_dump()
     app = QApplication(sys.argv[:1])
     primary, instance_server = claim_gui_instance()
     if not primary:

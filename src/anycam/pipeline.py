@@ -670,15 +670,22 @@ class AnyCamEngine:
             if not (chain.tail.link(no_pool) and no_pool.link(upload)):
                 raise RuntimeError("could not upload a layer to the GPU canvas")
             chain.tail = upload
-            gl_rack = gl_rack_elements() if chain.effects.get("balance") is not None else None
+            crop = tuple(getattr(layer, "crop", None) or (0.0, 0.0, 0.0, 0.0))
+            symmetric = len(crop) < 4 or abs(float(crop[0]) - float(crop[2])) < 1e-6
+            gl_rack = (gl_rack_elements(mirror_on_gpu=symmetric)
+                       if chain.effects.get("balance") is not None else None)
             if gl_rack:
-                # The colour step and mirror as shaders (see apply_effects).
-                shader, flip = gl_rack["gl_balance"], gl_rack["gl_flip"]
-                self._add(shader, flip)
-                chain.add(shader, flip)
-                if not (upload.link(shader) and shader.link(flip)):
-                    raise RuntimeError("could not add the GPU colour step")
-                chain.tail = flip
+                # The colour step (and mirror) as shaders (see apply_effects).
+                gl_elements = [gl_rack["gl_balance"]] + (
+                    [gl_rack["gl_flip"]] if "gl_flip" in gl_rack else [])
+                self._add(*gl_elements)
+                chain.add(*gl_elements)
+                previous = upload
+                for element in gl_elements:
+                    if not previous.link(element):
+                        raise RuntimeError("could not add the GPU colour step")
+                    previous = element
+                chain.tail = gl_elements[-1]
                 chain.effects.update(gl_rack)
                 apply_effects(chain.effects, getattr(layer, "effects", None) or Effects())
         return chain.output_pad.link(pad)

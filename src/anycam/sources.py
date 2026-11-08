@@ -9,11 +9,13 @@ advertise the exact MJPG mode we prefer.
 """
 from __future__ import annotations
 
+import functools
 import itertools
 
 import os
 import re
 import sys
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -389,16 +391,22 @@ void main () {
 """
 
 
-def gl_rack_elements() -> dict[str, Gst.Element] | None:
-    """GPU colour balance and mirror for a layer on the GPU canvas, or None."""
-    if (Gst.ElementFactory.find("glshader") is None
-            or Gst.ElementFactory.find("glvideoflip") is None):
+def gl_rack_elements(mirror_on_gpu: bool = True) -> dict[str, Gst.Element] | None:
+    """GPU colour balance (and mirror) for a layer on the GPU canvas, or None.
+
+    ``mirror_on_gpu`` is False for a layer whose crop is not left/right
+    symmetric: the GPU mirror runs after the crop, the CPU one before it, so
+    mirroring there would show the opposite edge of the picture.
+    """
+    if Gst.ElementFactory.find("glshader") is None:
         return None
     shader = make("glshader")
     shader.set_property("fragment", BALANCE_SHADER)
-    flip = make("glvideoflip", video_direction="identity")
     _set_balance_uniforms(shader, 0.0, 1.0, 1.0, 0.0)
-    return {"gl_balance": shader, "gl_flip": flip}
+    rack = {"gl_balance": shader}
+    if mirror_on_gpu and Gst.ElementFactory.find("glvideoflip") is not None:
+        rack["gl_flip"] = make("glvideoflip", video_direction="identity")
+    return rack
 
 
 def _set_balance_uniforms(shader: Gst.Element, brightness: float, contrast: float,
@@ -426,6 +434,55 @@ def gpu_colour_is_equivalent(fx: Effects) -> bool:
             and not bool(getattr(fx, "chroma_enabled", False)))
 
 
+_frame_shown: "weakref.WeakKeyDictionary[Gst.Element, tuple]" = weakref.WeakKeyDictionary()
+
+
+@functools.lru_cache(maxsize=6)
+def _frame_pixbuf(path: str, _stamp: tuple):
+    """The frame PNG as an in-memory GdkPixbuf (decoded here, by Pillow)."""
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf, GLib
+    from PIL import Image
+
+    with Image.open(path) as image:
+        rgba = image.convert("RGBA")
+    width, height = rgba.size
+    return GdkPixbuf.Pixbuf.new_from_bytes(
+        GLib.Bytes.new(rgba.tobytes()), GdkPixbuf.Colorspace.RGB, True, 8,
+        width, height, width * 4)
+
+
+def _set_frame_picture(frame: Gst.Element, path) -> None:
+    """Give ``gdkpixbufoverlay`` the frame picture without its file loader.
+
+    Setting ``location`` makes gdk-pixbuf decode the file on the calling (GUI)
+    thread, and gdk-pixbuf 2.44 does that through glycin: a sandboxed
+    ``bwrap`` loader process per element, about 10 ms each time, on every
+    build and effect change.  A frozen window was found blocked on a lock
+    while glycin's loader thread waited on a process that no longer existed.
+    An already decoded pixbuf needs no loader, and an unchanged picture is
+    not handed over again.
+    """
+    path = str(path)
+    try:
+        info = os.stat(path)
+        stamp = (info.st_mtime_ns, info.st_size)
+    except OSError:
+        stamp = (0, 0)
+    key = (path, stamp)
+    if _frame_shown.get(frame) == key:
+        return
+    try:
+        pixbuf = _frame_pixbuf(path, stamp)
+    except Exception as exc:  # noqa: BLE001 - fall back to the element's own loader
+        print(f"[frame] decoding {path} in-process failed ({exc}); using the file loader",
+              file=sys.stderr, flush=True)
+        frame.set_property("location", path)
+    else:
+        frame.set_property("pixbuf", pixbuf)
+    _frame_shown[frame] = key
+
+
 def apply_effects(elements: dict, fx: Effects) -> None:
     """Apply an Effects model to a live rack without renegotiating the graph."""
     if not elements:
@@ -450,8 +507,12 @@ def apply_effects(elements: dict, fx: Effects) -> None:
         else:
             _set_balance_uniforms(gl_balance, 0.0, 1.0, 1.0, 0.0)
     gl_flip = elements.get("gl_flip")
+    # The GPU mirror only exists when the layer's crop is left/right symmetric
+    # (see _link_to_mixer); otherwise the CPU mirror, which runs before the
+    # crop, keeps the region drawn in the crop editor.
+    flip_on_gpu = gpu and gl_flip is not None
     if gl_flip is not None:
-        gl_flip.set_property("video-direction", "horiz" if gpu and mirror else "identity")
+        gl_flip.set_property("video-direction", "horiz" if flip_on_gpu and mirror else "identity")
     balance = elements.get("balance")
     if balance is not None:
         neutral = gpu
@@ -469,7 +530,7 @@ def apply_effects(elements: dict, fx: Effects) -> None:
     flip = elements.get("videoflip")
     if flip is not None:
         flip.set_property("video-direction",
-                          "horiz" if mirror and not gpu else "identity")
+                          "horiz" if mirror and not flip_on_gpu else "identity")
 
     style = elements.get("style")
     if style is not None:
@@ -500,7 +561,7 @@ def apply_effects(elements: dict, fx: Effects) -> None:
                   file=sys.stderr, flush=True)
             frame_style = "none"
             path = overlay.render_window_frame(width, height, "none")
-        frame.set_property("location", str(path))
+        _set_frame_picture(frame, path)
         # A transparent PNG plus alpha=0 is a true bypass for the common case.
         frame.set_property("alpha", 0.0 if frame_style == "none" else 1.0)
 
@@ -570,7 +631,7 @@ SCALE_THREADS = min(4, max(1, (os.cpu_count() or 2) // 4))
 
 def _fit_letterbox(chain: SourceChain, src_w: int, src_h: int,
                    width: int, height: int, rate: bool = True,
-                   live: bool = False) -> Rect:
+                   live: bool = False, fps: int = 0) -> Rect:
     """Scale a source to fit inside the box, preserving its aspect ratio.
 
     The chain outputs only the fitted picture (the returned rectangle's size).
@@ -594,7 +655,13 @@ def _fit_letterbox(chain: SourceChain, src_w: int, src_h: int,
         # queue dropped the real frames, and a Distort filter showed 4 new
         # frames in 2 s (51 frames out, 47 of them copies).  The mixer repeats
         # a layer's last frame by itself; videorate only drops for a live one.
-        chain.add(make("videorate", drop_only=bool(live)))
+        rate_element = make("videorate", drop_only=bool(live))
+        if live and fps > 0:
+            # Drop-only cannot raise a slower source to a fixed higher rate
+            # (30 fps into a 60/1 chain failed to link), so a live chain caps
+            # the rate here and leaves it open in its final caps.
+            rate_element.set_property("max-rate", int(fps))
+        chain.add(rate_element)
     return rect
 
 
@@ -669,9 +736,10 @@ def camera_chain(device: str, width: int, height: int, fps: int, layer=None,
     # Crop percentages apply to the camera frame, not the compositor box.
     chain.add(*_crop_chain(layer, mode.width, mode.height))
     cropped_w, cropped_h = cropped_size(layer, mode.width, mode.height)
+    live = getattr(layer, "kind", "") in LIVE_KINDS
     fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height,
-                            live=getattr(layer, "kind", "") in LIVE_KINDS)
-    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
+                            live=live, fps=fps)
+    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer, pin_rate=not live)
     chain.camera_mode = mode
     chain.capture_request = (cap_w, cap_h, cap_fps)
     chain.camera_probe_error = camera_probe_error(device)
@@ -835,9 +903,10 @@ def network_chain(uri: str, width: int, height: int, fps: int, layer=None,
         f"video/x-raw,format=RGBA,width={source_w},height={source_h},pixel-aspect-ratio=1/1"))
     chain.add(*_crop_chain(layer, source_w, source_h))
     cropped_w, cropped_h = cropped_size(layer, source_w, source_h)
+    live = getattr(layer, "kind", "") in LIVE_KINDS
     fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height,
-                            live=getattr(layer, "kind", "") in LIVE_KINDS)
-    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
+                            live=live, fps=fps)
+    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer, pin_rate=not live)
     chain.dynamic_from = decode
     chain.pause_elements.append(decode)
     chain.source_size = (source_w, source_h)
@@ -1110,9 +1179,10 @@ def layer_tail(layer, source_size: tuple[int, int], width: int, height: int,
     src_w, src_h = source_size
     chain.add(*_crop_chain(layer, src_w, src_h))
     cropped_w, cropped_h = cropped_size(layer, src_w, src_h)
+    live = getattr(layer, "kind", "") in LIVE_KINDS
     fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height,
-                            live=getattr(layer, "kind", "") in LIVE_KINDS)
-    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
+                            live=live, fps=fps)
+    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer, pin_rate=not live)
     chain.source_size = (src_w, src_h)
     return chain
 

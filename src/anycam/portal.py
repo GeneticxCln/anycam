@@ -88,6 +88,11 @@ class ScreenSession:
             except OSError:
                 pass
             self.fd = -1
+        # A closed session must not look reusable: with its handle and streams
+        # kept, the next "Add desktop share" took it, take_remote() failed, and
+        # the layer it left behind broke every later start.
+        self.session_handle = ""
+        self.streams = []
 
 
 def _close_session(connection: Gio.DBusConnection | None,

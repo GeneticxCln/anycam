@@ -24,7 +24,6 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
-import tempfile
 from functools import lru_cache
 from pathlib import Path
 
@@ -114,9 +113,24 @@ def use_opengl_scene_graph() -> None:
 
 
 def _qml_file() -> Path:
-    path = Path(tempfile.gettempdir()) / f"anycam-gpu-preview-{os.getuid()}.qml"
-    if not path.exists() or path.read_text(encoding="utf-8") != QML:
-        path.write_text(QML, encoding="utf-8")
+    """The QML scene, in the user's own cache folder.
+
+    It used to go to a predictable name in /tmp: another local user could
+    create that file first (the write then raised and the window failed to
+    open) or plant a symlink there for AnyCam to overwrite.
+    """
+    from . import config
+
+    path = config.cache_dir() / "gpu-preview.qml"
+    if path.is_file() and not path.is_symlink():
+        try:
+            if path.read_text(encoding="utf-8") == QML:
+                return path
+        except OSError:
+            pass
+    temporary = path.with_name(f".gpu-preview-{os.getpid()}.qml")
+    temporary.write_text(QML, encoding="utf-8")
+    temporary.replace(path)        # replaces a symlink itself, never its target
     return path
 
 
@@ -143,9 +157,15 @@ def make_video_view(parent):
     from PySide6.QtQuick import QQuickItem
     from PySide6.QtQuickWidgets import QQuickWidget
 
+    try:
+        qml = _qml_file()
+    except OSError as exc:
+        # The image preview takes over; the window must still open.
+        _log(f"could not write the QML scene: {exc}")
+        return None
     view = QQuickWidget(parent)
     view.setResizeMode(QQuickWidget.ResizeMode.SizeRootObjectToView)
-    view.setSource(QUrl.fromLocalFile(str(_qml_file())))
+    view.setSource(QUrl.fromLocalFile(str(qml)))
     if view.status() != QQuickWidget.Status.Ready:
         _log("QML failed: " + "; ".join(error.toString() for error in view.errors()))
         view.deleteLater()
