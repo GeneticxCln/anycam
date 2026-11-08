@@ -183,6 +183,30 @@ class LayoutHistory:
         self._redo.clear()
 
 
+class _PreviewOverlay(QWidget):
+    """The editing marks drawn above the GPU video view.
+
+    Children paint over their parent, so with a GPU preview the selection,
+    guides and strokes are drawn by this transparent child instead of by
+    ``PreviewWidget`` itself.  Mouse input passes through to the preview.
+    It is repainted with its parent, never per video frame.
+    """
+
+    def __init__(self, preview: "PreviewWidget") -> None:
+        super().__init__(preview)
+        self.preview = preview
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+    def paintEvent(self, _event) -> None:
+        if not self.preview.gpu_live:
+            return  # the image preview paints its own marks
+        painter = QPainter(self)
+        self.preview._paint_marks(painter)
+        painter.end()
+
+
 class PreviewWidget(QWidget):
     """Paints the composited frame and edits layer boxes directly on it.
 
@@ -203,6 +227,9 @@ class PreviewWidget(QWidget):
     edit_finished = Signal(str, bool)
     context_menu_requested = Signal(str, QPoint)
     stroke_finished = Signal(object)     # a finished drawing stroke (dict)
+    # The device-pixel size the canvas is shown at changed (resize, screen
+    # scale); the engine scales the preview to it so painting is 1:1.
+    display_size_changed = Signal(int, int)
 
     HANDLE = 9.0
     MIN_BOX = 0.02
@@ -212,6 +239,7 @@ class PreviewWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.image: QImage | None = None
+        self._image_owner: object = None
         self.scene: Scene | None = None
         self.selected_id = ""
         self.selected_ids: list[str] = []
@@ -250,10 +278,91 @@ class PreviewWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # GPU preview (see gl_preview): a Qt Quick view under a transparent
+        # overlay.  ``gpu_live`` is True while the engine draws into it.
+        self.video_view = None
+        self._overlay: _PreviewOverlay | None = None
+        self.gpu_live = False
 
-    def set_image(self, image: QImage) -> None:
-        self.image = image
+    # ------------------------------------------------------------ GPU view
+    def enable_gpu(self) -> bool:
+        """Add the GPU video view and its overlay; False leaves the image path."""
+        from . import gl_preview
+
+        if self.video_view is not None:
+            return True
+        gl_preview.use_opengl_scene_graph()
+        view = gl_preview.make_video_view(self)
+        if view is None:
+            return False
+        view.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        view.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        view.setGeometry(self.rect())
+        view.lower()
+        self.video_view = view
+        self._overlay = _PreviewOverlay(self)
+        self._overlay.setGeometry(self.rect())
+        self._overlay.raise_()
+        return True
+
+    def disable_gpu(self) -> None:
+        """Back to the image preview for good (the engine could not use it)."""
+        for child in (self.video_view, self._overlay):
+            if child is not None:
+                child.hide()
+                child.deleteLater()
+        self.video_view = None
+        self._overlay = None
+        self.gpu_live = False
         self.update()
+
+    def set_gpu_live(self, live: bool) -> None:
+        """Show the video (live) or the idle text in the GPU view."""
+        live = bool(live) and self.video_view is not None
+        self.gpu_live = live
+        if self.video_view is not None:
+            root = self.video_view.rootObject()
+            if root is not None:
+                root.setProperty("live", live)
+            self.video_view.lower()
+        if self._overlay is not None:
+            self._overlay.raise_()
+            # Children added later (the Stage's "+" slots) stay on top.
+            for child in self.children():
+                if isinstance(child, QWidget) and child not in (self.video_view, self._overlay):
+                    child.raise_()
+        self.update()
+
+    def has_frame(self) -> bool:
+        return self.gpu_live or (self.image is not None and not self.image.isNull())
+
+    def set_image(self, image: QImage, owner: object = None) -> None:
+        """Show ``image``.  ``owner`` keeps the memory a zero-copy QImage
+        points into alive for as long as the image is shown."""
+        self.image = image
+        self._image_owner = owner
+        self.update()
+
+    def display_size(self) -> tuple[int, int]:
+        """Device pixels the canvas occupies inside the widget (letterboxed)."""
+        if self.canvas_size and self.canvas_size[0] > 0 and self.canvas_size[1] > 0:
+            aspect = QSize(int(self.canvas_size[0]), int(self.canvas_size[1]))
+        elif self.image is not None and not self.image.isNull():
+            aspect = self.image.size()
+        else:
+            aspect = QSize(16, 9)
+        fitted = aspect.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        ratio = self.devicePixelRatioF()
+        return (max(2, round(fitted.width() * ratio)),
+                max(2, round(fitted.height() * ratio)))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        for child in (self.video_view, self._overlay):
+            if child is not None:
+                child.setGeometry(self.rect())
+        width, height = self.display_size()
+        self.display_size_changed.emit(width, height)
 
     # ------------------------------------------------------------- selection
     def set_scene(self, scene: Scene | None) -> None:
@@ -430,9 +539,13 @@ class PreviewWidget(QWidget):
     # -------------------------------------------------------------- geometry
     def canvas_rect(self) -> QRectF:
         """The letterboxed canvas inside the widget, in widget pixels."""
-        if self.image is None or self.image.isNull():
+        if self.gpu_live and self.canvas_size and min(self.canvas_size) > 0:
+            frame = QSize(int(self.canvas_size[0]), int(self.canvas_size[1]))
+        elif self.image is None or self.image.isNull():
             return QRectF()
-        scaled = self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
+        else:
+            frame = self.image.size()
+        scaled = frame.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
         return QRectF((self.width() - scaled.width()) / 2.0,
                       (self.height() - scaled.height()) / 2.0,
                       scaled.width(), scaled.height())
@@ -916,6 +1029,10 @@ class PreviewWidget(QWidget):
     # --------------------------------------------------------------- painting
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
+        if self.gpu_live:
+            # The video view draws the canvas and the overlay child draws the
+            # marks; nothing here changes per frame.
+            return
         painter.fillRect(self.rect(), QColor("#07090b"))
         if self.image is None or self.image.isNull():
             painter.setPen(QColor("#41525c"))
@@ -924,11 +1041,19 @@ class PreviewWidget(QWidget):
             painter.setFont(font)
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Preview stopped\nAnyCam")
             return
-        scaled = self.image.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio,
-                                   Qt.TransformationMode.SmoothTransformation)
-        x = (self.width() - scaled.width()) // 2
-        y = (self.height() - scaled.height()) // 2
-        painter.drawImage(x, y, scaled)
+        target = self.canvas_rect()
+        ratio = self.devicePixelRatioF()
+        if (abs(self.image.width() - target.width() * ratio) > 1
+                or abs(self.image.height() - target.height() * ratio) > 1):
+            # Fitted while drawing (bilinear).  QImage.scaled(Smooth) per
+            # frame cost ~1 ms at full screen against ~0.4 ms here.
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.drawImage(target, self.image)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        self._paint_marks(painter)
+
+    def _paint_marks(self, painter: QPainter) -> None:
+        """Selection, guides and the stroke being drawn."""
         if self.edit_mode != "draw":
             self._paint_selection(painter)
             self._paint_guides(painter)
@@ -1399,6 +1524,7 @@ class AnyCamWindow(QMainWindow):
         self.preview.edit_started.connect(self._preview_edit_started)
         self.preview.edit_finished.connect(self._preview_edit_finished)
         self.preview.context_menu_requested.connect(self._preview_context_menu)
+        self._setup_preview_output()
         preview_layout.addWidget(self.preview, 1)
         self.draw_bar = self._build_draw_bar()
         preview_layout.addWidget(self.draw_bar)
@@ -5757,11 +5883,19 @@ class AnyCamWindow(QMainWindow):
                 screen_fds=self._screen_fds(),
                 screen_sizes=self._screen_sizes(),
                 preview_crop_layer=crop_preview,
+                preview_target=self.preview.display_size(),
+                preview_gl_sink=(self._attach_gpu_preview
+                                 if self.preview.video_view is not None else None),
                 skip_layers=set(self._lost_cameras),
                 pool=self._source_pool,
                 on_frame=self._on_frame,
             ).build()
             self.engine.start()
+            gpu = getattr(self.engine, "preview_backend", "") == "gpu"
+            if self.preview.video_view is not None and not gpu:
+                self.log_event("preview: GPU preview did not start; using the image preview")
+                self.preview.disable_gpu()
+            self.preview.set_gpu_live(gpu)
             self.preview.layer_sizes = self.engine.source_sizes()
             if self.vcam_on and not self.engine.report.vcam_active:
                 # The held output exists but this canvas has no tap: reattach
@@ -5827,6 +5961,7 @@ class AnyCamWindow(QMainWindow):
         self.status_chip.setText("STOPPED")
         self.start_button.setText("Start preview")
         if clear_preview:
+            self.preview.set_gpu_live(False)
             self.preview.image = None
             self.preview.layer_sizes = {}
             self.preview.update()
@@ -6155,6 +6290,18 @@ class AnyCamWindow(QMainWindow):
 
     def snapshot(self) -> None:
         image = self.preview.image
+        if self.preview.gpu_live and self.preview.video_view is not None:
+            # The GPU preview has no CPU frame: read back what it shows, at
+            # the size it shows it (the image preview saved its preview-size
+            # frame too).
+            view = self.preview.video_view
+            grabbed = view.grabFramebuffer()
+            # The framebuffer is in device pixels but may not say so
+            # (devicePixelRatio 1.0 on a 1.5x screen): scale by the width.
+            ratio = grabbed.width() / max(1, view.width())
+            rect = self.preview.canvas_rect()
+            image = grabbed.copy(int(rect.x() * ratio), int(rect.y() * ratio),
+                                 int(rect.width() * ratio), int(rect.height() * ratio))
         if image is None or image.isNull():
             self._status("No frame to snapshot")
             return
@@ -6249,6 +6396,43 @@ class AnyCamWindow(QMainWindow):
         self._pending_frame = (width, height, stride, raw, fmt)
         self.frame_ready.emit()
 
+    def _setup_preview_output(self) -> None:
+        """Resize following and the GPU preview, for either window's preview."""
+        # A resize (window drag, maximise, layout change) sends many sizes;
+        # the engine follows the last one after a short pause.
+        self._preview_resize_timer = QTimer(self)
+        self._preview_resize_timer.setSingleShot(True)
+        self._preview_resize_timer.setInterval(120)
+        self._preview_resize_timer.timeout.connect(self._apply_preview_size)
+        self.preview.display_size_changed.connect(
+            lambda *_: self._preview_resize_timer.start())
+        self._enable_gpu_preview()
+
+    def _enable_gpu_preview(self) -> None:
+        """Use the GPU preview when this system can run it (see gl_preview)."""
+        from . import gl_preview
+
+        reason = gl_preview.unavailable_reason()
+        if reason:
+            if gl_preview.requested() == "gpu" or "did not load" in reason:
+                self.log_event(f"preview: GPU preview unavailable ({reason})")
+            return
+        if self.preview.enable_gpu():
+            self.log_event("preview: GPU preview (qml6glsink)")
+
+    def _attach_gpu_preview(self, sink) -> bool:
+        from . import gl_preview
+
+        return gl_preview.attach_sink(sink, self.preview.video_view)
+
+    def _apply_preview_size(self) -> None:
+        """Have the engine scale the preview to the widget's shown size."""
+        if self.engine is None:
+            return
+        setter = getattr(self.engine, "set_preview_target", None)
+        if callable(setter):
+            setter(*self.preview.display_size())
+
     def _update_preview(self) -> None:
         frame = self._pending_frame
         self._pending_frame = None
@@ -6257,8 +6441,12 @@ class AnyCamWindow(QMainWindow):
         width, height, stride, raw, fmt = frame
         qformat = (QImage.Format.Format_RGB888 if fmt == "RGB"
                    else QImage.Format.Format_RGBA8888)
-        image = QImage(raw, width, height, stride, qformat).copy()
-        self.preview.set_image(image)
+        # No .copy(): the QImage reads ``raw`` in place and the widget keeps
+        # ``raw`` alive with it.  The copy cost ~0.75 ms of GUI-thread CPU per
+        # frame at panel size.  ``raw`` is immutable bytes, and anything that
+        # changes the image (snapshot painting, conversions) detaches first.
+        image = QImage(raw, width, height, stride, qformat)
+        self.preview.set_image(image, owner=raw)
 
     def _update_source_status(self) -> None:
         """A running canvas is not proof that its inputs are fresh."""
@@ -6387,7 +6575,7 @@ class AnyCamWindow(QMainWindow):
 
     def _save_screenshot(self) -> bool:
         path = getattr(self, "auto_screenshot_path", "")
-        has_frame = self.preview.image is not None and not self.preview.image.isNull()
+        has_frame = self.preview.has_frame()
         if not path:
             return has_frame
         pixmap = self.grab()

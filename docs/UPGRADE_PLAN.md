@@ -21,7 +21,10 @@ PipeWire 1.6.10, Vesktop (Electron 44).
 | 1.1 PipeWire camera spike | **Done**, findings below |
 | 1.2–1.3, 1.5 PipeWire camera output and setting | **Done.** "Publish as: loopback / PipeWire / both"; loopback stays the default |
 | 1.4 Live rename of the node | Open (the name is fixed to "AnyCam") |
-| Phase C, D | Open |
+| 2a.1 Packaging check for `qml6glsink` | **Done.** Usable only with the distribution's PySide6 (same Qt as `gst-plugin-qml6`); pip's bundles its own Qt and the plugin refuses to load. The reference machine now uses `pyside6` 6.12.0 from pacman |
+| 2a.2 GPU preview (`qml6glsink` in a `QQuickWidget`) | **Done, optional.** Used when the plugin loads, CPU preview otherwise. Window thread median 40–47% → 18–20%; 15% target met in some samples, with periodic spikes still unexplained |
+| 2a.3 Cheaper CPU preview (the fallback) | **Done.** Frames capped at 960×540 and following the widget, bilinear paint, zero-copy QImage: GUI-thread Python work down ~25–30% |
+| Phase D | Open |
 
 ## Summary
 
@@ -125,6 +128,53 @@ draws selection handles, slots and drag feedback).
    copy, no `QImage` conversion, GPU scaling), or a lower preview rate and size (the preview
    does not need 1080p60).
 4. Measure the UI thread and total CPU before and after.
+
+**Findings (2026-11-07, reference machine, 1080p60 canvas, StreamCam scene).**
+
+* Step 1 fails: AnyCam's PySide6 comes from pip with its own Qt 6.11.2; `gst-plugin-qml6`
+  links the system Qt 6.12 and Qt private APIs. Loading both in one process is not workable,
+  and the same mismatch would hit every pip install.
+* Offscreen, the GUI-thread costs per frame were: the smooth `QImage.scaled` per paint (about
+  1 ms full screen), the QImage `.copy()` (0.75 ms live), and the PyGObject map, which copies
+  every buffer into new `bytes` (0.6 ms in isolation, about 1.2 ms live at 960×540). The map
+  copy grows with the frame size, so scaling the preview to the full widget size (tried
+  first) made the live total slightly worse: the copy grew more than the paint shrank.
+* Kept: preview frames at the widget's shown size but at most 960×540 (smaller panels get
+  smaller frames; a resize changes the caps live, without a rebuild); painting with a
+  bilinear `drawImage` instead of `QImage.scaled` (0.04 ms at panel size); a zero-copy
+  QImage over the frame bytes, which the widget keeps alive.
+* Live, profiled per handler by main-thread CPU time, before → after:
+  `_tick`+`paintEvent` 130/111 → 96/82 ms per second, `_update_preview` 20 → 4 ms/s.
+  Whole-thread totals are noisy (old 61%/34%, new 33%/31%).
+* What remains is mostly Qt itself, outside AnyCam's handlers: repainting the window and
+  handing it to the Wayland compositor at the preview rate. The levers left are a lower
+  preview frame rate, gst-python's zero-copy `map()` (an extra system package), or a GL
+  widget.
+
+**GPU preview (2026-11-08).** After switching to the distribution's PySide6 6.12.0 (same Qt
+as `gst-plugin-qml6`), `qml6glsink` loads. What it took:
+
+* A prototype in a widget window: `qml6glsink` → `GstGLQt6VideoItem` in a `QQuickWidget`,
+  with a transparent `QWidget` on top for the editing marks. GPU-native frames
+  (`gltestsrc`) rendered correctly straight away; system-memory frames rendered **nothing**,
+  with `GL_INVALID_OPERATION: <image> and <target> are incompatible` per frame. `glupload`
+  had proposed a udmabuf pool upstream and imported those buffers as EGLImages, which
+  NVIDIA rejects. `identity drop-allocation=true` before `glupload` keeps the pool off, so
+  it falls back to a plain texture upload. Same source, prototype: main thread 2–3%
+  against 8–9% for appsink + QImage, process 18% against 71%.
+* The sink takes Qt's GL context from the item's window, which Qt Quick creates only for a
+  **visible** view; a hidden view made the pipeline fail with "failed to retrieve wrapped
+  context". The view stays visible, and a QML `live` property swaps the video for the
+  "Preview stopped" text.
+* PyGObject cannot pass a C++ object to the sink's `widget` (gpointer) property; it is set
+  through `g_object_set` with ctypes.
+* Verified in AnyCam on Wayland: live picture in the window, three engine rebuilds re-attach
+  a new sink to the same item, and Snapshot reads the view back (the framebuffer is in
+  device pixels while reporting a pixel ratio of 1.0, so the crop scales by width).
+* A/B in AnyCam (same build, `ANYCAM_PREVIEW=image` against GPU, two rounds, six 5 s samples
+  each, StreamCam scene at 1080p60): window thread median 40% / 47% → 18% / 20%, process
+  median 400% / 448% → 351% / 380%. Single samples still spike to ~40% in GPU mode;
+  the cause is not known yet.
 
 **Done when:** at 1080p60 the UI thread stays under 15% of a core, the preview keeps every
 editing interaction (select, drag, resize, crop, slot menus), and the offscreen GUI tests still

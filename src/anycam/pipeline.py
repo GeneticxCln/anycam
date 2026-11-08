@@ -433,6 +433,8 @@ class AnyCamEngine:
         screen_fds: dict[str, int] | None = None,
         screen_sizes: dict[str, tuple[int, int]] | None = None,
         preview_crop_layer: str = "",
+        preview_target: tuple[int, int] | None = None,
+        preview_gl_sink: Callable[[Gst.Element], bool] | None = None,
         skip_layers: set[str] | None = None,
         pool: SourcePool | None = None,
         on_frame: Callable | None = None,
@@ -470,6 +472,17 @@ class AnyCamEngine:
         # The crop editor shows this layer uncropped while the model keeps its
         # real crop, so the window is drawn over the picture it edits.
         self.preview_crop_layer = preview_crop_layer
+        # The device-pixel size the preview widget shows the canvas at.  The
+        # preview branch scales to exactly that, so the GUI paints 1:1.
+        self.preview_target = preview_target
+        # Set by a window with a GPU preview: called with the new qml6glsink
+        # so it can be pointed at the window's video item.  False from it (or
+        # no qml6glsink) falls back to the appsink preview.
+        self.preview_gl_sink = preview_gl_sink
+        # "gpu" (qml6glsink) or "image" (appsink -> QImage) once built.
+        self.preview_backend = ""
+        # Frames that reached the GPU preview's sink.
+        self.preview_gl_frames = 0
         self.canvas_w = int(project.output.canvas_w)
         self.canvas_h = int(project.output.canvas_h)
         self.fps = int(project.output.fps)
@@ -544,6 +557,7 @@ class AnyCamEngine:
         self.layer_sources: dict[str, tuple[int, int]] = {}
         self._record_sink = None
         self._appsink = None
+        self._preview_caps = None
         self._pending_sample = None
         # Rate limit for preview frames that cannot be handed to the GUI.
         self._preview_problem_at = 0.0
@@ -1123,24 +1137,93 @@ class AnyCamEngine:
         self._branch_count += 1
         return queue
 
-    def _preview_size(self) -> tuple[int, int]:
-        """A size the GUI can paint without copying the whole canvas.
+    # The largest preview frame.  Every frame is copied once into Python
+    # (PyGObject maps a buffer into new ``bytes``), so its size is paid per
+    # frame on the GUI thread; above this the widget upscales it on paint,
+    # which costs less than the bigger copy.
+    PREVIEW_MAX = (960, 540)
 
-        The preview widget is far smaller than the canvas, and every frame is
-        copied into a QImage on the GUI thread.  The panel is ~1236 px wide at
-        the default window size, so 960x540 is already panel resolution and
-        costs ~14% less CPU than 1280x720 at 60 fps.  Only the preview is
-        scaled down: canvas, recording and the virtual camera keep the project
-        resolution.
+    def _preview_size(self) -> tuple[int, int]:
+        """The preview frame size: the widget's shown size, at most PREVIEW_MAX.
+
+        A smaller widget gets a smaller frame (a cheaper copy and paint).
+        Only the preview is scaled: canvas, recording and the virtual camera
+        keep the project resolution.  Never larger than the canvas.
         """
-        limit_w, limit_h = 960, 540
+        limit_w, limit_h = self.preview_target or self.PREVIEW_MAX
+        limit_w = max(2, min(int(limit_w), self.PREVIEW_MAX[0]))
+        limit_h = max(2, min(int(limit_h), self.PREVIEW_MAX[1]))
         scale = min(1.0, limit_w / max(1, self.canvas_w),
                     limit_h / max(1, self.canvas_h))
         width = max(2, int(self.canvas_w * scale) // 2 * 2)
         height = max(2, int(self.canvas_h * scale) // 2 * 2)
         return width, height
 
+    def set_preview_target(self, width: int, height: int) -> bool:
+        """Follow a resized preview widget without rebuilding the graph.
+
+        The capsfilter after ``videoscale`` is changed in place; videoscale
+        renegotiates on the next buffer.  True when the size changed.
+        """
+        previous = self._preview_size()
+        self.preview_target = (int(width), int(height))
+        size = self._preview_size()
+        if size == previous:
+            return False
+        caps = self._preview_caps
+        if caps is not None:
+            caps.set_property("caps", Gst.Caps.from_string(
+                caps_string(size[0], size[1], self.fps)))
+        return True
+
     def _build_preview(self) -> None:
+        if self.preview_gl_sink is not None and self._build_gl_preview():
+            self.preview_backend = "gpu"
+            return
+        self._build_image_preview()
+        self.preview_backend = "image"
+
+    def _build_gl_preview(self) -> bool:
+        """Canvas -> texture -> the window's Qt Quick video item.
+
+        No frame enters Python and the GUI thread only composites.  The
+        identity drops the allocation query: otherwise glupload proposes a
+        udmabuf pool upstream and imports those buffers as EGLImages, which
+        NVIDIA rejects ("<image> and <target> are incompatible"), leaving the
+        item transparent.  Without the pool glupload uses a plain texture
+        upload.
+        """
+        if Gst.ElementFactory.find("qml6glsink") is None:
+            return False
+        sink = Gst.ElementFactory.make("qml6glsink", "preview_gl_sink")
+        if sink is None:
+            return False
+        sink.set_property("sync", False)
+        try:
+            attached = bool(self.preview_gl_sink(sink))
+        except Exception as exc:  # noqa: BLE001 - the image preview takes over
+            print(f"[preview] GPU preview unavailable: {exc}", file=sys.stderr, flush=True)
+            attached = False
+        if not attached:
+            return False
+        queue = self._branch("preview", max_buffers=1, max_time_ns=0)
+        queue.set_property("leaky", 2)
+        no_pool = make("identity", "preview_no_pool", drop_allocation=True)
+        upload = make("glupload", "preview_gl_upload")
+        convert = make("glcolorconvert", "preview_gl_convert")
+        self._add(no_pool, upload, convert, sink)
+        self._link([queue, no_pool, upload, convert, sink])
+        self._probe(sink.get_static_pad("sink"), Gst.PadProbeType.BUFFER,
+                    self._on_gl_preview_buffer)
+        self._appsink = None
+        self._pending_sample = None
+        return True
+
+    def _on_gl_preview_buffer(self, _pad, _info):
+        self.preview_gl_frames += 1
+        return Gst.PadProbeReturn.OK
+
+    def _build_image_preview(self) -> None:
         # One buffered frame, leaking downstream instead of blocking: when the
         # window gains focus or is resized the GUI thread can stall for a
         # moment, and a blocking queue would then lock the compositor up.
@@ -1154,6 +1237,7 @@ class AnyCamEngine:
         scale = make("videoscale")
         preview_w, preview_h = self._preview_size()
         caps = caps_filter(caps_string(preview_w, preview_h, self.fps), "preview_caps")
+        self._preview_caps = caps
         sink = make("appsink", "preview_sink", emit_signals=True,
                     max_buffers=2, drop=True, sync=False)
         self._add(convert, format_caps, scale, caps, sink)

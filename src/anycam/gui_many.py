@@ -227,6 +227,7 @@ class ManyCamWindow(AnyCamWindow):
         self.preview.edit_started.connect(self._preview_edit_started)
         self.preview.edit_finished.connect(self._preview_edit_finished)
         self.preview.installEventFilter(self)
+        self._setup_preview_output()
         self.stage_add_buttons: list[QPushButton] = []
         self._stage_slots: list[tuple[QPushButton, tuple]] = []
         self._stage_canvas: tuple | None = None

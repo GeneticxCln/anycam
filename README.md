@@ -66,12 +66,21 @@ are in [docs/EVIDENCE.md](docs/EVIDENCE.md).
   `onnxruntime-gpu[cuda,cudnn]` instead to run them on an NVIDIA GPU
 - `xdg-desktop-portal` + PipeWire (screen capture), `ffmpeg`, `v4l-utils`
 - `v4l2loopback` for the virtual camera (AnyCam sets it up on first launch, one password)
+- Optional GPU preview: `gst-plugin-qml6` (Arch; elsewhere the GStreamer Qt6 QML plugin) with the
+  **distribution's** PySide6. pip's PySide6 bundles its own Qt, which the plugin refuses to
+  load against, so with it AnyCam keeps the CPU preview
 
 ```bash
 sudo pacman -S --needed python pyside6 python-gobject gst-plugins-{base,good,bad,ugly} \
-  gst-libav gst-plugin-opengl ffmpeg v4l-utils pipewire-pulse xdg-desktop-portal \
-  python-numpy python-pillow python-psutil
+  gst-libav gst-plugin-opengl gst-plugin-qml6 ffmpeg v4l-utils pipewire-pulse \
+  xdg-desktop-portal python-numpy python-pillow python-psutil
 ```
+
+**GPU preview.** When `qml6glsink` loads (see above), the preview is drawn by the GPU: frames
+go from GStreamer straight into a texture, and the window only composites. On the reference
+machine at 1080p60 that halved the window thread (median 40–47% → 18–20% of a core) and
+saved 50–70% of a core overall. The log says `preview: GPU preview (qml6glsink)` when it is
+in use. `ANYCAM_PREVIEW=image` forces the CPU preview.
 
 ## Install and run
 
