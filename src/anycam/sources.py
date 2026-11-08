@@ -435,6 +435,7 @@ def gpu_colour_is_equivalent(fx: Effects) -> bool:
 
 
 _frame_shown: "weakref.WeakKeyDictionary[Gst.Element, tuple]" = weakref.WeakKeyDictionary()
+_frame_fallback_noted = False
 
 
 @functools.lru_cache(maxsize=6)
@@ -475,8 +476,11 @@ def _set_frame_picture(frame: Gst.Element, path) -> None:
     try:
         pixbuf = _frame_pixbuf(path, stamp)
     except Exception as exc:  # noqa: BLE001 - fall back to the element's own loader
-        print(f"[frame] decoding {path} in-process failed ({exc}); using the file loader",
-              file=sys.stderr, flush=True)
+        global _frame_fallback_noted
+        if not _frame_fallback_noted:
+            _frame_fallback_noted = True
+            print(f"[frame] decoding frame pictures in-process failed ({exc}); "
+                  "using gdk-pixbuf's file loader", file=sys.stderr, flush=True)
         frame.set_property("location", path)
     else:
         frame.set_property("pixbuf", pixbuf)

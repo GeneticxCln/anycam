@@ -302,6 +302,17 @@ def test_the_frame_picture_matches_the_file_loader_and_starts_no_loader_process(
     assert not [line for line in new_children if "glycin" in line or "bwrap" in line]
 
 
+def _has_gdkpixbuf_bindings() -> bool:
+    try:
+        gi.require_version("GdkPixbuf", "2.0")
+        from gi.repository import GdkPixbuf  # noqa: F401
+    except (ImportError, ValueError):
+        return False
+    return True
+
+
+@pytest.mark.skipif(not _has_gdkpixbuf_bindings(),
+                    reason="no GdkPixbuf bindings (gir1.2-gdkpixbuf-2.0); the file loader is used")
 def test_an_unchanged_frame_picture_is_not_handed_over_again():
     from anycam import overlay
     from anycam.sources import _set_frame_picture
