@@ -49,7 +49,7 @@ def headline() -> str:
 
 
 def release_line() -> str:
-    """``Version 1  ·  release 1.3.1`` (the major number, then the full release)."""
+    """``Version 1  ·  release 1.3.2`` (the major number, then the full release)."""
     return f"{RELEASE_NAME}  ·  release {config.VERSION}"
 
 
