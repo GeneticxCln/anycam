@@ -212,7 +212,17 @@ def test_window_frame_style_and_alpha_change_without_a_rebuild(tmp_path):
                                   frame_width=6))
     chain = sources.test_chain(320, 180, 30, layer)
     frame = chain.effects["frame"]
-    assert Path(frame.get_property("location")).exists()
+
+    def picture():
+        # An in-memory pixbuf, or the file when GdkPixbuf's bindings are missing.
+        pixbuf = frame.get_property("pixbuf")
+        if pixbuf is not None:
+            return bytes(pixbuf.read_pixel_bytes().get_data())
+        location = frame.get_property("location")
+        assert location and Path(location).exists()
+        return Path(location).read_bytes()
+
+    line = picture()
     assert frame.get_property("alpha") == pytest.approx(1.0)
 
     layer.effects.frame_style = "none"
@@ -221,6 +231,7 @@ def test_window_frame_style_and_alpha_change_without_a_rebuild(tmp_path):
     layer.effects.frame_style = "neon"
     sources.apply_effects(chain.effects, layer.effects)
     assert frame.get_property("alpha") == pytest.approx(1.0)
+    assert picture() != line
 
 
 def test_static_backdrop_sits_behind_a_capture_layer(tmp_path):
