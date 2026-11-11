@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
-from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QEventLoop, QPoint, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
@@ -5476,7 +5476,8 @@ class AnyCamWindow(QMainWindow):
         if report.get("ok") and path:
             if path not in self.recording_segments:
                 self.recording_segments.append(path)
-            self._status(f"Saved {path}")
+            warning = str(report.get("warning") or "")
+            self._status(f"Saved {path}" + (f" ({warning})" if warning else ""))
         else:
             self._status(
                 f"Recording failed: {report.get('error') or 'no frames'}")
@@ -5791,12 +5792,21 @@ class AnyCamWindow(QMainWindow):
 
         thread = threading.Thread(target=work, name="anycam-blocking",
                                   daemon=True)
-        thread.start()
         app = QApplication.instance()
-        while thread.is_alive():
-            if app is not None:
-                app.processEvents()
-            thread.join(0.02)
+        # The window keeps painting, but clicks and keys are held back: they
+        # used to run inside this nested loop (a second Record or a scene
+        # switch in the middle of a privileged operation).  Portal shortcuts
+        # check ``_ui_blocked`` for the same reason.
+        self._ui_blocked = getattr(self, "_ui_blocked", 0) + 1
+        try:
+            thread.start()
+            while thread.is_alive():
+                if app is not None:
+                    app.processEvents(
+                        QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+                thread.join(0.02)
+        finally:
+            self._ui_blocked -= 1
         if "error" in result:
             raise result["error"]
         return result.get("value")
@@ -5983,6 +5993,11 @@ class AnyCamWindow(QMainWindow):
                 except Exception:  # noqa: BLE001
                     pass
                 self.start_engine()
+                if self.engine is None:
+                    # The CPU compositor failed too: the cause was not the GPU
+                    # canvas (a busy camera, a bad encoder), so do not leave
+                    # the GPU canvas switched off for the rest of the session.
+                    self._gpu_canvas_failed = False
                 return
             # A failed rebuild must not leave the Record button armed with a
             # recorder writing in the background.
@@ -6136,6 +6151,9 @@ class AnyCamWindow(QMainWindow):
 
     def _on_global_shortcut(self, shortcut: str) -> None:
         """A portal global shortcut, pressed while any app has focus."""
+        if getattr(self, "_ui_blocked", 0):
+            self.log_event(f"global shortcut ignored while busy: {shortcut}")
+            return
         self.log_event(f"global shortcut: {shortcut}")
         if shortcut.startswith("scene-") and shortcut[6:].isdigit():
             index = int(shortcut[6:]) - 1
@@ -6243,22 +6261,37 @@ class AnyCamWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         """Finalise the recording and persist edits before the process exits."""
-        self._stop_thumbnails()
-        self.timer.stop()
-        self._camera_watch.stop()
-        self._transform_timer.stop()
-        self._autosave_timer.stop()
-        self.preview.cancel_pending_edits()
-        if self.engine is not None:
-            self.stop_engine()
-        self._finish_recorder()
-        self._finish_vcam_output()
-        self._stop_phone_link()
-        self._stop_desktop_integration()
-        self._source_pool.stop()
-        self._save_if_needed()
-        self._close_screen_sessions()
+        self._teardown()
         event.accept()
+
+    def _teardown(self) -> None:
+        """Stop everything and save, whatever fails on the way.
+
+        Each step runs on its own: an exception in one (a pipeline that will
+        not stop, a phone link that raises) used to skip the rest, including
+        the project save and the recording's finalisation.
+        """
+        steps = (
+            ("thumbnails", self._stop_thumbnails),
+            ("preview timer", self.timer.stop),
+            ("camera watch", self._camera_watch.stop),
+            ("transform timer", self._transform_timer.stop),
+            ("autosave timer", self._autosave_timer.stop),
+            ("pending edits", self.preview.cancel_pending_edits),
+            ("engine", lambda: self.stop_engine() if self.engine is not None else None),
+            ("recorder", self._finish_recorder),
+            ("virtual camera", self._finish_vcam_output),
+            ("phone link", self._stop_phone_link),
+            ("desktop integration", self._stop_desktop_integration),
+            ("source pool", self._source_pool.stop),
+            ("project save", self._save_if_needed),
+            ("screen sessions", self._close_screen_sessions),
+        )
+        for name, step in steps:
+            try:
+                step()
+            except Exception as exc:  # noqa: BLE001 - keep shutting down
+                print(f"[shutdown] {name} failed: {exc!r}", file=sys.stderr, flush=True)
 
     def _stop_thumbnails(self) -> None:
         timer = getattr(self, "_thumb_timer", None)
@@ -6273,21 +6306,7 @@ class AnyCamWindow(QMainWindow):
 
     def shutdown(self) -> None:
         """Backstop for QApplication.aboutToQuit and headless teardown."""
-        self._stop_thumbnails()
-        self.timer.stop()
-        self._camera_watch.stop()
-        self._transform_timer.stop()
-        self._autosave_timer.stop()
-        self.preview.cancel_pending_edits()
-        if self.engine is not None:
-            self.stop_engine()
-        self._finish_recorder()
-        self._finish_vcam_output()
-        self._stop_phone_link()
-        self._stop_desktop_integration()
-        self._source_pool.stop()
-        self._save_if_needed()
-        self._close_screen_sessions()
+        self._teardown()
 
     def toggle_engine(self) -> None:
         if self.engine is None:
@@ -6388,8 +6407,16 @@ class AnyCamWindow(QMainWindow):
         if image is None or image.isNull():
             self._status("No frame to snapshot")
             return
-        path = config.recordings_dir(self.project.output.record_dir) / overlay.timestamped_name("anycam-snapshot", ".png")
-        image.save(str(path))
+        try:
+            path = config.recordings_dir(self.project.output.record_dir) / overlay.timestamped_name("anycam-snapshot", ".png")
+        except OSError as exc:
+            self._status(f"Snapshot failed: {exc}")
+            return
+        # QImage.save reports failure (unwritable folder, full disk) only
+        # through its result; the status bar claimed success regardless.
+        if not image.save(str(path)):
+            self._status(f"Snapshot could not be written to {path}")
+            return
         self._status(f"Snapshot saved to {path}")
 
     def toggle_multiview(self) -> None:

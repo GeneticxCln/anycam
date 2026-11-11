@@ -58,6 +58,21 @@ def _coerce(value: Any, default: Any) -> Any:
     return value if value is not None else default
 
 
+def _ident(value: Any, prefix: str) -> str:
+    """A usable id: a non-empty string or integer, else a fresh one.
+
+    A hand-edited file can hold a list or object as an id; those are
+    unhashable and made the whole project refuse to load.
+    """
+    if isinstance(value, bool):
+        return new_id(prefix)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str) and value:
+        return value
+    return new_id(prefix)
+
+
 def _quad(value: Any, default: tuple[float, float, float, float]
           ) -> tuple[float, float, float, float]:
     """Four finite numbers (a box or a crop), or ``default``."""
@@ -211,8 +226,7 @@ class Layer:
         kind = data.get("kind")
         if not isinstance(kind, str) or not kind.strip():
             raise ValueError("layer has no kind")
-        raw_id = data.get("id")
-        layer_id = str(raw_id) if raw_id not in (None, "") else new_id("layer")
+        layer_id = _ident(data.get("id"), "layer")
         name = data.get("name")
         layer = cls(id=layer_id, kind=kind.strip(),
                     name=name if isinstance(name, str) and name else kind.strip())
@@ -283,7 +297,7 @@ class Scene:
             seen.add(layer.id)
             layers.append(layer)
         return cls(
-            id=data.get("id") or new_id("scene"),
+            id=_ident(data.get("id"), "scene"),
             name=name,
             layers=layers,
             transition=_coerce(data.get("transition"), "cut"),
@@ -392,6 +406,29 @@ class OutputConfig:
         return output
 
 
+# Largest canvas and rate the window offers; a hand-edited file may hold more.
+MAX_CANVAS = (7680, 4320)
+MAX_FPS = 240
+
+
+def normalize_output(output: "OutputConfig", warnings: list[str] | None = None) -> None:
+    """Make the canvas something the encoder can run, saying what changed.
+
+    H.264 4:2:0 needs even sizes (the engine refuses odd ones on every start,
+    and the project is saved, so it would refuse on every launch), and an
+    absurd size or rate would only exhaust memory.
+    """
+    width = min(max(2, output.canvas_w), MAX_CANVAS[0]) // 2 * 2
+    height = min(max(2, output.canvas_h), MAX_CANVAS[1]) // 2 * 2
+    fps = min(max(1, output.fps), MAX_FPS)
+    if (width, height, fps) != (output.canvas_w, output.canvas_h, output.fps):
+        if warnings is not None:
+            warnings.append(
+                f"canvas {output.canvas_w}x{output.canvas_h}@{output.fps} "
+                f"changed to {width}x{height}@{fps}")
+        output.canvas_w, output.canvas_h, output.fps = width, height, fps
+
+
 @dataclass
 class Project:
     name: str = "AnyCam project"
@@ -452,6 +489,7 @@ class Project:
             scenes=scenes,
             active_scene=_coerce(data.get("active_scene"), ""),
         )
+        normalize_output(p.output, warnings)
         if not p.scenes:
             p.scenes = [Scene(new_id("scene"), "Scene 1")]
             p.active_scene = p.scenes[0].id

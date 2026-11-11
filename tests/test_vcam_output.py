@@ -373,7 +373,7 @@ def test_reload_vcam_module_uses_pkexec_with_chromium_caps(tmp_path,
 
     monkeypatch.setattr(config.subprocess, "run", fake_run)
     monkeypatch.setattr(config.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None: True)
+    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None, device=None: True)
     monkeypatch.setattr(config, "other_virtual_cameras", lambda *a, **k: [])
     assert config.reload_vcam_module(str(device)) == ""
     assert calls[0][:2] == ["pkexec", "/bin/sh"]
@@ -575,7 +575,7 @@ def test_setup_is_needed_until_the_driver_is_right_and_permanent(tmp_path, monke
     device = tmp_path / "video10"
     device.write_text("")
     state = {"caps": False, "permanent": False, "writable": False}
-    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None: state["caps"])
+    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None, device=None: state["caps"])
     monkeypatch.setattr(config, "_vcam_configured_permanently",
                         lambda *a, **k: state["permanent"])
     monkeypatch.setattr(config.os, "access", lambda path, mode: state["writable"])
@@ -586,7 +586,7 @@ def test_setup_is_needed_until_the_driver_is_right_and_permanent(tmp_path, monke
     assert "cannot tell apps" in config.vcam_setup_needed(str(device))
     state["writable"] = True
     assert config.vcam_setup_needed(str(device)) == ""
-    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None: None)
+    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None, device=None: None)
     assert "not loaded" in config.vcam_setup_needed(str(device))
 
 
@@ -618,7 +618,7 @@ def test_setup_writes_permanent_settings_with_one_prompt(monkeypatch):
 
     monkeypatch.setattr(config.subprocess, "run", fake_run)
     monkeypatch.setattr(config.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None: False)
+    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None, device=None: False)
     monkeypatch.setattr(config, "other_virtual_cameras", lambda *a, **k: [])
     monkeypatch.setattr(config, "vcam_setup_needed", lambda device=None: "")
     assert config.setup_vcam_system("/dev/video10") == ""
@@ -636,14 +636,14 @@ def test_setup_reports_a_camera_still_in_use(monkeypatch):
     monkeypatch.setattr(config.subprocess, "run", lambda cmd, **kw:
                         subprocess.CompletedProcess(cmd, config.VCAM_SETUP_BUSY, "", ""))
     monkeypatch.setattr(config.shutil, "which", lambda name: f"/usr/bin/{name}")
-    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None: False)
+    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None, device=None: False)
     monkeypatch.setattr(config, "other_virtual_cameras", lambda *a, **k: [])
     message = config.setup_vcam_system("/dev/video10")
     assert "has the virtual camera open" in message
 
 
 def test_setup_refuses_to_remove_another_apps_virtual_camera(monkeypatch):
-    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None: False)
+    monkeypatch.setattr(config, "vcam_exclusive_caps", lambda path=None, device=None: False)
     monkeypatch.setattr(config, "other_virtual_cameras",
                         lambda *a, **k: ["/dev/video11 (OBS Virtual Camera)"])
     monkeypatch.setattr(config.subprocess, "run", lambda *a, **k: pytest.fail("ran"))

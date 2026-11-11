@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import itertools
 import sys
+import threading
 import time
+from pathlib import Path
 from dataclasses import dataclass, field
 
 import gi
@@ -98,8 +100,16 @@ class Entry:
     # Pad probes on this pipeline; their closures hold the entry, so they are
     # removed at teardown or the dead pipeline is never freed.
     probes: list = field(default_factory=list)
+    # Reconnect state of a network stream (see SourcePool.poll_errors).
+    failures: int = 0
+    restarts: int = 0
+    restart_at: float = 0.0
+    restarting: bool = False
+    frames_at_restart: int = 0
+    closed: bool = False
 
     def teardown(self) -> None:
+        self.closed = True
         self.pipeline.set_state(Gst.State.NULL)
         for pad, probe in self.probes:
             try:
@@ -197,7 +207,9 @@ def capture_spec(layer, canvas_w: int, canvas_h: int, fps: int, *,
         return CaptureSpec("screen", str(node), canvas_w, canvas_h, fps,
                            fd=screen_fd, expected=expected)
     if kind == "video":
-        return CaptureSpec("video", layer.source, canvas_w, canvas_h, fps)
+        # filesrc does not expand "~"; the missing-file check upstream does.
+        source = str(Path(layer.source).expanduser()) if layer.source else ""
+        return CaptureSpec("video", source, canvas_w, canvas_h, fps)
     if kind == "network":
         return CaptureSpec("network", layer.source, canvas_w, canvas_h, fps)
     if kind == "phone":
@@ -420,7 +432,7 @@ class SourcePool:
 
     def poll_errors(self) -> None:
         self.sweep()
-        for entry in self._entries.values():
+        for entry in list(self._entries.values()):
             bus = entry.pipeline.get_bus()
             if bus is None:
                 continue
@@ -433,10 +445,21 @@ class SourcePool:
                     err, debug = msg.parse_error()
                     # A network source's URL (camera password included) is
                     # often quoted by the failing element.
-                    entry.error = config.redact_text(
-                        f"{err.message} ({debug})", entry.spec.source)
-                    print(f"[capture-error] {entry.channel} {entry.error}",
+                    # Only a network source can carry a secret (user:pass@).
+                    # A device or file path is the useful part of the message:
+                    # masked it read 'Could not open resource: ***'.
+                    secrets = ((entry.spec.source,)
+                               if entry.spec.kind == "network" else ())
+                    text = config.redact_text(
+                        f"{err.message} ({debug})", *secrets)
+                    # Keep the first error: a failing source follows its real
+                    # reason ('No such file') with a generic 'state change
+                    # failed', which used to replace it.
+                    if not entry.error:
+                        entry.error = text
+                    print(f"[capture-error] {entry.channel} {text}",
                           file=sys.stderr, flush=True)
+                    self._schedule_restart(entry)
                 elif entry.spec.kind == "video" and not entry.error:
                     # File video is the only repeatable capture.  Seek the
                     # capture pipeline itself, so the canvas keeps the last
@@ -449,6 +472,53 @@ class SourcePool:
                         entry.loops += 1
                     else:
                         entry.error = "video loop could not seek to the start"
+                elif entry.spec.kind == "network":
+                    # A dropped stream ends the pipeline; the canvas would
+                    # sit on the last frame for ever.
+                    if not entry.error:
+                        entry.error = "the stream ended"
+                    self._schedule_restart(entry)
+            self._maybe_restart(entry)
+
+    # Reconnect a network stream after it fails or ends: 1, 2, 4 ... 30 s.
+    RESTART_MAX_S = 30.0
+    # A stream that delivered this many frames since its last restart was
+    # healthy, so its next failure starts the backoff again from one second.
+    HEALTHY_FRAMES = 25
+
+    def _schedule_restart(self, entry: Entry) -> None:
+        if entry.spec.kind != "network" or entry.restart_at or entry.restarting:
+            return
+        if entry.frames - entry.frames_at_restart >= self.HEALTHY_FRAMES:
+            entry.failures = 0
+        entry.failures += 1
+        delay = min(self.RESTART_MAX_S, 2.0 ** (entry.failures - 1))
+        entry.restart_at = time.monotonic() + delay
+        self._note(f"network source {entry.channel} lost; reconnecting in {delay:.0f} s")
+
+    def _maybe_restart(self, entry: Entry) -> None:
+        if (not entry.restart_at or entry.restarting or entry.closed
+                or time.monotonic() < entry.restart_at):
+            return
+        entry.restarting = True
+
+        def reconnect() -> None:
+            # NULL can block on a hung server: keep it off the caller's thread.
+            try:
+                entry.pipeline.set_state(Gst.State.NULL)
+                if entry.closed:
+                    return
+                entry.error = ""
+                entry.restart_at = 0.0
+                entry.restarts += 1
+                entry.frames_at_restart = entry.frames
+                entry.pipeline.set_state(Gst.State.PLAYING)
+                self._note(f"network source {entry.channel} reconnecting")
+            finally:
+                entry.restarting = False
+
+        threading.Thread(target=reconnect, daemon=True,
+                         name=f"anycam-reconnect-{entry.channel}").start()
 
     def errors(self) -> dict[str, str]:
         return {entry.channel: entry.error

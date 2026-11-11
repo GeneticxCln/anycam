@@ -405,7 +405,12 @@ class Background(Processor):
 
             path = overlay.render_background(self.backdrop or "Studio", width, height)
             with Image.open(path) as opened:
-                self._cache = (size, opened.convert("RGBA"), now)
+                picture = opened.convert("RGBA")
+            # render_background never makes a picture under 64 px; the
+            # composite must still come out at the frame's size.
+            if picture.size != size:
+                picture = picture.resize(size, Image.BILINEAR)
+            self._cache = (size, picture, now)
         return self._cache[1]
 
     def process(self, image: Image.Image, now: float) -> Image.Image:

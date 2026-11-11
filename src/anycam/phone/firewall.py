@@ -12,6 +12,7 @@ Two backends, picked by :func:`backend`:
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from pathlib import Path
@@ -28,12 +29,59 @@ def _read(path: Path) -> str:
         return ""
 
 
-def ufw_blocks(port: int, *, ufw_dir: Path = UFW_DIR,
-               defaults: Path = UFW_DEFAULTS) -> bool:
-    """True when ufw is on, drops incoming traffic and has no rule for ``port``.
+def ufw_rules_readable(*, ufw_dir: Path = UFW_DIR) -> bool:
+    """Whether this user may read ufw's rules.
 
-    Unknown (unreadable config, no ufw) is reported as not blocked: the
-    dialog then shows no button rather than a wrong one.
+    Debian and Ubuntu install ``user.rules`` as mode 640, owner root: a normal
+    user cannot see which ports are open.  (``ufw.conf`` and ``/etc/default/ufw``
+    are world-readable, so "enabled, default deny" is still known.)
+    """
+    try:
+        (ufw_dir / "user.rules").read_text(encoding="utf-8")
+    except PermissionError:
+        return False
+    except OSError:
+        return True         # missing file: nothing hidden, just no rules
+    return True
+
+
+def _allowed_path() -> Path:
+    from .. import config
+
+    return config.state_dir() / "firewall-allowed.json"
+
+
+def remember_allowed(port: int, *, state_file: Path | None = None) -> None:
+    """Note that this app opened ``port`` in ufw (rules unreadable afterwards)."""
+    path = state_file or _allowed_path()
+    ports = _allowed_ports(path)
+    if port not in ports:
+        ports.append(int(port))
+        try:
+            path.write_text(json.dumps({"ufw": ports}), encoding="utf-8")
+        except OSError:
+            pass
+
+
+def _allowed_ports(path: Path) -> list[int]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return [int(p) for p in data.get("ufw", [])]
+    except (OSError, ValueError, TypeError, AttributeError):
+        return []
+
+
+def ufw_blocks(port: int, *, ufw_dir: Path = UFW_DIR,
+               defaults: Path = UFW_DEFAULTS,
+               state_file: Path | None = None) -> bool:
+    """True when ufw is on, drops incoming traffic and may have no rule for ``port``.
+
+    When the rules cannot be read (the normal case on Debian/Ubuntu) there is no
+    way to prove the port is open, so the answer is "blocked" unless AnyCam
+    opened it itself earlier; opening it again is harmless (``ufw allow`` is
+    idempotent).  Unknown for other reasons (no ufw, disabled, default allow)
+    is reported as not blocked: the dialog then shows no button rather than a
+    wrong one.
     """
     if shutil.which("ufw") is None and not (ufw_dir / "ufw.conf").exists():
         return False
@@ -42,6 +90,8 @@ def ufw_blocks(port: int, *, ufw_dir: Path = UFW_DIR,
     policy = re.search(r'^DEFAULT_INPUT_POLICY="?(\w+)', _read(defaults), re.M)
     if policy is None or policy.group(1).upper() == "ACCEPT":
         return False
+    if not ufw_rules_readable(ufw_dir=ufw_dir):
+        return port not in _allowed_ports(state_file or _allowed_path())
     rules = _read(ufw_dir / "user.rules")
     if not rules:
         return False
