@@ -369,6 +369,9 @@ uniform float brightness;
 uniform float contrast;
 uniform float saturation;
 uniform float hue;
+uniform float red_gain;
+uniform float green_gain;
+uniform float blue_gain;
 void main () {
   vec4 c = texture2D(tex, v_texcoord);
   vec3 rgb = c.rgb * 255.0;
@@ -386,6 +389,7 @@ void main () {
   o.r = 1.16438*(y-16.0) + 1.59603*(v-128.0);
   o.g = 1.16438*(y-16.0) - 0.391762*(u-128.0) - 0.812968*(v-128.0);
   o.b = 1.16438*(y-16.0) + 2.01723*(u-128.0);
+  o *= vec3(red_gain, green_gain, blue_gain);
   gl_FragColor = vec4(clamp(o / 255.0, 0.0, 1.0), c.a);
 }
 """
@@ -410,17 +414,26 @@ def gl_rack_elements(mirror_on_gpu: bool = True) -> dict[str, Gst.Element] | Non
 
 
 def _set_balance_uniforms(shader: Gst.Element, brightness: float, contrast: float,
-                          saturation: float, hue: float) -> None:
+                          saturation: float, hue: float,
+                          gains: tuple[float, float, float] = (1.0, 1.0, 1.0)) -> None:
     from gi.repository import GObject
 
     # glshader only takes float uniforms; doubles were ignored (all zero: black).
     uniforms = Gst.Structure.new_empty("uniforms")
     for key, value in (("brightness", brightness), ("contrast", contrast),
-                       ("saturation", saturation), ("hue", hue)):
+                       ("saturation", saturation), ("hue", hue),
+                       ("red_gain", gains[0]), ("green_gain", gains[1]),
+                       ("blue_gain", gains[2])):
         typed = GObject.Value(GObject.TYPE_FLOAT)
         typed.set_float(float(value))
         uniforms.set_value(key, typed)
     shader.set_property("uniforms", uniforms)
+
+
+def rgb_gains(fx) -> tuple[float, float, float]:
+    """The per-channel gains of an Effects model, each held to 0..2."""
+    return tuple(max(0.0, min(2.0, _effect_number(getattr(fx, name, 1.0), 1.0)))
+                 for name in ("red_gain", "green_gain", "blue_gain"))  # type: ignore[return-value]
 
 
 def gpu_colour_is_equivalent(fx: Effects) -> bool:
@@ -506,10 +519,12 @@ def apply_effects(elements: dict, fx: Effects) -> None:
     gpu = elements.get("gl_balance") is not None and gpu_colour_is_equivalent(fx)
     gl_balance = elements.get("gl_balance")
     if gl_balance is not None:
+        # RGB levels have no CPU element, so they always run in the shader.
+        gains = rgb_gains(fx)
         if gpu:
-            _set_balance_uniforms(gl_balance, brightness, contrast, saturation, hue)
+            _set_balance_uniforms(gl_balance, brightness, contrast, saturation, hue, gains)
         else:
-            _set_balance_uniforms(gl_balance, 0.0, 1.0, 1.0, 0.0)
+            _set_balance_uniforms(gl_balance, 0.0, 1.0, 1.0, 0.0, gains)
     gl_flip = elements.get("gl_flip")
     # The GPU mirror only exists when the layer's crop is left/right symmetric
     # (see _link_to_mixer); otherwise the CPU mirror, which runs before the

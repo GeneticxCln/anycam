@@ -180,3 +180,139 @@ def test_zoom_shows_the_panned_quarter():
     assert top_left[..., 0].min() == 255 and top_left[..., 2].max() == 0
     bottom_right = run_chain(picture, layer(zoom=2.0, pan=(1.0, 1.0)), (4, 2))
     assert bottom_right[..., 2].min() == 255 and bottom_right[..., 0].max() == 0
+
+
+# -------------------------------------------------------- whole-canvas pixels
+import time  # noqa: E402
+
+from anycam.model import Project, Scene  # noqa: E402
+from anycam.pipeline import AnyCamEngine  # noqa: E402
+
+CANVAS = (320, 180)
+
+
+def scene_project(*layers: Layer) -> Project:
+    project = Project(name="phase3")
+    project.output.canvas_w, project.output.canvas_h = CANVAS
+    project.output.fps = 30
+    scene = Scene("scene_p3", "P3")
+    for item in layers:
+        scene.add_layer(item)
+    project.scenes = [scene]
+    project.active_scene = scene.id
+    return project
+
+
+class Shot:
+    """Run an engine and keep its newest canvas frame as an RGBA array."""
+
+    def __init__(self, project: Project) -> None:
+        self.project = project
+        self.pixels: np.ndarray | None = None
+        self.engine = AnyCamEngine(project, preview=True, on_frame=self._on_frame).build()
+
+    def _on_frame(self, sample) -> None:
+        caps = sample.get_caps().get_structure(0)
+        width, height = caps.get_value("width"), caps.get_value("height")
+        ok, info = sample.get_buffer().map(Gst.MapFlags.READ)
+        if not ok:
+            return
+        try:
+            self.pixels = np.frombuffer(info.data, dtype=np.uint8)[
+                : width * height * 4].reshape(height, width, 4).copy()
+        finally:
+            sample.get_buffer().unmap(info)
+
+    def settle(self, seconds: float = 1.2) -> np.ndarray:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            self.engine.pump(40)
+        assert self.pixels is not None, "the canvas produced no frame"
+        return self.pixels
+
+    def __enter__(self) -> "Shot":
+        self.engine.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.engine.stop()
+
+
+def colour_at(pixels: np.ndarray, fx: float, fy: float) -> tuple[int, int, int]:
+    height, width = pixels.shape[:2]
+    return tuple(int(v) for v in pixels[int(fy * height), int(fx * width)][:3])
+
+
+def is_red(rgb) -> bool:
+    return rgb[0] > 200 and rgb[1] < 60 and rgb[2] < 60
+
+
+def is_dark(rgb) -> bool:
+    return max(rgb) < 90
+
+
+def test_a_box_hanging_off_the_canvas_is_clipped_not_refused():
+    red = Layer("red", "test", "Red", source="red", box=(-0.5, 0.0, 1.0, 1.0), z=1)
+    with Shot(scene_project(red)) as shot:
+        pixels = shot.settle()
+    assert is_red(colour_at(pixels, 0.1, 0.5))      # on the canvas
+    assert not is_red(colour_at(pixels, 0.8, 0.5))  # past the box's right edge
+
+
+def test_a_box_larger_than_the_canvas_fills_it():
+    red = Layer("red", "test", "Red", source="red", box=(-0.5, -0.5, 2.0, 2.0), z=1)
+    with Shot(scene_project(red)) as shot:
+        pixels = shot.settle()
+    for fx, fy in ((0.02, 0.02), (0.98, 0.02), (0.5, 0.5), (0.02, 0.98), (0.98, 0.98)):
+        assert is_red(colour_at(pixels, fx, fy)), (fx, fy)
+
+
+def test_cover_layers_fill_their_pad_and_contain_layers_centre_in_it():
+    cover = Layer("c", "test", "Cover", source="red", box=(0, 0, 0.5, 1.0), z=1, fit="cover")
+    contain = Layer("n", "test", "Contain", source="blue", box=(0.5, 0, 0.5, 1.0), z=2)
+    with Shot(scene_project(cover, contain)) as shot:
+        engine = shot.engine
+        shot.settle()
+        assert engine._layer_pads["c"].get_property("sizing-policy").value_nick == "none"
+        assert engine._layer_pads["n"].get_property("sizing-policy").value_nick == \
+            "keep-aspect-ratio"
+
+
+def test_live_zoom_and_box_changes_need_no_rebuild():
+    layer_zoom = Layer("z", "test", "Z", source="smpte", box=(0, 0, 1, 1), z=1,
+                       zoom=1.5, pan=(0.5, 0.5))
+    plain = Layer("p", "test", "P", source="smpte", box=(0, 0, 1, 1), z=2)
+    with Shot(scene_project(layer_zoom, plain)) as shot:
+        shot.settle(0.6)
+        engine = shot.engine
+        layer_zoom.zoom = 3.0
+        layer_zoom.pan = (0.0, 0.0)
+        assert engine.set_layer_framing("z") is True
+        assert engine.set_layer_framing("p") is False   # built without a framing stage
+        engine.set_layer_box("z", (0.0, 0.0, 0.5, 0.5))
+        shot.settle(0.6)
+        framing = engine._layer_chains["z"].effects["framing"]
+        assert framing.margins is not None and framing.margins[0] == 0
+
+
+# ----------------------------------------------------------------- RGB levels
+def test_rgb_gains_are_clamped_and_reach_the_shader_uniforms():
+    from anycam.model import Effects
+
+    assert sources.rgb_gains(Effects()) == (1.0, 1.0, 1.0)
+    assert sources.rgb_gains(Effects(red_gain=9.0, green_gain=-1.0, blue_gain=0.5)) == (2.0, 0.0, 0.5)
+    assert "red_gain" in sources.BALANCE_SHADER and "blue_gain" in sources.BALANCE_SHADER
+    if Gst.ElementFactory.find("glshader") is None:
+        pytest.skip("glshader unavailable")
+    shader = Gst.ElementFactory.make("glshader", None)
+    sources._set_balance_uniforms(shader, 0.0, 1.0, 1.0, 0.0, (1.5, 1.0, 0.25))
+    uniforms = shader.get_property("uniforms")
+    assert abs(uniforms.get_value("red_gain") - 1.5) < 1e-6
+    assert abs(uniforms.get_value("blue_gain") - 0.25) < 1e-6
+
+
+def test_effects_levels_round_trip():
+    from anycam.model import Effects
+
+    fx = Effects.from_dict({"red_gain": 1.25, "blue_gain": "x"})
+    assert fx.red_gain == 1.25 and fx.blue_gain == 1.0

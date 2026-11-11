@@ -326,6 +326,7 @@ class PlaylistMixin:
         if target is None:
             return
         self._show_playlist_item(target)
+        self.playlist_last = now          # the caller's clock is the one compared next tick
 
     def _apply_playlist_visibility(self) -> None:
         """Show only the playlist's current layer (the rotation's state)."""
