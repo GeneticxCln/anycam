@@ -5,11 +5,12 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog,
-    QHBoxLayout, QInputDialog, QListWidget, QListWidgetItem, QPushButton, QVBoxLayout, QWidget,
+    QComboBox, QDialog, QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem,
+    QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from .. import config
+from ..engine import transitions
 from ..layouts import GRID_KINDS, arrange, layout_preset
 from ..model import (Layer, Scene, camera_grid_scene,
                     new_id, two_camera_scene)
@@ -65,10 +66,49 @@ class SceneMixin:
         row.addWidget(add)
         row.addWidget(remove)
         layout.addLayout(row)
+        arrive = QHBoxLayout()
+        arrive.addWidget(QLabel("Arrives with"))
+        self.transition_combo = QComboBox()
+        for kind in transitions.TRANSITIONS:
+            self.transition_combo.addItem(transitions.LABELS[kind], kind)
+        self.transition_combo.setToolTip(
+            "How the selected scene appears when you switch to it")
+        self.transition_combo.currentIndexChanged.connect(self._scene_transition_changed)
+        self.transition_ms = QSpinBox()
+        self.transition_ms.setRange(100, 5000)
+        self.transition_ms.setSingleStep(100)
+        self.transition_ms.setSuffix(" ms")
+        self.transition_ms.setKeyboardTracking(False)
+        self.transition_ms.valueChanged.connect(self._scene_transition_changed)
+        arrive.addWidget(self.transition_combo, 1)
+        arrive.addWidget(self.transition_ms)
+        layout.addLayout(arrive)
+        self._sync_transition_controls()
         self._refresh_scene_list()
         return page
 
+    def _sync_transition_controls(self) -> None:
+        if not hasattr(self, "transition_combo"):
+            return
+        scene = self.scene
+        self.transition_combo.blockSignals(True)
+        self.transition_ms.blockSignals(True)
+        index = self.transition_combo.findData(transitions.transition_kind(scene.transition))
+        self.transition_combo.setCurrentIndex(max(0, index))
+        self.transition_ms.setValue(int(scene.transition_ms))
+        self.transition_ms.setEnabled(scene.transition != "cut")
+        self.transition_combo.blockSignals(False)
+        self.transition_ms.blockSignals(False)
+
+    def _scene_transition_changed(self, _value=None) -> None:
+        scene = self.scene
+        scene.transition = str(self.transition_combo.currentData() or "cut")
+        scene.transition_ms = int(self.transition_ms.value())
+        self.transition_ms.setEnabled(scene.transition != "cut")
+        self._mark_dirty()
+
     def _refresh_scenes(self) -> None:
+        self._sync_transition_controls()
         self.scene_combo.blockSignals(True)
         self.scene_combo.clear()
         for scene in self.project.scenes:
@@ -309,7 +349,10 @@ class SceneMixin:
             return
         self._apply_playlist_visibility()
         try:
-            switched = self.engine.switch_scene(self.scene)
+            scene = self.scene
+            switched = self.engine.switch_scene(
+                scene, transitions.transition_kind(scene.transition),
+                transitions.transition_seconds(scene.transition_ms))
         except Exception as exc:  # noqa: BLE001 - fall back to the full rebuild
             self.log_event(f"scene: live switch failed ({exc}); rebuilding")
             switched = False

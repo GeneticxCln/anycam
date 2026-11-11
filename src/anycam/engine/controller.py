@@ -34,9 +34,10 @@ from .layers import LayerMixin  # noqa: E402
 from .outputs.record_tap import RecordTapMixin  # noqa: E402
 from .outputs.stream import StreamMixin  # noqa: E402
 from .outputs.taps import VcamTapMixin  # noqa: E402
+from .transitions import TransitionMixin  # noqa: E402
 
 
-class AnyCamEngine(LayerMixin, CanvasMixin, AudioMixin, VcamTapMixin, RecordTapMixin,
+class AnyCamEngine(LayerMixin, TransitionMixin, CanvasMixin, AudioMixin, VcamTapMixin, RecordTapMixin,
                    StreamMixin, HealthMixin):
     """Build and run one scene as a GStreamer compositor graph.
 
@@ -141,6 +142,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         self.bus: Gst.Bus | None = None
         self.chains: list[SourceChain] = []
         self._layer_pads: dict[str, Gst.Pad] = {}
+        self._ghosts: list = []        # the outgoing scene's layers during a transition
         # Permanent zorder=0 standby.  It is deliberately not a scene layer:
         # no remove/add/layout operation can ever detach this pad.
         self._background_pad: Gst.Pad | None = None
@@ -430,6 +432,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
     def pump(self, timeout_ms: int = 50) -> list[Gst.Message]:
         if self.bus is None:
             return []
+        self.poll_transition()
         messages: list[Gst.Message] = []
         deadline = time.monotonic() + timeout_ms / 1000.0
         while True:
@@ -495,6 +498,10 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         # report (0 frames, 100% dropped).  Stopping is final.
         if self.pipeline is None or self._stopped:
             return self.report.as_dict()
+        run = self._transition
+        if run is not None:
+            run.stop.set()                 # no pad is touched once teardown starts
+            self._transition = None
         self.report.stopped = time.monotonic()
         elapsed = self.report.stopped - self._start_time
         stop_frames = self._frame_count

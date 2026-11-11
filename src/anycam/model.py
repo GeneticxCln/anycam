@@ -318,7 +318,9 @@ class Scene:
     id: str
     name: str
     layers: list[Layer] = field(default_factory=list)
-    transition: str = "cut"      # reserved: scene changes are hard cuts today
+    # How this scene arrives when it is switched to (see engine.transitions).
+    transition: str = "cut"
+    transition_ms: int = 500
     playlist: PlaylistConfig = field(default_factory=PlaylistConfig)
     # Layout template that last arranged this preset; "" means the boxes
     # were placed by hand.  Stored so switching presets restores the picker.
@@ -355,6 +357,7 @@ class Scene:
             name=name,
             layers=layers,
             transition=_coerce(data.get("transition"), "cut"),
+            transition_ms=max(100, min(5000, _coerce(data.get("transition_ms"), 500))),
             playlist=PlaylistConfig.from_dict(data.get("playlist")),
             layout=_coerce(data.get("layout"), ""),
         )
@@ -363,6 +366,7 @@ class Scene:
         return {"id": self.id, "name": self.name,
                 "layers": [l.to_dict() for l in self.layers],
                 "transition": self.transition,
+                "transition_ms": self.transition_ms,
                 "playlist": asdict(self.playlist),
                 "layout": self.layout}
 

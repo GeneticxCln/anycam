@@ -91,6 +91,12 @@ class EffectsPanelMixin:
              lambda v: self._set_effect("saturation", v), None),
             ("hue", "Hue", -180, 180, int(round(fx.hue * 180)),
              lambda v: self._set_effect("hue", v), lambda v: f"{v}\u00b0"),
+            ("red_gain", "Red level", 0, 200, int(round(fx.red_gain * 100)),
+             lambda v: self._set_effect("red_gain", v), None),
+            ("green_gain", "Green level", 0, 200, int(round(fx.green_gain * 100)),
+             lambda v: self._set_effect("green_gain", v), None),
+            ("blue_gain", "Blue level", 0, 200, int(round(fx.blue_gain * 100)),
+             lambda v: self._set_effect("blue_gain", v), None),
         ):
             holder, slider, _label = _slider_row(
                 label, low, high, value, callback, display=display)
@@ -709,7 +715,7 @@ class EffectsPanelMixin:
         fx = layer.effects
         if attr == "brightness":
             fx.brightness = max(-1.0, min(1.0, float(value) / 100.0))
-        elif attr in ("contrast", "saturation"):
+        elif attr in ("contrast", "saturation", "red_gain", "green_gain", "blue_gain"):
             setattr(fx, attr, max(0.0, min(2.0, float(value) / 100.0)))
         elif attr == "hue":
             fx.hue = max(-1.0, min(1.0, float(value) / 180.0))
@@ -868,6 +874,8 @@ class EffectsPanelMixin:
             self._effect_sliders["saturation"].setValue(
                 int(round(fx.saturation * 100)))
             self._effect_sliders["hue"].setValue(int(round(fx.hue * 180)))
+            for gain in ("red_gain", "green_gain", "blue_gain"):
+                self._effect_sliders[gain].setValue(int(round(getattr(fx, gain) * 100)))
             style_index = self.effect_style.findData(fx.color_effect)
             self.effect_style.setCurrentIndex(style_index if style_index >= 0 else 0)
             self.effect_mirror.setChecked(bool(fx.mirror))

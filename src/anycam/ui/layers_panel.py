@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .. import animated, config
+from .. import animated, config, geometry
 from ..geometry import clamp
 from ..model import (Layer, new_id)
 from .theme import STYLE  # noqa: F401
@@ -88,7 +88,11 @@ class LayersMixin:
                                             ("W", "w"), ("H", "h"))):
             fields.addWidget(QLabel(label), 1, col)
             spin = QDoubleSpinBox()
-            spin.setRange(0.0, 1.0)
+            # Typing a box that leaves the canvas is allowed (it is clipped).
+            if key in ("x", "y"):
+                spin.setRange(*geometry.BOX_POSITION_RANGE)
+            else:
+                spin.setRange(PreviewWidget.MIN_BOX, geometry.BOX_SIZE_RANGE[1])
             spin.setDecimals(3)
             spin.setSingleStep(0.005)
             spin.setKeyboardTracking(False)
@@ -114,6 +118,7 @@ class LayersMixin:
         self.reset_crop_button.clicked.connect(self._reset_crop)
         transform_layout.addWidget(self.reset_crop_button)
         layout.addWidget(transform)
+        layout.addWidget(self._framing_group())
 
         camera = QGroupBox("Camera source")
         camera_layout = QGridLayout(camera)
@@ -694,11 +699,104 @@ class LayersMixin:
         count = len(targets)
         self._status(f"Aligned {'1 layer' if count == 1 else f'{count} layers'} {label}")
 
+    # ------------------------------------------------------------- framing
+    def _framing_group(self) -> QGroupBox:
+        group = QGroupBox("Frame")
+        grid = QGridLayout(group)
+        self.fit_combo = QComboBox()
+        for label, value in (("Contain (show everything)", "contain"),
+                             ("Cover (fill, trim the overflow)", "cover"),
+                             ("Stretch (fill, ignore the shape)", "stretch")):
+            self.fit_combo.addItem(label, value)
+        self.fit_combo.currentIndexChanged.connect(self._framing_changed)
+        self.flip_h_check = QCheckBox("Flip horizontally")
+        self.flip_v_check = QCheckBox("Flip vertically")
+        self.flip_h_check.toggled.connect(self._framing_changed)
+        self.flip_v_check.toggled.connect(self._framing_changed)
+        self.rotation_combo = QComboBox()
+        for degrees in geometry.ROTATIONS:
+            self.rotation_combo.addItem(f"{degrees}°", degrees)
+        self.rotation_combo.currentIndexChanged.connect(self._framing_changed)
+        self.zoom_spin = QDoubleSpinBox()
+        self.zoom_spin.setRange(1.0, geometry.MAX_ZOOM)
+        self.zoom_spin.setSingleStep(0.1)
+        self.zoom_spin.setSuffix("×")
+        self.zoom_spin.setKeyboardTracking(False)
+        self.zoom_spin.valueChanged.connect(self._framing_live_changed)
+        self.pan_spins = {}
+        for key in ("x", "y"):
+            spin = QDoubleSpinBox()
+            spin.setRange(0.0, 1.0)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.05)
+            spin.setKeyboardTracking(False)
+            spin.valueChanged.connect(self._framing_live_changed)
+            self.pan_spins[key] = spin
+        grid.addWidget(QLabel("Fit"), 0, 0)
+        grid.addWidget(self.fit_combo, 0, 1, 1, 3)
+        grid.addWidget(self.flip_h_check, 1, 0, 1, 2)
+        grid.addWidget(self.flip_v_check, 1, 2, 1, 2)
+        grid.addWidget(QLabel("Rotate"), 2, 0)
+        grid.addWidget(self.rotation_combo, 2, 1)
+        grid.addWidget(QLabel("Zoom"), 3, 0)
+        grid.addWidget(self.zoom_spin, 3, 1)
+        grid.addWidget(QLabel("Pan X / Y"), 4, 0)
+        grid.addWidget(self.pan_spins["x"], 4, 1)
+        grid.addWidget(self.pan_spins["y"], 4, 2)
+        return group
+
+    def _sync_framing_fields(self, layer: Layer | None) -> None:
+        widgets = (self.fit_combo, self.flip_h_check, self.flip_v_check,
+                   self.rotation_combo, self.zoom_spin, *self.pan_spins.values())
+        for widget in widgets:
+            widget.blockSignals(True)
+            widget.setEnabled(layer is not None)
+        fit, flip_h, flip_v, rotation, zoom, pan = geometry.layer_transform(
+            layer if layer is not None else Layer("none", "test", ""))
+        self.fit_combo.setCurrentIndex(max(0, self.fit_combo.findData(fit)))
+        self.flip_h_check.setChecked(flip_h)
+        self.flip_v_check.setChecked(flip_v)
+        self.rotation_combo.setCurrentIndex(max(0, self.rotation_combo.findData(rotation)))
+        self.zoom_spin.setValue(zoom)
+        self.pan_spins["x"].setValue(pan[0])
+        self.pan_spins["y"].setValue(pan[1])
+        for widget in widgets:
+            widget.blockSignals(False)
+
+    def _framing_changed(self, _value=None) -> None:
+        """Fit, flip and rotation shape the chain, so they rebuild the layer."""
+        layer = self.preview.selected_layer()
+        if layer is None:
+            return
+        before = self._layout_snapshot()
+        layer.fit = str(self.fit_combo.currentData() or "contain")
+        layer.flip_h = self.flip_h_check.isChecked()
+        layer.flip_v = self.flip_v_check.isChecked()
+        layer.rotation = int(self.rotation_combo.currentData() or 0)
+        self._record_history(before)
+        self._mark_dirty()
+        self.preview.update()
+        self._schedule_transform_commit(layer.id)
+
+    def _framing_live_changed(self, _value=None) -> None:
+        """Zoom and pan move a live crop; only a layer built without one restarts."""
+        layer = self.preview.selected_layer()
+        if layer is None:
+            return
+        before = self._layout_snapshot()
+        layer.zoom = geometry.clamp(self.zoom_spin.value(), 1.0, geometry.MAX_ZOOM)
+        layer.pan = (self.pan_spins["x"].value(), self.pan_spins["y"].value())
+        self._record_history(before)
+        self._mark_dirty()
+        if self.engine is not None and not self.engine.set_layer_framing(layer.id):
+            self._schedule_transform_commit(layer.id)
+
     def _sync_transform_fields(self) -> None:
         if not hasattr(self, "box_spins"):
             return
         layer = self.preview.selected_layer()
         enabled = layer is not None
+        self._sync_framing_fields(layer)
         for spin in (*self.box_spins.values(), *self.crop_spins.values()):
             spin.setEnabled(enabled)
         self.reset_crop_button.setEnabled(enabled)
@@ -749,24 +847,22 @@ class LayersMixin:
         before = self._layout_snapshot()
         x, y, w, h = layer.box
         targets = self.preview.selected_layers() or [layer]
+        low, high = geometry.BOX_POSITION_RANGE
         if key in ("x", "y"):
-            delta = 0.0
-            if key == "x":
-                delta = clamp(value, 0.0, 1.0 - w) - x
-            else:
-                delta = clamp(value, 0.0, 1.0 - h) - y
+            delta = (clamp(value, low, high) - (x if key == "x" else y))
             for item in targets:
                 ix, iy, iw, ih = item.box
                 if key == "x":
-                    item.box = (clamp(ix + delta, 0.0, 1.0 - iw), iy, iw, ih)
+                    item.box = (clamp(ix + delta, low, high), iy, iw, ih)
                 else:
-                    item.box = (ix, clamp(iy + delta, 0.0, 1.0 - ih), iw, ih)
+                    item.box = (ix, clamp(iy + delta, low, high), iw, ih)
         else:
             targets = [layer]
+            top = geometry.BOX_SIZE_RANGE[1]
             if key == "w":
-                w = clamp(value, PreviewWidget.MIN_BOX, 1.0 - x)
+                w = clamp(value, PreviewWidget.MIN_BOX, top)
             else:
-                h = clamp(value, PreviewWidget.MIN_BOX, 1.0 - y)
+                h = clamp(value, PreviewWidget.MIN_BOX, top)
             layer.box = (x, y, w, h)
         self.preview.update()
         self._sync_transform_fields()
