@@ -14,6 +14,7 @@ gi.require_version("GstVideo", "1.0")
 from gi.repository import Gst  # noqa: E402
 
 from .. import config, overlay  # noqa: E402
+from .. import geometry
 from ..geometry import box_pixels, clamp  # noqa: E402
 from ..model import Layer, Scene  # noqa: E402
 from ..engine.source_pool import CAPTURE_KINDS, capture_spec  # noqa: E402
@@ -368,7 +369,7 @@ class LayerMixin:
         # The chain delivers the picture at its natural aspect.  The pad is the
         # layer box; centring inside it (instead of stretching to it) is what
         # lets a live move/resize or layout change skip a canvas rebuild.
-        pad.set_property("sizing-policy", "keep-aspect-ratio")
+        pad.set_property("sizing-policy", self._sizing_policy(layer))
         pad.set_property("alpha", float(clamp(layer.alpha)) if layer.visible else 0.0)
         if self._link_to_mixer(chain, pad, layer) != Gst.PadLinkReturn.OK:
             raise RuntimeError(f"could not link {layer.name} into the compositor")
@@ -433,6 +434,26 @@ class LayerMixin:
             return Gst.PadProbeReturn.OK
 
         self._probe(pad, Gst.PadProbeType.BUFFER, on_buffer)
+
+    @staticmethod
+    def _sizing_policy(layer: Layer) -> str:
+        """Cover and stretch fill the pad; contain is centred inside it."""
+        return "none" if geometry.fit_mode(layer.fit) != "contain" else "keep-aspect-ratio"
+
+    def set_layer_framing(self, layer_id: str) -> bool:
+        """Apply a layer's zoom, pan and cover window live (no rebuild).
+
+        False when the layer has no framing stage, i.e. it was built without a
+        transform: the caller must restart the engine for it to take effect.
+        """
+        layer = self.scene.layer(layer_id)
+        chain = self._layer_chains.get(layer_id)
+        framing = getattr(chain, "effects", {}).get("framing") if chain else None
+        if layer is None or framing is None:
+            return False
+        rect = box_pixels(layer, self.canvas_w, self.canvas_h)
+        framing.apply(layer, rect.w, rect.h)
+        return True
 
     def _box_pixels(self, layer: Layer) -> tuple[int, int, int, int]:
         rect = box_pixels(layer, self.canvas_w, self.canvas_h)
@@ -967,3 +988,5 @@ class LayerMixin:
                             ("width", int(rect.w)), ("height", int(rect.h))):
             if int(pad.get_property(name)) != value:
                 pad.set_property(name, value)
+        # A cover window follows the box's shape.
+        self.set_layer_framing(layer_id)

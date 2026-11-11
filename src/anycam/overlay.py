@@ -748,9 +748,42 @@ def fit_rgba(source: Path, width: int, height: int, out: Path | None = None) -> 
     return out
 
 
+def apply_transform(image: Image.Image, width: int, height: int, transform) -> Image.Image:
+    """``image`` flipped, turned, framed and fitted into ``width`` x ``height``.
+
+    ``transform`` is :func:`anycam.geometry.layer_transform`'s tuple.  This is
+    the still-picture twin of the video chain's flip/crop/scale stages and uses
+    the same geometry, so a photo and a camera agree.
+    """
+    from . import geometry
+
+    fit, flip_h, flip_v, rotation, zoom, pan = transform
+    if flip_h:
+        image = ImageOps.mirror(image)
+    if flip_v:
+        image = ImageOps.flip(image)
+    if rotation:
+        image = image.transpose({90: Image.Transpose.ROTATE_270,
+                                 180: Image.Transpose.ROTATE_180,
+                                 270: Image.Transpose.ROTATE_90}[rotation])
+    left, top, right, bottom = geometry.framing_margins(
+        image.width, image.height, width, height, fit, zoom, pan)
+    image = image.crop((left, top, image.width - right, image.height - bottom))
+    if fit == "contain":
+        scale = min(width / image.width, height / image.height)
+        size = (max(1, int(round(image.width * scale))),
+                max(1, int(round(image.height * scale))))
+    else:
+        size = (width, height)
+    resized = image.resize(size, Image.LANCZOS)
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    canvas.paste(resized, ((width - size[0]) // 2, (height - size[1]) // 2), resized)
+    return canvas
+
+
 def prepare_rgba(source: Path, width: int, height: int,
                  crop: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
-                 out: Path | None = None) -> Path:
+                 out: Path | None = None, transform=None) -> Path:
     """EXIF-correct, crop and fit a photo/logo into a layer box.
 
     Cropping before fitting means the normalised crop is a fraction of the
@@ -765,14 +798,19 @@ def prepare_rgba(source: Path, width: int, height: int,
     image = image.crop((left, top,
                         max(left + 1, image.width - right),
                         max(top + 1, image.height - bottom)))
-    scale = min(width / image.width, height / image.height)
-    resized = image.resize((max(1, int(image.width * scale)),
-                           max(1, int(image.height * scale))), Image.LANCZOS)
-    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
-    canvas.paste(resized, ((width - resized.width) // 2,
-                           (height - resized.height) // 2), resized)
+    if transform is not None:
+        canvas = apply_transform(image, width, height, transform)
+    else:
+        scale = min(width / image.width, height / image.height)
+        resized = image.resize((max(1, int(image.width * scale)),
+                               max(1, int(image.height * scale))), Image.LANCZOS)
+        canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        canvas.paste(resized, ((width - resized.width) // 2,
+                               (height - resized.height) // 2), resized)
     if out is None:
         crop_key = "-".join(f"{value:.4f}" for value in crop)
+        if transform is not None:
+            crop_key += "-" + "-".join(str(part) for part in transform)
         out = (config.cache_dir() / "overlays"
                / f"img-{source.stem}-{_fingerprint(source)}-{width}x{height}-{crop_key}.png")
     out = Path(out)
@@ -841,7 +879,9 @@ def render_layer(layer, canvas_w: int, canvas_h: int,
             # edge of the source (every other layer kind mirrors first).
             left, top, right, bottom = source_crop
             source_crop = (right, top, left, bottom)
-        return prepare_rgba(source, w, h, source_crop)
+        from . import geometry
+        transform = geometry.layer_transform(layer) if geometry.has_transform(layer) else None
+        return prepare_rgba(source, w, h, source_crop, transform=transform)
     raise ValueError(f"layer {layer.kind} is not an overlay")
 
 

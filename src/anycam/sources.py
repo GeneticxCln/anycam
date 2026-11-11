@@ -24,7 +24,7 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
-from . import config, procedural
+from . import config, geometry, procedural
 from .geometry import Rect, crop_pixels, fit_contain
 from .effects import FilterSlot, SwapGate
 from .model import Effects
@@ -635,7 +635,7 @@ SCALE_THREADS = min(4, max(1, (os.cpu_count() or 2) // 4))
 
 def _fit_letterbox(chain: SourceChain, src_w: int, src_h: int,
                    width: int, height: int, rate: bool = True,
-                   live: bool = False, fps: int = 0) -> Rect:
+                   live: bool = False, fps: int = 0, layer=None) -> Rect:
     """Scale a source to fit inside the box, preserving its aspect ratio.
 
     The chain outputs only the fitted picture (the returned rectangle's size).
@@ -644,7 +644,15 @@ def _fit_letterbox(chain: SourceChain, src_w: int, src_h: int,
     so when the box is moved or resized live.  Baking black bands into the
     frame here (the old ``videobox``) distorted the picture as soon as the pad
     changed shape without a rebuild.  The bands are now transparent.
+
+    A layer with a transform (``Layer.fit``/``flip``/``rotation``/``zoom``) gets
+    its flip, a live ``videocrop`` for cover and zoom, and a scale to the
+    box (cover, stretch) or to the contained rectangle; see ``geometry``.
     """
+    transformed = layer is not None and geometry.has_transform(layer)
+    if transformed:
+        return _fit_transformed(chain, src_w, src_h, width, height, layer,
+                                rate=rate, live=live, fps=fps)
     rect = fit_contain(src_w, src_h, width, height)
     # Several threads: a camera shrunk into a box (a stage insets it) is a
     # full-frame resample at the canvas rate; on one thread it saturated a
@@ -653,19 +661,68 @@ def _fit_letterbox(chain: SourceChain, src_w: int, src_h: int,
     chain.add(caps_filter(
         f"video/x-raw,format=RGBA,width={rect.w},height={rect.h}"))
     if rate:
-        # A live source must not be padded with duplicates.  When an effect
-        # made the source thread slower than the frame rate, videorate filled
-        # the gaps with copies, the thread spent its time on those, the source
-        # queue dropped the real frames, and a Distort filter showed 4 new
-        # frames in 2 s (51 frames out, 47 of them copies).  The mixer repeats
-        # a layer's last frame by itself; videorate only drops for a live one.
-        rate_element = make("videorate", drop_only=bool(live))
-        if live and fps > 0:
-            # Drop-only cannot raise a slower source to a fixed higher rate
-            # (30 fps into a 60/1 chain failed to link), so a live chain caps
-            # the rate here and leaves it open in its final caps.
-            rate_element.set_property("max-rate", int(fps))
-        chain.add(rate_element)
+        _add_rate(chain, live, fps)
+    return rect
+
+
+def _add_rate(chain: SourceChain, live: bool, fps: int) -> None:
+    # A live source must not be padded with duplicates.  When an effect
+    # made the source thread slower than the frame rate, videorate filled
+    # the gaps with copies, the thread spent its time on those, the source
+    # queue dropped the real frames, and a Distort filter showed 4 new
+    # frames in 2 s (51 frames out, 47 of them copies).  The mixer repeats
+    # a layer's last frame by itself; videorate only drops for a live one.
+    rate_element = make("videorate", drop_only=bool(live))
+    if live and fps > 0:
+        # Drop-only cannot raise a slower source to a fixed higher rate
+        # (30 fps into a 60/1 chain failed to link), so a live chain caps
+        # the rate here and leaves it open in its final caps.
+        rate_element.set_property("max-rate", int(fps))
+    chain.add(rate_element)
+
+
+class Framing:
+    """The live crop of a framed layer (cover, zoom, pan) and what it needs.
+
+    Holds the ``videocrop`` that selects the window of the (flipped, rotated)
+    picture to show, and recomputes its margins when zoom, pan or the box
+    aspect change, without touching the rest of the graph.
+    """
+
+    def __init__(self, crop: Gst.Element, src_w: int, src_h: int) -> None:
+        self.crop, self.src_w, self.src_h = crop, int(src_w), int(src_h)
+        self.margins: tuple[int, int, int, int] | None = None
+
+    def apply(self, layer, box_w: int, box_h: int) -> tuple[int, int, int, int]:
+        fit, _fh, _fv, _rot, zoom, pan = geometry.layer_transform(layer)
+        margins = geometry.framing_margins(
+            self.src_w, self.src_h, box_w, box_h, fit, zoom, pan)
+        if margins != self.margins:
+            self.margins = margins
+            for prop, value in zip(("left", "top", "right", "bottom"), margins,
+                                   strict=True):
+                self.crop.set_property(prop, int(value))
+        return margins
+
+
+def _fit_transformed(chain: SourceChain, src_w: int, src_h: int, width: int,
+                     height: int, layer, rate: bool, live: bool, fps: int) -> Rect:
+    fit, flip_h, flip_v, rotation, _zoom, _pan = geometry.layer_transform(layer)
+    direction = geometry.flip_direction(flip_h, flip_v, rotation)
+    if direction != "identity":
+        chain.add(make("videoflip", video_direction=direction))
+    turned_w, turned_h = geometry.rotated_size(src_w, src_h, rotation)
+    framing = Framing(make("videocrop"), turned_w, turned_h)
+    margins = framing.apply(layer, width, height)
+    window_w = max(1, turned_w - margins[0] - margins[2])
+    window_h = max(1, turned_h - margins[1] - margins[3])
+    rect = (Rect(0, 0, int(width), int(height)) if fit != "contain"
+            else fit_contain(window_w, window_h, width, height))
+    chain.add(framing.crop, make("videoscale", n_threads=SCALE_THREADS),
+              caps_filter(f"video/x-raw,format=RGBA,width={rect.w},height={rect.h}"))
+    chain.effects["framing"] = framing
+    if rate:
+        _add_rate(chain, live, fps)
     return rect
 
 
@@ -742,7 +799,7 @@ def camera_chain(device: str, width: int, height: int, fps: int, layer=None,
     cropped_w, cropped_h = cropped_size(layer, mode.width, mode.height)
     live = getattr(layer, "kind", "") in LIVE_KINDS
     fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height,
-                            live=live, fps=fps)
+                            live=live, fps=fps, layer=layer)
     _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer, pin_rate=not live)
     chain.camera_mode = mode
     chain.capture_request = (cap_w, cap_h, cap_fps)
@@ -865,7 +922,7 @@ def image_chain(path: str, width: int, height: int, fps: int, layer=None,
     fitted = Rect(0, 0, int(width), int(height))
     if fit:
         cropped_w, cropped_h = cropped_size(layer, src_w, src_h)
-        fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height, rate=False)
+        fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height, rate=False, layer=layer)
     _add_effects(chain, layer)
     _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
     chain.source_size = (src_w, src_h)
@@ -883,7 +940,7 @@ def file_video_chain(path: str, width: int, height: int, fps: int, layer=None) -
     source_w, source_h = video_size(path) or (width, height)
     chain.add(*_crop_chain(layer, source_w, source_h))
     cropped_w, cropped_h = cropped_size(layer, source_w, source_h)
-    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height)
+    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height, layer=layer)
     _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
     chain.dynamic_from = decode
     chain.source_size = (source_w, source_h)
@@ -909,7 +966,7 @@ def network_chain(uri: str, width: int, height: int, fps: int, layer=None,
     cropped_w, cropped_h = cropped_size(layer, source_w, source_h)
     live = getattr(layer, "kind", "") in LIVE_KINDS
     fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height,
-                            live=live, fps=fps)
+                            live=live, fps=fps, layer=layer)
     _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer, pin_rate=not live)
     chain.dynamic_from = decode
     chain.pause_elements.append(decode)
@@ -1003,7 +1060,7 @@ def screen_chain(node_id: int, width: int, height: int, fps: int, layer=None,
     crop_base = (fit.w, fit.h) if gl_scale else (source_w, source_h)
     chain.add(*_crop_chain(layer, crop_base[0], crop_base[1]))
     cropped_w, cropped_h = cropped_size(layer, crop_base[0], crop_base[1])
-    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height, rate=False)
+    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height, rate=False, layer=layer)
     # The canvas layer_tail owns the output rate.  A forced framerate here
     # makes a damage-driven DMA-BUF screencast emit one frame and then stall.
     # The same applies to videorate: a screencast advertises framerate=0/1
@@ -1074,7 +1131,7 @@ def test_chain(width: int, height: int, fps: int, layer=None) -> SourceChain:
     _add_effects(chain, layer)
     chain.add(*_crop_chain(layer, width, height))
     cropped_w, cropped_h = cropped_size(layer, width, height)
-    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height)
+    fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height, layer=layer)
     _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
     chain.pause_elements.append(src)
     chain.source_size = (width, height)
@@ -1108,7 +1165,7 @@ def animation_chain(preset: str, width: int, height: int, fps: int,
         key, f"backdrop_{key}_{_next_source_number():x}", width, height, fps)
     chain.add(source.appsrc)
     chain.cleanup.append(source.stop)
-    fitted = _fit_letterbox(chain, source.width, source.height, width, height)
+    fitted = _fit_letterbox(chain, source.width, source.height, width, height, layer=layer)
     _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
     chain.source_size = (source.width, source.height)
     return chain
@@ -1157,7 +1214,7 @@ def animated_chain(layer, width: int, height: int, fps: int) -> SourceChain:
     chain.add(source.appsrc)
     chain.cleanup.append(source.stop)
     chain.control = generator
-    fitted = _fit_letterbox(chain, size[0], size[1], width, height)
+    fitted = _fit_letterbox(chain, size[0], size[1], width, height, layer=layer)
     _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
     chain.source_size = size
     return chain
@@ -1191,7 +1248,7 @@ def layer_tail(layer, source_size: tuple[int, int], width: int, height: int,
     cropped_w, cropped_h = cropped_size(layer, src_w, src_h)
     live = getattr(layer, "kind", "") in LIVE_KINDS
     fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height,
-                            live=live, fps=fps)
+                            live=live, fps=fps, layer=layer)
     _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer, pin_rate=not live)
     chain.source_size = (src_w, src_h)
     return chain

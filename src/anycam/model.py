@@ -14,6 +14,8 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from . import geometry
+
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
@@ -112,6 +114,11 @@ class Effects:
     # preset never has to rebuild the layer graph.
     color_effect: str = "none"     # none|sepia|heat|xray|xpro|yellowblue
     mirror: bool = False             # horizontal flip, live
+    # RGB levels: a gain per colour channel (1 = unchanged), for white-balance
+    # and tint corrections that brightness/contrast cannot make.
+    red_gain: float = 1.0
+    green_gain: float = 1.0
+    blue_gain: float = 1.0
     # One live filter from anycam.effects (distortion, retro TV, cleanup) and
     # its 0..1 strength.  Swapped in while running, so it never rebuilds.
     filter: str = "none"
@@ -231,6 +238,16 @@ class Layer:
     # V4L2 control values to re-apply to a camera layer's device on start and
     # after a reconnect (brightness, zoom, focus ... - see camera_controls).
     camera_controls: dict[str, int] = field(default_factory=dict)
+    # How the picture sits in its box: contain (letterbox), cover (fill and cut
+    # the overflow) or stretch (fill, ignore the aspect).  Flips apply first,
+    # then the clockwise quarter-turn ``rotation``; ``zoom`` > 1 magnifies about
+    # ``pan`` (0..1 across the picture).  All of them are plain video stages.
+    fit: str = "contain"
+    flip_h: bool = False
+    flip_v: bool = False
+    rotation: int = 0
+    zoom: float = 1.0
+    pan: tuple[float, float] = (0.5, 0.5)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Layer":
@@ -248,7 +265,8 @@ class Layer:
         name = data.get("name")
         layer = cls(id=layer_id, kind=kind.strip(),
                     name=name if isinstance(name, str) and name else kind.strip())
-        special = ("id", "kind", "name", "box", "crop", "effects", "playlist", "camera_controls")
+        special = ("id", "kind", "name", "box", "crop", "effects", "playlist",
+                   "camera_controls", "pan")
         for item in fields(cls):
             if item.name in special or item.name not in data:
                 continue
@@ -257,6 +275,17 @@ class Layer:
         layer.box = _quad(data.get("box"), layer.box)
         layer.crop = _quad(data.get("crop"), layer.crop)
         layer.effects = Effects.from_dict(data.get("effects"))
+        layer.fit = geometry.fit_mode(layer.fit)
+        layer.rotation = geometry.rotation_degrees(layer.rotation)
+        layer.zoom = geometry.clamp(layer.zoom, 1.0, geometry.MAX_ZOOM)
+        pan = data.get("pan")
+        if isinstance(pan, (list, tuple)) and len(pan) == 2:
+            try:
+                numbers = (float(pan[0]), float(pan[1]))
+            except (TypeError, ValueError):
+                numbers = None
+            if numbers and all(_finite(value) for value in numbers):
+                layer.pan = (geometry.clamp(numbers[0]), geometry.clamp(numbers[1]))
         controls = data.get("camera_controls")
         if isinstance(controls, dict):
             layer.camera_controls = {
@@ -280,6 +309,7 @@ class Layer:
         d = asdict(self)
         d["box"] = list(self.box)
         d["crop"] = list(self.crop)
+        d["pan"] = list(self.pan)
         return d
 
 
