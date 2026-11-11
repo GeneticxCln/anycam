@@ -14,6 +14,12 @@ All notable changes. Versions follow `pyproject.toml`; each `vX.Y.Z` tag publish
 - The virtual camera's on/off choice is remembered across launches.
 - CI runs `ruff` (defect rules) and reports coverage.
 - Added `CONTRIBUTING.md`, `SECURITY.md` and `NOTICE`.
+- Layers have a fit mode (contain, cover, stretch), flips, a quarter-turn rotation, zoom and pan; zoom and
+  pan change live. A layer box may leave the canvas (numeric entry), and RGB levels join the colour sliders
+  (GPU canvas).
+- Scenes arrive with a transition (fade, slide, wipe) and Studio mode stages the next scene for Cut or
+  Transition. A "Rounded corners" filter and `scripts/bench_canvas.py`, a CPU-per-frame benchmark reported
+  relative to a baseline run, were added.
 
 ## 1.3.2 - 2026-11-08
 

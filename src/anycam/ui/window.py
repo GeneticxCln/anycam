@@ -200,6 +200,7 @@ class AnyCamWindow(GeneralPanelMixin, EffectsPanelMixin, DrawMixin, BackdropMixi
         self.scene_combo.currentIndexChanged.connect(self._scene_changed)
         header.addWidget(QLabel("Scene"))
         header.addWidget(self.scene_combo)
+        self._build_studio_controls(header)
         self.status_chip = QLabel("STOPPED")
         self.status_chip.setObjectName("accent")
         header.addWidget(self.status_chip)

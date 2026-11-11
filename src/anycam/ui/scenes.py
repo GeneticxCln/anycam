@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem,
+    QCheckBox, QComboBox, QDialog, QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem,
     QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
@@ -87,6 +87,62 @@ class SceneMixin:
         self._refresh_scene_list()
         return page
 
+    # ---------------------------------------------------------- studio mode
+    def _build_studio_controls(self, header: QHBoxLayout) -> None:
+        """Stage a scene, then take it: CUT is instant, TRANS uses its transition."""
+        self.studio_check = QCheckBox("Studio")
+        self.studio_check.setToolTip(
+            "Stage the next scene, then take it live with Cut or Transition")
+        self.studio_check.toggled.connect(self._studio_toggled)
+        self.next_scene_combo = QComboBox()
+        self.next_scene_combo.setToolTip("The scene that goes live next")
+        self.cut_button = QPushButton("Cut")
+        self.cut_button.clicked.connect(lambda: self.take_next_scene(cut=True))
+        self.trans_button = QPushButton("Transition")
+        self.trans_button.clicked.connect(lambda: self.take_next_scene(cut=False))
+        header.addWidget(self.studio_check)
+        for widget in (self.next_scene_combo, self.cut_button, self.trans_button):
+            header.addWidget(widget)
+        self._studio_toggled(False)
+
+    def _studio_toggled(self, on: bool) -> None:
+        for widget in (self.next_scene_combo, self.cut_button, self.trans_button):
+            widget.setVisible(bool(on))
+        if on:
+            self._refresh_next_scene()
+
+    def _refresh_next_scene(self) -> None:
+        combo = getattr(self, "next_scene_combo", None)
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        wanted = combo.currentData()
+        combo.clear()
+        for scene in self.project.scenes:
+            if scene.id != self.project.active_scene:
+                combo.addItem(scene.name, scene.id)
+        index = combo.findData(wanted)
+        combo.setCurrentIndex(max(0, index))
+        combo.blockSignals(False)
+        for button in (self.cut_button, self.trans_button):
+            button.setEnabled(combo.count() > 0)
+
+    def take_next_scene(self, cut: bool = False) -> bool:
+        """Put the staged scene live; ``cut`` ignores its transition."""
+        scene_id = self.next_scene_combo.currentData() if hasattr(self, "next_scene_combo") else None
+        index = next((i for i, scene in enumerate(self.project.scenes) if scene.id == scene_id), -1)
+        if index < 0:
+            return False
+        target = self.project.scenes[index]
+        self._take_override = ("cut", 0.0) if cut else (
+            (target.transition, transitions.transition_seconds(target.transition_ms))
+            if target.transition != "cut" else ("fade", 0.5))
+        try:
+            self.switch_scene(index)
+        finally:
+            self._take_override = None
+        return True
+
     def _sync_transition_controls(self) -> None:
         if not hasattr(self, "transition_combo"):
             return
@@ -109,6 +165,7 @@ class SceneMixin:
 
     def _refresh_scenes(self) -> None:
         self._sync_transition_controls()
+        self._refresh_next_scene()
         self.scene_combo.blockSignals(True)
         self.scene_combo.clear()
         for scene in self.project.scenes:
@@ -350,9 +407,10 @@ class SceneMixin:
         self._apply_playlist_visibility()
         try:
             scene = self.scene
-            switched = self.engine.switch_scene(
-                scene, transitions.transition_kind(scene.transition),
-                transitions.transition_seconds(scene.transition_ms))
+            kind, seconds = (getattr(self, "_take_override", None)
+                             or (transitions.transition_kind(scene.transition),
+                                 transitions.transition_seconds(scene.transition_ms)))
+            switched = self.engine.switch_scene(scene, kind, seconds)
         except Exception as exc:  # noqa: BLE001 - fall back to the full rebuild
             self.log_event(f"scene: live switch failed ({exc}); rebuilding")
             switched = False

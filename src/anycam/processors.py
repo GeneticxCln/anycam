@@ -929,6 +929,45 @@ class AutoFrame(Processor):
             box=(left, top, left + crop_w, top + crop_h)).convert("RGBA")
 
 
+class RoundCorners(Processor):
+    """Round the picture's corners by clearing the alpha outside them.
+
+    ``amount`` 0..1 is the radius as a share of half the short side, so 1.0 on a
+    square is a circle.  The mask is built once per size and radius.
+    """
+
+    def __init__(self, amount: float = 0.25) -> None:
+        super().__init__(amount)
+        self._mask: np.ndarray | None = None
+        self._key: tuple[int, int, int] | None = None
+
+    @staticmethod
+    def radius(width: int, height: int, amount: float) -> int:
+        return int(round(max(0.0, min(1.0, amount)) * min(width, height) / 2.0))
+
+    def mask(self, width: int, height: int) -> np.ndarray | None:
+        radius = self.radius(width, height, self.amount)
+        if radius <= 0:
+            return None
+        key = (width, height, radius)
+        if key != self._key:
+            # 4x supersampled for smooth edges.
+            big = Image.new("L", (width * 4, height * 4), 0)
+            ImageDraw.Draw(big).rounded_rectangle(
+                (0, 0, width * 4 - 1, height * 4 - 1), radius=radius * 4, fill=255)
+            self._mask = np.asarray(big.resize((width, height), Image.LANCZOS))
+            self._key = key
+        return self._mask
+
+    def process(self, image: Image.Image, now: float) -> Image.Image:
+        mask = self.mask(*image.size)
+        if mask is None:
+            return image
+        pixels = np.array(image.convert("RGBA"))
+        np.minimum(pixels[..., 3], mask, out=pixels[..., 3])
+        return Image.fromarray(pixels, "RGBA")
+
+
 # ------------------------------------------------------------------ registry
 def make_processor(name: str, amount: float) -> Processor:
     """Build the processor registered under ``name`` (see ``effects``)."""
@@ -947,6 +986,8 @@ def make_processor(name: str, amount: float) -> Processor:
         return FacePrivacy(variant, amount)
     if kind == "touchup":
         return TouchUp(variant, amount)
+    if kind == "corners":
+        return RoundCorners(amount)
     if kind == "zoom":
         return Zoom(amount)
     if kind == "autoframe":

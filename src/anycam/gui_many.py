@@ -158,6 +158,7 @@ class ManyCamWindow(AnyCamWindow):
         self.scene_combo = QComboBox()
         self.scene_combo.setVisible(False)
         header.addWidget(self.scene_combo)
+        self._build_studio_controls(header)
         self.settings_button = QPushButton("Settings")
         self.settings_button.setToolTip("Sources, audio, playlist and output")
         self.settings_button.clicked.connect(lambda: self._open_settings())

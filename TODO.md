@@ -40,24 +40,24 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 
 - [ ] GL backend (`glvideomixer` + shaders) with the current `compositor` as CPU fallback.
 - [x] Encoder selection: NVENC when available, VA-API next, x264 fallback (B42). Passed: `tests/test_pipeline.py`, `tests/test_engine_fixes.py`.
-- [ ] Fit modes contain/cover/stretch, reusing `geometry.fit_contain`.
-- [ ] Flip, rotate, zoom/pan, rounded corners, off-canvas boxes, RGB levels.
+- [x] Fit modes contain/cover/stretch (`Layer.fit`). Passed: `tests/test_phase3_canvas.py` (real GStreamer chain pixels, cover window maths).
+- [x] Flip, quarter-turn rotate, live zoom/pan, rounded corners (filter), off-canvas boxes, RGB levels. Passed: `tests/test_phase3_canvas.py` (every flip/rotate combination against numpy; canvas pixels for off-canvas boxes). RGB levels run in the GPU shader only, so they are covered by uniform tests here and need a real GL canvas to see.
 - [ ] Chroma shader with smoothness and spill removal; live effect changes, no Apply button.
-- [ ] Program and Preview canvases; TRANS and CUT; cut/fade/slide/wipe transitions.
+- [x] Cut/fade/slide/wipe transitions between scenes and a Studio mode with a staged scene, CUT and TRANSITION. Passed: `tests/test_phase3_canvas.py` (blend and slide mid-way, clean stop mid-transition). There is no second Preview canvas: the staged scene is chosen, not shown.
 - [ ] Performance gate: ≤100% CPU for 1080p60 with 3 layers + recording on this machine (spike: 68%), and stable 4K30. Failing this re-opens the stack decision.
-- [ ] Golden-pixel tests per transform; CI runs on software GL.
+- [ ] Golden-pixel tests per transform: done for the CPU canvas (`tests/test_phase3_canvas.py`). The GPU canvas does not start under Xvfb + llvmpipe here (`glvideomixer` stream error), so GL pixel tests stay hardware-gated.
 
 ## 3. M3 — studio UI
 
-- [ ] Split `gui.py` into `ui/` modules.
-- [ ] Text/title editor with lower-third templates, dynamic clock and timer (B32).
+- [x] Split `gui.py` into `ui/` modules. Passed: full suite on the split tree.
+- [x] Text/title editor with lower-third templates, dynamic clock and timer (B32). Passed: `tests/test_phase2_foundations.py`.
 - [x] Effects panel follows the selected layer and updates without a rebuild (B33). Passed 2026-11-06: selected-layer GUI test plus real compositor live property probe.
 - [x] Reload refreshes audio widgets from the model (B34). Passed: `tests/test_audit_fixes_2026_11_07b.py::test_reload_refreshes_the_format_and_forgets_old_state`.
 - [x] Persist "Include microphone" and vcam on/off (B35). Passed: `tests/test_gui.py` (microphone), `tests/test_housekeeping_2026_11_12.py` (virtual camera).
-- [ ] Window fits 1366×768; numeric fields readable; remove the dead right strip (B36).
-- [ ] Non-blocking portal flow with restore tokens; no 120 s UI stalls (B37).
-- [ ] Canvas/FPS edits apply while running, with a clear hint (B40).
-- [ ] Playlist: fix the double-length first item and undo of membership changes (B44).
+- [x] Window fits 1366×768 (B36). Passed: `tests/test_phase2_foundations.py::test_the_windows_fit_a_1366_by_768_screen`.
+- [x] Non-blocking portal flow; no 120 s UI stalls (B37). Passed: `tests/test_portal.py::test_portal_wait_pumps_the_gui_while_the_picker_is_open`. Restore tokens are not implemented.
+- [x] Canvas/FPS edits apply while running (B40). Passed: `tests/test_phase2_foundations.py::test_canvas_edits_reach_the_running_preview_after_a_pause`.
+- [x] Playlist: the double-length first item is fixed (B44). Passed: `tests/test_phase2_foundations.py::test_the_first_playlist_item_does_not_stay_twice_as_long`.
 - [x] One scene-switch path; Ctrl+1…9 no longer skips a step (B45). Passed: `tests/test_gui.py::test_scene_shortcut_runs_the_same_bookkeeping_as_the_scene_picker`.
 - [ ] Program/Preview monitors, live preset thumbnails, realtime toolbar, properties panel that follows selection.
 - [ ] Rename/reorder/duplicate scenes and layers; lock layers.

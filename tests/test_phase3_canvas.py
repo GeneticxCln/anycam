@@ -501,3 +501,73 @@ def test_rgb_sliders_write_the_effect_levels(window):
     window._effect_sliders["red_gain"].setValue(150)
     window._effect_sliders["blue_gain"].setValue(40)
     assert layer.effects.red_gain == 1.5 and layer.effects.blue_gain == 0.4
+
+
+def test_studio_mode_stages_a_scene_and_takes_it_with_cut_or_transition(window):
+    taken = []
+
+    class FakeEngine:
+        def switch_scene(self, scene, kind="cut", seconds=0.0):
+            taken.append((scene.id, kind, seconds))
+            return True
+
+        def source_sizes(self):
+            return {}
+
+        def set_layer_visible(self, *_args):
+            return True
+
+        def stop(self):
+            return {}
+
+    window.studio_check.setChecked(True)
+    assert window.next_scene_combo.isVisibleTo(window)
+    assert window.next_scene_combo.currentData() == "scene_b"
+    window.engine = FakeEngine()
+    window.take_next_scene(cut=True)
+    assert taken[-1] == ("scene_b", "cut", 0.0)
+    assert window.project.active_scene == "scene_b"
+    # Back to Alpha, whose own transition is a 700 ms slide.
+    window.project.scenes[0].transition, window.project.scenes[0].transition_ms = "slide-up", 700
+    window._refresh_next_scene()
+    window.take_next_scene(cut=False)
+    assert taken[-1] == ("scene_a", "slide-up", 0.7)
+    # A scene whose transition is "cut" still gets a fade from the Transition button.
+    window.project.scenes[1].transition = "cut"
+    window._refresh_next_scene()
+    window.take_next_scene(cut=False)
+    assert taken[-1] == ("scene_b", "fade", 0.5)
+    window.engine = None
+
+
+# ------------------------------------------------------------ rounded corners
+def test_rounded_corners_clear_the_corners_and_keep_the_middle():
+    from PIL import Image
+
+    from anycam import effects, processors
+
+    assert "round-corners" in effects.FILTERS
+    processor = processors.make_processor("corners:", 1.0)
+    picture = Image.new("RGBA", (64, 64), (200, 30, 30, 255))
+    out = np.array(processor.process(picture, 0.0))
+    assert out[0, 0, 3] == 0 and out[0, 63, 3] == 0 and out[63, 0, 3] == 0
+    assert out[32, 32, 3] == 255 and out[32, 1, 3] > 200      # the edge midpoints stay
+    assert (out[32, 32, :3] == (200, 30, 30)).all()
+    processor.set_amount(0.0)
+    assert np.array(processor.process(picture, 0.0))[0, 0, 3] == 255
+    # A rectangle rounds by its short side.
+    wide = processors.RoundCorners(0.5).process(Image.new("RGBA", (128, 32), (9, 9, 9, 255)), 0)
+    assert np.array(wide)[0, 0, 3] == 0 and np.array(wide)[16, 64, 3] == 255
+
+
+def test_the_relative_benchmark_runs_and_reports_ratios():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "scripts" / "bench_canvas.py"
+    spec = importlib.util.spec_from_file_location("bench_canvas", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    row = module.run_case("baseline", 0.5)
+    assert row["fps"] > 5 and row["cpu_s_per_frame"] > 0
+    assert set(module.CASES) >= {"baseline", "four-layers", "rotated-cover"}

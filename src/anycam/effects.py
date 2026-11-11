@@ -201,6 +201,8 @@ _PROCESSOR_LIST = (
     _proc("zoom", "Zoom", "Framing", "zoom:", "Digital zoom into the middle", 0.3),
     _proc("auto-frame", "Auto-frame", "Framing", "autoframe:",
           "Keep your face centred as you move"),
+    _proc("round-corners", "Rounded corners", "Framing", "corners:",
+          "Round the picture's corners (a circle at full strength on a square)", 0.25),
 )
 
 from . import masks as _masks  # noqa: E402
