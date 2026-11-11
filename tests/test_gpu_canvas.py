@@ -70,7 +70,7 @@ def test_a_direct_engine_defaults_to_the_cpu_canvas(monkeypatch):
 
 
 def test_an_unusable_gl_canvas_falls_back_to_the_compositor(monkeypatch):
-    monkeypatch.setattr(pipeline, "gl_canvas_problem", lambda: "glvideomixer is not installed")
+    monkeypatch.setattr("anycam.engine.controller.gl_canvas_problem", lambda: "glvideomixer is not installed")
     engine = AnyCamEngine(_project(), preview=True, canvas="gpu").build()
     try:
         assert engine.canvas_backend == "cpu"
@@ -281,7 +281,7 @@ def _distinct_frames_with_a_look(monkeypatch=None, latency=None) -> tuple[int, i
     import zlib
 
     if latency is not None:
-        monkeypatch.setattr(pipeline, "GL_MIXER_LATENCY_NS", latency)
+        monkeypatch.setattr("anycam.engine.controller.GL_MIXER_LATENCY_NS", latency)
     seen: list[int] = []
 
     def on_frame(sample):

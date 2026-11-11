@@ -458,7 +458,7 @@ def test_camera_picker_rescans_after_a_device_renumber(app, monkeypatch):
         _close(window, app)
 
 
-def test_camera_error_keeps_a_live_screen_instead_of_rebuilding(app, monkeypatch):
+def test_camera_error_swaps_in_a_card_instead_of_rebuilding(app, monkeypatch):
     """A busy camera must not tear down the live PiP screen share."""
     project = Project(name="screen")
     scene = Scene(new_id("scene"), "Screen")
@@ -474,10 +474,10 @@ def test_camera_error_keeps_a_live_screen_instead_of_rebuilding(app, monkeypatch
 
     class Engine:
         def __init__(self):
-            self.dropped = []
+            self.lost = []
 
-        def drop_capture(self, layer_id):
-            self.dropped.append(layer_id)
+        def mark_layer_lost(self, layer_id):
+            self.lost.append(layer_id)
             return True
 
         def stop(self):
@@ -491,10 +491,12 @@ def test_camera_error_keeps_a_live_screen_instead_of_rebuilding(app, monkeypatch
     try:
         window._handle_pipeline_error(
             "Camera source error: v4l2src: Device or resource busy")
-        assert engine.dropped == [camera.id]
+        # The camera becomes its card on the running canvas; the share and the
+        # rest of the graph are not rebuilt.
+        assert engine.lost == [camera.id]
         assert restarts == []
         assert window._lost_cameras == {camera.id: camera.source}
-        assert "screen preview kept live" in window.statusBar().currentMessage()
+        assert "placeholder shown" in window.statusBar().currentMessage()
     finally:
         window.engine = None
         _close(window, app)

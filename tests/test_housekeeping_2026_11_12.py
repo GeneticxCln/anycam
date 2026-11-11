@@ -183,3 +183,222 @@ def test_the_vcam_button_remembers_the_choice():
         window.engine = None
         window.close()
         app.processEvents()
+
+
+# ------------------------------------------------------------ live scene switch
+def _two_scene_project():
+    project = model.Project(name="switch")
+    project.output.canvas_w, project.output.canvas_h, project.output.fps = 320, 180, 15
+    first = model.Scene(model.new_id("scene"), "One")
+    first.add_layer(model.Layer("a1", "test", "Ball", source="ball", box=(0, 0, 1, 1)))
+    first.add_layer(model.Layer("a2", "text", "Title", source="ONE", box=(0.1, 0.1, 0.4, 0.2)))
+    hidden = model.Layer("a3", "test", "Hidden", source="snow", box=(0.5, 0.5, 0.3, 0.3))
+    hidden.visible = False
+    first.add_layer(hidden)
+    second = model.Scene(model.new_id("scene"), "Two")
+    second.add_layer(model.Layer("b1", "test", "Bars", source="smpte", box=(0, 0, 0.5, 1)))
+    second.add_layer(model.Layer("b2", "test", "Checks", source="checkers-8",
+                                 box=(0.5, 0, 0.5, 1)))
+    project.scenes = [first, second]
+    project.active_scene = first.id
+    return project, first, second
+
+
+def _run(engine, seconds):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        engine.pump(40)
+
+
+def test_switching_scenes_swaps_layers_on_the_same_canvas():
+    pytest.importorskip("gi")
+    from anycam.pipeline import AnyCamEngine
+
+    project, first, second = _two_scene_project()
+    engine = AnyCamEngine(project, preview=True).build()
+    engine.start()
+    try:
+        _run(engine, 1.0)
+        assert set(engine._layer_pads) == {"a1", "a2", "a3"}
+        pipeline_id = id(engine.pipeline)
+        compositor = engine.compositor
+
+        assert engine.switch_scene(second) is True
+        _run(engine, 0.5)
+        assert set(engine._layer_pads) == {"b1", "b2"}
+        assert engine.scene is second and engine.compositor is compositor
+        assert id(engine.pipeline) == pipeline_id
+        # background standby + the two new layers; the old pads were released
+        assert len(compositor.sinkpads) == 3
+        # the scene we left comes back exactly as it was (a3 stays hidden)
+        assert [(l.id, l.visible) for l in first.layers] == [
+            ("a1", True), ("a2", True), ("a3", False)]
+
+        before = engine._frame_count
+        assert engine.switch_scene(first) is True
+        _run(engine, 1.0)
+        assert set(engine._layer_pads) == {"a1", "a2", "a3"}
+        assert engine._frame_count > before + 5, "the canvas stopped after the switch"
+        assert not engine.report.error
+    finally:
+        engine.stop()
+
+
+def test_a_live_scene_switch_keeps_one_continuous_recording(tmp_path):
+    pytest.importorskip("gi")
+    import shutil
+    import subprocess
+
+    if shutil.which("ffprobe") is None:
+        pytest.skip("ffprobe is required")
+    from anycam.engine.outputs.recorder import Recorder
+    from anycam.pipeline import AnyCamEngine
+
+    project, first, second = _two_scene_project()
+    out = tmp_path / "switching.mp4"
+    recorder = Recorder()
+    assert recorder.start(str(out), 320, 180, 15)
+    engine = AnyCamEngine(project, recorder=recorder, preview=True).build()
+    engine.start()
+    try:
+        for scene in (first, second, first, second):
+            assert engine.switch_scene(scene)
+            _run(engine, 0.8)
+    finally:
+        engine.stop()
+    result = recorder.stop()
+    assert result["ok"], result
+    info = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                           "-of", "csv=p=0", str(out)], capture_output=True, text=True)
+    assert float(info.stdout) > 2.5          # one file across all four switches
+
+
+def test_a_scene_with_a_screen_share_asks_for_a_rebuild():
+    pytest.importorskip("gi")
+    from anycam.pipeline import AnyCamEngine
+
+    project, first, second = _two_scene_project()
+    shared = model.Scene(model.new_id("scene"), "Share")
+    shared.add_layer(model.Layer("s1", "screen", "Screen", source="42"))
+    project.scenes.append(shared)
+    engine = AnyCamEngine(project, preview=True).build()
+    engine.start()
+    try:
+        _run(engine, 0.5)
+        assert engine.switch_scene(shared) is False
+        assert engine.scene is first             # nothing was touched
+    finally:
+        engine.stop()
+
+
+def test_the_window_switches_scenes_without_restarting_the_engine(monkeypatch):
+    pytest.importorskip("PySide6")
+    pytest.importorskip("gi")
+    from PySide6.QtWidgets import QApplication
+
+    from anycam.gui_many import ManyCamWindow
+
+    app = QApplication.instance() or QApplication([])
+    project, first, second = _two_scene_project()
+    window = ManyCamWindow(project)
+    window.headless = True
+    window._persist = False
+    restarts = []
+    monkeypatch.setattr(window, "restart_engine", lambda: restarts.append(1))
+    try:
+        window.start_engine()
+        assert window.engine is not None
+        engine = window.engine
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not window.preview.has_frame():
+            window.engine.pump(40)
+            app.processEvents()
+        window.switch_scene(1)
+        app.processEvents()
+        assert window.engine is engine and restarts == []
+        assert engine.scene is second
+        window.switch_scene(0)
+        app.processEvents()
+        assert engine.scene is first and restarts == []
+    finally:
+        window.shutdown()
+        window.close()
+        app.processEvents()
+
+
+def test_stopping_the_engine_keeps_the_window_responsive():
+    pytest.importorskip("PySide6")
+    pytest.importorskip("gi")
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication
+
+    from anycam.gui_many import ManyCamWindow
+
+    app = QApplication.instance() or QApplication([])
+    project, first, second = _two_scene_project()
+    window = ManyCamWindow(project)
+    window.headless = True            # start without the threaded path ...
+    window._persist = False
+    try:
+        window.start_engine()
+        assert window.engine is not None
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and not window.preview.has_frame():
+            window.engine.pump(40)
+            app.processEvents()
+        window.headless = False       # ... then stop through it
+        ran = []
+        for delay in (30, 60, 90):
+            QTimer.singleShot(delay, lambda delay=delay: ran.append(delay))
+        window.stop_engine()
+        assert window.engine is None
+        assert ran, "no Qt event ran while the engine was finalising"
+    finally:
+        window.headless = True
+        window.shutdown()
+        window.close()
+        app.processEvents()
+
+
+# ------------------------------------------------- camera loss and return, live
+def test_a_lost_camera_becomes_a_card_and_comes_back_without_a_rebuild():
+    pytest.importorskip("gi")
+    from anycam.pipeline import AnyCamEngine
+
+    project = model.Project(name="loss")
+    project.output.canvas_w, project.output.canvas_h, project.output.fps = 320, 180, 15
+    scene = model.Scene(model.new_id("scene"), "S")
+    scene.add_layer(model.Layer("ball", "test", "Ball", source="ball", box=(0, 0, 0.5, 1)))
+    scene.add_layer(model.Layer("cam", "camera", "Cam", source="/dev/video98",
+                                box=(0.5, 0, 0.5, 1)))
+    project.scenes, project.active_scene = [scene], scene.id
+    engine = AnyCamEngine(project, preview=True).build()
+    engine.start()
+    try:
+        end = time.monotonic() + 8
+        while time.monotonic() < end and not engine.report.source_errors:
+            engine.pump(50)
+        assert engine.report.source_errors, "the missing device never reported an error"
+        pipeline_id = id(engine.pipeline)
+        pads = len(engine.compositor.sinkpads)
+
+        assert engine.mark_layer_lost("cam") is True
+        assert engine.mark_layer_lost("cam") is True          # idempotent
+        before = engine._frame_count
+        end = time.monotonic() + 3
+        while time.monotonic() < end and engine.report.source_errors:
+            engine.pump(50)
+        assert engine.report.source_errors == [], "the dead capture was not released"
+        assert engine.report.camera_placeholders == ["Cam"]
+        assert len(engine.compositor.sinkpads) == pads
+        assert id(engine.pipeline) == pipeline_id
+        _run(engine, 1.0)
+        assert engine._frame_count > before + 5
+
+        assert engine.attach_capture("cam") is True
+        _run(engine, 0.5)
+        assert len(engine.compositor.sinkpads) == pads        # the card is gone, not piled up
+        assert engine.report.camera_placeholders == []
+        assert not engine.skip_layers
+    finally:
+        engine.stop()

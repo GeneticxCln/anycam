@@ -76,7 +76,7 @@ def test_rtmp_uses_nvenc_and_cuda_when_available(monkeypatch):
         pytest.skip("cudaupload unavailable")
     from anycam import pipeline as pipeline_module
 
-    monkeypatch.setattr(pipeline_module, "nvenc_available",
+    monkeypatch.setattr("anycam.engine.encoders.nvenc_available",
                         lambda codec="h264": codec == "h264")
     project = make_project()
     project.output.encoder = "nvenc_av1"
@@ -237,7 +237,7 @@ def test_missing_rtmp_sink_keeps_preview_and_recording(monkeypatch, tmp_path):
         def poll(self) -> None:
             pass
 
-    monkeypatch.setattr(pipeline_module, "make", make_without_rtmp)
+    monkeypatch.setattr("anycam.engine.outputs.stream.make", make_without_rtmp)
     frames: list[int] = []
     vcam = _FakeVcam()
     out = tmp_path / "still-recording.mp4"

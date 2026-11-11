@@ -751,14 +751,14 @@ def test_the_nvenc_probe_is_remembered_for_a_minute(monkeypatch):
     from anycam import pipeline
 
     calls = []
-    monkeypatch.setattr(pipeline, "_nvenc_seen", {})
-    monkeypatch.setattr(pipeline, "_probe_nvenc",
+    monkeypatch.setattr("anycam.engine.encoders._nvenc_seen", {})
+    monkeypatch.setattr("anycam.engine.encoders._probe_nvenc",
                         lambda codec: calls.append(codec) or True)
     assert pipeline.nvenc_available("h264") and pipeline.nvenc_available("h264")
     assert calls == ["h264"]
     pipeline.nvenc_available("h265")
     assert calls == ["h264", "h265"]
-    monkeypatch.setattr(pipeline, "_NVENC_TTL_S", 0.0)
+    monkeypatch.setattr("anycam.engine.encoders._NVENC_TTL_S", 0.0)
     pipeline.nvenc_available("h264")
     assert calls == ["h264", "h265", "h264"]
 

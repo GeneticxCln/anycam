@@ -1448,8 +1448,7 @@ class AnyCamWindow(QMainWindow):
             self._load_playlist_state()
             self._mark_dirty()
             self._status(f"Scene: {self.project.scenes[index].name}")
-            if self.engine is not None:
-                self.restart_engine()
+            self._show_scene_live()
 
     def toggle_mic_mute(self) -> None:
         muted = not self.project.audio.mic_muted
@@ -3873,6 +3872,16 @@ class AnyCamWindow(QMainWindow):
         # A camera that fails again after a reconnect must not be reopened in
         # a tight loop; repeated opens are what wedges some UVC devices.
         self._camera_retry_ms = min(10000, int(self._camera_retry_ms * 1.5))
+        if self.engine is not None and all(
+                self.scene.layer(layer_id) is not None for layer_id in missing):
+            # Swap each lost camera for its card on the running canvas: the
+            # other sources, the recording and the virtual camera keep going.
+            if all(self.engine.mark_layer_lost(layer_id) for layer_id in missing):
+                devices = ", ".join(sorted(set(missing.values())))
+                self._status(f"{devices} disconnected · placeholder shown; "
+                             f"retrying in {self._camera_retry_ms / 1000:.1f}s")
+                self._camera_watch.start(self._camera_retry_ms)
+                return
         if (self.engine is not None and self._has_screen_layer()
                 and message.startswith("Camera source error:")):
             # Do not rebuild a PiP just because the camera failed.  A rebuild
@@ -3924,9 +3933,10 @@ class AnyCamWindow(QMainWindow):
             return
         for layer_id in restored:
             del self._lost_cameras[layer_id]
-        if self.engine is not None and self._has_screen_layer():
-            # Reattach the camera capture on its existing channel.  Rebuilding
-            # here would stop the live screen pipewiresrc and lose the PiP.
+        if self.engine is not None:
+            # Reattach the camera capture on the running canvas.  Rebuilding
+            # here would stop every other source (a screen share loses its
+            # portal session) and the recording and virtual camera feed.
             failed = [layer_id for layer_id in restored
                       if not self.engine.attach_capture(layer_id)]
             if failed:
@@ -4037,8 +4047,7 @@ class AnyCamWindow(QMainWindow):
         self._refresh_layers()
         self._load_playlist_state()
         self._mark_dirty()
-        if self.engine is not None:
-            self.restart_engine()
+        self._show_scene_live()
 
     def _scene_row_changed(self, row: int) -> None:
         if row < 0:
@@ -4058,8 +4067,7 @@ class AnyCamWindow(QMainWindow):
         self._refresh_layers()
         self._load_playlist_state()
         self._mark_dirty()
-        if self.engine is not None:
-            self.restart_engine()
+        self._show_scene_live()
 
     def add_scene(self) -> None:
         scene = Scene(new_id("scene"), f"Scene {len(self.project.scenes) + 1}")
@@ -4142,8 +4150,7 @@ class AnyCamWindow(QMainWindow):
         self._refresh_layers()
         self._load_playlist_state()
         self._mark_dirty()
-        if self.engine is not None:
-            self.restart_engine()
+        self._show_scene_live()
 
     def rename_scene(self, scene_id: str = "") -> None:
         """Rename a preset from its context menu or the Scene list."""
@@ -4177,8 +4184,12 @@ class AnyCamWindow(QMainWindow):
         self._refresh_layers()
         self._load_playlist_state()
         self._mark_dirty()
-        if self.engine is not None:
-            self.restart_engine()
+        if any(layer.kind == "screen" for layer in removed.layers):
+            # A removed share must end with its graph, not stay detached.
+            if self.engine is not None:
+                self.restart_engine()
+        else:
+            self._show_scene_live()
         # The deleted scene's screen shares: end their portal captures once
         # the canvas no longer uses them (they used to run until exit).
         # _close_screen_session keeps a session another layer still shares.
@@ -5470,7 +5481,7 @@ class AnyCamWindow(QMainWindow):
         if recorder is None:
             return
         self._recorder = None
-        report = recorder.stop()
+        report = self._run_with_ui(recorder.stop)
         self._recording_path = ""
         path = str(report.get("path") or "")
         if report.get("ok") and path:
@@ -5780,7 +5791,7 @@ class AnyCamWindow(QMainWindow):
 
     def _run_with_ui(self, function):
         """Run a blocking call on a thread while Qt keeps handling events."""
-        if self.headless:
+        if self.headless or getattr(self, "_closing", False):
             return function()
         result: dict = {}
 
@@ -5894,11 +5905,7 @@ class AnyCamWindow(QMainWindow):
             # "advance" to that same item, showing it for two intervals.
             self.playlist_index = 0
             self.scene.playlist.index = 0
-        if self.playlist_index >= 0 and self.playlist_ids:
-            for position, layer_id in enumerate(self.playlist_ids):
-                layer = self.scene.layer(layer_id)
-                if layer is not None:
-                    layer.visible = position == self.playlist_index
+        self._apply_playlist_visibility()
         if (self.recording and self._recorder is not None
                 and self._recorder.requested_size not in (
                     None, (self.project.output.canvas_w,
@@ -6043,11 +6050,15 @@ class AnyCamWindow(QMainWindow):
     def stop_engine(self, *, clear_preview: bool = True) -> None:
         self.timer.stop()
         if self.engine is not None:
-            report = self.engine.stop()
+            # Finalising takes up to a few seconds (end-of-stream through the
+            # muxers).  It runs on a worker while the window keeps painting;
+            # ``self.engine`` is cleared first so no timer touches a graph
+            # that is shutting down.
+            engine, self.engine = self.engine, None
+            report = self._run_with_ui(engine.stop)
             if report.get("record_path"):
                 self.recording_segments.append(report["record_path"])
                 self._status(f"Saved {report['record_path']}")
-            self.engine = None
         # The pool keeps a screen capture alive briefly so an immediate
         # rebuild reuses it (a fresh damage-driven portal stream can be black
         # until the window repaints).  A real stop must release it afterwards.
@@ -6060,6 +6071,36 @@ class AnyCamWindow(QMainWindow):
             self.preview.image = None
             self.preview.layer_sizes = {}
             self.preview.update()
+
+    def _apply_playlist_visibility(self) -> None:
+        """Show only the playlist's current layer (the rotation's state)."""
+        if self.playlist_index >= 0 and self.playlist_ids:
+            for position, layer_id in enumerate(self.playlist_ids):
+                layer = self.scene.layer(layer_id)
+                if layer is not None:
+                    layer.visible = position == self.playlist_index
+
+    def _show_scene_live(self) -> None:
+        """Put the active scene on the running canvas; rebuild only if it cannot.
+
+        A rebuild stops every source, the preview, the recording tap and the
+        virtual camera's feed for seconds.  Swapping the layers on the same
+        compositor does none of that.
+        """
+        if self.engine is None:
+            return
+        self._apply_playlist_visibility()
+        try:
+            switched = self.engine.switch_scene(self.scene)
+        except Exception as exc:  # noqa: BLE001 - fall back to the full rebuild
+            self.log_event(f"scene: live switch failed ({exc}); rebuilding")
+            switched = False
+        if not switched:
+            self.restart_engine()
+            return
+        self.preview.layer_sizes = self.engine.source_sizes()
+        self._source_status = ()
+        self._update_canvas_note()
 
     def restart_engine(self) -> None:
         was_running = self.engine is not None
@@ -6271,6 +6312,7 @@ class AnyCamWindow(QMainWindow):
         not stop, a phone link that raises) used to skip the rest, including
         the project save and the recording's finalisation.
         """
+        self._closing = True           # no nested event loops while quitting
         steps = (
             ("thumbnails", self._stop_thumbnails),
             ("preview timer", self.timer.stop),

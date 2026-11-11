@@ -256,7 +256,7 @@ def test_health_flags_a_capture_that_stops():
 
 def test_report_lists_every_camera_mode(monkeypatch, tmp_path):
     """B48: two cameras used to leave only the last mode in the report."""
-    from anycam import pool as pool_module
+    from anycam.engine import source_pool as pool_module
     from anycam.sources import CameraMode
 
     def modes(device):
