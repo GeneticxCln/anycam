@@ -837,11 +837,45 @@ class AnyCamEngine:
 
     def _add_layer(self, layer: Layer, zorder: int) -> None:
         """Build one layer into the canvas; leave no pool reference on failure."""
+        chains_before = len(self.chains)
+        self._partial_pad = None
         try:
             self._add_layer_impl(layer, zorder)
         except Exception:
             self._rollback_layer_capture(layer.id)
+            self._discard_partial_layer(layer.id, chains_before)
             raise
+        self._partial_pad = None
+
+    def _discard_partial_layer(self, layer_id: str, chains_before: int) -> None:
+        """Take out what a layer that failed to build left in the canvas.
+
+        A requested compositor pad that never got a feed makes the mixer wait
+        for it for ever (the canvas freezes), and an orphan chain keeps its
+        elements, probes and generator threads until the next rebuild.
+        """
+        pad, self._partial_pad = getattr(self, "_partial_pad", None), None
+        self._layer_pads.pop(layer_id, None)
+        self._layer_chains.pop(layer_id, None)
+        self.layer_sources.pop(layer_id, None)
+        orphans = self.chains[chains_before:]
+        for chain in orphans:
+            for hook in getattr(chain, "cleanup", ()):
+                try:
+                    hook()
+                except Exception:  # noqa: BLE001 - one hook must not block the rest
+                    pass
+        for chain in reversed(orphans):
+            try:
+                self._dispose_chain(chain, pad)
+            except Exception:  # noqa: BLE001 - the canvas must survive its own cleanup
+                pass
+            pad = None
+        if pad is not None and self.compositor is not None:
+            try:
+                self.compositor.release_request_pad(pad)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _rollback_layer_capture(self, layer_id: str) -> None:
         """Give back the capture a half-built layer acquired."""
@@ -1045,6 +1079,7 @@ class AnyCamEngine:
         pad = self.compositor.request_pad_simple("sink_%u")
         if pad is None:
             raise RuntimeError("compositor refused a request pad")
+        self._partial_pad = pad
         pad.set_property("xpos", box[0])
         pad.set_property("ypos", box[1])
         pad.set_property("width", box[2])

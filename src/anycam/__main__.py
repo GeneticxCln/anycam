@@ -24,8 +24,11 @@ def cmd_sources(_args) -> int:
 
 def cmd_doctor(_args) -> int:
     summary = config.system_summary()
+    elements = config.check_elements()
+    summary["elements"] = elements
     checks = {
         "gstreamer": summary["gstreamer"] != "unavailable",
+        "gstreamer_elements": not elements["missing"],
         "camera": Path(summary["camera"]).exists(),
         "v4l2loopback": summary["vcam_available"],
         "ffprobe": config.has_command("ffprobe"),
@@ -42,6 +45,18 @@ def cmd_doctor(_args) -> int:
         summary["vcam_conversion"] = {"error": str(exc)}
     print(json.dumps(summary, indent=2))
     return 0 if all(checks.values()) else 1
+
+
+def cmd_elements(_args) -> int:
+    """List missing GStreamer elements; exit 1 when a required one is absent."""
+    report = config.check_elements()
+    for name in report["missing"]:
+        print(f"MISSING {name}")
+    for name, why in report["optional_missing"].items():
+        print(f"optional {name} ({why})")
+    if not report["missing"]:
+        print("all required elements present")
+    return 1 if report["missing"] else 0
 
 
 def cmd_demo(args) -> int:
@@ -87,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("probe", help="print the detected system/devices as JSON").set_defaults(func=cmd_probe)
     sub.add_parser("sources", help="list cameras and microphones").set_defaults(func=cmd_sources)
     sub.add_parser("doctor", help="check runtime prerequisites").set_defaults(func=cmd_doctor)
+    sub.add_parser("elements", help="list missing GStreamer elements").set_defaults(
+        func=cmd_elements)
 
     # Listed for `anycam --help`; the early dispatch above forwards the real
     # soak arguments to its own parser.

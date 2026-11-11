@@ -1104,8 +1104,10 @@ def run_gui(project: Project | None = None) -> int:
     # open that already failed needs its re-select hint.
     if window.hold_vcam_device():
         # The card is a placeholder: once a source exists and the preview
-        # starts, the held node follows the canvas without a second click.
-        window.feed_held_vcam()
+        # starts, the held node follows the canvas without a second click
+        # (unless the user turned the virtual camera off last time).
+        if window.project.output.vcam_enabled:
+            window.feed_held_vcam()
         window.note_vcam_consumers()
         window.ensure_vcam_visible()
     QTimer.singleShot(200, window._autostart_preview)

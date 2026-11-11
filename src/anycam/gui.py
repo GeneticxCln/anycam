@@ -6357,6 +6357,11 @@ class AnyCamWindow(QMainWindow):
 
     def toggle_vcam(self) -> None:
         self.vcam_on = not self.vcam_on
+        # The user's choice, kept for the next launch (a failed start below
+        # clears ``vcam_on`` but is not a choice).
+        if self.project.output.vcam_enabled != self.vcam_on:
+            self.project.output.vcam_enabled = self.vcam_on
+            self._mark_dirty()
         self.vcam_button.setText("Virtual camera: on" if self.vcam_on else "Virtual camera")
         self.project.output.vcam_device = (self.vcam_edit.text().strip()
                                            or config.loopback_device())
@@ -6915,7 +6920,8 @@ def run_gui(project: Project | None = None) -> int:
     # Hold the loopback node from launch: apps that remember "AnyCam" must be
     # able to open it before the preview is started.
     if window.hold_vcam_device():
-        window.feed_held_vcam()
+        if window.project.output.vcam_enabled:
+            window.feed_held_vcam()
         window.note_vcam_consumers()
         window.ensure_vcam_visible()
     code = app.exec()

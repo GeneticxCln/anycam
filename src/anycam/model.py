@@ -367,6 +367,9 @@ class OutputConfig:
     # driver or root, but only apps with PipeWire camera support list it) or
     # "both".
     vcam_backend: str = "v4l2"
+    # Whether the held virtual camera follows the canvas when the app starts.
+    # The Virtual camera button writes it, so "off" survives a restart.
+    vcam_enabled: bool = True
     # Portal screen captures: automatic follows the compositor's orientation
     # tag.  rotate-180 / vertical-flip / none are explicit corrections for a
     # share that is wrong.

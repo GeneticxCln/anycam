@@ -26,6 +26,32 @@ sys.path.insert(0, str(ROOT / "src"))
 from anycam import portal  # noqa: E402
 
 
+def frame_problems(image, stream_size) -> list[str]:
+    """Why ``image`` cannot be the portal stream that was asked for (empty: fine).
+
+    The capture used to report ``ok: true`` for any frame that arrived: a
+    black frame, one flat colour, or a different node (a webcam instead of the
+    shared window) all passed.  A blank frame and a wrong shape are failures.
+    """
+    problems: list[str] = []
+    width, height = image.size
+    if width < 2 or height < 2:
+        problems.append(f"frame is only {width}x{height}")
+        return problems
+    low, high = zip(*image.getextrema())
+    if max(high) - min(low) < 4:
+        problems.append("frame is a single flat colour (black or blank)")
+    want_w, want_h = (stream_size or (0, 0))[:2]
+    if want_w > 1 and want_h > 1:
+        # The portal reports logical pixels and the buffer is physical, so
+        # compare the shape, not the size (the engine does the same).
+        got, want = width / height, want_w / want_h
+        if abs(got - want) > 0.02 * want:
+            problems.append(
+                f"frame is {width}x{height} but the portal stream is {want_w}x{want_h}")
+    return problems
+
+
 def _portal_version() -> str:
     """Return the ScreenCast interface version, or a useful error string."""
     import gi
@@ -225,9 +251,11 @@ def capture(out_path: Path, timeout: float, types: int = 3,
         image = Image.frombytes("RGB", (width, height), data[:expected])
         out_path.parent.mkdir(parents=True, exist_ok=True)
         image.save(out_path)
+        problems = frame_problems(image, (stream.width, stream.height))
 
         return {
-            "ok": True,
+            "ok": not problems,
+            "problems": problems,
             "file": str(out_path),
             "width": width,
             "height": height,
@@ -293,7 +321,7 @@ def main() -> int:
             return 1
         report_path.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps(report, indent=2), flush=True)
-        return 0
+        return 0 if report.get("ok") else 1
     finally:
         _close_window(app, window)
 

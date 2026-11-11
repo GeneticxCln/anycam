@@ -8,7 +8,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 25
+    timeout-minutes: 40
     env:
       PYTHONPATH: src
       QT_QPA_PLATFORM: offscreen
@@ -25,7 +25,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             python3 python3-pip python3-gi python3-gi-cairo \
             gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-gdkpixbuf-2.0 \
-            gstreamer1.0-tools gstreamer1.0-plugins-base \
+            v4l-utils gstreamer1.0-tools gstreamer1.0-plugins-base \
             gstreamer1.0-x gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
             gstreamer1.0-libav gstreamer1.0-pipewire \
@@ -47,10 +47,17 @@ jobs:
           /usr/bin/python3 -m pip install --break-system-packages --upgrade pip
           /usr/bin/python3 -m pip install --break-system-packages \
             "PySide6-Essentials>=6.6" numpy Pillow psutil pytest pytest-timeout \
-            onnxruntime cryptography
+            pytest-cov onnxruntime cryptography
+          /usr/bin/python3 -m pip install --break-system-packages ruff
 
       - name: Compile sources
         run: /usr/bin/python3 -m compileall -q src tests
+
+      # Real defects only (undefined names, unused imports, late-binding
+      # closures, mutable defaults, comparisons to singletons): style is not
+      # enforced.  The rule set is in pyproject.toml.
+      - name: Lint
+        run: /usr/bin/python3 -m ruff check src
 
       - name: Run tests
         # addopts in pyproject.toml is "-q", which cancels out -v and would
@@ -61,6 +68,7 @@ jobs:
           /usr/bin/python3 -m pytest tests \
             -o addopts="" -v \
             --timeout=180 --timeout-method=thread \
+            --cov=anycam --cov-report=term:skip-covered --cov-report=xml \
             --junitxml=report.xml
 
       - name: Upload the test report
@@ -69,6 +77,14 @@ jobs:
         with:
           name: pytest-report
           path: report.xml
+          if-no-files-found: warn
+
+      - name: Upload the coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
           if-no-files-found: warn
 
   # The same suite with the hardware masking switch on.  A developer runs
@@ -92,7 +108,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             python3 python3-pip python3-gi python3-gi-cairo \
             gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-gdkpixbuf-2.0 \
-            gstreamer1.0-tools gstreamer1.0-plugins-base \
+            v4l-utils gstreamer1.0-tools gstreamer1.0-plugins-base \
             gstreamer1.0-x gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
             gstreamer1.0-libav gstreamer1.0-pipewire \

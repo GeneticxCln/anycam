@@ -884,6 +884,51 @@ def vcam_pixel_format(device: str) -> str:
     return "YUY2"
 
 
+# GStreamer elements the app cannot run without ("a|b" means either one), and
+# the ones that only switch a feature on.  scripts/setup.sh and ``anycam
+# doctor`` both read these, so they cannot drift apart.
+REQUIRED_ELEMENTS: tuple[str, ...] = (
+    "appsink", "appsrc", "audiomixer", "audioconvert", "audioresample",
+    "avenc_aac", "aacparse", "capsfilter", "compositor", "decodebin",
+    "fakesink", "filesink", "filesrc", "flvmux", "gdkpixbufoverlay",
+    "h264parse", "identity", "imagefreeze", "intervideosink", "intervideosrc",
+    "jpegdec", "level", "mp4mux", "pngdec", "pulsesrc", "queue",
+    "rtmp2sink|rtmpsink", "tee", "textoverlay", "uridecodebin", "v4l2sink",
+    "v4l2src", "valve", "videobalance", "videoconvert", "videocrop",
+    "videorate", "videoscale", "volume", "x264enc",
+)
+OPTIONAL_ELEMENTS: dict[str, str] = {
+    "glvideomixer": "GPU canvas", "glupload": "GPU canvas and preview",
+    "gldownload": "GPU canvas", "glcolorconvert": "GPU canvas",
+    "glshader": "GPU colour looks", "qml6glsink": "GPU preview",
+    "coloreffects": "film looks", "videoflip": "mirror and screen rotation",
+    "webrtcdsp": "microphone noise suppression", "webrtcbin": "phone camera",
+    "pipewiresrc": "screen sharing", "pipewiresink": "PipeWire virtual camera",
+    "nvh264enc": "NVENC encoding", "vah264enc": "VA-API encoding",
+}
+
+
+def installed_elements() -> set[str] | None:
+    """Names of the installed GStreamer elements (None: gst-inspect is missing)."""
+    code, out = run(["gst-inspect-1.0"], timeout=30)
+    if code != 0:
+        return None
+    return {match.group(1) for match in
+            re.finditer(r"^\S+:\s+(\S+):", out, re.M)}
+
+
+def check_elements(installed: set[str] | None = None) -> dict:
+    """``{"missing": [...], "optional_missing": {...}}`` for this machine."""
+    have = installed if installed is not None else installed_elements()
+    if have is None:
+        return {"missing": ["gst-inspect-1.0"], "optional_missing": {}}
+    missing = [name for name in REQUIRED_ELEMENTS
+               if not any(option in have for option in name.split("|"))]
+    optional = {name: why for name, why in OPTIONAL_ELEMENTS.items()
+                if name not in have}
+    return {"missing": missing, "optional_missing": optional}
+
+
 def system_summary() -> dict:
     code, gst = run(["gst-inspect-1.0", "--version"])
     return {
