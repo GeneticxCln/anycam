@@ -178,7 +178,7 @@ class FakeRecorder:
 
 
 def test_changing_the_canvas_size_while_recording_starts_a_new_file(app, monkeypatch):
-    monkeypatch.setattr("anycam.gui.Recorder", FakeRecorder)
+    monkeypatch.setattr("anycam.ui.outputs.Recorder", FakeRecorder)
     window = ManyCamWindow(make_project(pattern_layer(), width=640, height=360))
     window.headless = True
     window._persist = False

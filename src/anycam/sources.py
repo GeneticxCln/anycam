@@ -1114,7 +1114,7 @@ def animation_chain(preset: str, width: int, height: int, fps: int,
     return chain
 
 
-ANIMATED_KINDS = ("ticker", "lower_third", "gif", "drawing", "particles")
+ANIMATED_KINDS = ("ticker", "lower_third", "gif", "drawing", "particles", "clock", "timer")
 
 
 def animated_chain(layer, width: int, height: int, fps: int) -> SourceChain:
@@ -1128,9 +1128,15 @@ def animated_chain(layer, width: int, height: int, fps: int) -> SourceChain:
                                     layer.background)
         size = (width, height)
     elif kind == "lower_third":
-        name, _sep, title = str(layer.source or "").partition("|")
-        generator = animated.LowerThird(width, height, name.strip(), title.strip(),
-                                        layer.color, layer.background)
+        name, title, color, background, accent = animated.lower_third_style(
+            layer.source, layer.color, layer.background)
+        generator = animated.LowerThird(width, height, name, title, color, background, accent)
+        size = (width, height)
+    elif kind == "clock":
+        generator = animated.Clock(width, height, layer.source, layer.color, layer.background)
+        size = (width, height)
+    elif kind == "timer":
+        generator = animated.Timer(width, height, layer.source, layer.color, layer.background)
         size = (width, height)
     elif kind == "particles":
         from . import particles

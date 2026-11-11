@@ -300,7 +300,7 @@ def test_scene_cards_are_built_from_the_project(app):
 def test_preset_deck_numbers_scenes_and_supports_rename_and_remove(app, monkeypatch):
     project, second = _two_scene_project()
     window = _window(project, app)
-    monkeypatch.setattr("anycam.gui.QInputDialog.getText",
+    monkeypatch.setattr("PySide6.QtWidgets.QInputDialog.getText",
                         lambda *args, **kwargs: ("Intro", True))
     try:
         window.rename_scene(second.id)
@@ -319,7 +319,8 @@ def test_preset_deck_numbers_scenes_and_supports_rename_and_remove(app, monkeypa
 
 def test_manycam_layout_leaves_the_classic_window_alone():
     """Importing the alternative layout must not patch the base class."""
-    assert AnyCamWindow._refresh_scenes.__qualname__.startswith("AnyCamWindow.")
+    # the classic implementation lives in the scenes mixin of anycam.ui
+    assert AnyCamWindow._refresh_scenes.__qualname__ == "SceneMixin._refresh_scenes"
     assert ManyCamWindow._refresh_scenes is not AnyCamWindow._refresh_scenes
     assert ManyCamWindow._scene_changed is not AnyCamWindow._scene_changed
 
@@ -431,7 +432,7 @@ def test_layout_switch_keeps_the_portal_session(app, monkeypatch):
     def refuse(*_args, **_kwargs):
         raise AssertionError("layout switch requested a new portal session")
 
-    monkeypatch.setattr("anycam.gui.portal.request_screen_cast", refuse)
+    monkeypatch.setattr("anycam.ui.screens.portal.request_screen_cast", refuse)
     try:
         window.apply_layout("full")
         window._assign_slot(0, camera)
@@ -1136,8 +1137,8 @@ def test_desktop_only_audio_enables_engine_and_recorder(app, monkeypatch, tmp_pa
             seen.append(("recorder", kwargs["audio"]))
             return False
 
-    monkeypatch.setattr(gui, "AnyCamEngine", FakeEngine)
-    monkeypatch.setattr(gui, "Recorder", FakeRecorder)
+    monkeypatch.setattr("anycam.ui.engine_control.AnyCamEngine", FakeEngine)
+    monkeypatch.setattr("anycam.ui.outputs.Recorder", FakeRecorder)
     try:
         window.start_engine()
         window._start_recorder()

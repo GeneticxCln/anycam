@@ -263,7 +263,7 @@ def test_a_gpu_canvas_that_fails_to_start_retries_on_the_cpu(app, monkeypatch, t
                 raise RuntimeError("GL context lost")
             return super().start()
 
-    monkeypatch.setattr(gui, "AnyCamEngine", FlakyGpuEngine)
+    monkeypatch.setattr("anycam.ui.engine_control.AnyCamEngine", FlakyGpuEngine)
     try:
         window.start_engine()
         assert asked == ["gpu", "cpu"]

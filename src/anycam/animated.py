@@ -75,6 +75,48 @@ class Ticker:
         return np.asarray(out, dtype=np.uint8)
 
 
+# name -> (text colour, card colour, accent colour).  A lower third's ``source``
+# is ``name|title|template``; an unknown or missing template is "Classic".
+LOWER_THIRD_TEMPLATES: dict[str, tuple[str, str, str]] = {
+    "Classic": ("#ffffff", "#101418e6", "#5eead0"),
+    "Glass": ("#ffffff", "#ffffff33", "#ffffff"),
+    "Bold": ("#101418", "#facc15f2", "#101418"),
+    "Broadcast": ("#ffffff", "#1d4ed8f0", "#f97316"),
+    "Minimal": ("#ffffff", "#00000099", "#00000000"),
+    "Rose": ("#ffffff", "#9f1239eb", "#fda4af"),
+}
+
+
+def split_lower_third(source: str) -> tuple[str, str, str]:
+    """``(name, title, template)`` from a lower third's source text."""
+    parts = str(source or "").split("|")
+    name = parts[0].strip() if parts else ""
+    title = parts[1].strip() if len(parts) > 1 else ""
+    template = parts[2].strip() if len(parts) > 2 else ""
+    return name, title, template if template in LOWER_THIRD_TEMPLATES else "Classic"
+
+
+def lower_third_style(source: str, color: str, background: str) -> tuple[str, str, str, str, str]:
+    """``(name, title, text colour, card colour, accent)`` for a lower third.
+
+    A template named in the source wins; without one the layer's own colours
+    are used with the classic accent, as before templates existed.
+    """
+    name, title, template = split_lower_third(source)
+    named = len(str(source or "").split("|")) > 2
+    if named:
+        text_colour, card, accent = LOWER_THIRD_TEMPLATES[template]
+        return name, title, text_colour, card, accent
+    return name, title, color, background, LOWER_THIRD_TEMPLATES["Classic"][2]
+
+
+def join_lower_third(name: str, title: str, template: str = "Classic") -> str:
+    """The source text for :func:`split_lower_third` (``|`` in the text is dropped)."""
+    clean = lambda text: str(text or "").replace("|", "/").strip()  # noqa: E731
+    base = f"{clean(name)}|{clean(title)}"
+    return base if template in ("", "Classic") else f"{base}|{template}"
+
+
 class LowerThird:
     """A name card that slides in from the left when it is shown."""
 
@@ -118,8 +160,11 @@ class LowerThird:
         """Slide in again (called when the layer is shown)."""
         self._start = None
 
-    def reconfigure(self, name: str, title: str, color: str, background: str) -> None:
+    def reconfigure(self, name: str, title: str, color: str, background: str,
+                    accent: str | None = None) -> None:
         """Change the text and colours while it is running (and slide in again)."""
+        if accent is not None:
+            self._accent = accent
         card = self._render(name or "Name", title, color, background, self._accent)
         with self._lock:
             self._card = card
@@ -134,6 +179,144 @@ class LowerThird:
             out = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
             out.paste(self._card, (int(-self.width * (1.0 - eased)), 0), self._card)
         return np.asarray(out, dtype=np.uint8)
+
+
+def _badge(text: str, width: int, height: int, color: str, background: str) -> Image.Image:
+    """``text`` centred on a rounded badge the size of the layer (with alpha)."""
+    return overlay.render_text_image(text, width, height, int(height * 0.8), color,
+                                     background, "badge")
+
+
+class Clock:
+    """The time of day on a badge; redrawn only when the text changes."""
+
+    label = "Clock"
+
+    def __init__(self, width: int, height: int, fmt: str = "%H:%M:%S",
+                 color: str = "#ffffff", background: str = "#101418cc") -> None:
+        self._lock = threading.Lock()
+        self.width, self.height = max(8, int(width)), max(8, int(height))
+        self._fmt, self._color, self._background = self._valid(fmt), color, background
+        self._shown = ""
+        self._frame: np.ndarray | None = None
+
+    @staticmethod
+    def _valid(fmt: str) -> str:
+        import time as _time
+
+        import re as _re
+
+        fmt = (fmt or "").strip() or "%H:%M:%S"
+        # glibc prints an unknown directive (``%Q``) as it is; accept only the
+        # standard ones so a typo falls back to the default instead of showing.
+        known = _re.compile(r"%[-_0^#]?[aAbBcCdDeFgGhHIjklmMnpPrRsStTuUVwWxXyYzZ%]")
+        if _re.sub(known, "", fmt).count("%"):
+            return "%H:%M:%S"
+        try:
+            return fmt if _time.strftime(fmt) else "%H:%M:%S"
+        except (ValueError, OverflowError):
+            return "%H:%M:%S"
+
+    def reconfigure(self, fmt: str, color: str, background: str) -> None:
+        with self._lock:
+            self._fmt, self._color, self._background = self._valid(fmt), color, background
+            self._shown, self._frame = "", None
+
+    def text(self) -> str:
+        import time as _time
+
+        return _time.strftime(self._fmt)
+
+    def frame(self, t: float) -> np.ndarray:
+        with self._lock:
+            now = self.text()
+            if now != self._shown or self._frame is None:
+                self._shown = now
+                self._frame = np.asarray(
+                    _badge(now, self.width, self.height, self._color, self._background),
+                    dtype=np.uint8)
+            return self._frame
+
+
+def parse_timer(source: str) -> tuple[str, float]:
+    """``("countdown" | "stopwatch", seconds)`` from a timer's source text.
+
+    ``stopwatch`` counts up from zero; ``countdown:300``, ``countdown 5:00`` and
+    a bare ``5:00`` or ``90`` count down from that many minutes:seconds / seconds.
+    """
+    text = str(source or "").strip().lower()
+    if text.startswith("stopwatch"):
+        return "stopwatch", 0.0
+    text = text.removeprefix("countdown").lstrip(" :=").strip()
+    seconds = 0.0
+    try:
+        if ":" in text:
+            for part in text.split(":"):
+                seconds = seconds * 60 + float(part or 0)
+        elif text:
+            seconds = float(text)
+    except ValueError:
+        seconds = 0.0
+    return "countdown", max(0.0, seconds if seconds == seconds else 0.0)
+
+
+def format_timer(seconds: float) -> str:
+    """``MM:SS``, or ``H:MM:SS`` from an hour on."""
+    whole = max(0, int(seconds))
+    hours, rest = divmod(whole, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+class Timer:
+    """A countdown or stopwatch badge.  Showing the layer starts it again."""
+
+    label = "Timer"
+    WARN_SECONDS = 10
+
+    def __init__(self, width: int, height: int, source: str = "countdown:300",
+                 color: str = "#ffffff", background: str = "#101418cc") -> None:
+        self._lock = threading.Lock()
+        self.width, self.height = max(8, int(width)), max(8, int(height))
+        self._mode, self._total = parse_timer(source)
+        self._color, self._background = color, background
+        self._start: float | None = None
+        self._shown = ""
+        self._frame: np.ndarray | None = None
+
+    def restart(self) -> None:
+        with self._lock:
+            self._start = None
+
+    def reconfigure(self, source: str, color: str, background: str) -> None:
+        with self._lock:
+            self._mode, self._total = parse_timer(source)
+            self._color, self._background = color, background
+            self._start, self._shown, self._frame = None, "", None
+
+    def reading(self, t: float) -> tuple[str, bool]:
+        """``(text, warning)`` at generator time ``t`` (starts the clock on first use)."""
+        if self._start is None:
+            self._start = t
+        elapsed = max(0.0, t - self._start)
+        if self._mode == "stopwatch":
+            return format_timer(elapsed), False
+        left = max(0.0, self._total - elapsed)
+        # whole seconds, rounded up, so 00:00 shows only when it is really over
+        shown = int(left) + (0 if left == int(left) else 1)
+        return format_timer(shown), shown <= self.WARN_SECONDS
+
+    def frame(self, t: float) -> np.ndarray:
+        with self._lock:
+            text, warning = self.reading(t)
+            key = f"{text}|{warning}"
+            if key != self._shown or self._frame is None:
+                self._shown = key
+                color = "#ff3b5c" if warning else self._color
+                self._frame = np.asarray(
+                    _badge(text, self.width, self.height, color, self._background),
+                    dtype=np.uint8)
+            return self._frame
 
 
 class GifPlayer:

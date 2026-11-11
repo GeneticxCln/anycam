@@ -213,6 +213,12 @@ class Layer:
     # Reserved scene-decoration marker.  "backdrop" layers sit behind every
     # capture layer and are replaced (not stacked) by the Looks tab.
     role: str = ""
+    # A locked layer cannot be moved, resized, cropped or deleted by accident
+    # (it still plays, and every property can be changed from its panels).
+    locked: bool = False
+    # V4L2 control values to re-apply to a camera layer's device on start and
+    # after a reconnect (brightness, zoom, focus ... - see camera_controls).
+    camera_controls: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Layer":
@@ -230,7 +236,7 @@ class Layer:
         name = data.get("name")
         layer = cls(id=layer_id, kind=kind.strip(),
                     name=name if isinstance(name, str) and name else kind.strip())
-        special = ("id", "kind", "name", "box", "crop", "effects", "playlist")
+        special = ("id", "kind", "name", "box", "crop", "effects", "playlist", "camera_controls")
         for item in fields(cls):
             if item.name in special or item.name not in data:
                 continue
@@ -239,6 +245,12 @@ class Layer:
         layer.box = _quad(data.get("box"), layer.box)
         layer.crop = _quad(data.get("crop"), layer.crop)
         layer.effects = Effects.from_dict(data.get("effects"))
+        controls = data.get("camera_controls")
+        if isinstance(controls, dict):
+            layer.camera_controls = {
+                str(key): int(value) for key, value in controls.items()
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                and _finite(float(value))}
         items = data.get("playlist")
         for entry in items if isinstance(items, list) else []:
             if isinstance(entry, dict) and isinstance(entry.get("source"), str):

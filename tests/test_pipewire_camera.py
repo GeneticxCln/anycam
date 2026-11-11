@@ -284,7 +284,7 @@ def test_choosing_a_backend_republishes_a_held_camera(app, monkeypatch, tmp_path
             started.append("stop")
             return {}
 
-    monkeypatch.setattr(gui, "VcamOutput", Output)
+    monkeypatch.setattr("anycam.ui.outputs.VcamOutput", Output)
     monkeypatch.setattr(window, "setup_vcam_if_needed", lambda: True)
     monkeypatch.setattr(window, "ensure_vcam_visible", lambda *a: None)
     try:

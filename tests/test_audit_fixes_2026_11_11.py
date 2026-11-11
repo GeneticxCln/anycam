@@ -444,7 +444,7 @@ def _flaky_window(monkeypatch, tmp_path, fail_cpu):
                 raise RuntimeError("camera busy")
             return super().start()
 
-    monkeypatch.setattr(gui, "AnyCamEngine", Flaky)
+    monkeypatch.setattr("anycam.ui.engine_control.AnyCamEngine", Flaky)
     return app, window
 
 

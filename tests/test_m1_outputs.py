@@ -203,7 +203,9 @@ def test_silent_rtsp_source_cannot_stall_the_canvas():
             conn.close()
         thread.join(timeout=2)
 
-    assert measured >= 0.99 * elapsed * 30, (
+    # 99 % of the frames the canvas rate allows, give or take the two frames a
+    # 2-second window can lose at its edges (the counter is read between pumps).
+    assert measured >= elapsed * 30 - 2, (
         f"canvas produced {measured} frames in {elapsed:.2f}s"
     )
     assert frames, "network stall left the preview without a frame"

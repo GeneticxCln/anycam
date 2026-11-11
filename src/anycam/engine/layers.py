@@ -456,8 +456,13 @@ class LayerMixin:
         if layer.kind == "ticker":
             control.reconfigure(layer.source, layer.color, layer.background)
         elif layer.kind == "lower_third":
-            name, _sep, title = str(layer.source or "").partition("|")
-            control.reconfigure(name.strip(), title.strip(), layer.color, layer.background)
+            from .. import animated
+
+            name, title, color, background, accent = animated.lower_third_style(
+                layer.source, layer.color, layer.background)
+            control.reconfigure(name, title, color, background, accent)
+        elif layer.kind in ("clock", "timer"):
+            control.reconfigure(layer.source, layer.color, layer.background)
         else:
             return False
         return True

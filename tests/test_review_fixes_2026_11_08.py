@@ -112,7 +112,7 @@ def test_a_gpu_canvas_that_fails_while_building_falls_back(app, monkeypatch, tmp
                 raise RuntimeError("could not upload a layer to the GPU canvas")
             return super().build()
 
-    monkeypatch.setattr(gui, "AnyCamEngine", BreaksWhileBuilding)
+    monkeypatch.setattr("anycam.ui.engine_control.AnyCamEngine", BreaksWhileBuilding)
     try:
         window.start_engine()
         assert asked == ["gpu", "cpu"]

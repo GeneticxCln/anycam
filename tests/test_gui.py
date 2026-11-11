@@ -1038,7 +1038,7 @@ def test_camera_grid_scene_button_builds_the_selected_slots(app, monkeypatch):
         def slots(self):
             return ["/dev/video2", "/dev/video3", "", "/dev/video5"]
 
-    monkeypatch.setattr("anycam.gui.CameraGridDialog", FakeDialog)
+    monkeypatch.setattr("anycam.ui.scenes.CameraGridDialog", FakeDialog)
     try:
         before = len(window.project.scenes)
         window.add_camera_grid_scene()
@@ -1291,7 +1291,7 @@ def test_vcam_toggle_starts_the_preview_it_needs(app, monkeypatch):
             self.active = False
             return {"device": self.device, "ok": True, "error": ""}
 
-    monkeypatch.setattr("anycam.gui.VcamOutput", FakeVcam)
+    monkeypatch.setattr("anycam.ui.outputs.VcamOutput", FakeVcam)
     window = _window()
     try:
         assert window.engine is None
@@ -1335,7 +1335,7 @@ def test_vcam_output_survives_engine_restarts(app, monkeypatch):
             self.stopped = True
             return {"device": self.device, "ok": True, "error": ""}
 
-    monkeypatch.setattr("anycam.gui.VcamOutput", FakeVcam)
+    monkeypatch.setattr("anycam.ui.outputs.VcamOutput", FakeVcam)
     window = _window()
     try:
         window.start_engine()
@@ -1399,7 +1399,7 @@ def test_vcam_sink_error_is_rebuilt_not_turned_off(app, monkeypatch):
         def set_canvas_attached(self, _attached):
             return None
 
-    monkeypatch.setattr("anycam.gui.VcamOutput", FakeVcam)
+    monkeypatch.setattr("anycam.ui.outputs.VcamOutput", FakeVcam)
     window = _window()
     try:
         window.vcam_on = True
@@ -1816,7 +1816,7 @@ def test_a_codec_change_restarts_the_canvas_instead_of_a_broken_attach(app, tmp_
         window.toggle_record()
         window.toggle_record()                    # stop; the tap stays in place
         assert first.record_codec() == "h264"
-        monkeypatch.setattr("anycam.gui.recording_codec", lambda _pref: "h265")
+        monkeypatch.setattr("anycam.ui.outputs.recording_codec", lambda _pref: "h265")
         window.toggle_record()
         assert window.engine is not first, "the stale H.264 tap was reused"
     finally:

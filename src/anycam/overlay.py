@@ -137,7 +137,7 @@ def _fit_font(draw: ImageDraw.ImageDraw, text: str, box: tuple[int, int], start:
     return _load_font(8)
 
 
-def render_text_png(
+def render_text_image(
     text: str,
     width: int,
     height: int,
@@ -145,9 +145,8 @@ def render_text_png(
     color: str = "#ffffff",
     background: str = "#101418cc",
     style: str = "badge",
-    out: Path | None = None,
-) -> Path:
-    """Render a text badge with a transparent surround."""
+) -> Image.Image:
+    """Text on a badge (or bare) with a transparent surround, as an RGBA picture."""
     width, height = max(8, int(width)), max(8, int(height))
     image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
@@ -162,6 +161,22 @@ def render_text_png(
     tx = (width - (bbox[2] - bbox[0])) // 2 - bbox[0]
     ty = (height - (bbox[3] - bbox[1])) // 2 - bbox[1]
     draw.text((tx, ty), text, font=font, fill=parse_color(color))
+    return image
+
+
+def render_text_png(
+    text: str,
+    width: int,
+    height: int,
+    font_size: int,
+    color: str = "#ffffff",
+    background: str = "#101418cc",
+    style: str = "badge",
+    out: Path | None = None,
+) -> Path:
+    """Render a text badge with a transparent surround."""
+    width, height = max(8, int(width)), max(8, int(height))
+    image = render_text_image(text, width, height, font_size, color, background, style)
     if out is None:
         digest = hashlib.sha1(
             f"{text}|{width}x{height}|{font_size}|{color}|{background}|{style}".encode()
