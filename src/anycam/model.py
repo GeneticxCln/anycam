@@ -401,9 +401,25 @@ class AudioConfig:
     mic_denoise: str = "moderate"
     mic_auto_gain: bool = False
     media_file: str = ""
-    media_loop: bool = True      # reserved: the media bed plays once today
+    media_loop: bool = True      # a single media file restarts; a playlist wraps round
     media_gain_db: float = 0.0
     media_muted: bool = False
+    # Extra audio files played after ``media_file`` in order (or shuffled).
+    media_playlist: list[str] = field(default_factory=list)
+    media_shuffle: bool = False
+    # Gate/compressor ("off", "gate", "compressor", "broadcast") and equaliser
+    # ("flat", "voice", "warm", "bright", "bass-cut") on the microphone.
+    mic_dynamics: str = "off"
+    mic_eq: str = "flat"
+    # Per-source sync offsets: audio held back by this many milliseconds, so a
+    # microphone that runs ahead of a slow capture card lines up with it.
+    mic_delay_ms: int = 0
+    desktop_delay_ms: int = 0
+    media_delay_ms: int = 0
+    # Audio output: a monitor so the streamer hears the mix, and a virtual
+    # microphone (a PipeWire source node other apps can record from).
+    monitor_device: str = ""
+    virtual_mic: bool = False
     # Desktop audio: a PipeWire/PulseAudio monitor source ("what you hear").
     desktop_device: str = ""
     desktop_gain_db: float = 0.0
@@ -411,7 +427,19 @@ class AudioConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "AudioConfig":
-        return _coerce_fields(cls, data)
+        audio = _coerce_fields(cls, data, skip=("media_playlist",))
+        raw = data.get("media_playlist") if isinstance(data, dict) else None
+        audio.media_playlist = [item for item in raw if isinstance(item, str) and item] \
+            if isinstance(raw, list) else []
+        audio.mic_dynamics = audio.mic_dynamics.strip().lower() \
+            if audio.mic_dynamics.strip().lower() in ("off", "gate", "compressor", "broadcast") \
+            else "off"
+        audio.mic_eq = audio.mic_eq.strip().lower() \
+            if audio.mic_eq.strip().lower() in ("flat", "voice", "warm", "bright", "bass-cut") \
+            else "flat"
+        for name in ("mic_delay_ms", "desktop_delay_ms", "media_delay_ms"):
+            setattr(audio, name, max(0, min(2000, int(getattr(audio, name)))))
+        return audio
 
 
 @dataclass

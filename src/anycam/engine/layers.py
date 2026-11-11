@@ -376,6 +376,7 @@ class LayerMixin:
             raise RuntimeError(f"could not link {layer.name} into the compositor")
         self._layer_pads[layer.id] = pad
         self._layer_chains[layer.id] = chain
+        self.ensure_layer_audio(layer)
 
         def on_first_buffer(_pad, _info, layer_id=layer.id):
             self._pads_with_data.add(layer_id)
@@ -531,6 +532,7 @@ class LayerMixin:
             self.layer_sources[layer_id] = entry.source_size
         layer.visible = visible
         pad.set_property("alpha", float(clamp(layer.alpha)) if visible else 0.0)
+        self.apply_layer_audio(layer)
         control = getattr(self._layer_chains.get(layer_id), "control", None)
         if visible and control is not None and hasattr(control, "restart"):
             control.restart()   # a lower third slides in again each time it is shown
@@ -692,6 +694,7 @@ class LayerMixin:
         pad = self._layer_pads.pop(layer_id, None)
         if pad is not None:
             pad.set_property("alpha", 0.0)
+        self.drop_layer_audio(layer_id)
         removed = self._layer_chains.pop(layer_id, None)
         # A generated layer (animation, ticker, GIF, drawing) owns a feeder
         # thread.  Without this it kept drawing frames into an invisible pad

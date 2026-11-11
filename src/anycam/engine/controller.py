@@ -158,6 +158,11 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         self._preview_gate_open = False
         self._preview_gate_deadline = 0.0
         self.media_volume: Gst.Element | None = None
+        self._layer_audio: dict[str, tuple] = {}
+        self._audio_levels: dict[str, tuple[float, float, float]] = {}
+        self._media_items: list[str] = []
+        self._media_index = 0
+        self._media_eos = False
         self.audio_tee: Gst.Element | None = None
         # Live output taps.  A valve lets the GUI stop feeding the recorder or
         # vcam without rebuilding (and therefore interrupting) the canvas.
@@ -429,10 +434,26 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
             raise RuntimeError(self.report.error)
         return self
 
+    def _note_level(self, msg, struct) -> None:
+        """Record a ``level`` meter reading under the input it belongs to."""
+        source = msg.src.get_name() if msg.src is not None else ""
+        name = source[:-len("_level")] if source.endswith("_level") else source
+        peaks, rms = struct.get_value("peak"), struct.get_value("rms")
+        try:
+            peak = max(float(value) for value in peaks) if peaks else -100.0
+            loud = max(float(value) for value in rms) if rms else -100.0
+        except (TypeError, ValueError):
+            return
+        self._audio_levels[name] = (peak, loud, time.monotonic())
+        if name == "mic":
+            self.mic_level_db = peak
+            self.report.mic_level_db = peak
+
     def pump(self, timeout_ms: int = 50) -> list[Gst.Message]:
         if self.bus is None:
             return []
         self.poll_transition()
+        self.service_media()
         messages: list[Gst.Message] = []
         deadline = time.monotonic() + timeout_ms / 1000.0
         while True:
@@ -461,13 +482,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
             elif msg.type == Gst.MessageType.ELEMENT:
                 struct = msg.get_structure()
                 if struct is not None and struct.get_name() == "level":
-                    peaks = struct.get_value("peak")
-                    if peaks:
-                        try:
-                            self.mic_level_db = float(peaks[0])
-                            self.report.mic_level_db = self.mic_level_db
-                        except (TypeError, ValueError):
-                            pass
+                    self._note_level(msg, struct)
             if time.monotonic() >= deadline:
                 break
         self._poll_vcam_bus()
