@@ -30,6 +30,8 @@ from .auth import Pairing, clean_name
 from .tls import ensure_certificate, fingerprint, lan_address
 
 MAX_BODY = 64 * 1024
+MAX_CONNECTIONS = 32
+HANDSHAKE_TIMEOUT_S = 15
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/index.html": ("index.html", "text/html; charset=utf-8"),
           "/phone.js": ("phone.js", "text/javascript; charset=utf-8")}
@@ -48,12 +50,32 @@ class _TLSServer(http.server.ThreadingHTTPServer):
     def __init__(self, address, handler, context: ssl.SSLContext, service):
         self.context = context
         self.service = service
+        # One thread per connection, and the page is reachable by anything on
+        # the network: bound them, so a flood of half-open connections cannot
+        # exhaust threads and memory.  A phone needs a handful.
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)       # over the limit: drop it
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
     def finish_request(self, request, client_address):
         # The TLS handshake runs on the request's own thread: a phone that
         # stalls mid-handshake cannot block accept() for everyone else.
-        request.settimeout(15)
+        request.settimeout(HANDSHAKE_TIMEOUT_S)
         try:
             tls = self.context.wrap_socket(request, server_side=True)
         except (OSError, ssl.SSLError):

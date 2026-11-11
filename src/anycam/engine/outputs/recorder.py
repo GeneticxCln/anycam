@@ -346,12 +346,20 @@ class Recorder:
                 break   # an errored pipeline never reaches EOS
             if msg.type == Gst.MessageType.EOS:
                 self._eos = True
+        finalised = self._eos
         pipeline.set_state(Gst.State.NULL)
         file = Path(self.path)
         size = file.stat().st_size if file.exists() else 0
         ok = bool(size > 0 and not self.error
                   and self._last_in.get("video") is not None)
+        # The file is fragmented MP4, playable up to its last fragment even
+        # when the muxer never saw end-of-stream (a stuck audio pad), so that
+        # is still a usable recording; but say it was not closed cleanly.
         result = {"path": self.path, "bytes": size, "ok": ok,
+                  "finalised": bool(finalised),
+                  "warning": ("" if finalised or not ok else
+                              "the file was not closed cleanly; the last "
+                              "moments may be missing"),
                   "error": self.error, "rejected_frames": self.rejected_frames}
         self._clear_runtime()
         return result

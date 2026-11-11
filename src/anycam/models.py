@@ -50,6 +50,7 @@ CATALOG: dict[str, ModelInfo] = {
 }
 
 ProgressHandler = Callable[[int, int], None]
+_verified: dict[str, tuple[int, int]] = {}
 
 
 def models_dir() -> Path:
@@ -65,11 +66,19 @@ def model_path(key: str) -> Path | None:
         return None
     path = models_dir() / info.filename
     try:
-        if path.stat().st_size == info.size:
-            return path
+        stat = path.stat()
+        if stat.st_size != info.size:
+            return None
+        # Size alone accepts a replaced file; check the pinned hash once per
+        # change of the file, not on every call.
+        stamp = (stat.st_mtime_ns, stat.st_size)
+        if _verified.get(str(path)) != stamp:
+            if _sha256(path) != info.sha256:
+                return None
+            _verified[str(path)] = stamp
+        return path
     except OSError:
-        pass
-    return None
+        return None
 
 
 def _sha256(path: Path) -> str:

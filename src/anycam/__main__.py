@@ -29,6 +29,7 @@ def cmd_doctor(_args) -> int:
         "camera": Path(summary["camera"]).exists(),
         "v4l2loopback": summary["vcam_available"],
         "ffprobe": config.has_command("ffprobe"),
+        "v4l2-ctl": config.has_command("v4l2-ctl"),
         "pactl": config.has_command("pactl"),
     }
     summary["checks"] = checks

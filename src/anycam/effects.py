@@ -13,6 +13,7 @@ frame and chroma key are separate stages, so they stack with the filter.
 from __future__ import annotations
 
 import itertools
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -483,6 +484,7 @@ class FilterSlot:
 
         def relink() -> None:
             ok = False
+            upstream = downstream = None
             try:
                 # The neighbours *now*: they are re-read here rather than
                 # captured earlier, so a topology change cannot leave this
@@ -501,6 +503,8 @@ class FilterSlot:
                       == Gst.PadLinkReturn.OK
                       and new.get_static_pad("src").link(downstream)
                       == Gst.PadLinkReturn.OK)
+            except Exception as exc:  # noqa: BLE001 - restore below
+                print(f"[filter] swap to {key} failed: {exc!r}", file=sys.stderr, flush=True)
             finally:
                 if ok:
                     self._replace_in_list(old, new)
@@ -508,8 +512,10 @@ class FilterSlot:
                     self.key, self.amount = key, amount
                     if old_runner is not None:
                         old_runner.stop()
-                elif new_runner is not None:
-                    new_runner.stop()
+                else:
+                    if new_runner is not None:
+                        new_runner.stop()
+                    self._restore(old, new, upstream, downstream, parent)
                 self._finish()
 
         if parent.get_state(0)[1] != Gst.State.PLAYING:
@@ -576,6 +582,38 @@ class FilterSlot:
         timer.daemon = True
         timer.start()
         return "scheduled"
+
+    @staticmethod
+    def _restore(old, new, upstream, downstream, parent) -> None:
+        """Put the previous filter back after a swap that did not link.
+
+        Without this the layer's picture stopped for good: the old bin had
+        been taken out and the new one was not connected.
+        """
+        try:
+            new.set_state(Gst.State.NULL)
+            for pad in (new.get_static_pad("sink"), new.get_static_pad("src")):
+                peer = pad.get_peer()
+                if peer is not None:
+                    (peer.unlink(pad) if pad.get_direction() == Gst.PadDirection.SINK
+                     else pad.unlink(peer))
+            if new.get_parent() is parent:
+                parent.remove(new)
+            if old.get_parent() is not parent:
+                parent.add(old)
+            old.sync_state_with_parent()
+            if upstream is not None and downstream is not None:
+                for pad, target in ((upstream, old.get_static_pad("sink")),
+                                    (old.get_static_pad("src"), downstream)):
+                    if pad.is_linked() and pad.get_peer() is target:
+                        continue
+                    if pad.get_direction() == Gst.PadDirection.SRC:
+                        pad.link(target)
+                    else:
+                        target.link(pad)
+        except Exception as exc:  # noqa: BLE001 - nothing more can be done here
+            print(f"[filter] could not restore the previous filter: {exc!r}",
+                  file=sys.stderr, flush=True)
 
     def _finish(self) -> None:
         wanted = None

@@ -6,10 +6,13 @@ the same assets are used by the headless demo, the GUI and the tests.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
+import os
 import random
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -24,6 +27,26 @@ OVERLAY_CACHE_MAX_BYTES = 256 * 1024 * 1024
 OVERLAY_CACHE_MAX_FILES = 1500
 _PRUNE_INTERVAL_S = 30.0
 _last_prune = 0.0
+
+
+def save_png_atomic(image: Image.Image, out: Path) -> Path:
+    """Write ``image`` to ``out`` so a reader never sees a half-written PNG.
+
+    Overlay PNGs are rewritten under the same name while a running pipeline,
+    an old engine or the GUI may still open them.  The picture goes to a
+    private temporary name first and is renamed over the target (atomic on one
+    filesystem).  The temporary has no ``.png`` suffix, so the cache pruner
+    leaves it alone.
+    """
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    temp = out.with_name(f".{out.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        image.save(temp, "PNG")
+        os.replace(temp, out)
+    finally:
+        temp.unlink(missing_ok=True)
+    return out
 
 
 def prune_overlay_cache(directory: Path | None = None, *,
@@ -146,7 +169,7 @@ def render_text_png(
         out = config.cache_dir() / "overlays" / f"text-{digest}.png"
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    image.save(out)
+    save_png_atomic(image, out)
     return out
 
 
@@ -330,6 +353,16 @@ def render_window_frame(
     # inner rectangles invert and Pillow raised "y1 must be >= y0", which
     # aborted the whole canvas build (and every launch, as it is saved).
     thickness = max(1, min(48, int(thickness), min(width, height) // 12))
+    if out is None:
+        digest = hashlib.sha1(
+            f"frame4|{_frames_revision()}|{style}|{color}|{matte}|{thickness}|{width}x{height}".encode()
+        ).hexdigest()[:16]
+        cached = config.cache_dir() / "overlays" / f"frame-{digest}.png"
+        # The name is the whole recipe, so an existing file is the answer.
+        # Re-rendering it on every effect-slider tick cost ~40 ms each.
+        if cached.is_file() and cached.stat().st_size > 0:
+            return cached
+        out = cached
     rgba = parse_color(color, (94, 234, 208, 255))
     matte_rgba = parse_color(matte, (11, 13, 16, 255))
     image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
@@ -410,15 +443,21 @@ def render_window_frame(
             ):
                 draw.line([x, y, x + dx * tick, y], fill=rgba, width=thickness)
                 draw.line([x, y, x, y + dy * tick], fill=rgba, width=thickness)
-    if out is None:
-        digest = hashlib.sha1(
-            f"frame3|{style}|{color}|{matte}|{thickness}|{width}x{height}".encode()
-        ).hexdigest()[:16]
-        out = config.cache_dir() / "overlays" / f"frame-{digest}.png"
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    image.save(out)
+    save_png_atomic(image, out)
     return out
+
+
+@functools.lru_cache(maxsize=1)
+def _frames_revision() -> str:
+    """A short hash of ``frames.py``: any frame painter change renders anew."""
+    from . import frames
+
+    try:
+        return hashlib.sha1(Path(frames.__file__).read_bytes()).hexdigest()[:8]
+    except OSError:
+        return "0"
 
 
 def _stages_revision() -> str:
@@ -430,6 +469,11 @@ def _stages_revision() -> str:
     except OSError:
         return "0"
 
+
+# Bump when a palette or painter below changes: it is part of the cache key.
+# (The key used to hash the function's bytecode, which leaves out the
+# palettes - they are constants - so an edited palette kept its old picture.)
+BACKGROUND_REV = 2
 
 BACKGROUND_NAMES = (
     "Aurora", "Midnight", "Sunset", "Studio", "Ocean",
@@ -458,9 +502,7 @@ def render_background(name: str, width: int, height: int,
         if not out.exists():
             out.parent.mkdir(parents=True, exist_ok=True)
             picture = stages.STATIC[name](width, height)
-            tmp = out.with_suffix(".tmp.png")
-            picture.convert("RGB").save(tmp)
-            tmp.replace(out)
+            save_png_atomic(picture.convert("RGB"), out)
         return out
     palettes = {
         "Aurora": ((8, 20, 35), (24, 82, 92), (94, 234, 208)),
@@ -515,11 +557,11 @@ def render_background(name: str, width: int, height: int,
         image = Image.alpha_composite(image, edge)
     if out is None:
         slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-        revision = hashlib.sha1(render_background.__code__.co_code).hexdigest()[:8]
+        revision = f"{BACKGROUND_REV}-{_stages_revision()}"
         out = config.cache_dir() / "backgrounds" / f"{slug}-{width}x{height}-{revision}.png"
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    image.convert("RGB").save(out)
+    save_png_atomic(image.convert("RGB"), out)
     return out
 
 
@@ -567,7 +609,7 @@ def render_face_frame(
         out = config.cache_dir() / "overlays" / f"face-{digest}.png"
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    image.save(out)
+    save_png_atomic(image, out)
     return out
 
 
@@ -641,7 +683,7 @@ def render_camera_placeholder(
         out = config.cache_dir() / "overlays" / f"camera-placeholder-{digest}.png"
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    image.save(out)
+    save_png_atomic(image, out)
     return out
 
 
@@ -686,7 +728,7 @@ def fit_rgba(source: Path, width: int, height: int, out: Path | None = None) -> 
                / f"img-{source.stem}-{_fingerprint(source)}-{width}x{height}.png")
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(out)
+    save_png_atomic(canvas, out)
     _maybe_prune(out)
     return out
 
@@ -720,7 +762,7 @@ def prepare_rgba(source: Path, width: int, height: int,
                / f"img-{source.stem}-{_fingerprint(source)}-{width}x{height}-{crop_key}.png")
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(out)
+    save_png_atomic(canvas, out)
     _maybe_prune(out)
     return out
 

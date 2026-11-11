@@ -188,7 +188,7 @@ def test_diagnostics_fix_button_reloads_and_reholds_the_device(app, monkeypatch)
 
     caps = {"value": False}
     monkeypatch.setattr(many.config, "vcam_exclusive_caps",
-                        lambda path=None: caps["value"])
+                        lambda path=None, device=None: caps["value"])
     monkeypatch.setattr(many.config, "vcam_setup_needed",
                         lambda device=None: "" if caps["value"] else "exclusive_caps=0")
     window = _window(empty_project(), app)
@@ -223,7 +223,7 @@ def test_diagnostics_fix_button_surfaces_an_authorization_failure(app,
     import anycam.gui_many as many
 
     monkeypatch.setattr(many.config, "vcam_exclusive_caps",
-                        lambda path=None: False)
+                        lambda path=None, device=None: False)
     window = _window(empty_project(), app)
     try:
         window.hold_vcam_device = lambda: True
@@ -1199,7 +1199,7 @@ def test_launch_refreshes_udev_so_chromium_lists_anycam(app, monkeypatch):
         monkeypatch.setattr(gui.config, "vcam_udev_capabilities",
                             lambda device=None: ":video_output:")
         monkeypatch.setattr(gui.config, "vcam_exclusive_caps",
-                            lambda path=None: True)
+                            lambda path=None, device=None: True)
         calls = []
 
         def fake_refresh(device=None, *, prompt=True):

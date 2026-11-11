@@ -68,13 +68,29 @@ _H265_ALIASES = {"h265", "hevc", "nvh265", "nvenc_h265", "nvenc_hevc",
 _AV1_ALIASES = {"av1", "nvav1", "nvenc_av1", "av1_nvenc"}
 
 
+_NVENC_TTL_S = 60.0
+_nvenc_seen: dict[str, tuple[float, bool]] = {}
+
+
 def nvenc_available(codec: str = "h264") -> bool:
     """Whether NVENC for ``codec`` can run on this machine right now.
 
     The GStreamer factory alone is not enough: a headless host can install
     ``nvcodec`` without a usable NVIDIA driver.  ``nvidia-smi`` is the cheap
-    runtime check; selection still falls back to x264 if it cannot run.
+    runtime check; selection still falls back to x264 if it cannot run.  The
+    answer is kept for a minute: every recording and stream build asked, and
+    each ask ran ``nvidia-smi`` (up to its 2 s timeout) on the GUI thread.
     """
+    now = time.monotonic()
+    seen = _nvenc_seen.get(codec)
+    if seen is not None and now - seen[0] < _NVENC_TTL_S:
+        return seen[1]
+    answer = _probe_nvenc(codec)
+    _nvenc_seen[codec] = (now, answer)
+    return answer
+
+
+def _probe_nvenc(codec: str) -> bool:
     factory = ENCODER_FACTORIES.get(codec, "")
     if not factory or Gst.ElementFactory.find(factory) is None:
         return False
@@ -2881,7 +2897,9 @@ class AnyCamEngine:
             self.mic_volume.set_property("mute", bool(muted))
 
     def stop(self) -> dict:
-        if self.pipeline is None:
+        # A second stop used to re-run the whole shutdown and overwrite the
+        # report (0 frames, 100% dropped).  Stopping is final.
+        if self.pipeline is None or self._stopped:
             return self.report.as_dict()
         self.report.stopped = time.monotonic()
         elapsed = self.report.stopped - self._start_time

@@ -183,11 +183,18 @@ def parse_strokes(source) -> list[dict]:
     for item in data.get("strokes", []) if isinstance(data, dict) else []:
         try:
             points = [(float(x), float(y)) for x, y in item["points"]]
-            if not points or item.get("tool") not in TOOLS:
+            width = float(item.get("width", 0.006))
+            if (not points or item.get("tool") not in TOOLS
+                    or not all(math.isfinite(v) for point in points for v in point)):
                 continue
+            if not math.isfinite(width):
+                width = 0.006
+            # Normalised to the layer: a few boxes beyond the edge are fine,
+            # 1e300 only overflows the drawing code.
             strokes.append({"tool": item["tool"], "color": str(item.get("color", "#ff3b5c")),
-                            "width": max(0.0005, float(item.get("width", 0.006))),
-                            "points": [[x, y] for x, y in points]})
+                            "width": min(0.5, max(0.0005, width)),
+                            "points": [[min(4.0, max(-3.0, x)), min(4.0, max(-3.0, y))]
+                                       for x, y in points]})
         except (KeyError, TypeError, ValueError):
             continue
     return strokes
@@ -222,7 +229,12 @@ class DrawingCanvas:
     def frame(self, t: float) -> np.ndarray:
         with self._lock:
             if self._frame is None:
-                self._frame = self._render(self._strokes)
+                try:
+                    self._frame = self._render(self._strokes)
+                except (OverflowError, ValueError, TypeError):
+                    # Strokes set from outside parse_strokes: never let one
+                    # bad number blank the layer for good.
+                    self._frame = np.zeros((self.height, self.width, 4), np.uint8)
             return self._frame
 
     def _render(self, strokes: list[dict]) -> np.ndarray:

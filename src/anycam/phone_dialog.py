@@ -86,6 +86,7 @@ class PhonePairDialog(QDialog):
         self.firewall_text = QLabel(
             "This computer's firewall blocks phones. Allow them once:")
         self.firewall_text.setWordWrap(True)
+        self.firewall_text.setTextFormat(Qt.TextFormat.PlainText)
         bar.addWidget(self.firewall_text, 1)
         self.firewall_button = QPushButton("Allow phones")
         self.firewall_button.clicked.connect(self.allow_through_firewall)
@@ -97,9 +98,13 @@ class PhonePairDialog(QDialog):
         self._firewall_timer.setInterval(150)
         self._firewall_timer.timeout.connect(self._poll_firewalld)
         self.host = str(getattr(service, "host", "") or "")
-        self.firewall_backend = firewall.backend()
-        self.firewall_bar.setVisible(firewall.blocks(self.port, self.host))
+        self.firewall_backend = ""
+        self.firewall_bar.setVisible(False)
+        self._detect_firewall()
         self.status = QLabel("Waiting for the phone…")
+        # The phone chooses its own name (up to 40 characters, markup
+        # included): show it as text, never as rich text.
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
@@ -117,6 +122,45 @@ class PhonePairDialog(QDialog):
         self._renew.timeout.connect(self.refresh_code)
         self._renew.start()
         self.refresh_code()
+
+    def _detect_firewall(self) -> None:
+        """Find out whether the firewall blocks phones, without stalling the UI.
+
+        The checks are D-Bus calls (2-5 s timeouts when a service hangs).  They
+        run on a thread; the dialog waits a moment for the usual instant answer
+        and otherwise shows itself and fills the warning in when it arrives.
+        """
+        result: dict = {}
+
+        def work() -> None:
+            try:
+                result["backend"] = firewall.backend()
+                result["blocked"] = bool(firewall.blocks(self.port, self.host))
+            except Exception:  # noqa: BLE001 - unknown is "not blocked"
+                result.setdefault("backend", "")
+                result["blocked"] = False
+            result["done"] = True
+
+        import threading
+
+        thread = threading.Thread(target=work, name="anycam-firewall-check", daemon=True)
+        thread.start()
+        thread.join(0.3)
+        self._detect_result = result
+        self._detect_timer = QTimer(self)
+        self._detect_timer.setInterval(150)
+        self._detect_timer.timeout.connect(self._apply_firewall_detection)
+        self._apply_firewall_detection()
+        if not result.get("done"):
+            self._detect_timer.start()
+
+    def _apply_firewall_detection(self) -> None:
+        result = self._detect_result
+        if not result.get("done"):
+            return
+        self._detect_timer.stop()
+        self.firewall_backend = str(result.get("backend") or "")
+        self.firewall_bar.setVisible(bool(result.get("blocked")))
 
     def allow_through_firewall(self, *, retried: bool = False) -> None:
         """Open the phone port; the desktop asks for the password."""
@@ -144,7 +188,11 @@ class PhonePairDialog(QDialog):
             output = bytes(process.readAllStandardError()).decode(errors="replace").strip()
             process.deleteLater()
         self.log(f"firewall: pkexec exit {code}: {output or 'no output'}")
-        if code == 0 and not firewall.ufw_blocks(self.port):
+        if code == 0 and (not firewall.ufw_blocks(self.port)
+                          or not firewall.ufw_rules_readable()):
+            # ufw allow succeeded.  Where its rules cannot be read (Debian,
+            # Ubuntu) the check cannot confirm it, so remember it instead.
+            firewall.remember_allowed(self.port)
             self.firewall_bar.setVisible(False)
             self.status.setText("Phones are allowed through the firewall. "
                                 "Scan the code now.")

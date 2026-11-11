@@ -138,6 +138,8 @@ Design and build order: `docs/PHONE_CAMERA.md`.
 - [ ] Fix `scripts/capture-screencast.py`, which reports `ok: true` on the wrong frame (B55).
 - [ ] Evidence gaps: live portal screen capture, physical unplug, 10-minute soak with the virtual camera.
 
+- [ ] `AnyCamEngine.stop()` (up to ~4 s) and `Recorder.stop()` (up to 5 s) block the UI thread while finalising; move them off-thread with the M1 controller split (2026-11-11 audit).
+
 ## 11. Needs the user / hardware
 
 - [ ] Physical camera unplug and replug on the real StreamCam.

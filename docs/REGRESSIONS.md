@@ -646,3 +646,55 @@ unchanged and one playable file is produced;
 `::test_vcam_output_survives_engine_restarts` now also asserts that toggling
 the vcam does not replace the engine; `tests/test_m1_outputs.py::test_stream_prefers_rtmp2sink`
 asserts the selected sink factory. Full suite: 152 passed, 1 hardware-gated skip.
+
+
+## 2026-11-11 — full-project audit (25 findings)
+
+Regression tests: `tests/test_audit_fixes_2026_11_11.py`.
+
+Fixed:
+
+- **Frame overlay re-rendered on every effect change.** `render_window_frame`
+  returned a fresh ~40 ms render per colour-slider tick; the picture is now
+  looked up by recipe (including a hash of `frames.py`) and reused.
+- **ufw detection on Debian/Ubuntu.** `/etc/ufw/user.rules` is mode 640 root, so
+  the "Allow phones" button never appeared. Unreadable rules now count as
+  "cannot prove the port is open"; a successful `ufw allow` is remembered in
+  `firewall-allowed.json` in the state directory.
+- **Capture errors lost the device/file path** (`Could not open ***`) and the
+  informative first error was replaced by the generic follow-up. Only network
+  sources are redacted, and the first error is kept.
+- **`~/clip.mp4` video layers** failed in `filesrc`; the spec now expands `~`.
+- **Phone-chosen device names** were rendered as rich text in the pairing dialog.
+- **`ANYCAM_SCREEN_FLIP`** was ignored whenever the project said `automatic`.
+- **`exclusive_caps`** was read for the wrong device slot (`exclusive_caps=0,1`)
+  and the setup checks ignored the device they were given.
+- **Project load**: unhashable ids no longer reject the whole file; odd, huge
+  or too-fast canvases are normalised (with a load warning) instead of failing
+  the engine on every launch.
+- **Drawing strokes** with infinite/huge width or coordinates blanked the layer.
+- **`AnyCamEngine.stop()`** is idempotent (a second call used to overwrite the
+  report with 0 frames / 100 % dropped).
+- **GUI**: failed snapshot writes are reported; the GPU canvas is only disabled
+  for the session when the CPU retry succeeds; shutdown runs every step even if
+  one raises (the project save used to be skipped); user input is held back
+  while a privileged step runs in `_run_with_ui`.
+- **Filter swap rollback.** A swap whose new bin cannot link now restores the
+  previous filter instead of leaving the layer without a picture.
+- **Recorder** reports `finalised` and a warning when the muxer never reached
+  end-of-stream (fragmented MP4, so the file is still usable).
+- **Overlay PNGs** are written atomically; the background cache key uses an
+  explicit `BACKGROUND_REV` (it hashed bytecode, which omits the palettes).
+- **Phone link**: concurrent connections are capped (32); the certificate is
+  remade when the LAN address changes; the openssl fallback names the address.
+- **Network sources** that fail or end are restarted with a 1/2/4…30 s backoff.
+- Small: `nvenc_available` is cached for a minute; the firewall check no longer
+  blocks the pairing dialog; static replacement backdrops match tiny frames;
+  `v4l2-ctl` missing is named once (and in `anycam doctor`); `models.model_path`
+  verifies the pinned SHA-256 once per file change; the soak report picks the
+  longest mount prefix; `install-desktop.sh` quotes the `Exec` path per the
+  Desktop Entry spec and installs the 512 px icon in `hicolor/512x512`.
+
+Still open: `engine.stop()` (up to ~4 s) and `Recorder.stop()` (up to 5 s) block
+the GUI thread while they finalise; moving them off-thread needs the M1
+controller split.

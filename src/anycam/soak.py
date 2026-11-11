@@ -40,11 +40,15 @@ def _disk_usage(path: str | Path) -> dict:
         return {}
     fstype = ""
     try:
+        # The longest matching mount point is the filesystem that holds the
+        # path; the first match is "/" or an outer mount.
+        best = -1
         for part in psutil.disk_partitions(all=True):
             mount = part.mountpoint.rstrip("/") or "/"
-            if str(target) == mount or str(target).startswith(mount + "/"):
-                fstype = part.fstype
-                break
+            inside = (str(target) == mount or mount == "/"
+                      or str(target).startswith(mount + "/"))
+            if inside and len(mount) > best:
+                best, fstype = len(mount), part.fstype
     except (psutil.Error, OSError):
         pass
     return {

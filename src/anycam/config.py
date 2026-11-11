@@ -209,6 +209,19 @@ class CameraInfo:
         return {"device": self.device, "name": self.name, "formats": self.formats}
 
 
+_v4l2_ctl_noted = False
+
+
+def _note_no_v4l2_ctl(reason: str) -> None:
+    """Say once why no camera is listed (the tool is missing, not the camera)."""
+    global _v4l2_ctl_noted
+    if _v4l2_ctl_noted:
+        return
+    _v4l2_ctl_noted = True
+    print(f"[config] cannot list cameras: v4l2-ctl did not run ({reason}); "
+          "install v4l-utils", file=sys.stderr, flush=True)
+
+
 def list_video_devices() -> list[CameraInfo]:
     """Enumerate V4L2 capture devices without importing GStreamer."""
     devices: list[CameraInfo] = []
@@ -216,8 +229,13 @@ def list_video_devices() -> list[CameraInfo]:
         return devices
     for entry in sorted(Path("/sys/class/video4linux").glob("video*")):
         dev = f"/dev/{entry.name}"
-        name = (entry / "name").read_text(errors="replace").strip() if (entry / "name").exists() else ""
+        try:
+            name = (entry / "name").read_text(errors="replace").strip()
+        except OSError:
+            name = ""      # the node vanished (unplug) between glob and read
         code, out = run(["v4l2-ctl", "-d", dev, "--list-formats"])
+        if code == 127:
+            _note_no_v4l2_ctl(out)
         if code != 0 or not out.strip():
             continue
         formats = re.findall(r"\[\d+\]:\s+'([^']+)'", out)
@@ -337,10 +355,15 @@ def screen_flip_method(value: str | None = None) -> str:
     Automatic follows the ``image-orientation`` tag exposed by the
     compositor.  It deliberately does not force a rotation on KWin: rotating
     the captured source also flips AnyCam's preview and every vcam consumer.
-    Use rotate-180, vertical-flip or none from the Output settings (or
-    ANYCAM_SCREEN_FLIP) when a specific share needs correcting.
+    Precedence: an explicit setting (rotate-180, vertical-flip, none ...) from
+    the Output settings, then ``ANYCAM_SCREEN_FLIP``, then automatic.  The
+    project always stores a value, so its default ``automatic`` means "no
+    explicit choice" and defers to the environment; it used to win over it.
     """
-    raw = os.environ.get("ANYCAM_SCREEN_FLIP", "") if value is None else value
+    env = os.environ.get("ANYCAM_SCREEN_FLIP", "")
+    raw = env if value is None else value
+    if str(raw or "").strip().lower() in ("", "auto", "automatic"):
+        raw = env
     value = str(raw or "").strip().lower()
     aliases = {
         "": "automatic", "auto": "automatic", "180": "rotate-180",
@@ -577,11 +600,11 @@ def reload_vcam_module(device: str | None = None, *,
         return f"{reason}. Run: {manual}"
     # The parameter and the node are recreated by udev; give them a moment.
     for _ in range(60):
-        if Path(dev).exists() and vcam_exclusive_caps() is True:
+        if Path(dev).exists() and vcam_exclusive_caps(device=dev) is True:
             return ""
         time.sleep(0.05)
     return (f"v4l2loopback reloaded but {dev} still reports "
-            f"exclusive_caps={vcam_exclusive_caps()}. Run: {manual}")
+            f"exclusive_caps={vcam_exclusive_caps(device=dev)}. Run: {manual}")
 
 
 # ------------------------------------------------- one-time system setup
@@ -647,24 +670,53 @@ def trigger_vcam_uevent(device: str | None = None) -> bool:
     return True
 
 
-def _effective_exclusive_caps(config_text: str) -> bool | None:
-    """exclusive_caps as modprobe will apply it: the last value given wins."""
+def _module_values(line: str, option: str) -> list[str] | None:
+    """The comma-separated values of ``option=`` on one modprobe line."""
+    found = None
+    for match in re.finditer(rf"\b{re.escape(option)}=([^\s]+)", line):
+        found = [item.strip() for item in match.group(1).split(",")]
+    return found
+
+
+def _effective_exclusive_caps(config_text: str, index: int = 0) -> bool | None:
+    """exclusive_caps as modprobe will apply it: the last value given wins.
+
+    The option takes one value per loopback device (``exclusive_caps=0,1``);
+    ``index`` picks the device's slot (see :func:`_device_slot`).  A slot the
+    list does not reach is unset, which v4l2loopback treats as off.
+    """
     value: bool | None = None
     for line in config_text.splitlines():
         line = line.split("#", 1)[0]
         if line.split()[:2] != ["options", "v4l2loopback"]:
             continue
-        for match in re.finditer(r"\bexclusive_caps=([^\s,]+)", line):
-            value = match.group(1).upper() in ("1", "Y", "YES", "TRUE")
+        values = _module_values(line, "exclusive_caps")
+        if values is None:
+            continue
+        slot = values[index] if index < len(values) else "0"
+        value = slot.upper() in ("1", "Y", "YES", "TRUE")
     return value
 
 
-def _vcam_configured_permanently() -> bool:
+def _device_slot(config_text: str, device: str) -> int:
+    """Which per-device slot of the module options belongs to ``device``."""
+    match = re.search(r"video(\d+)$", str(device or ""))
+    if match is None:
+        return 0
+    numbers: list[str] = []
+    for line in config_text.splitlines():
+        line = line.split("#", 1)[0]
+        if line.split()[:2] == ["options", "v4l2loopback"]:
+            numbers = _module_values(line, "video_nr") or numbers
+    return numbers.index(match.group(1)) if match.group(1) in numbers else 0
+
+
+def _vcam_configured_permanently(device: str | None = None) -> bool:
     """modprobe's effective config loads v4l2loopback with exclusive_caps=1."""
     code, out = run(["modprobe", "-c"]) if shutil.which("modprobe") else (1, "")
     if code != 0:
         return False
-    return _effective_exclusive_caps(out) is True
+    return _effective_exclusive_caps(out, _device_slot(out, device or "")) is True
 
 
 def vcam_caps_overrides(dirs: tuple[str, ...] = ("/etc/modprobe.d", "/usr/lib/modprobe.d",
@@ -691,12 +743,12 @@ def vcam_caps_overrides(dirs: tuple[str, ...] = ("/etc/modprobe.d", "/usr/lib/mo
 def vcam_setup_needed(device: str | None = None) -> str:
     """Why the one-time virtual camera setup is still needed ("" if done)."""
     dev = device or loopback_device()
-    caps = vcam_exclusive_caps()
+    caps = vcam_exclusive_caps(device=dev)
     if caps is None or not Path(dev).exists():
         return "the virtual camera driver is not loaded"
     if caps is not True:
         return "the driver is loaded without exclusive_caps=1, so Chromium apps skip it"
-    if not _vcam_configured_permanently():
+    if not _vcam_configured_permanently(dev):
         return "the driver settings are not permanent (lost at the next reboot)"
     uevent = Path("/sys/class/video4linux") / Path(dev).name / "uevent"
     if not os.access(uevent, os.W_OK):
@@ -717,7 +769,7 @@ def setup_vcam_system(device: str | None = None) -> str:
     if match is None:
         return f"virtual camera device {dev} is not a video node"
     number = match.group(1)
-    if vcam_exclusive_caps() is not True:
+    if vcam_exclusive_caps(device=dev) is not True:
         others = other_virtual_cameras(dev)
         if others:
             return ("setting up AnyCam's camera would remove "
