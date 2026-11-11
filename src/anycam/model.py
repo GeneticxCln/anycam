@@ -153,6 +153,10 @@ class PlaylistConfig:
     interval: float = 3.0
     loop: bool = True
     index: int = -1
+    # Seconds an item stays when it differs from ``interval`` (layer id -> s).
+    durations: dict[str, float] = field(default_factory=dict)
+    shuffle: bool = False
+    paused: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "PlaylistConfig":
@@ -161,11 +165,19 @@ class PlaylistConfig:
         if not isinstance(ids, list):
             ids = []
         interval = _coerce(data.get("interval"), 3.0)
+        raw_durations = data.get("durations")
         return cls(
             layer_ids=[str(value) for value in ids if value],
             interval=interval if interval > 0 else 3.0,
             loop=_coerce(data.get("loop"), True),
             index=_coerce(data.get("index"), -1),
+            durations={str(key): float(value)
+                       for key, value in (raw_durations if isinstance(raw_durations, dict)
+                                          else {}).items()
+                       if isinstance(value, (int, float)) and not isinstance(value, bool)
+                       and _finite(float(value)) and value > 0},
+            shuffle=_coerce(data.get("shuffle"), False),
+            paused=_coerce(data.get("paused"), False),
         )
 
 

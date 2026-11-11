@@ -90,13 +90,14 @@ def _plain(text: str) -> str:
 def _lookup(catalog: dict[str, str], source: str) -> str:
     if not source or not catalog:
         return source
-    if source in catalog:
-        return catalog[source]
-    plain = _plain(source)
-    if plain in catalog:
-        # keep the mnemonic position out of it: a translated mnemonic would
-        # need its own letter, so the ampersand is dropped
-        return catalog[plain]
+    # Keep the padding some labels carry ("  Align left"); look up the words.
+    core = source.strip()
+    lead, trail = source[:len(source) - len(source.lstrip())], source[len(source.rstrip()):]
+    for key in (source, core, _plain(core)):
+        if key in catalog:
+            # a translated mnemonic would need its own letter, so any
+            # ampersand of the source is dropped with the lookup
+            return lead + catalog[key] + trail if key != source else catalog[key]
     return source
 
 
@@ -179,10 +180,10 @@ def collect(root) -> set[str]:
             bar_store = bar.property(_SOURCE) or {}
             texts += [bar_store.get(f"tab{i}", widget.tabText(i)) for i in range(widget.count())]
         texts.append(store.get("tooltip", widget.toolTip()))
-        found.update(_plain(t) for t in texts if t and t.strip())
+        found.update(_plain(t.strip()) for t in texts if t and t.strip())
     for action in root.findChildren(QAction):
         store = action.property(_SOURCE) or {}
         for text in (store.get("text", action.text()), store.get("tooltip", action.toolTip())):
             if text and text.strip():
-                found.add(_plain(text))
+                found.add(_plain(text.strip()))
     return found

@@ -561,7 +561,7 @@ class PreviewWidget(QWidget):
             Qt.Key.Key_Up: (0.0, -1.0),
             Qt.Key.Key_Down: (0.0, 1.0),
         }
-        if layer is None or not layer.visible or event.key() not in arrows:
+        if layer is None or not layer.visible or layer.locked or event.key() not in arrows:
             super().keyPressEvent(event)
             return
         if self._nudge_layer and self._nudge_layer != layer.id:
@@ -575,7 +575,8 @@ class PreviewWidget(QWidget):
             changed_layers = [layer]
             rebuild = True
         else:
-            changed_layers = self.selected_layers() or [layer]
+            changed_layers = [item for item in (self.selected_layers() or [layer])
+                              if not item.locked]
             for item in changed_layers:
                 item.box = self._shift_box(item.box, dx * step, dy * step)
             rebuild = any(item.kind in ("text", "logo", "image")
@@ -598,10 +599,13 @@ class PreviewWidget(QWidget):
             self.edit_finished.emit(layer_id, rebuild)
 
     def _begin_drag(self, layer: Layer, pos: QPointF, mode: str, handle: str) -> None:
+        if layer.locked:
+            return          # selecting a locked layer is fine; dragging it is not
         self.edit_started.emit(layer.id)
         group = []
         if mode == "move":
-            group = [(item.id, tuple(item.box)) for item in self.selected_layers()]
+            group = [(item.id, tuple(item.box)) for item in self.selected_layers()
+                     if not item.locked]
         if not group:
             group = [(layer.id, tuple(layer.box))]
         self._guides = []

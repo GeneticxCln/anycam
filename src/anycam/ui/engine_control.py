@@ -171,6 +171,7 @@ class EngineMixin:
             elif not self._quiet_engine_errors:
                 QMessageBox.critical(self, "AnyCam", message)
             return
+        self._apply_saved_camera_controls()
         self._started_at = time.monotonic()
         self.playlist_last = self._started_at
         if self.playlist_index >= len(self.playlist_ids):

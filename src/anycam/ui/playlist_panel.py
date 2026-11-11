@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QListWidget, QPushButton, QSlider, QVBoxLayout, QWidget,
 )
 
-from .. import config
+from .. import config, playlist
 from ..model import (Layer, new_id)
 from .theme import STYLE  # noqa: F401
 from .layout_history import LayoutHistory  # noqa: F401
@@ -32,6 +32,7 @@ class PlaylistMixin:
         layout.addWidget(info)
         self.playlist_list = QListWidget()
         layout.addWidget(self.playlist_list, 1)
+        self.playlist_list.currentRowChanged.connect(self._playlist_selection_changed)
         row = QHBoxLayout()
         add = QPushButton("+ Add media")
         add.clicked.connect(self._add_playlist_items)
@@ -40,6 +41,27 @@ class PlaylistMixin:
         row.addWidget(add)
         row.addWidget(clear)
         layout.addLayout(row)
+        item_row = QHBoxLayout()
+        self.playlist_up = QPushButton("Up")
+        self.playlist_up.clicked.connect(lambda: self.move_playlist_item(-1))
+        self.playlist_down = QPushButton("Down")
+        self.playlist_down.clicked.connect(lambda: self.move_playlist_item(1))
+        self.playlist_remove = QPushButton("Remove item")
+        self.playlist_remove.clicked.connect(lambda: self.remove_playlist_item())
+        for button in (self.playlist_up, self.playlist_down, self.playlist_remove):
+            item_row.addWidget(button)
+        layout.addLayout(item_row)
+        transport = QHBoxLayout()
+        self.playlist_prev = QPushButton("Previous")
+        self.playlist_prev.clicked.connect(lambda: self.playlist_step(-1))
+        self.playlist_pause = QPushButton("Pause")
+        self.playlist_pause.setCheckable(True)
+        self.playlist_pause.toggled.connect(self.set_playlist_paused)
+        self.playlist_next = QPushButton("Next")
+        self.playlist_next.clicked.connect(lambda: self.playlist_step(1))
+        for button in (self.playlist_prev, self.playlist_pause, self.playlist_next):
+            transport.addWidget(button)
+        layout.addLayout(transport)
         grid = QGridLayout()
         self.playlist_interval = QDoubleSpinBox()
         self.playlist_interval.setRange(0.5, 120.0)
@@ -52,6 +74,17 @@ class PlaylistMixin:
         self.playlist_enabled.setChecked(True)
         self.playlist_enabled.toggled.connect(self._playlist_settings_changed)
         grid.addWidget(self.playlist_enabled, 1, 0, 1, 2)
+        self.playlist_shuffle = QCheckBox("Shuffle")
+        self.playlist_shuffle.toggled.connect(self._playlist_settings_changed)
+        grid.addWidget(self.playlist_shuffle, 2, 0, 1, 2)
+        self.playlist_item_seconds = QDoubleSpinBox()
+        self.playlist_item_seconds.setRange(0.0, playlist.MAX_SECONDS)
+        self.playlist_item_seconds.setSpecialValueText("Playlist interval")
+        self.playlist_item_seconds.setSuffix(" s")
+        self.playlist_item_seconds.setEnabled(False)
+        self.playlist_item_seconds.valueChanged.connect(self._playlist_item_seconds_changed)
+        grid.addWidget(QLabel("Selected item stays"), 3, 0)
+        grid.addWidget(self.playlist_item_seconds, 3, 1)
         layout.addLayout(grid)
 
         music = QGroupBox("Music (audio file)")
@@ -123,11 +156,18 @@ class PlaylistMixin:
         self.playlist_enabled.blockSignals(True)
         self.playlist_enabled.setChecked(bool(state.loop))
         self.playlist_enabled.blockSignals(False)
+        self.playlist_shuffle.blockSignals(True)
+        self.playlist_shuffle.setChecked(bool(state.shuffle))
+        self.playlist_shuffle.blockSignals(False)
+        self.playlist_pause.blockSignals(True)
+        self.playlist_pause.setChecked(bool(state.paused))
+        self.playlist_pause.blockSignals(False)
+        state.durations = {key: value for key, value in state.durations.items() if key in valid}
         self.playlist_list.clear()
         for layer_id in ids:
             layer = self.scene.layer(layer_id)
             if layer is not None:
-                self.playlist_list.addItem(f"{layer.name}  ·  {layer.kind}")
+                self.playlist_list.addItem(self._playlist_label(layer))
         self.playlist_list.setCurrentRow(index if index >= 0 else -1)
 
     def _store_playlist_state(self) -> None:
@@ -136,6 +176,8 @@ class PlaylistMixin:
         state.layer_ids = [layer_id for layer_id in self.playlist_ids if layer_id in valid]
         state.interval = float(self.playlist_interval.value())
         state.loop = bool(self.playlist_enabled.isChecked())
+        state.shuffle = bool(self.playlist_shuffle.isChecked())
+        state.paused = bool(self.playlist_pause.isChecked())
         state.index = int(self.playlist_index)
 
     def _playlist_settings_changed(self, _value=None) -> None:
@@ -175,24 +217,115 @@ class PlaylistMixin:
         if self.engine is not None:
             self.restart_engine()
 
-    def _advance_playlist(self, now: float) -> None:
-        if self.engine is None or not self.playlist_ids:
+    def _playlist_label(self, layer) -> str:
+        own = self.scene.playlist.durations.get(layer.id)
+        return f"{layer.name}  ·  {layer.kind}" + (f"  ·  {own:g} s" if own else "")
+
+    def _playlist_selection_changed(self, row: int) -> None:
+        ids = self.playlist_ids
+        valid = 0 <= row < len(ids)
+        self.playlist_item_seconds.setEnabled(valid)
+        self.playlist_item_seconds.blockSignals(True)
+        self.playlist_item_seconds.setValue(
+            self.scene.playlist.durations.get(ids[row], 0.0) if valid else 0.0)
+        self.playlist_item_seconds.blockSignals(False)
+
+    def _playlist_item_seconds_changed(self, seconds: float) -> None:
+        row = self.playlist_list.currentRow()
+        if not 0 <= row < len(self.playlist_ids):
             return
-        interval = self.playlist_interval.value()
+        layer_id = self.playlist_ids[row]
+        if seconds > 0:
+            self.scene.playlist.durations[layer_id] = float(seconds)
+        else:
+            self.scene.playlist.durations.pop(layer_id, None)
+        layer = self.scene.layer(layer_id)
+        if layer is not None and self.playlist_list.item(row) is not None:
+            self.playlist_list.item(row).setText(self._playlist_label(layer))
+        self._mark_dirty()
+
+    def set_playlist_paused(self, paused: bool) -> None:
+        self.scene.playlist.paused = bool(paused)
+        self.playlist_pause.setText("Resume" if paused else "Pause")
+        self.playlist_last = time.monotonic()      # the timer starts again from now
+        self._mark_dirty()
+
+    def _show_playlist_item(self, index: int) -> None:
+        self.playlist_index = index
+        self.scene.playlist.index = index
+        self.playlist_last = time.monotonic()
+        for position, layer_id in enumerate(self.playlist_ids):
+            if self.engine is not None:
+                self.engine.set_layer_visible(layer_id, position == index)
+            else:
+                layer = self.scene.layer(layer_id)
+                if layer is not None:
+                    layer.visible = position == index
+        self.playlist_list.setCurrentRow(index)
+
+    def playlist_step(self, direction: int) -> bool:
+        """Jump to the next (+1) or previous (-1) item now."""
+        if not self.playlist_ids:
+            return False
+        if direction >= 0:
+            target = playlist.next_index(
+                self.playlist_ids, self.playlist_index, loop=True,
+                shuffle=self.playlist_shuffle.isChecked())
+        else:
+            target = playlist.previous_index(self.playlist_ids, self.playlist_index, loop=True)
+        if target is None:
+            return False
+        self._show_playlist_item(target)
+        return True
+
+    def move_playlist_item(self, delta: int) -> bool:
+        row = self.playlist_list.currentRow()
+        target = row + int(delta)
+        if not (0 <= row < len(self.playlist_ids) and 0 <= target < len(self.playlist_ids)):
+            return False
+        ids = self.playlist_ids
+        ids[row], ids[target] = ids[target], ids[row]
+        if self.playlist_index == row:
+            self.playlist_index = target
+        elif self.playlist_index == target:
+            self.playlist_index = row
+        self._store_playlist_state()
+        self._load_playlist_state()
+        self.playlist_list.setCurrentRow(target)
+        self._mark_dirty()
+        return True
+
+    def remove_playlist_item(self, row: int | None = None) -> bool:
+        """Take one item out of the rotation and out of the scene."""
+        row = self.playlist_list.currentRow() if row is None else row
+        if not 0 <= row < len(self.playlist_ids):
+            return False
+        layer_id = self.playlist_ids[row]
+        self.remove_layers([layer_id])      # also drops it from playlist_ids
+        if layer_id in self.playlist_ids:
+            self.playlist_ids.remove(layer_id)
+        self.scene.playlist.durations.pop(layer_id, None)
+        self._store_playlist_state()
+        self._load_playlist_state()
+        self._mark_dirty()
+        return True
+
+    def _advance_playlist(self, now: float) -> None:
+        if self.engine is None or not self.playlist_ids or self.playlist_pause.isChecked():
+            return
+        state = self.scene.playlist
+        current = (self.playlist_ids[self.playlist_index]
+                   if 0 <= self.playlist_index < len(self.playlist_ids) else "")
+        interval = playlist.item_seconds(state, current) if current else self.playlist_interval.value()
         if now - self.playlist_last < interval:
             return
         self.playlist_last = now
-        if self.playlist_index + 1 >= len(self.playlist_ids):
-            if not self.playlist_enabled.isChecked():
-                return
-            next_index = 0
-        else:
-            next_index = self.playlist_index + 1
-        self.playlist_index = next_index
-        self.scene.playlist.index = next_index
-        for position, layer_id in enumerate(self.playlist_ids):
-            self.engine.set_layer_visible(layer_id, position == self.playlist_index)
-        self.playlist_list.setCurrentRow(self.playlist_index)
+        target = playlist.next_index(
+            self.playlist_ids, self.playlist_index,
+            loop=self.playlist_enabled.isChecked(), shuffle=self.playlist_shuffle.isChecked())
+        if target is None:
+            return
+        self._show_playlist_item(target)
 
     def _apply_playlist_visibility(self) -> None:
         """Show only the playlist's current layer (the rotation's state)."""

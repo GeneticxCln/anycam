@@ -179,6 +179,31 @@ def project_path() -> Path:
     return config_dir() / "project.json"
 
 
+def _last_project_pointer() -> Path:
+    return config_dir() / "last-project"
+
+
+def current_project_path() -> Path:
+    """The project file in use: the last one opened or saved as, else the default."""
+    try:
+        chosen = Path(_last_project_pointer().read_text(encoding="utf-8").strip())
+    except OSError:
+        return project_path()
+    return chosen if str(chosen) and chosen.is_file() else project_path()
+
+
+def remember_project_path(path: Path) -> None:
+    """Make ``path`` the project opened at the next launch (the default clears it)."""
+    pointer = _last_project_pointer()
+    try:
+        if Path(path) == project_path():
+            pointer.unlink(missing_ok=True)
+        else:
+            pointer.write_text(str(Path(path)) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def assets_dir() -> Path:
     """Runtime assets shipped inside the package, with a checkout fallback."""
     packaged = Path(__file__).resolve().parent / "assets"

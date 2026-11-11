@@ -132,29 +132,69 @@ class DesktopMixin:
                    "the shortcuts above work while AnyCam has focus."
         label.setText(text)
 
-    def _install_shortcuts(self) -> None:
-        """Keyboard shortcuts for the actions an operator needs mid-stream."""
-        bindings = {
-            "Ctrl+P": self.toggle_engine,
-            "Ctrl+R": self.toggle_record,
-            "Ctrl+Shift+V": self.toggle_vcam,
-            "F5": self.snapshot,
-            "Ctrl+M": self.toggle_mic_mute,
-            "Ctrl+Z": self.undo,
-            "Ctrl+Shift+Z": self.redo,
-            "Ctrl+Y": self.redo,
-            "Ctrl+D": self.duplicate_layer,
-            "Ctrl+Alt+Left": lambda: self._align_layers("left"),
-            "Ctrl+Alt+Right": lambda: self._align_layers("right"),
-            "Ctrl+Alt+Up": lambda: self._align_layers("top"),
-            "Ctrl+Alt+Down": lambda: self._align_layers("bottom"),
-            "Ctrl+Alt+H": lambda: self._align_layers("hcenter"),
-            "Ctrl+Alt+V": lambda: self._align_layers("vcenter"),
+    def _hotkey_actions(self) -> dict:
+        """Action id -> what it does (the keys come from ``anycam.hotkeys``)."""
+        actions = {
+            "preview": self.toggle_engine,
+            "record": self.toggle_record,
+            "vcam": self.toggle_vcam,
+            "snapshot": self.snapshot,
+            "mute": self.toggle_mic_mute,
+            "undo": self.undo,
+            "redo": self.redo,
+            "redo-alt": self.redo,
+            "duplicate": self.duplicate_layer,
+            "lock": self._toggle_selected_lock,
+            "next-scene": lambda: self._step_scene(1),
+            "previous-scene": lambda: self._step_scene(-1),
+            "align-left": lambda: self._align_layers("left"),
+            "align-right": lambda: self._align_layers("right"),
+            "align-top": lambda: self._align_layers("top"),
+            "align-bottom": lambda: self._align_layers("bottom"),
+            "align-hcenter": lambda: self._align_layers("hcenter"),
+            "align-vcenter": lambda: self._align_layers("vcenter"),
         }
         for index in range(1, 10):
-            bindings[f"Ctrl+{index}"] = lambda i=index - 1: self.switch_scene(i)
+            actions[f"scene-{index}"] = lambda i=index - 1: self.switch_scene(i)
+        return actions
+
+    def _toggle_selected_lock(self) -> None:
+        layer = self.preview.selected_layer()
+        if layer is not None:
+            self.set_layer_locked(layer.id, not layer.locked)
+
+    def _step_scene(self, step: int) -> None:
+        ids = [scene.id for scene in self.project.scenes]
+        if ids:
+            current = ids.index(self.project.active_scene) if self.project.active_scene in ids else 0
+            self.switch_scene((current + step) % len(ids))
+
+    def _install_shortcuts(self) -> None:
+        """Keyboard shortcuts for the actions an operator needs mid-stream.
+
+        The keys are the defaults of ``anycam.hotkeys`` unless the user chose
+        others; calling this again replaces the old bindings.
+        """
+        from .. import hotkeys
+
+        for old in getattr(self, "shortcuts", []):
+            old.setEnabled(False)
+            old.deleteLater()
         self.shortcuts = []
-        for key, callback in bindings.items():
+        keys = hotkeys.current()
+        for action, callback in self._hotkey_actions().items():
+            key = keys.get(action, "")
+            if not key:
+                continue
             shortcut = QShortcut(QKeySequence(key), self)
             shortcut.activated.connect(callback)
+            shortcut.setObjectName(f"hotkey-{action}")
             self.shortcuts.append(shortcut)
+
+    def set_hotkeys(self, mapping: dict[str, str]) -> dict[str, list[str]]:
+        """Save and apply a new key map; returns the keys bound twice (still applied)."""
+        from .. import hotkeys
+
+        hotkeys.save({**hotkeys.DEFAULTS, **mapping})
+        self._install_shortcuts()
+        return hotkeys.conflicts(hotkeys.current())

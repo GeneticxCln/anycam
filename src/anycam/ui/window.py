@@ -27,6 +27,7 @@ from .preview import PreviewWidget, _PreviewOverlay  # noqa: F401
 from .dialogs import CameraGridDialog, OverlayDialog, _slider_row  # noqa: F401
 from .cameras import _CAMERA_LOSS  # noqa: F401
 from .effects_panel import EffectsPanelMixin  # noqa: E402
+from .general_panel import GeneralPanelMixin  # noqa: E402
 from .draw_panel import DrawMixin  # noqa: E402
 from .backdrop_panel import BackdropMixin  # noqa: E402
 from .audio_panel import AudioPanelMixin  # noqa: E402
@@ -44,7 +45,7 @@ from .desktop import DesktopMixin  # noqa: E402
 from .phone import PhoneMixin  # noqa: E402
 
 
-class AnyCamWindow(EffectsPanelMixin, DrawMixin, BackdropMixin, AudioPanelMixin, PlaylistMixin, OutputPanelMixin, SceneMixin, LayersMixin, UndoMixin, CameraMixin, ScreenMixin, OutputsMixin, ProjectIOMixin, EngineMixin, DesktopMixin, PhoneMixin,
+class AnyCamWindow(GeneralPanelMixin, EffectsPanelMixin, DrawMixin, BackdropMixin, AudioPanelMixin, PlaylistMixin, OutputPanelMixin, SceneMixin, LayersMixin, UndoMixin, CameraMixin, ScreenMixin, OutputsMixin, ProjectIOMixin, EngineMixin, DesktopMixin, PhoneMixin,
                   QMainWindow):
     """The standalone studio window."""
 
@@ -170,6 +171,7 @@ class AnyCamWindow(EffectsPanelMixin, DrawMixin, BackdropMixin, AudioPanelMixin,
         self.timer.timeout.connect(self._tick)
         self._started_at = 0.0
         self._render_seconds = 0.0
+        self.apply_interface_polish()
 
     # ------------------------------------------------------------------- ui
     def _build_ui(self) -> None:
@@ -316,6 +318,8 @@ class AnyCamWindow(EffectsPanelMixin, DrawMixin, BackdropMixin, AudioPanelMixin,
             ("Add text…", "text"),
             ("Add scrolling ticker…", "ticker"),
             ("Add lower third…", "lower_third"),
+            ("Add clock", "clock"),
+            ("Add timer…", "timer"),
             ("Add animated GIF…", "gif"),
             ("Add test pattern", "test"),
         ):
@@ -340,13 +344,24 @@ class AnyCamWindow(EffectsPanelMixin, DrawMixin, BackdropMixin, AudioPanelMixin,
 
         if layer is not None:
             menu.addSeparator()
-            if layer.kind in ("ticker", "lower_third"):
+            if layer.kind in ("ticker", "lower_third", "clock", "timer"):
                 edit = menu.addAction(f"Edit {layer.name}…")
                 edit.setData("edit")
+            rename = menu.addAction("Rename…")
+            rename.setData("rename")
+            lock = menu.addAction("Unlock layer" if layer.locked else "Lock layer")
+            lock.setData("lock")
+            if layer.kind == "camera":
+                controls = menu.addAction("Camera controls…")
+                controls.setData("camera-controls")
+            if layer.kind in ("screen", "video", "network", "camera"):
+                region = menu.addAction("Show only a region…")
+                region.setData("region")
             duplicate = menu.addAction("Duplicate layer")
             duplicate.setData("duplicate")
             remove = menu.addAction(f"Remove {layer.name}")
             remove.setData("remove")
+            remove.setEnabled(not layer.locked)
         return menu
 
     def _preview_context_menu(self, layer_id: str, position) -> None:
@@ -367,6 +382,16 @@ class AnyCamWindow(EffectsPanelMixin, DrawMixin, BackdropMixin, AudioPanelMixin,
             self.snapshot()
         elif data == "edit":
             self.edit_overlay(layer_id)
+        elif data == "rename":
+            self.rename_layer(layer_id)
+        elif data == "lock":
+            layer = self.scene.layer(layer_id)
+            if layer is not None:
+                self.set_layer_locked(layer_id, not layer.locked)
+        elif data == "camera-controls":
+            self.open_camera_controls(layer_id)
+        elif data == "region":
+            self.select_screen_region(layer_id)
         elif data == "duplicate":
             if layer_id:
                 self.preview.select_layer(layer_id)
@@ -386,7 +411,7 @@ class AnyCamWindow(EffectsPanelMixin, DrawMixin, BackdropMixin, AudioPanelMixin,
     def edit_overlay(self, layer_id: str, values: tuple[str, str, str] | None = None) -> bool:
         """Edit a ticker or lower third; ``values`` skips the dialog (tests, scripts)."""
         layer = self.scene.layer(layer_id)
-        if layer is None or layer.kind not in ("ticker", "lower_third"):
+        if layer is None or layer.kind not in ("ticker", "lower_third", "clock", "timer"):
             return False
         if values is None:
             dialog = OverlayDialog(layer, self)

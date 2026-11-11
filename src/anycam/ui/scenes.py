@@ -220,6 +220,39 @@ class SceneMixin:
         self._mark_dirty()
         self._show_scene_live()
 
+    def duplicate_scene(self, scene_id: str = "") -> Scene | None:
+        """Copy a scene (layers get new ids) and switch to the copy."""
+        scene = next((s for s in self.project.scenes
+                      if s.id == (scene_id or self.project.active_scene)), None)
+        if scene is None:
+            return None
+        copy_ = Scene.from_dict(scene.to_dict())
+        copy_.id = new_id("scene")
+        copy_.name = f"{scene.name} copy"
+        renamed = {}
+        for layer in copy_.layers:
+            renamed[layer.id] = layer.id = new_id("layer")
+        copy_.playlist.layer_ids = [renamed.get(i, i) for i in copy_.playlist.layer_ids]
+        self._append_scene(copy_)
+        # Next to the original rather than at the end.
+        index = next(i for i, item in enumerate(self.project.scenes) if item.id == scene.id)
+        self.move_scene(copy_.id, index + 1 - (len(self.project.scenes) - 1))
+        return copy_
+
+    def move_scene(self, scene_id: str, delta: int) -> bool:
+        """Move a scene ``delta`` places in the list (the order of Ctrl+1..9)."""
+        scenes = self.project.scenes
+        index = next((i for i, item in enumerate(scenes) if item.id == scene_id), -1)
+        target = max(0, min(len(scenes) - 1, index + int(delta)))
+        if index < 0 or target == index:
+            return False
+        scenes.insert(target, scenes.pop(index))
+        self._refresh_scenes()
+        self._refresh_scene_list()
+        self._mark_dirty()
+        self._status(f"Moved {scenes[target].name} to position {target + 1}")
+        return True
+
     def rename_scene(self, scene_id: str = "") -> None:
         """Rename a preset from its context menu or the Scene list."""
         scene = next((s for s in self.project.scenes

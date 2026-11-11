@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .. import config
+from .. import animated, config
 from ..geometry import clamp
 from ..model import (Layer, new_id)
 from .theme import STYLE  # noqa: F401
@@ -32,6 +32,10 @@ class LayersMixin:
         self.layer_list.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.layer_list.model().rowsMoved.connect(self._layers_reordered)
         self.layer_list.itemChanged.connect(self._layer_visibility)
+        self.layer_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.layer_list.customContextMenuRequested.connect(self._layer_list_menu)
+        self.layer_list.itemDoubleClicked.connect(
+            lambda item: self.rename_layer(item.data(Qt.ItemDataRole.UserRole)))
         self.layer_list.itemSelectionChanged.connect(self._layers_selection_changed)
         layout.addWidget(self.layer_list, 1)
 
@@ -194,6 +198,7 @@ class LayersMixin:
                    ("Screen", "screen"), ("Phone camera", "phone"),
                    ("Network URL", "network"),
                    ("Ticker", "ticker"), ("Lower third", "lower_third"),
+                   ("Clock", "clock"), ("Timer", "timer"),
                    ("Animated GIF", "gif"))
         for index, (label, kind) in enumerate(sources):
             button = QPushButton(f"+ {label}")
@@ -221,7 +226,8 @@ class LayersMixin:
         self.layer_list.blockSignals(True)
         self.layer_list.clear()
         for layer in sorted(self.scene.layers, key=lambda l: l.z):
-            item = QListWidgetItem(f"{layer.name}  ·  {layer.kind}")
+            item = QListWidgetItem(f"{layer.name}  ·  {layer.kind}"
+                                   + ("  ·  locked" if layer.locked else ""))
             item.setData(Qt.ItemDataRole.UserRole, layer.id)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if layer.visible else Qt.CheckState.Unchecked)
@@ -235,6 +241,43 @@ class LayersMixin:
             self.preview.set_scene(self.scene)
             self._sync_transform_fields()
             self._sync_effects_controls()
+
+    def _layer_list_menu(self, position) -> None:
+        item = self.layer_list.itemAt(position)
+        layer_id = item.data(Qt.ItemDataRole.UserRole) if item is not None else ""
+        self._preview_context_menu(layer_id, self.layer_list.viewport().mapToGlobal(position))
+
+    def rename_layer(self, layer_id: str = "", name: str | None = None) -> bool:
+        """Give a layer a new name (asks for one when ``name`` is not given)."""
+        layer = self.scene.layer(layer_id or self.preview.selected_id)
+        if layer is None:
+            return False
+        if name is None:
+            name, accepted = QInputDialog.getText(
+                self, "Rename layer", "Layer name:", text=layer.name)
+            if not accepted:
+                return False
+        name = " ".join(str(name).split())
+        if not name or name == layer.name:
+            return False
+        before = self._layout_snapshot()
+        layer.name = name
+        self._refresh_layers()
+        self._record_history(before)
+        self._mark_dirty()
+        self._status(f"Renamed layer to {name}")
+        return True
+
+    def set_layer_locked(self, layer_id: str, locked: bool) -> bool:
+        """Lock a layer against accidental dragging, nudging and removal (or unlock it)."""
+        layer = self.scene.layer(layer_id)
+        if layer is None or layer.locked == bool(locked):
+            return False
+        layer.locked = bool(locked)
+        self._refresh_layers()
+        self._mark_dirty()
+        self._status(f"{layer.name} {'locked' if layer.locked else 'unlocked'}")
+        return True
 
     def _layers_reordered(self, *_args) -> None:
         # Map the new list order back to scene.layers by z-order.
@@ -288,6 +331,21 @@ class LayersMixin:
             layer = Layer(new_id("layer"), "ticker", "Ticker", source=source,
                           box=(0.0, 0.9, 1.0, 0.1), z=0, color="#ffffff",
                           background="#101418cc")
+        elif kind == "clock":
+            layer = Layer(new_id("layer"), "clock", "Clock", source=source or "%H:%M:%S",
+                          box=(0.80, 0.03, 0.17, 0.07), z=0, color="#ffffff",
+                          background="#101418cc")
+        elif kind == "timer":
+            if not source:
+                text, ok = QInputDialog.getText(
+                    self, "Timer", "Countdown from (mm:ss), or type stopwatch:",
+                    text="05:00")
+                if not ok or not text.strip():
+                    return None
+                source = text.strip()
+            layer = Layer(new_id("layer"), "timer", "Timer", source=source,
+                          box=(0.80, 0.11, 0.17, 0.07), z=0, color="#ffffff",
+                          background="#101418cc")
         elif kind == "lower_third":
             if not source:
                 name, ok = QInputDialog.getText(self, "Lower third", "Name:")
@@ -295,7 +353,10 @@ class LayersMixin:
                     return None
                 title, _ok = QInputDialog.getText(
                     self, "Lower third", "Title or subtitle (optional):")
-                source = f"{name.strip()}|{title.strip()}"
+                style, picked = QInputDialog.getItem(
+                    self, "Lower third", "Style:", list(animated.LOWER_THIRD_TEMPLATES),
+                    0, False)
+                source = animated.join_lower_third(name, title, style if picked else "Classic")
             layer = Layer(new_id("layer"), "lower_third",
                           source.partition("|")[0] or "Lower third", source=source,
                           box=(0.04, 0.66, 0.50, 0.20), z=0, color="#ffffff",
@@ -474,6 +535,10 @@ class LayersMixin:
         """Remove layers by id from whatever selected them (list or canvas)."""
         removed = [layer_id for layer_id in removed
                    if layer_id and self.scene.layer(layer_id) is not None]
+        locked = [layer_id for layer_id in removed if self.scene.layer(layer_id).locked]
+        if locked:
+            removed = [layer_id for layer_id in removed if layer_id not in locked]
+            self._status("Locked layers were kept: unlock them to remove them")
         if not removed:
             return
         before = self._layout_snapshot()
@@ -732,6 +797,37 @@ class LayersMixin:
         self._sync_transform_fields()
         self._record_history(before)
         self._schedule_transform_commit(layer.id)
+
+    def set_layer_region(self, layer_id: str, x: float, y: float, w: float, h: float) -> bool:
+        """Show only a region of a source: ``x, y, w, h`` as fractions of its picture.
+
+        This is the screen-region share: pick the screen or window once, then
+        keep just the part you want (a terminal, a slide, one monitor corner).
+        It is the crop, expressed as the window to keep.
+        """
+        layer = self.scene.layer(layer_id)
+        if layer is None:
+            return False
+        x, y = clamp(x, 0.0, 1.0), clamp(y, 0.0, 1.0)
+        w = clamp(w, PreviewWidget.MIN_CROP_SPAN, 1.0 - x)
+        h = clamp(h, PreviewWidget.MIN_CROP_SPAN, 1.0 - y)
+        before = self._layout_snapshot()
+        layer.crop = (x, y, clamp(1.0 - x - w), clamp(1.0 - y - h))
+        self._record_history(before)
+        self._sync_transform_fields()
+        self._preview_edit_finished(layer.id, True)
+        return True
+
+    def select_screen_region(self, layer_id: str = "") -> bool:
+        """Start choosing the region of a screen share by dragging its crop window."""
+        layer = self.scene.layer(layer_id or self.preview.selected_id)
+        if layer is None or layer.kind not in ("screen", "video", "network", "camera"):
+            return False
+        self.preview.select_layer(layer.id)
+        self._set_edit_mode("crop")
+        self._status("Drag the crop window over the part of the picture to keep, "
+                     "or use Reset crop to show it all")
+        return True
 
     def _schedule_transform_commit(self, layer_id: str) -> None:
         if self.engine is None:

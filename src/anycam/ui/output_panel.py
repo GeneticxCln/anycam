@@ -58,11 +58,24 @@ class OutputPanelMixin:
             spin.valueChanged.connect(
                 lambda value, field=spin: field.setValue(value - value % 2)
                 if value % 2 else None)
+        # A size or rate edit takes effect while the preview runs: after a short
+        # pause (so typing "1280" does not rebuild at 1, 12, 128 ...) the canvas
+        # is rebuilt with the new format; nothing happens when it is stopped.
+        self._canvas_apply_timer = QTimer(self)
+        self._canvas_apply_timer.setSingleShot(True)
+        self._canvas_apply_timer.setInterval(800)
+        self._canvas_apply_timer.timeout.connect(self._apply_canvas_edit)
         for spin in (self.width_spin, self.height_spin, self.fps_spin):
             spin.valueChanged.connect(lambda *_: self._mark_dirty())
+            spin.valueChanged.connect(lambda *_: self._canvas_apply_timer.start())
         grid.addWidget(QLabel("Width"), 0, 0); grid.addWidget(self.width_spin, 0, 1)
         grid.addWidget(QLabel("Height"), 1, 0); grid.addWidget(self.height_spin, 1, 1)
         grid.addWidget(QLabel("FPS"), 2, 0); grid.addWidget(self.fps_spin, 2, 1)
+        canvas_hint = QLabel("A new size or rate restarts the running preview; the virtual "
+                             "camera keeps the mode it opened with.")
+        canvas_hint.setObjectName("muted")
+        canvas_hint.setWordWrap(True)
+        grid.addWidget(canvas_hint, 3, 0, 1, 2)
         layout.addWidget(box)
 
         encoder_box = QGroupBox("Video encoder")
@@ -292,6 +305,11 @@ class OutputPanelMixin:
         index = self.screen_flip_combo.findData(value)
         if index >= 0:
             self.screen_flip_combo.setCurrentIndex(index)
+
+    def _apply_canvas_edit(self) -> None:
+        """Apply the Width/Height/FPS boxes to the project (and the running canvas)."""
+        self.set_output_format(self.width_spin.value(), self.height_spin.value(),
+                               self.fps_spin.value())
 
     def set_output_format(self, width: int, height: int, fps: int) -> None:
         """Apply a canvas size and rate, keeping the Output tab in sync."""

@@ -74,6 +74,7 @@ class UndoMixin:
                 existing.crop = fresh.crop
                 existing.alpha = fresh.alpha
                 existing.z = fresh.z
+                existing.name = fresh.name      # renames are recorded too
                 restored.append(existing)
         self.scene.layers = restored
         self._transform_timer.stop()

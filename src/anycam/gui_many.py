@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QStatusBar,
+    QScrollArea,
     QTabWidget,
     QToolButton,
     QVBoxLayout,
@@ -161,6 +162,17 @@ class ManyCamWindow(AnyCamWindow):
         self.settings_button.setToolTip("Sources, audio, playlist and output")
         self.settings_button.clicked.connect(lambda: self._open_settings())
         header.addWidget(self.settings_button)
+        self.project_button = QPushButton("Project")
+        self.project_button.setToolTip("Open, save as, import and export")
+        project_menu = QMenu(self.project_button)
+        for label, handler in (("Open project…", lambda: self.open_project()),
+                               ("Save", self.save_project),
+                               ("Save project as…", lambda: self.save_project_as()),
+                               ("Import scene…", lambda: self.import_scene()),
+                               ("Export scene…", lambda: self.export_scene())):
+            project_menu.addAction(label, handler)
+        self.project_button.setMenu(project_menu)
+        header.addWidget(self.project_button)
         self.status_chip = QLabel("STOPPED")
         self.status_chip.setObjectName("accent")
         header.addWidget(self.status_chip)
@@ -325,17 +337,29 @@ class ManyCamWindow(AnyCamWindow):
         dialog.setWindowTitle("AnyCam settings")
         dialog.resize(520, 680)
         tabs = QTabWidget(dialog)
-        tabs.addTab(self._layers_tab(), "Sources")
-        tabs.addTab(self._audio_tab(), "Audio")
-        tabs.addTab(self._playlist_tab(), "Media")
-        tabs.addTab(self._output_tab(), "Output")
-        tabs.addTab(self._stream_tab(), "Stream")
-        tabs.addTab(self._diagnostics_tab(), "Diagnostics")
-        tabs.addTab(self._about_tab(), "About")
+
+        def scrolled(page: QWidget) -> QScrollArea:
+            # Each page scrolls instead of forcing the dialog taller than a
+            # small screen (the Output page alone wants ~1170 px).
+            area = QScrollArea()
+            area.setWidgetResizable(True)
+            area.setFrameShape(QFrame.Shape.NoFrame)
+            area.setWidget(page)
+            return area
+
+        tabs.addTab(scrolled(self._layers_tab()), "Sources")
+        tabs.addTab(scrolled(self._audio_tab()), "Audio")
+        tabs.addTab(scrolled(self._playlist_tab()), "Media")
+        tabs.addTab(scrolled(self._output_tab()), "Output")
+        tabs.addTab(scrolled(self._stream_tab()), "Stream")
+        tabs.addTab(scrolled(self._diagnostics_tab()), "Diagnostics")
+        tabs.addTab(scrolled(self._general_tab()), "General")
+        tabs.addTab(scrolled(self._about_tab()), "About")
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(tabs)
         self.settings_tabs = tabs
+        self.apply_interface_polish(dialog)
         return dialog
 
     def _about_tab(self) -> QWidget:
@@ -690,11 +714,27 @@ class ManyCamWindow(AnyCamWindow):
     def _scene_context_menu(self, scene_id: str, position) -> None:
         menu = QMenu(self)
         rename = menu.addAction("Rename…")
+        duplicate = menu.addAction("Duplicate")
+        ids = [scene.id for scene in self.project.scenes]
+        left = menu.addAction("Move left")
+        left.setEnabled(scene_id in ids and ids.index(scene_id) > 0)
+        right = menu.addAction("Move right")
+        right.setEnabled(scene_id in ids and ids.index(scene_id) < len(ids) - 1)
+        menu.addSeparator()
+        export = menu.addAction("Export scene…")
         remove = menu.addAction("Remove")
         remove.setEnabled(len(self.project.scenes) > 1)
         chosen = menu.exec(position)
         if chosen is rename:
             self.rename_scene(scene_id)
+        elif chosen is duplicate:
+            self.duplicate_scene(scene_id)
+        elif chosen is left:
+            self.move_scene(scene_id, -1)
+        elif chosen is right:
+            self.move_scene(scene_id, 1)
+        elif chosen is export:
+            self.export_scene(scene_id)
         elif chosen is remove:
             self.remove_scene(scene_id)
 

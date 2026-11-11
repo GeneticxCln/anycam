@@ -6,8 +6,11 @@ import shutil
 from pathlib import Path
 
 
+from PySide6.QtWidgets import QFileDialog
+
 from .. import config
-from ..model import (Project, default_project)
+from ..model import (Project, default_project, load_scene_preset, new_id,
+                     save_scene_preset)
 from .theme import STYLE  # noqa: F401
 from .layout_history import LayoutHistory  # noqa: F401
 from .preview import PreviewWidget, _PreviewOverlay  # noqa: F401
@@ -17,8 +20,13 @@ from .dialogs import CameraGridDialog, OverlayDialog, _slider_row  # noqa: F401
 class ProjectIOMixin:
     """Loading, saving and autosaving the project."""
 
+    def _project_target(self) -> Path:
+        """The file the project is read from and autosaved to."""
+        return getattr(self, "project_file", None) or config.project_path()
+
     def _load_saved_project(self) -> Project:
-        path = config.project_path()
+        path = config.current_project_path()
+        self.project_file = path
         if not path.exists():
             return default_project()
         try:
@@ -57,7 +65,7 @@ class ProjectIOMixin:
         self.project.audio.media_file = self.media_edit.text().strip()
         self.project.editor.snap_enabled = self.preview.snap_enabled
         self.project.editor.snap_px = self.preview.snap_px
-        return self.project.save(config.project_path())
+        return self.project.save(self._project_target())
 
     def save_project(self) -> None:
         try:
@@ -95,17 +103,20 @@ class ProjectIOMixin:
         except Exception as exc:  # noqa: BLE001 - closing must still work
             self._status(f"Could not save project: {exc}")
 
-    def reload_project(self) -> None:
-        """Re-read the saved project and refresh the controls that mirror it."""
-        path = config.project_path()
+    def reload_project(self, path: Path | str | None = None) -> bool:
+        """Re-read a project file (default: the current one) and refresh the controls.
+
+        Returns whether the project was loaded.
+        """
+        path = Path(path) if path else self._project_target()
         if not path.exists():
             self._status(f"No saved project at {path}")
-            return
+            return False
         try:
             project = Project.load(path)
         except Exception as exc:  # noqa: BLE001
             self._status(f"Could not load {path}: {exc}")
-            return
+            return False
         was_running = self.engine is not None
         if was_running:
             self.stop_engine()
@@ -196,6 +207,100 @@ class ProjectIOMixin:
         self._sync_editor_controls()
         repaired = (f" · repaired: {'; '.join(project.load_warnings[:2])}"
                     if project.load_warnings else "")
+        self.project_file = path
+        config.remember_project_path(path)
         self._status(f"Loaded project from {path}{repaired}")
         if was_running:
             self.start_engine()
+        return True
+
+    # ------------------------------------------------------- files and presets
+    def open_project(self, path: Path | str | None = None) -> bool:
+        """Open a project file (asks for one when ``path`` is not given)."""
+        if not path:
+            chosen, _ = QFileDialog.getOpenFileName(
+                self, "Open project", str(self._project_target().parent),
+                "AnyCam projects (*.json);;All files (*)")
+            if not chosen:
+                return False
+            path = chosen
+        # What is on screen belongs to the file that is open now: keep it.
+        if getattr(self, "_dirty", False) and self._persist and not self.headless:
+            self._autosave()
+        return self.reload_project(path)
+
+    def save_project_as(self, path: Path | str | None = None) -> bool:
+        """Save the project under a new name and keep working in that file."""
+        if not path:
+            chosen, _ = QFileDialog.getSaveFileName(
+                self, "Save project as", str(self._project_target()),
+                "AnyCam projects (*.json)")
+            if not chosen:
+                return False
+            path = chosen
+        path = Path(path)
+        if path.suffix.lower() != ".json":
+            path = path.with_suffix(path.suffix + ".json")
+        previous = getattr(self, "project_file", None)
+        self.project_file = path
+        try:
+            written = self._write_project()
+        except Exception as exc:  # noqa: BLE001 - a failed save must not crash the UI
+            self.project_file = previous
+            self._status(f"Could not save project: {exc}")
+            return False
+        config.remember_project_path(written)
+        self._dirty = False
+        self._autosave_timer.stop()
+        self._status(f"Saved project to {written}")
+        return True
+
+    def export_scene(self, scene_id: str = "", path: Path | str | None = None) -> bool:
+        """Write one scene as a shareable preset file."""
+        scene = next((s for s in self.project.scenes
+                      if s.id == (scene_id or self.project.active_scene)), None)
+        if scene is None:
+            return False
+        if not path:
+            chosen, _ = QFileDialog.getSaveFileName(
+                self, "Export scene", f"{scene.name}.anycam-scene.json",
+                "AnyCam scenes (*.anycam-scene.json)")
+            if not chosen:
+                return False
+            path = chosen
+        path = Path(path)
+        try:
+            written = save_scene_preset(scene, path.parent)
+            if path.name != written.name:
+                written.replace(path)
+                written = path
+        except OSError as exc:
+            self._status(f"Could not export {scene.name}: {exc}")
+            return False
+        self._status(f"Exported {scene.name} to {written}")
+        return True
+
+    def import_scene(self, path: Path | str | None = None) -> bool:
+        """Add a scene preset file as a new scene."""
+        if not path:
+            chosen, _ = QFileDialog.getOpenFileName(
+                self, "Import scene", "", "AnyCam scenes (*.anycam-scene.json *.json)")
+            if not chosen:
+                return False
+            path = chosen
+        warnings: list[str] = []
+        try:
+            scene = load_scene_preset(path, warnings)
+        except Exception as exc:  # noqa: BLE001 - a bad file is reported, not raised
+            self._status(f"Could not import {path}: {exc}")
+            return False
+        # Fresh ids: the file may be imported twice, or come from this project.
+        scene.id = new_id("scene")
+        renamed = {}
+        for layer in scene.layers:
+            renamed[layer.id] = layer.id = new_id("layer")
+        scene.playlist.layer_ids = [renamed.get(i, i) for i in scene.playlist.layer_ids]
+        self._append_scene(scene)
+        extra = f" ({len(warnings)} repaired)" if warnings else ""
+        self._status(f"Imported scene {scene.name}{extra}")
+        return True

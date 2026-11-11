@@ -10,11 +10,13 @@ from PySide6.QtWidgets import (
     QInputDialog,
 )
 
-from .. import config
+import threading
+
+from .. import camera_controls, config
 from .theme import STYLE  # noqa: F401
 from .layout_history import LayoutHistory  # noqa: F401
 from .preview import PreviewWidget, _PreviewOverlay  # noqa: F401
-from .dialogs import CameraGridDialog, OverlayDialog, _slider_row  # noqa: F401
+from .dialogs import CameraControlsDialog, CameraGridDialog, OverlayDialog, _slider_row  # noqa: F401
 
 # Phrases a disconnected or wedged camera produces.  An error from another
 # element (an encoder, the virtual camera's writer) has none of them, so a
@@ -158,6 +160,46 @@ class CameraMixin:
         # camera and swapped them for placeholder cards.
         return cameras if "v4l2src" in text else {}
 
+    def open_camera_controls(self, layer_id: str = "", controls=None, show: bool = True):
+        """The camera's brightness, exposure, zoom, focus ... as live controls.
+
+        Changes go straight to the device and are remembered on the layer, so
+        they come back after a restart or a replug.  ``controls`` and ``show``
+        let tests supply a canned list and skip the modal loop.
+        """
+        layer = self.scene.layer(layer_id or self.preview.selected_id)
+        if layer is None or layer.kind != "camera":
+            return None
+        device = layer.source or config.camera_device()
+        found = controls if controls is not None else camera_controls.list_controls(device)
+
+        def apply(name: str, value: int) -> str:
+            problem = camera_controls.set_control(device, name, value)
+            if not problem:
+                layer.camera_controls[name] = int(value)
+                self._mark_dirty()
+            return problem
+
+        dialog = CameraControlsDialog(layer, found, apply, self)
+        if show:
+            dialog.exec()
+        return dialog
+
+    def _apply_saved_camera_controls(self, layer_ids=None) -> None:
+        """Re-apply remembered camera controls (off the UI thread: v4l2-ctl blocks)."""
+        jobs = [(layer.source, dict(layer.camera_controls)) for layer in self.scene.layers
+                if layer.kind == "camera" and layer.source and layer.camera_controls
+                and (layer_ids is None or layer.id in layer_ids)]
+        if not jobs or self.headless:
+            return
+
+        def work() -> None:
+            for device, saved in jobs:
+                for problem in camera_controls.apply_saved(device, saved):
+                    print(f"[camera] {device}: {problem}", flush=True)
+
+        threading.Thread(target=work, name="anycam-camera-controls", daemon=True).start()
+
     def _has_screen_layer(self) -> bool:
         """Whether this scene is using a portal screen capture."""
         return any(layer.kind == "screen" for layer in self.scene.layers)
@@ -260,6 +302,7 @@ class CameraMixin:
                     f"retrying in {self._camera_retry_ms / 1000:.1f}s"
                 )
                 return
+            self._apply_saved_camera_controls(set(restored))
             self._status(
                 "Camera reconnected: "
                 + ", ".join(sorted(set(restored.values()))))
