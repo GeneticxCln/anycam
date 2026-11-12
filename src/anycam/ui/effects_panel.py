@@ -309,6 +309,11 @@ class EffectsPanelMixin:
         self.effect_grid.installEventFilter(self)
         layout.addWidget(self.effect_grid, 1)
 
+        self.favourite_check = QCheckBox("\u2605 Favourite")
+        self.favourite_check.setToolTip("Keep the filter in this slot in the Favourites list")
+        self.favourite_check.toggled.connect(self._favourite_toggled)
+        layout.addWidget(self.favourite_check)
+
         holder, strength, label = _slider_row(
             "Strength", 0, 100, 50,
             lambda v: self._set_effect(self._slot_attr() + "_amount", v / 100.0))
@@ -373,6 +378,16 @@ class EffectsPanelMixin:
                     film = {**neutral, "color_effect": value}
                     entries.append({"label": label, "kind": "film",
                                     "apply": film, "preview": dict(film)})
+        elif category == "Favourites":
+            for key in effect_library.favourites():
+                spec = effect_library.FILTERS[key]
+                if not effect_library.filter_available(key):
+                    continue
+                values = {"filter": spec.key, "filter_amount": spec.default}
+                entries.append({"label": spec.label, "kind": "filter",
+                                "apply": values, "preview": values,
+                                "tip": f"\u2605 {spec.description}",
+                                "amount": bool(spec.prop)})
         elif category in effect_library.FILTER_CATEGORIES:
             entries.append({"label": "No filter", "kind": "filter",
                             "apply": {"filter": "none"}, "preview": {}})
@@ -419,6 +434,32 @@ class EffectsPanelMixin:
                                 "preview": {**values, "frame_color": "#ff4d7a",
                                             "frame_width": 6}})
         return entries
+
+    def _current_filter_key(self) -> str:
+        layer = self._effects_layer()
+        if layer is None:
+            return ""
+        key = getattr(layer.effects, self._slot_attr(), "none")
+        return key if key and key != "none" else ""
+
+    def _favourite_toggled(self, starred: bool) -> None:
+        key = self._current_filter_key()
+        if not key or getattr(self, "_syncing_effects", False):
+            return
+        effect_library.set_favourite(key, bool(starred))
+        if str(self.effect_category.currentData()) == "Favourites":
+            self._populate_effect_grid()
+        self._status(("Added to" if starred else "Removed from") + " favourites")
+
+    def _sync_favourite_check(self) -> None:
+        check = getattr(self, "favourite_check", None)
+        if check is None:
+            return
+        key = self._current_filter_key()
+        check.blockSignals(True)
+        check.setEnabled(bool(key))
+        check.setChecked(bool(key) and key in effect_library.favourites())
+        check.blockSignals(False)
 
     def _slot_attr(self) -> str:
         """The Effects field of the chosen filter slot: ``filter`` or ``filter2``."""
@@ -837,6 +878,7 @@ class EffectsPanelMixin:
         """Mirror the selected layer's effect values into the panel."""
         if not hasattr(self, "effects_target"):
             return
+        self._sync_favourite_check()
         layer = self._effects_layer()
         self._syncing_effects = True
         try:

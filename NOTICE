@@ -21,3 +21,9 @@ Runtime dependencies (installed separately, each under its own licence)
 ------------------------------------------------------------------------
 GStreamer (LGPL; some plugins GPL/proprietary - x264enc is GPL), PySide6/Qt (LGPL), PyGObject (LGPL),
 NumPy, Pillow, psutil, onnxruntime (MIT), cryptography and segno (optional).
+
+Effect packs
+------------
+Packs you place in ~/.local/share/anycam/effects/ are third-party code under their own licences (the
+`license` and `author` fields of their pack.json). They run only in the isolated effect worker process.
+See docs/EFFECT_PACKS.md.

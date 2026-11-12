@@ -5,12 +5,13 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QComboBox, QGridLayout, QGroupBox, QLabel, QLineEdit, QListWidget,
+    QCheckBox, QComboBox, QGridLayout, QGroupBox, QLabel, QLineEdit, QListWidget,
     QPushButton, QSpinBox,
     QVBoxLayout, QWidget,
 )
 
-from .. import config, streaming
+from .. import config, effect_worker, packs, streaming
+from .. import effects as effect_library
 from ..engine.outputs.vcam import pipewire_available
 from ..pipeline import nvenc_available, va_present
 from .theme import STYLE  # noqa: F401
@@ -125,6 +126,20 @@ class OutputPanelMixin:
         grid.addWidget(self.record_free_label, 3, 0, 1, 3)
         self._update_record_free()
         return box
+
+    def _effects_isolated_changed(self, on: bool) -> None:
+        self.project.output.effects_isolated = bool(on)
+        effect_worker.set_isolation(bool(on))
+        self._mark_dirty()
+        if self.engine is not None:
+            self.restart_engine()
+
+    def _packs_summary(self) -> str:
+        found = [spec for spec in effect_library.FILTERS.values() if spec.category == "Packs"]
+        problems = getattr(self, "pack_problems", [])
+        text = (f"{len(found)} effect pack entr{'y' if len(found) == 1 else 'ies'} loaded from "
+                f"{packs.packs_dir()}")
+        return text + (f" \u00b7 {len(problems)} problem(s): {problems[0]}" if problems else "")
 
     def _pick_record_dir(self) -> None:
         from PySide6.QtWidgets import QFileDialog
@@ -289,6 +304,17 @@ class OutputPanelMixin:
         self.effects_device_combo.currentIndexChanged.connect(self._effects_device_changed)
         effects_grid.addWidget(QLabel("Run models on"), 0, 0)
         effects_grid.addWidget(self.effects_device_combo, 0, 1)
+        self.effects_isolated_check = QCheckBox("Run AI effects in a separate process")
+        self.effects_isolated_check.setChecked(self.project.output.effects_isolated)
+        self.effects_isolated_check.setToolTip(
+            "A crash or hang in a model then costs the effect, never the stream. "
+            "Effect packs always run this way.")
+        self.effects_isolated_check.toggled.connect(self._effects_isolated_changed)
+        effects_grid.addWidget(self.effects_isolated_check, 2, 0, 1, 2)
+        self.packs_note = QLabel(self._packs_summary())
+        self.packs_note.setObjectName("muted")
+        self.packs_note.setWordWrap(True)
+        effects_grid.addWidget(self.packs_note, 3, 0, 1, 2)
         self.effects_device_note = QLabel()
         self.effects_device_note.setObjectName("muted")
         self.effects_device_note.setWordWrap(True)

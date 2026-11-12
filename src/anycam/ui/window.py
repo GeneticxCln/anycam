@@ -12,7 +12,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QMainWindow, QMenu, QPushButton, QSplitter, QStatusBar, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from .. import config, portal
+from .. import config, effect_worker, portal
+from .. import effects as effect_library
 from ..layouts import LAYOUT_PRESETS
 from ..model import (Project)
 from ..engine.outputs.recorder import Recorder
@@ -76,6 +77,8 @@ class AnyCamWindow(GeneralPanelMixin, EffectsPanelMixin, DrawMixin, BackdropMixi
         from .. import inference
 
         inference.set_preference(self.project.output.effects_device)
+        effect_worker.set_isolation(self.project.output.effects_isolated)
+        self.pack_problems = effect_library.reload_packs()
         from .. import segment
 
         segment.set_model(self.project.output.segmentation_model)
@@ -403,8 +406,8 @@ class AnyCamWindow(GeneralPanelMixin, EffectsPanelMixin, DrawMixin, BackdropMixi
     # Browse: the thumbnail library.  Adjust: every individual control.
     FRAME_GROUPS = {f"{group} frames": group for group in frames_library.GROUPS}
 
-    EFFECT_CATEGORIES = ("Looks", "Portrait", "Face", "Masks", "Framing", "Distort",
-                         "Retro TV", "Touch-up", "Frames", "Shapes",
+    EFFECT_CATEGORIES = ("Favourites", "Looks", "Portrait", "Face", "Masks", "Framing",
+                         "Distort", "Retro TV", "Touch-up", "Packs", "Frames", "Shapes",
                          *FRAME_GROUPS, "Animations", "Emoji rain")
 
     _CAPTURE_KINDS = ("camera", "screen", "video", "network", "phone", "test")

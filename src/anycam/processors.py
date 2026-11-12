@@ -929,6 +929,26 @@ class AutoFrame(Processor):
             box=(left, top, left + crop_w, top + crop_h)).convert("RGBA")
 
 
+class SelfTest(Processor):
+    """Processors for testing the worker process (never offered in the UI)."""
+
+    def __init__(self, mode: str, amount: float = 0.5) -> None:
+        super().__init__(amount)
+        self.mode, self.count = mode, 0
+
+    def process(self, image: Image.Image, now: float) -> Image.Image:
+        self.count += 1
+        if self.mode == "crash" and self.count >= 3:
+            import os
+
+            os._exit(7)
+        if self.mode == "hang" and self.count >= 3:
+            time.sleep(60)
+        if self.mode == "raise":
+            raise RuntimeError("selftest failure")
+        return ImageOps.invert(image.convert("RGB")).convert("RGBA")
+
+
 class RoundCorners(Processor):
     """Round the picture's corners by clearing the alpha outside them.
 
@@ -988,6 +1008,12 @@ def make_processor(name: str, amount: float) -> Processor:
         return TouchUp(variant, amount)
     if kind == "corners":
         return RoundCorners(amount)
+    if kind == "selftest":
+        return SelfTest(variant, amount)
+    if kind == "pack":
+        from . import packs
+
+        return packs.load_effect(variant, amount)
     if kind == "zoom":
         return Zoom(amount)
     if kind == "autoframe":
@@ -1286,7 +1312,10 @@ def build_processor_bin(name: str, amount: float, bin_name: str, width: int,
     """A bin that runs processor ``name``; returns ``(bin, runner)``."""
     if name.partition(":")[0] in NATIVE_FRAMING:
         return build_framing_bin(name, amount, bin_name, width, height, fps)
-    processor = make_processor(name, amount)
+    from . import effect_worker
+
+    processor = (effect_worker.RemoteProcessor(name, amount)
+                 if effect_worker.wants_isolation(name) else make_processor(name, amount))
 
     def make(factory, element_name=None):
         element = Gst.ElementFactory.make(factory, element_name)

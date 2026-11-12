@@ -479,6 +479,9 @@ class OutputConfig:
     # only when onnxruntime has the CUDA provider).  ANYCAM_EFFECTS_DEVICE
     # overrides it.
     effects_device: str = "cpu"
+    # Run the AI effects (and effect packs) in a separate process, so a crash
+    # in a model never reaches the canvas, the recording or the stream.
+    effects_isolated: bool = True
     # Person cut-out model: "mediapipe" (bundled) or "rvm" (Robust Video
     # Matting, used once downloaded from Settings).
     segmentation_model: str = "mediapipe"
