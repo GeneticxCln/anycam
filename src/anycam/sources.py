@@ -882,6 +882,33 @@ def video_size(path: str) -> tuple[int, int] | None:
     return None
 
 
+_AUDIO_PROBE_CACHE: dict[tuple[str, float], bool] = {}
+
+
+def video_has_audio(path: str) -> bool:
+    """Whether a video file carries an audio stream (probed once per file version)."""
+    import subprocess
+
+    source = Path(path).expanduser()
+    try:
+        mtime = source.stat().st_mtime
+    except OSError:
+        return False
+    key = (str(source.resolve()), mtime)
+    if key in _AUDIO_PROBE_CACHE:
+        return _AUDIO_PROBE_CACHE[key]
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+             "stream=codec_type", "-of", "csv=p=0", str(source)],
+            capture_output=True, text=True, timeout=5)
+        found = proc.returncode == 0 and "audio" in proc.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        found = False
+    _AUDIO_PROBE_CACHE[key] = found
+    return found
+
+
 def _image_pixel_size(path: Path) -> tuple[int, int] | None:
     """Natural pixel size of an image file, or ``None`` when unreadable."""
     try:

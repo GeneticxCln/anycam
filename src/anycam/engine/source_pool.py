@@ -41,6 +41,7 @@ from ..sources import (
     jpeg_decoder,
     make,
     make_optional,
+    video_has_audio,
     video_size,
 )
 
@@ -706,7 +707,10 @@ class SourcePool:
             caps_filter(f"video/x-raw,format=RGBA,width={width},height={height},"
                         f"pixel-aspect-ratio=1/1,framerate={spec.fps}/1"),
         ]
-        return _Built(elements, (width, height), dynamic_from=decode, audio=True)
+        # An audio branch with nothing linked would stop the pipeline ever reaching
+        # EOS, and the clip would not loop; only a file with sound gets one.
+        return _Built(elements, (width, height), dynamic_from=decode,
+                      audio=video_has_audio(spec.source))
 
     @staticmethod
     def _network(spec: CaptureSpec) -> _Built:

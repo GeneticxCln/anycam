@@ -406,3 +406,15 @@ def test_a_video_layers_volume_and_mute_controls(window):
     window.preview.selected_id = "l1"
     window._sync_transform_fields()
     assert not window.layer_volume_slider.isEnabled()
+
+
+def test_only_a_file_with_sound_gets_an_audio_branch(tmp_path, clip):
+    from anycam import sources
+
+    assert sources.video_has_audio(clip) is True
+    silent = tmp_path / "silent.mp4"
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                    "testsrc=size=160x90:rate=15:duration=1", "-c:v", "mpeg4", str(silent)],
+                   check=True)
+    assert sources.video_has_audio(str(silent)) is False
+    assert sources.video_has_audio(str(tmp_path / "missing.mp4")) is False

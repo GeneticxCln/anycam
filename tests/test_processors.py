@@ -128,8 +128,9 @@ def test_tracking_smooths_and_briefly_holds_a_face(portrait):
 
 
 # ----------------------------------------------------------------- processors
+# Rounded corners clear the alpha at the corners on purpose.
 @pytest.mark.parametrize("key", [spec.key for spec in effects.available_filters()
-                                 if spec.processor])
+                                 if spec.processor and spec.key != "round-corners"])
 def test_every_processor_returns_an_opaque_picture_of_the_same_size(key, portrait):
     spec = effects.FILTERS[key]
     processor = processors.make_processor(spec.processor, spec.default)
