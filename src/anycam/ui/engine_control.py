@@ -495,6 +495,7 @@ class EngineMixin:
         if self.engine.mic_level_db is not None:
             db = self.engine.mic_level_db
             self.mic_level_label.setText("muted" if db < -80 else f"{db:.0f} dB")
+        self.update_audio_meters()
         self._advance_playlist(time.monotonic())
         if rec is not None:
             self._update_source_status()

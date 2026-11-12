@@ -174,6 +174,19 @@ class LayersMixin:
         appearance_layout.addWidget(QLabel("Opacity"), 0, 0)
         appearance_layout.addWidget(self.opacity_slider, 0, 1)
         appearance_layout.addWidget(self.opacity_label, 0, 2)
+        self.layer_volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.layer_volume_slider.setRange(0, 200)
+        self.layer_volume_slider.setValue(100)
+        self.layer_volume_slider.setToolTip("The sound of a video file (video layers only)")
+        self.layer_volume_slider.valueChanged.connect(self._layer_volume_changed)
+        self.layer_volume_label = QLabel("100%")
+        self.layer_volume_label.setObjectName("accent")
+        self.layer_mute_check = QCheckBox("Mute")
+        self.layer_mute_check.toggled.connect(self._layer_volume_changed)
+        appearance_layout.addWidget(QLabel("Volume"), 1, 0)
+        appearance_layout.addWidget(self.layer_volume_slider, 1, 1)
+        appearance_layout.addWidget(self.layer_volume_label, 1, 2)
+        appearance_layout.addWidget(self.layer_mute_check, 2, 1)
         self.order_buttons = []
         order_row = QHBoxLayout()
         for text, action in (("Raise", "raise"), ("Lower", "lower"),
@@ -763,6 +776,28 @@ class LayersMixin:
         for widget in widgets:
             widget.blockSignals(False)
 
+    def _layer_volume_changed(self, _value=None) -> None:
+        layer = self.preview.selected_layer()
+        if layer is None or layer.kind != "video":
+            return
+        layer.volume = self.layer_volume_slider.value() / 100.0
+        layer.muted = self.layer_mute_check.isChecked()
+        self.layer_volume_label.setText(f"{self.layer_volume_slider.value()}%")
+        self._mark_dirty()
+        if self.engine is not None:
+            self.engine.set_layer_volume(layer.id, layer.volume, layer.muted)
+
+    def _sync_layer_volume(self, layer: Layer | None) -> None:
+        is_video = layer is not None and layer.kind == "video"
+        for widget in (self.layer_volume_slider, self.layer_mute_check):
+            widget.blockSignals(True)
+            widget.setEnabled(is_video)
+        self.layer_volume_slider.setValue(int(round((layer.volume if is_video else 1.0) * 100)))
+        self.layer_mute_check.setChecked(bool(layer.muted) if is_video else False)
+        self.layer_volume_label.setText(f"{self.layer_volume_slider.value()}%")
+        for widget in (self.layer_volume_slider, self.layer_mute_check):
+            widget.blockSignals(False)
+
     def _framing_changed(self, _value=None) -> None:
         """Fit, flip and rotation shape the chain, so they rebuild the layer."""
         layer = self.preview.selected_layer()
@@ -797,6 +832,7 @@ class LayersMixin:
         layer = self.preview.selected_layer()
         enabled = layer is not None
         self._sync_framing_fields(layer)
+        self._sync_layer_volume(layer)
         for spin in (*self.box_spins.values(), *self.crop_spins.values()):
             spin.setEnabled(enabled)
         self.reset_crop_button.setEnabled(enabled)

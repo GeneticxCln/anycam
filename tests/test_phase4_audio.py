@@ -303,3 +303,106 @@ def test_removing_the_video_layer_removes_its_audio_input(clip):
         assert engine.report.error == ""
     finally:
         engine.stop()
+
+
+# ----------------------------------------------------------------- the panels
+@pytest.fixture
+def window(tmp_path, monkeypatch):
+    pytest.importorskip("PySide6")
+    for name in ("CACHE", "CONFIG", "STATE", "DATA"):
+        monkeypatch.setenv(f"XDG_{name}_HOME", str(tmp_path / name.lower()))
+    monkeypatch.setenv("XDG_VIDEOS_DIR", str(tmp_path / "videos"))
+    from PySide6.QtWidgets import QApplication
+
+    from anycam import config
+    from anycam.gui_many import ManyCamWindow
+
+    monkeypatch.setattr(config, "list_audio_sinks",
+                        lambda: [config.AudioSource("alsa_output.x", "Speakers", False)])
+    QApplication.instance() or QApplication([])
+    project = Project(name="p4")
+    scene = Scene("scene_a", "Alpha")
+    scene.add_layer(Layer("l1", "test", "Ball", source="ball"))
+    project.scenes, project.active_scene = [scene], scene.id
+    win = ManyCamWindow(project)
+    win.headless = True
+    win._persist = False
+    yield win
+    win.engine = None
+    win.close()
+
+
+def test_the_audio_tab_writes_voice_sync_and_output_settings(window):
+    audio = window.project.audio
+    window.dynamics_combo.setCurrentIndex(window.dynamics_combo.findData("broadcast"))
+    window.eq_combo.setCurrentIndex(window.eq_combo.findData("voice"))
+    window.delay_spins["mic_delay_ms"].setValue(120)
+    window.virtual_mic_check.setChecked(True)
+    window.monitor_combo.setCurrentIndex(window.monitor_combo.findData("alsa_output.x"))
+    assert (audio.mic_dynamics, audio.mic_eq, audio.mic_delay_ms) == ("broadcast", "voice", 120)
+    assert audio.virtual_mic is True and audio.monitor_device == "alsa_output.x"
+
+
+def test_the_mixer_bars_follow_the_engine_levels(window):
+    class FakeEngine:
+        class report:
+            audio_monitor = ""
+            audio_monitor_error = ""
+            virtual_mic = ""
+            virtual_mic_error = "PipeWire is not running"
+
+        def audio_levels(self):
+            return {"mic": (-12.0, -20.0), "master": (-3.0, -9.0)}
+
+    window.engine = FakeEngine()
+    window.update_audio_meters()
+    assert window.meter_bars["mic"].value() == -12 and window.meter_bars["master"].value() == -3
+    assert window.meter_bars["desktop"].value() == -60
+    assert "PipeWire is not running" in window.audio_output_note.text()
+    window.engine = None
+    window.update_audio_meters()
+    assert window.meter_bars["mic"].value() == -60
+
+
+def test_music_options_and_tracks_are_stored(window, tmp_path):
+    window.media_loop_check.setChecked(False)
+    window.media_shuffle_check.setChecked(True)
+    assert window.project.audio.media_loop is False and window.project.audio.media_shuffle is True
+    assert window.add_music_tracks([str(tmp_path / "a.wav"), str(tmp_path / "b.wav"), ""]) == 2
+    assert window.music_list.count() == 2 and len(window.project.audio.media_playlist) == 2
+    window.music_list.setCurrentRow(0)
+    window._remove_music_track()
+    assert window.project.audio.media_playlist == [str(tmp_path / "b.wav")]
+
+
+def test_listing_playback_devices_reads_pactl(monkeypatch):
+    from anycam import config
+
+    monkeypatch.setattr(config, "run", lambda cmd, timeout=5.0: (0, '[{"name":"s1","description":"Speakers"},{"x":1}]'))
+    assert [sink.name for sink in config.list_audio_sinks()] == ["s1"]
+    monkeypatch.setattr(config, "run", lambda cmd, timeout=5.0: (1, ""))
+    assert config.list_audio_sinks() == []
+
+
+def test_a_video_layers_volume_and_mute_controls(window):
+    video = Layer("v", "video", "Clip", source="/nowhere.mp4")
+    window.scene.add_layer(video)
+    window.preview.selected_id = "v"
+    window._sync_transform_fields()
+    assert window.layer_volume_slider.isEnabled()
+    heard = []
+
+    class FakeEngine:
+        def set_layer_volume(self, layer_id, volume, muted):
+            heard.append((layer_id, volume, muted))
+            return True
+
+    window.engine = FakeEngine()
+    window.layer_volume_slider.setValue(50)
+    window.layer_mute_check.setChecked(True)
+    assert heard[-1] == ("v", 0.5, True)
+    assert (video.volume, video.muted) == (0.5, True)
+    window.engine = None
+    window.preview.selected_id = "l1"
+    window._sync_transform_fields()
+    assert not window.layer_volume_slider.isEnabled()

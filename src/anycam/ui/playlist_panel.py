@@ -107,11 +107,33 @@ class PlaylistMixin:
         music_row.addWidget(self.media_gain_label)
         music_grid.addWidget(QLabel("Gain"), 1, 0)
         music_grid.addLayout(music_row, 1, 1, 1, 2)
+        self.media_loop_check = QCheckBox("Repeat")
+        self.media_loop_check.setChecked(self.project.audio.media_loop)
+        self.media_loop_check.toggled.connect(self._music_options_changed)
+        self.media_shuffle_check = QCheckBox("Shuffle")
+        self.media_shuffle_check.setChecked(self.project.audio.media_shuffle)
+        self.media_shuffle_check.toggled.connect(self._music_options_changed)
+        music_grid.addWidget(self.media_loop_check, 2, 0)
+        music_grid.addWidget(self.media_shuffle_check, 2, 1)
+        self.music_list = QListWidget()
+        self.music_list.setMaximumHeight(90)
+        self.music_list.addItems(self.project.audio.media_playlist)
+        music_grid.addWidget(QLabel("Then play"), 3, 0)
+        music_grid.addWidget(self.music_list, 3, 1, 1, 2)
+        music_buttons = QHBoxLayout()
+        add_music = QPushButton("Add tracks")
+        add_music.clicked.connect(self._add_music_tracks)
+        remove_music = QPushButton("Remove")
+        remove_music.clicked.connect(self._remove_music_track)
+        music_buttons.addWidget(add_music)
+        music_buttons.addWidget(remove_music)
+        music_buttons.addStretch(1)
+        music_grid.addLayout(music_buttons, 4, 1, 1, 2)
         music_note = QLabel("Music is mixed with the microphone through an "
                             "audiomixer at 48 kHz stereo.")
         music_note.setObjectName("muted")
         music_note.setWordWrap(True)
-        music_grid.addWidget(music_note, 2, 0, 1, 3)
+        music_grid.addWidget(music_note, 5, 0, 1, 3)
         layout.addWidget(music)
 
         desktop = QGroupBox("Desktop audio (optional)")
@@ -309,6 +331,36 @@ class PlaylistMixin:
         self._load_playlist_state()
         self._mark_dirty()
         return True
+
+    def _music_options_changed(self, *_args) -> None:
+        self.project.audio.media_loop = self.media_loop_check.isChecked()
+        self.project.audio.media_shuffle = self.media_shuffle_check.isChecked()
+        self._mark_dirty()
+
+    def _add_music_tracks(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Choose music", "", "Audio (*.wav *.mp3 *.ogg *.flac *.m4a *.aac)")
+        self.add_music_tracks(paths)
+
+    def add_music_tracks(self, paths) -> int:
+        added = [path for path in paths if path]
+        self.project.audio.media_playlist.extend(added)
+        self.music_list.addItems(added)
+        if added:
+            self._mark_dirty()
+            if self.engine is not None:
+                self.restart_engine()
+        return len(added)
+
+    def _remove_music_track(self) -> None:
+        row = self.music_list.currentRow()
+        if row < 0 or row >= len(self.project.audio.media_playlist):
+            return
+        del self.project.audio.media_playlist[row]
+        self.music_list.takeItem(row)
+        self._mark_dirty()
+        if self.engine is not None:
+            self.restart_engine()
 
     def _advance_playlist(self, now: float) -> None:
         if self.engine is None or not self.playlist_ids or self.playlist_pause.isChecked():

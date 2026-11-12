@@ -155,6 +155,12 @@ def _measure_chain(use_gl: bool, width: int, height: int, fps: int,
         return False
 
     warmup = 4
+    # A GL chain on a machine where OpenGL cannot start accepts the first
+    # frames and then stops consuming: a blocking push would wait for ever.
+    # Taking the pipeline down releases it, and the chain reports "unavailable".
+    watchdog = threading.Timer(8.0, lambda: pipeline.set_state(Gst.State.NULL))
+    watchdog.daemon = True
+    watchdog.start()
     try:
         if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             return None
@@ -188,6 +194,7 @@ def _measure_chain(use_gl: bool, width: int, height: int, fps: int,
     except Exception:  # noqa: BLE001 - a failed probe is "unavailable"
         return None
     finally:
+        watchdog.cancel()
         pad.remove_probe(probe)
         pipeline.set_state(Gst.State.NULL)
     processed = min(frames, seen[0] - start)

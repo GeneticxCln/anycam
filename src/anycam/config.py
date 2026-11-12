@@ -346,6 +346,20 @@ def list_audio_sources() -> list[AudioSource]:
     return sources
 
 
+def list_audio_sinks() -> list[AudioSource]:
+    """Playback devices (for the audio monitor); empty when pactl cannot list them."""
+    code, out = run(["pactl", "-f", "json", "list", "sinks"])
+    if code != 0:
+        return []
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return []
+    return [AudioSource(name=item.get("name", ""), description=item.get("description", ""),
+                        is_monitor=False)
+            for item in data if isinstance(item, dict) and item.get("name")]
+
+
 def microphone() -> str:
     env = os.environ.get("ANYCAM_MIC")
     if env:
