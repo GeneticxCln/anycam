@@ -567,12 +567,14 @@ def test_five_scene_switches_keep_one_recording(app, tmp_path, monkeypatch):
         assert _wait_for(app, lambda: window.preview.image is not None, timeout=8)
         _pump(app, 1.0)
         previous = window.engine
-        # Five rebuilds, including the return to the first scene.
+        # Five switches, including the return to the first scene.  They happen
+        # on the running canvas: the engine (and so the recording tap) is the
+        # same object throughout.
         for index in (1, 2, 3, 4, 0):
             window.switch_scene(index)
             assert window.engine is not None, window.statusBar().currentMessage()
-            assert window.engine is not previous
-            previous = window.engine
+            assert window.engine is previous
+            assert window.engine.scene is window.scene
             _pump(app, 0.45)
         window.close()
         app.processEvents()
@@ -824,7 +826,7 @@ def test_duplicate_camera_shares_one_pooled_capture(app, tmp_path, monkeypatch):
     device = tmp_path / "fake-camera"
     device.write_bytes(b"")
     monkeypatch.setattr(
-        "anycam.pool.camera_modes",
+        "anycam.engine.source_pool.camera_modes",
         lambda _device: [sources.CameraMode("MJPG", 320, 180, 30)],
     )
     window = AnyCamWindow(build_demo_project("testsrc", 320, 180, 30))
@@ -1036,7 +1038,7 @@ def test_camera_grid_scene_button_builds_the_selected_slots(app, monkeypatch):
         def slots(self):
             return ["/dev/video2", "/dev/video3", "", "/dev/video5"]
 
-    monkeypatch.setattr("anycam.gui.CameraGridDialog", FakeDialog)
+    monkeypatch.setattr("anycam.ui.scenes.CameraGridDialog", FakeDialog)
     try:
         before = len(window.project.scenes)
         window.add_camera_grid_scene()
@@ -1141,24 +1143,28 @@ def test_camera_reconnects_when_its_device_returns(app, monkeypatch):
     window._lost_cameras = {back.id: back.source, gone.id: gone.source}
 
     class FakeEngine:
+        def __init__(self):
+            self.attached = []
+
+        def attach_capture(self, layer_id):
+            self.attached.append(layer_id)
+            return True
+
         def stop(self):
             return {}
 
-    window.engine = FakeEngine()
+    engine = FakeEngine()
+    window.engine = engine
     window._camera_watch.start()
-    seen = {}
-
-    def fake_restart():
-        # The restored camera must no longer be skipped when the graph rebuilds.
-        seen["lost"] = set(window._lost_cameras)
-        window.engine = FakeEngine()
-
-    monkeypatch.setattr(window, "restart_engine", fake_restart)
+    restarts = []
+    monkeypatch.setattr(window, "restart_engine", lambda: restarts.append(1))
     monkeypatch.setattr("anycam.gui.Path.exists",
                         lambda self: str(self) == "/dev/anycam-back")
     try:
         window._reconnect_cameras()
-        assert seen["lost"] == {gone.id}
+        # Only the returned camera is reattached, live: no rebuild.
+        assert engine.attached == [back.id]
+        assert restarts == []
         assert window._lost_cameras == {gone.id: "/dev/anycam-gone"}
         assert window._camera_watch.isActive()
         assert "Camera reconnected: /dev/anycam-back" in window.statusBar().currentMessage()
@@ -1168,30 +1174,54 @@ def test_camera_reconnects_when_its_device_returns(app, monkeypatch):
         app.processEvents()
 
 
-def test_camera_reconnect_retries_with_backoff_when_restart_fails(app, monkeypatch):
+def test_camera_reconnect_retries_with_backoff_when_the_capture_cannot_resume(app, monkeypatch):
     """A present-but-wedged UVC device must not stop the reconnect watch."""
     window = _window()
     camera = Layer("layer_retry", "camera", "Retry", source="/dev/anycam-retry")
     window.scene.add_layer(camera)
     window._lost_cameras = {camera.id: camera.source}
-    window.engine = object()
     calls = []
 
-    def failing_restart():
-        calls.append(1)
-        window.engine = None
+    class FakeEngine:
+        def attach_capture(self, layer_id):
+            calls.append(layer_id)
+            return False
 
-    monkeypatch.setattr(window, "restart_engine", failing_restart)
+        def stop(self):
+            return {}
+
+    window.engine = FakeEngine()
     monkeypatch.setattr("anycam.gui.Path.exists", lambda self: True)
     try:
         window._reconnect_cameras()
-        assert calls == [1]
+        assert calls == [camera.id]
         assert window._lost_cameras == {camera.id: camera.source}
         assert window._camera_watch.isActive()
         assert window._camera_watch.interval() > 1200
         assert "retrying" in window.statusBar().currentMessage().lower()
     finally:
         window.engine = None
+        window.close()
+        app.processEvents()
+
+
+def test_camera_reconnect_retries_with_backoff_when_the_preview_cannot_restart(app, monkeypatch):
+    """With no running canvas the preview is started again; a failure backs off."""
+    window = _window()
+    camera = Layer("layer_retry2", "camera", "Retry", source="/dev/anycam-retry2")
+    window.scene.add_layer(camera)
+    window._lost_cameras = {camera.id: camera.source}
+    window.engine = None
+    calls = []
+    monkeypatch.setattr(window, "start_engine", lambda: calls.append(1))
+    monkeypatch.setattr("anycam.gui.Path.exists", lambda self: True)
+    try:
+        window._reconnect_cameras()
+        assert calls == [1]
+        assert window._lost_cameras == {camera.id: camera.source}
+        assert window._camera_watch.interval() > 1200
+        assert "retrying" in window.statusBar().currentMessage().lower()
+    finally:
         window.close()
         app.processEvents()
 
@@ -1261,7 +1291,7 @@ def test_vcam_toggle_starts_the_preview_it_needs(app, monkeypatch):
             self.active = False
             return {"device": self.device, "ok": True, "error": ""}
 
-    monkeypatch.setattr("anycam.gui.VcamOutput", FakeVcam)
+    monkeypatch.setattr("anycam.ui.outputs.VcamOutput", FakeVcam)
     window = _window()
     try:
         assert window.engine is None
@@ -1305,7 +1335,7 @@ def test_vcam_output_survives_engine_restarts(app, monkeypatch):
             self.stopped = True
             return {"device": self.device, "ok": True, "error": ""}
 
-    monkeypatch.setattr("anycam.gui.VcamOutput", FakeVcam)
+    monkeypatch.setattr("anycam.ui.outputs.VcamOutput", FakeVcam)
     window = _window()
     try:
         window.start_engine()
@@ -1369,7 +1399,7 @@ def test_vcam_sink_error_is_rebuilt_not_turned_off(app, monkeypatch):
         def set_canvas_attached(self, _attached):
             return None
 
-    monkeypatch.setattr("anycam.gui.VcamOutput", FakeVcam)
+    monkeypatch.setattr("anycam.ui.outputs.VcamOutput", FakeVcam)
     window = _window()
     try:
         window.vcam_on = True
@@ -1786,7 +1816,7 @@ def test_a_codec_change_restarts_the_canvas_instead_of_a_broken_attach(app, tmp_
         window.toggle_record()
         window.toggle_record()                    # stop; the tap stays in place
         assert first.record_codec() == "h264"
-        monkeypatch.setattr("anycam.gui.recording_codec", lambda _pref: "h265")
+        monkeypatch.setattr("anycam.ui.outputs.recording_codec", lambda _pref: "h265")
         window.toggle_record()
         assert window.engine is not first, "the stale H.264 tap was reused"
     finally:

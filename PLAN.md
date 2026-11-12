@@ -1,3 +1,5 @@
+> **Superseded.** Open work is tracked in `TODO.md`; closed work in `docs/REGRESSIONS.md`. This file is the original 2026-10-30 plan, kept for history.
+
 # AnyCam remediation plan
 
 Derived from the full project audit (code read + dynamic verification on this

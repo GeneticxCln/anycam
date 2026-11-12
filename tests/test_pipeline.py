@@ -131,7 +131,7 @@ def test_screen_health_uses_sequence_then_timestamp(monkeypatch, sequences, expe
     tail = caps_filter(caps.to_string())
     chain = SourceChain(elements=[src, tail], tail=tail, source_size=(32, 18))
     chain.check_element = src
-    monkeypatch.setattr(pipeline_module, "build_chain", lambda *args, **kwargs: chain)
+    monkeypatch.setattr("anycam.engine.layers.build_chain", lambda *args, **kwargs: chain)
     project = make_project(32, 18, 30)
     project.scene.layers = [Layer("screen", "screen", "Screen", source="123")]
     engine = AnyCamEngine(project, preview=True).build()
@@ -182,7 +182,7 @@ def test_two_screens_with_repeated_pts_keep_changing_pixels(monkeypatch, has_seq
         tail.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, inspect_timestamp)
         return chain
 
-    monkeypatch.setattr(pipeline_module, "build_chain", build_screen)
+    monkeypatch.setattr("anycam.engine.layers.build_chain", build_screen)
     project = make_project(64, 36, 30)
     project.scene.layers = [
         Layer("left", "screen", "Left", source="123", box=(0, 0, 0.5, 1)),
@@ -383,7 +383,7 @@ def test_encoder_auto_prefers_nvenc_and_cuda_input(monkeypatch):
         pytest.skip("nvh264enc unavailable")
     from anycam import pipeline as pipeline_module
 
-    monkeypatch.setattr(pipeline_module, "nvenc_available",
+    monkeypatch.setattr("anycam.engine.encoders.nvenc_available",
                         lambda *_args, **_kwargs: True)
     project = make_project(320, 180, 30)
     project.output.encoder = "auto"
@@ -398,7 +398,7 @@ def test_encoder_auto_prefers_nvenc_and_cuda_input(monkeypatch):
 def test_cpu_encoder_keeps_i420_conversion(monkeypatch):
     from anycam import pipeline as pipeline_module
 
-    monkeypatch.setattr(pipeline_module, "nvenc_available",
+    monkeypatch.setattr("anycam.engine.encoders.nvenc_available",
                         lambda *_args, **_kwargs: True)
     project = make_project(320, 180, 30)
     project.output.encoder = "cpu"
@@ -419,7 +419,7 @@ def test_hardware_recording_uses_cuda_upload(monkeypatch, tmp_path):
         pytest.skip("cudaupload unavailable")
     from anycam import pipeline as pipeline_module
 
-    monkeypatch.setattr(pipeline_module, "nvenc_available",
+    monkeypatch.setattr("anycam.engine.encoders.nvenc_available",
                         lambda *_args, **_kwargs: True)
     project = make_project(320, 180, 30)
     project.output.encoder = "nvenc"
@@ -444,8 +444,7 @@ def test_rtmp_bitrate_scales_above_1080p():
 def test_encoder_plan_falls_back_to_h264_for_rtmp(monkeypatch):
     from anycam import pipeline as pipeline_module
 
-    monkeypatch.setattr(
-        pipeline_module, "nvenc_available",
+    monkeypatch.setattr("anycam.engine.encoders.nvenc_available",
         lambda codec="h264": codec in {"h264", "h265", "av1"})
     plan = pipeline_module.encoder_plan("nvenc_av1")
     assert plan.codec == "av1"
@@ -454,14 +453,13 @@ def test_encoder_plan_falls_back_to_h264_for_rtmp(monkeypatch):
     assert rtmp.codec == "h264"
     assert "RTMP/FLV uses H.264" in rtmp.note
 
-    monkeypatch.setattr(
-        pipeline_module, "nvenc_available",
+    monkeypatch.setattr("anycam.engine.encoders.nvenc_available",
         lambda codec="h264": codec == "h265")
     fallback = pipeline_module.encoder_plan("nvenc_av1")
     assert fallback.codec == "h265"
     assert "AV1 unavailable" in fallback.note
 
-    monkeypatch.setattr(pipeline_module, "nvenc_available",
+    monkeypatch.setattr("anycam.engine.encoders.nvenc_available",
                         lambda _codec="h264": False)
     assert pipeline_module.encoder_plan("nvenc_h265").codec == "h264"
 
@@ -479,7 +477,7 @@ def test_hardware_hevc_and_av1_record_to_mp4(monkeypatch, tmp_path,
         pytest.skip(f"{factory} unavailable")
     if Gst.ElementFactory.find(pipeline_module.ENCODER_PARSERS[codec]) is None:
         pytest.skip(f"{codec} parser unavailable")
-    monkeypatch.setattr(pipeline_module, "nvenc_available",
+    monkeypatch.setattr("anycam.engine.encoders.nvenc_available",
                         lambda *_args, **_kwargs: True)
     project = make_project(320, 180, 30)
     project.output.encoder = preference

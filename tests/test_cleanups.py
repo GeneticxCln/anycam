@@ -178,7 +178,7 @@ class FakeRecorder:
 
 
 def test_changing_the_canvas_size_while_recording_starts_a_new_file(app, monkeypatch):
-    monkeypatch.setattr("anycam.gui.Recorder", FakeRecorder)
+    monkeypatch.setattr("anycam.ui.outputs.Recorder", FakeRecorder)
     window = ManyCamWindow(make_project(pattern_layer(), width=640, height=360))
     window.headless = True
     window._persist = False
@@ -259,11 +259,11 @@ def test_frame_rate_parsing_survives_streams_without_one():
 
 
 def test_verify_mp4_reports_a_stream_with_unknown_rate_instead_of_crashing(monkeypatch):
-    monkeypatch.setattr(pipeline, "ffprobe", lambda path: {
+    monkeypatch.setattr("anycam.engine.verify.ffprobe", lambda path: {
         "format": {"duration": "N/A"},
         "streams": [{"codec_type": "video", "width": 1920, "height": 1080,
                      "r_frame_rate": "0/0", "nb_frames": "N/A"}]})
-    monkeypatch.setattr(pipeline, "_count_packets", lambda path: 0)
+    monkeypatch.setattr("anycam.engine.verify._count_packets", lambda path: 0)
     ok, info = pipeline.verify_mp4("x.mp4")
     assert ok is False and info["rate"] == 0.0
 

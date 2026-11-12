@@ -179,6 +179,31 @@ def project_path() -> Path:
     return config_dir() / "project.json"
 
 
+def _last_project_pointer() -> Path:
+    return config_dir() / "last-project"
+
+
+def current_project_path() -> Path:
+    """The project file in use: the last one opened or saved as, else the default."""
+    try:
+        chosen = Path(_last_project_pointer().read_text(encoding="utf-8").strip())
+    except OSError:
+        return project_path()
+    return chosen if str(chosen) and chosen.is_file() else project_path()
+
+
+def remember_project_path(path: Path) -> None:
+    """Make ``path`` the project opened at the next launch (the default clears it)."""
+    pointer = _last_project_pointer()
+    try:
+        if Path(path) == project_path():
+            pointer.unlink(missing_ok=True)
+        else:
+            pointer.write_text(str(Path(path)) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def assets_dir() -> Path:
     """Runtime assets shipped inside the package, with a checkout fallback."""
     packaged = Path(__file__).resolve().parent / "assets"
@@ -882,6 +907,51 @@ def vcam_pixel_format(device: str) -> str:
         if "NV12" in formats:
             return "NV12"
     return "YUY2"
+
+
+# GStreamer elements the app cannot run without ("a|b" means either one), and
+# the ones that only switch a feature on.  scripts/setup.sh and ``anycam
+# doctor`` both read these, so they cannot drift apart.
+REQUIRED_ELEMENTS: tuple[str, ...] = (
+    "appsink", "appsrc", "audiomixer", "audioconvert", "audioresample",
+    "avenc_aac", "aacparse", "capsfilter", "compositor", "decodebin",
+    "fakesink", "filesink", "filesrc", "flvmux", "gdkpixbufoverlay",
+    "h264parse", "identity", "imagefreeze", "intervideosink", "intervideosrc",
+    "jpegdec", "level", "mp4mux", "pngdec", "pulsesrc", "queue",
+    "rtmp2sink|rtmpsink", "tee", "textoverlay", "uridecodebin", "v4l2sink",
+    "v4l2src", "valve", "videobalance", "videoconvert", "videocrop",
+    "videorate", "videoscale", "volume", "x264enc",
+)
+OPTIONAL_ELEMENTS: dict[str, str] = {
+    "glvideomixer": "GPU canvas", "glupload": "GPU canvas and preview",
+    "gldownload": "GPU canvas", "glcolorconvert": "GPU canvas",
+    "glshader": "GPU colour looks", "qml6glsink": "GPU preview",
+    "coloreffects": "film looks", "videoflip": "mirror and screen rotation",
+    "webrtcdsp": "microphone noise suppression", "webrtcbin": "phone camera",
+    "pipewiresrc": "screen sharing", "pipewiresink": "PipeWire virtual camera",
+    "nvh264enc": "NVENC encoding", "vah264enc": "VA-API encoding",
+}
+
+
+def installed_elements() -> set[str] | None:
+    """Names of the installed GStreamer elements (None: gst-inspect is missing)."""
+    code, out = run(["gst-inspect-1.0"], timeout=30)
+    if code != 0:
+        return None
+    return {match.group(1) for match in
+            re.finditer(r"^\S+:\s+(\S+):", out, re.M)}
+
+
+def check_elements(installed: set[str] | None = None) -> dict:
+    """``{"missing": [...], "optional_missing": {...}}`` for this machine."""
+    have = installed if installed is not None else installed_elements()
+    if have is None:
+        return {"missing": ["gst-inspect-1.0"], "optional_missing": {}}
+    missing = [name for name in REQUIRED_ELEMENTS
+               if not any(option in have for option in name.split("|"))]
+    optional = {name: why for name, why in OPTIONAL_ELEMENTS.items()
+                if name not in have}
+    return {"missing": missing, "optional_missing": optional}
 
 
 def system_summary() -> dict:

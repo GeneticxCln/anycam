@@ -18,7 +18,8 @@ import gi  # noqa: E402
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
-from anycam import effects, overlay, pipeline, pool as pool_module  # noqa: E402
+from anycam import effects, overlay, pipeline
+from anycam.engine import source_pool as pool_module  # noqa: E402
 from anycam.engine.outputs.recorder import ENCODER_PTS_BIAS, Recorder  # noqa: E402
 from anycam.model import Layer, Project, Scene, new_id  # noqa: E402
 from anycam.pipeline import AnyCamEngine, EncodedFeed  # noqa: E402
@@ -265,8 +266,8 @@ def test_a_removed_screen_capture_is_never_expired(monkeypatch):
 
 
 def test_two_modes_of_one_camera_share_one_capture(monkeypatch):
-    monkeypatch.setattr("anycam.pool.camera_modes", lambda device: [])
-    monkeypatch.setattr("anycam.pool.camera_probe_error", lambda device: "")
+    monkeypatch.setattr("anycam.engine.source_pool.camera_modes", lambda device: [])
+    monkeypatch.setattr("anycam.engine.source_pool.camera_probe_error", lambda device: "")
     shared = SourcePool()
     big = CaptureSpec("camera", "/dev/video77", 1920, 1080, 30)
     small = CaptureSpec("camera", "/dev/video77", 640, 360, 15)
@@ -485,8 +486,8 @@ def _fake_camera(monkeypatch):
     from anycam.sources import CameraMode
 
     modes = [CameraMode("MJPG", 1920, 1080, 30), CameraMode("MJPG", 1280, 720, 30)]
-    monkeypatch.setattr("anycam.pool.camera_modes", lambda device: modes)
-    monkeypatch.setattr("anycam.pool.camera_probe_error", lambda device: "")
+    monkeypatch.setattr("anycam.engine.source_pool.camera_modes", lambda device: modes)
+    monkeypatch.setattr("anycam.engine.source_pool.camera_probe_error", lambda device: "")
 
 
 def test_a_camera_capture_is_keyed_by_the_mode_it_really_uses(monkeypatch):

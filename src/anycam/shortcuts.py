@@ -159,9 +159,12 @@ class GlobalShortcuts:
             return
         self.session_handle = str(handle)
         token = self._token()
+        from . import hotkeys
+
+        triggers = hotkeys.global_triggers({identifier: trigger for identifier, _d, trigger in SHORTCUTS})
         shortcuts = [(identifier, {"description": GLib.Variant("s", description),
-                                   "preferred_trigger": GLib.Variant("s", trigger)})
-                     for identifier, description, trigger in SHORTCUTS]
+                                   "preferred_trigger": GLib.Variant("s", triggers[identifier])})
+                     for identifier, description, _trigger in SHORTCUTS]
         self._request(
             "BindShortcuts",
             GLib.Variant("(oa(sa{sv})sa{sv})", (

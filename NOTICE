@@ -1,0 +1,23 @@
+AnyCam
+Copyright (c) 2026 AnyCam contributors. Licensed under the MIT License (see LICENSE).
+
+Bundled third-party material
+----------------------------
+- YuNet face detector (yunet.onnx) - OpenCV Zoo, Apache-2.0.
+- MediaPipe selfie segmentation (selfie_segmentation_landscape.onnx), ONNX conversion by onnx-community
+  - Apache-2.0.
+- Noto Emoji pictures (assets/emoji) - Google, Apache-2.0, pinned commit 99701e07d3d1fe1bdbcdb14964547f0fd592966f.
+- sample-portrait.jpg - NASA portrait of Neil Armstrong, public domain in the United States.
+
+Details, hashes and sources: src/anycam/assets/models/NOTICE.md and src/anycam/assets/emoji/NOTICE.md.
+
+Not bundled
+-----------
+- Robust Video Matting (rvm_mobilenetv3_fp32.onnx), GPL-3.0, https://github.com/PeterL1n/RobustVideoMatting.
+  Downloaded from the author's release only when you click Download in Settings -> AI effects, and verified
+  against a pinned SHA-256. Its licence does not allow bundling it in this MIT package.
+
+Runtime dependencies (installed separately, each under its own licence)
+------------------------------------------------------------------------
+GStreamer (LGPL; some plugins GPL/proprietary - x264enc is GPL), PySide6/Qt (LGPL), PyGObject (LGPL),
+NumPy, Pillow, psutil, onnxruntime (MIT), cryptography and segno (optional).

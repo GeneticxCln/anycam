@@ -39,7 +39,7 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 ## 2. M2 — GPU canvas, transforms, transitions
 
 - [ ] GL backend (`glvideomixer` + shaders) with the current `compositor` as CPU fallback.
-- [ ] Encoder selection: NVENC when available, x264 fallback (B42).
+- [x] Encoder selection: NVENC when available, VA-API next, x264 fallback (B42). Passed: `tests/test_pipeline.py`, `tests/test_engine_fixes.py`.
 - [ ] Fit modes contain/cover/stretch, reusing `geometry.fit_contain`.
 - [ ] Flip, rotate, zoom/pan, rounded corners, off-canvas boxes, RGB levels.
 - [ ] Chroma shader with smoothness and spill removal; live effect changes, no Apply button.
@@ -52,13 +52,13 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 - [ ] Split `gui.py` into `ui/` modules.
 - [ ] Text/title editor with lower-third templates, dynamic clock and timer (B32).
 - [x] Effects panel follows the selected layer and updates without a rebuild (B33). Passed 2026-11-06: selected-layer GUI test plus real compositor live property probe.
-- [ ] Reload refreshes audio widgets from the model (B34).
-- [ ] Persist "Include microphone" and vcam on/off (B35).
+- [x] Reload refreshes audio widgets from the model (B34). Passed: `tests/test_audit_fixes_2026_11_07b.py::test_reload_refreshes_the_format_and_forgets_old_state`.
+- [x] Persist "Include microphone" and vcam on/off (B35). Passed: `tests/test_gui.py` (microphone), `tests/test_housekeeping_2026_11_12.py` (virtual camera).
 - [ ] Window fits 1366×768; numeric fields readable; remove the dead right strip (B36).
 - [ ] Non-blocking portal flow with restore tokens; no 120 s UI stalls (B37).
 - [ ] Canvas/FPS edits apply while running, with a clear hint (B40).
 - [ ] Playlist: fix the double-length first item and undo of membership changes (B44).
-- [ ] One scene-switch path; Ctrl+1…9 no longer skips a step (B45).
+- [x] One scene-switch path; Ctrl+1…9 no longer skips a step (B45). Passed: `tests/test_gui.py::test_scene_shortcut_runs_the_same_bookkeeping_as_the_scene_picker`.
 - [ ] Program/Preview monitors, live preset thumbnails, realtime toolbar, properties panel that follows selection.
 - [ ] Rename/reorder/duplicate scenes and layers; lock layers.
 - [ ] Open, Save As, import/export projects and presets; layout preset gallery.
@@ -122,10 +122,10 @@ Design and build order: `docs/PHONE_CAMERA.md`.
 - [ ] Packages: AUR, Flatpak, AppImage, `.deb`.
 - [ ] First-run wizard that sets up `v4l2loopback` via `pkexec`, with a clear undo.
 - [ ] Compatibility matrix: Firefox, Chromium, Zoom, Teams, Meet, OBS (settles B19).
-- [ ] Declare PySide6 and PyGObject in `pyproject.toml`; fix `ui/*.qss` package data; finish the B53 audit (B53).
-- [ ] Doctor checks every required plugin and `setup.sh` fails when an element is missing (B52).
-- [ ] `ruff` + coverage in CI; single-instance guard (B47).
-- [ ] `NOTICE`, `CHANGELOG`, `CONTRIBUTING`, `SECURITY`, user docs; screenshots from synthetic sources only.
+- [x] Declare PySide6 (`gui`) and PyGObject (`gi`) as extras in `pyproject.toml`; there is no `ui/` package data to fix (B53).
+- [x] Doctor checks every required plugin and `setup.sh` fails when an element is missing (B52). Passed: `tests/test_housekeeping_2026_11_12.py`.
+- [x] `ruff` + coverage in CI (2026-11-12); single-instance guard (B47, `tests/test_gui_state_fixes.py`).
+- [x] `NOTICE`, `CHANGELOG`, `CONTRIBUTING`, `SECURITY` (2026-11-12). [ ] User docs; screenshots from synthetic sources only.
 - [ ] Publish the repo only when the user says so.
 
 ## 10. Verification and documentation debt
@@ -135,7 +135,7 @@ Design and build order: `docs/PHONE_CAMERA.md`.
 - [ ] Soak tracks RSS, tmpfs, disk and FDs; frame stalls fail the run.
 - [ ] Replace `PLAN.md` with the 2026-10-31 audit (or check the audit text in under `docs/`) so the plan and `PARITY.md` stop disagreeing.
 - [ ] Rebuild `PARITY.md` from measured results only; close the remaining overclaims (B55).
-- [ ] Fix `scripts/capture-screencast.py`, which reports `ok: true` on the wrong frame (B55).
+- [x] `scripts/capture-screencast.py` reports `ok: false` for a flat or wrong-shaped frame (B55). Passed: `tests/test_housekeeping_2026_11_12.py`.
 - [ ] Evidence gaps: live portal screen capture, physical unplug, 10-minute soak with the virtual camera.
 
 - [ ] `AnyCamEngine.stop()` (up to ~4 s) and `Recorder.stop()` (up to 5 s) block the UI thread while finalising; move them off-thread with the M1 controller split (2026-11-11 audit).
@@ -157,20 +157,13 @@ Design and build order: `docs/PHONE_CAMERA.md`.
 | B12 | Live record/vcam toggles done; scene and layer changes still rebuild | M1 |
 | B32 | Text cannot be edited; no font/colour; no renaming | M3 |
 | B33 | Effects panel edits the wrong layer; Apply rebuilds | M3 |
-| B34 | Reload leaves audio widgets stale | M3 |
-| B35 | Mic and vcam toggles are not persisted | M3 |
 | B36 | Window minimum height 1109 px | M3 |
 | B37 | Portal calls block the UI; no restore token | M3 |
 | B40 | Canvas/FPS edits do nothing while running | M3 |
-| B42 | `auto` never picks NVENC; fixed bitrate/GOP | M2 |
 | B43 | Face detection runs on the UI thread | M5 |
 | B44 | First playlist item lasts twice as long | M3 |
-| B45 | Three scene-switch implementations; shortcuts skip | M3 |
 | B46 | Reconnect only handles a missing node | M1 |
-| B47 | No single-instance guard | M9 |
-| B52 | Doctor/setup do not require every plugin | M9 |
-| B53 | PySide6/PyGObject undeclared; empty `ui/` package data | M9 |
-| B55 | Remaining docs/evidence overclaims | Cross-cutting |
+| B55 | `PARITY.md` still holds unmeasured claims | Cross-cutting |
 
 ## Closed recently (for reference)
 

@@ -158,7 +158,7 @@ def test_layer_failing_mid_build_releases_its_capture(monkeypatch):
     def boom(*args, **kwargs):
         raise RuntimeError("tail failed")
 
-    monkeypatch.setattr("anycam.pipeline.layer_tail", boom)
+    monkeypatch.setattr("anycam.engine.layers.layer_tail", boom)
     engine = AnyCamEngine(project_with(make_test_layer()), pool=pool, preview=True)
     with pytest.raises(RuntimeError, match="tail failed"):
         engine.build()
@@ -272,7 +272,7 @@ def test_a_newly_visible_source_is_not_stalled_before_its_own_grace():
 
 
 def test_hidden_camera_tail_uses_the_real_mode_not_the_canvas_size(monkeypatch):
-    from anycam import pool as pool_module
+    from anycam.engine import source_pool as pool_module
 
     monkeypatch.setattr(
         pool_module, "camera_modes",
@@ -307,8 +307,8 @@ def _fake_elements(monkeypatch, present):
 
 def test_auto_uses_vaapi_on_intel_or_amd_when_nvenc_is_missing(monkeypatch):
     pipeline_module = _fake_elements(monkeypatch, {"vah264enc", "vah265enc"})
-    monkeypatch.setattr(pipeline_module, "nvenc_available", lambda codec="h264": False)
-    monkeypatch.setattr(pipeline_module, "_va_encodes", lambda factory: factory in ("vah264enc", "vah265enc"))
+    monkeypatch.setattr("anycam.engine.encoders.nvenc_available", lambda codec="h264": False)
+    monkeypatch.setattr("anycam.engine.encoders._va_encodes", lambda factory: factory in ("vah264enc", "vah265enc"))
     plan = pipeline_module.encoder_plan("auto")
     assert (plan.factory, plan.codec, plan.hardware) == ("vah264enc", "h264", True)
     assert "VA-API" in plan.note
@@ -320,12 +320,12 @@ def test_auto_uses_vaapi_on_intel_or_amd_when_nvenc_is_missing(monkeypatch):
 
 def test_nvenc_stays_first_and_a_broken_va_driver_falls_back(monkeypatch):
     pipeline_module = _fake_elements(monkeypatch, {"vah264enc", "nvh264enc"})
-    monkeypatch.setattr(pipeline_module, "nvenc_available", lambda codec="h264": codec == "h264")
-    monkeypatch.setattr(pipeline_module, "_va_encodes", lambda factory: True)
+    monkeypatch.setattr("anycam.engine.encoders.nvenc_available", lambda codec="h264": codec == "h264")
+    monkeypatch.setattr("anycam.engine.encoders._va_encodes", lambda factory: True)
     assert pipeline_module.encoder_plan("auto").factory == "nvh264enc"
     assert pipeline_module.encoder_plan("vaapi").factory == "vah264enc", "an explicit choice wins"
-    monkeypatch.setattr(pipeline_module, "nvenc_available", lambda codec="h264": False)
-    monkeypatch.setattr(pipeline_module, "_va_encodes", lambda factory: False)  # driver broken
+    monkeypatch.setattr("anycam.engine.encoders.nvenc_available", lambda codec="h264": False)
+    monkeypatch.setattr("anycam.engine.encoders._va_encodes", lambda factory: False)  # driver broken
     plan = pipeline_module.encoder_plan("auto")
     assert plan.factory == "x264enc" and "No hardware encoder" in plan.note
 

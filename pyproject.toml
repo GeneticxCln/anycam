@@ -25,6 +25,10 @@ gui = ["PySide6>=6.6"]
 dev = ["pytest>=8", "pytest-timeout>=2"]
 # Powers the bundled YuNet face overlay; install with `pip install -e '.[face]'`.
 face = ["onnxruntime>=1.16"]
+# PyGObject builds against the system's GLib/GStreamer headers, so most users
+# take python-gobject from their distribution instead; this extra is for a
+# virtual environment that has those development packages.
+gi = ["PyGObject>=3.42"]
 # Phone camera: in-process TLS certificate and QR code (otherwise the openssl
 # and qrencode commands are used).
 phone = ["cryptography>=42", "segno>=1.6"]
@@ -41,4 +45,14 @@ addopts = "-q"
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.setuptools.package-data]
-anycam = ["phone/static/*.html", "phone/static/*.js", "assets/*.png", "assets/*.jpg", "assets/models/*.onnx", "assets/models/*.md", "assets/emoji/*.png", "assets/emoji/*.json", "assets/emoji/*.md"]
+anycam = ["phone/static/*.html", "phone/static/*.js", "assets/*.png", "assets/*.jpg", "assets/models/*.onnx", "assets/models/*.md", "assets/emoji/*.png", "assets/emoji/*.json", "assets/emoji/*.md", "assets/i18n/*.json"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+# Defects, not style: undefined/unused names, late-binding closures, mutable
+# defaults, singleton comparisons, invalid escapes and similar.
+select = ["F", "E9", "B006", "B008", "B012", "B015", "B018", "B023",
+          "E711", "E712", "E713", "E714", "PLE"]

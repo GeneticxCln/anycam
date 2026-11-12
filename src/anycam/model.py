@@ -14,6 +14,8 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from . import geometry
+
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
@@ -112,6 +114,11 @@ class Effects:
     # preset never has to rebuild the layer graph.
     color_effect: str = "none"     # none|sepia|heat|xray|xpro|yellowblue
     mirror: bool = False             # horizontal flip, live
+    # RGB levels: a gain per colour channel (1 = unchanged), for white-balance
+    # and tint corrections that brightness/contrast cannot make.
+    red_gain: float = 1.0
+    green_gain: float = 1.0
+    blue_gain: float = 1.0
     # One live filter from anycam.effects (distortion, retro TV, cleanup) and
     # its 0..1 strength.  Swapped in while running, so it never rebuilds.
     filter: str = "none"
@@ -153,6 +160,10 @@ class PlaylistConfig:
     interval: float = 3.0
     loop: bool = True
     index: int = -1
+    # Seconds an item stays when it differs from ``interval`` (layer id -> s).
+    durations: dict[str, float] = field(default_factory=dict)
+    shuffle: bool = False
+    paused: bool = False
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "PlaylistConfig":
@@ -161,11 +172,19 @@ class PlaylistConfig:
         if not isinstance(ids, list):
             ids = []
         interval = _coerce(data.get("interval"), 3.0)
+        raw_durations = data.get("durations")
         return cls(
             layer_ids=[str(value) for value in ids if value],
             interval=interval if interval > 0 else 3.0,
             loop=_coerce(data.get("loop"), True),
             index=_coerce(data.get("index"), -1),
+            durations={str(key): float(value)
+                       for key, value in (raw_durations if isinstance(raw_durations, dict)
+                                          else {}).items()
+                       if isinstance(value, (int, float)) and not isinstance(value, bool)
+                       and _finite(float(value)) and value > 0},
+            shuffle=_coerce(data.get("shuffle"), False),
+            paused=_coerce(data.get("paused"), False),
         )
 
 
@@ -213,6 +232,22 @@ class Layer:
     # Reserved scene-decoration marker.  "backdrop" layers sit behind every
     # capture layer and are replaced (not stacked) by the Looks tab.
     role: str = ""
+    # A locked layer cannot be moved, resized, cropped or deleted by accident
+    # (it still plays, and every property can be changed from its panels).
+    locked: bool = False
+    # V4L2 control values to re-apply to a camera layer's device on start and
+    # after a reconnect (brightness, zoom, focus ... - see camera_controls).
+    camera_controls: dict[str, int] = field(default_factory=dict)
+    # How the picture sits in its box: contain (letterbox), cover (fill and cut
+    # the overflow) or stretch (fill, ignore the aspect).  Flips apply first,
+    # then the clockwise quarter-turn ``rotation``; ``zoom`` > 1 magnifies about
+    # ``pan`` (0..1 across the picture).  All of them are plain video stages.
+    fit: str = "contain"
+    flip_h: bool = False
+    flip_v: bool = False
+    rotation: int = 0
+    zoom: float = 1.0
+    pan: tuple[float, float] = (0.5, 0.5)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Layer":
@@ -230,7 +265,8 @@ class Layer:
         name = data.get("name")
         layer = cls(id=layer_id, kind=kind.strip(),
                     name=name if isinstance(name, str) and name else kind.strip())
-        special = ("id", "kind", "name", "box", "crop", "effects", "playlist")
+        special = ("id", "kind", "name", "box", "crop", "effects", "playlist",
+                   "camera_controls", "pan")
         for item in fields(cls):
             if item.name in special or item.name not in data:
                 continue
@@ -239,6 +275,23 @@ class Layer:
         layer.box = _quad(data.get("box"), layer.box)
         layer.crop = _quad(data.get("crop"), layer.crop)
         layer.effects = Effects.from_dict(data.get("effects"))
+        layer.fit = geometry.fit_mode(layer.fit)
+        layer.rotation = geometry.rotation_degrees(layer.rotation)
+        layer.zoom = geometry.clamp(layer.zoom, 1.0, geometry.MAX_ZOOM)
+        pan = data.get("pan")
+        if isinstance(pan, (list, tuple)) and len(pan) == 2:
+            try:
+                numbers = (float(pan[0]), float(pan[1]))
+            except (TypeError, ValueError):
+                numbers = None
+            if numbers and all(_finite(value) for value in numbers):
+                layer.pan = (geometry.clamp(numbers[0]), geometry.clamp(numbers[1]))
+        controls = data.get("camera_controls")
+        if isinstance(controls, dict):
+            layer.camera_controls = {
+                str(key): int(value) for key, value in controls.items()
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                and _finite(float(value))}
         items = data.get("playlist")
         for entry in items if isinstance(items, list) else []:
             if isinstance(entry, dict) and isinstance(entry.get("source"), str):
@@ -256,6 +309,7 @@ class Layer:
         d = asdict(self)
         d["box"] = list(self.box)
         d["crop"] = list(self.crop)
+        d["pan"] = list(self.pan)
         return d
 
 
@@ -367,6 +421,9 @@ class OutputConfig:
     # driver or root, but only apps with PipeWire camera support list it) or
     # "both".
     vcam_backend: str = "v4l2"
+    # Whether the held virtual camera follows the canvas when the app starts.
+    # The Virtual camera button writes it, so "off" survives a restart.
+    vcam_enabled: bool = True
     # Portal screen captures: automatic follows the compositor's orientation
     # tag.  rotate-180 / vertical-flip / none are explicit corrections for a
     # share that is wrong.
