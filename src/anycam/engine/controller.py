@@ -32,7 +32,7 @@ from .canvas import CanvasMixin  # noqa: E402
 from .health import HealthMixin  # noqa: E402
 from .layers import LayerMixin  # noqa: E402
 from .outputs.record_tap import RecordTapMixin  # noqa: E402
-from .outputs.stream import StreamMixin  # noqa: E402
+from .outputs.stream import RtmpState, StreamMixin  # noqa: E402
 from .outputs.taps import VcamTapMixin  # noqa: E402
 from .transitions import TransitionMixin  # noqa: E402
 
@@ -56,6 +56,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         preview: bool = False,
         audio: bool = False,
         rtmp: str | None = None,
+        rtmp_extra: list[str] | tuple[str, ...] | None = None,
         screen_node: int | None = None,
         screen_fds: dict[str, int] | None = None,
         screen_sizes: dict[str, tuple[int, int]] | None = None,
@@ -129,6 +130,8 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         self.preview = preview
         self.audio = audio
         self.rtmp = rtmp or ""
+        # More places to publish the same encode (a second platform, a backup).
+        self.rtmp_extra = [url for url in (rtmp_extra or ()) if url and url != self.rtmp]
         self.screen_node = screen_node
         self.screen_fds = dict(screen_fds or {})
         # Portal stream sizes, keyed by layer id: used to crop a screen layer
@@ -185,6 +188,11 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         self._rtmp_appsrc: Gst.Element | None = None
         self._rtmp_audio_appsrc: Gst.Element | None = None
         self._rtmp_failed = False
+        self._rtmp_state = RtmpState()
+        self._rtmp_extras: list[RtmpState] = []
+        self._rtmp_publisher = None
+        self._rtmp_sink_factory = "rtmp2sink"
+        self._rtmp_with_audio = False
         self._rtmp_encoder: Gst.Element | None = None
         self._rtmp_feed: EncodedFeed | None = None
         self._stopped = False
@@ -244,7 +252,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
             self.pipeline.set_state(Gst.State.NULL)
         if self._vcam_pipeline is not None:
             self._vcam_pipeline.set_state(Gst.State.NULL)
-        self._teardown_rtmp()
+        self._teardown_rtmp(everything=True)
         if self._owns_pool:
             self.pool.stop()
         self._close_screen_fds()
@@ -426,6 +434,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
             self._vcam_pipeline.set_state(Gst.State.PLAYING)
         if self._rtmp_pipeline is not None:
             self._rtmp_pipeline.set_state(Gst.State.PLAYING)
+        self.start_extra_targets()
         result = self.pipeline.set_state(Gst.State.PLAYING)
         if result == Gst.StateChangeReturn.FAILURE:
             self.report.error = "pipeline failed to start"
@@ -573,7 +582,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
             self._vcam_pipeline.send_event(Gst.Event.new_eos())
             self._vcam_pipeline.set_state(Gst.State.NULL)
             self._vcam_bus = None
-        self._teardown_rtmp()
+        self._teardown_rtmp(everything=True)
         # The graph is gone: a late add_layer()/start() must see that.
         self._stopped = True
         self._release_graph()

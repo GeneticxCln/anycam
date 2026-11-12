@@ -464,6 +464,8 @@ class OutputConfig:
     # ignored: recordings always went to ~/Videos/AnyCam regardless.
     record_dir: str = ""
     rtmp_url: str = ""
+    # More destinations that receive the same encode as ``rtmp_url``.
+    rtmp_extra_urls: list[str] = field(default_factory=list)
     # H.264 encoder for recordings: auto prefers NVENC when a working NVIDIA
     # driver/plugin is present, nvenc forces it, and cpu forces x264.
     encoder: str = "auto"
@@ -481,7 +483,10 @@ class OutputConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "OutputConfig":
-        output = _coerce_fields(cls, data)
+        output = _coerce_fields(cls, data, skip=("rtmp_extra_urls",))
+        raw = data.get("rtmp_extra_urls") if isinstance(data, dict) else None
+        output.rtmp_extra_urls = ([url.strip() for url in raw if isinstance(url, str) and url.strip()]
+                                  if isinstance(raw, list) else [])
         defaults = cls()
         # A canvas or rate the encoder cannot use would only fail later.
         if output.canvas_w < 2 or output.canvas_h < 2:

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import threading
+import time
+from dataclasses import dataclass
 
 import gi
 
@@ -17,6 +19,34 @@ from ...engine.audio_helpers import (MIC_DENOISE_LEVELS, mic_dsp_wanted, describ
 from ...engine.canvas_helpers import (GL_MIXER_LATENCY_NS, canvas_requested, gl_canvas_problem, _empty_drawing)  # noqa: E402,F401
 
 Gst.init(None)
+
+
+@dataclass
+class Publisher:
+    """One live publish leg (see ``StreamMixin._make_publisher``)."""
+
+    url: str
+    pipeline: Gst.Pipeline
+    bus: Gst.Bus
+    video_src: Gst.Element
+    audio_src: Gst.Element | None
+    feed: EncodedFeed
+    first_data: float = 0.0
+
+
+@dataclass
+class RtmpState:
+    """What the window shows for one destination, and its reconnect clock."""
+
+    url: str = ""
+    state: str = "off"            # off | connecting | live | waiting | failed
+    error: str = ""
+    failures: int = 0
+    restarts: int = 0
+    restart_at: float = 0.0
+    live_since: float = 0.0
+    publisher: Publisher | None = None
+    failed_flag: bool = False
 
 
 class StreamMixin:
@@ -92,23 +122,38 @@ class StreamMixin:
                 raise RuntimeError("could not tap shared audio for RTMP")
             self._on(audio_sink, "new-sample", self._on_rtmp_audio_sample)
 
-        output = Gst.Pipeline.new("anycam-rtmp")
-        video_src = make("appsrc", "rtmp_video_src", format=Gst.Format.TIME,
+        self._rtmp_sink_factory = sink_factory
+        self._rtmp_with_audio = audio_sink is not None
+        self._rtmp_encoder = enc
+        publisher = self._make_publisher(url, "anycam-rtmp")
+        self._adopt_primary(publisher)
+        self._rtmp_state.url = url
+        self._rtmp_state.state = "connecting"
+        self.report.rtmp_url = url
+        for extra_url in self.rtmp_extra:
+            self._add_extra_target(extra_url)
+        self._publish_report()
+
+    # ------------------------------------------------------------ publishers
+    def _make_publisher(self, url: str, name: str, prefix: str = "rtmp") -> "Publisher":
+        """One publish leg: appsrc(s) -> flvmux -> rtmp sink, in its own pipeline."""
+        output = Gst.Pipeline.new(name)
+        video_src = make("appsrc", f"{prefix}_video_src", format=Gst.Format.TIME,
                          is_live=True)
         video_src.set_property(
             "caps", Gst.Caps.from_string("video/x-h264,stream-format=avc,alignment=au"))
         video_src.set_property("max-buffers", 8)
         video_src.set_property("block", False)
-        mux = make("flvmux", "rtmp_mux", streamable=True)
-        sink = make(sink_factory, "rtmp_sink", location=url, sync=False)
+        mux = make("flvmux", f"{prefix}_mux", streamable=True)
+        sink = make(self._rtmp_sink_factory, f"{prefix}_sink", location=url, sync=False)
         output.add(video_src)
         output.add(mux)
         output.add(sink)
         if not video_src.link(mux):
             raise RuntimeError("could not link RTMP video into flvmux")
-        self._rtmp_audio_appsrc = None
-        if audio_sink is not None:
-            audio_src = make("appsrc", "rtmp_audio_src", format=Gst.Format.TIME,
+        audio_src = None
+        if self._rtmp_with_audio:
+            audio_src = make("appsrc", f"{prefix}_audio_src", format=Gst.Format.TIME,
                              is_live=True)
             audio_src.set_property(
                 "caps", Gst.Caps.from_string("audio/mpeg,mpegversion=4,stream-format=raw"))
@@ -118,48 +163,209 @@ class StreamMixin:
             output.add(audio_src)
             if not audio_src.link(mux):
                 raise RuntimeError("could not link RTMP audio into flvmux")
-            self._rtmp_audio_appsrc = audio_src
         if not mux.link(sink):
-            raise RuntimeError(f"could not link flvmux into {sink_factory}")
-        self._rtmp_pipeline = output
-        self._rtmp_bus = output.get_bus()
-        self._rtmp_appsrc = video_src
-        self._rtmp_encoder = enc
-        self._rtmp_feed = EncodedFeed(video_src, lambda: force_keyframe(enc))
-        self.report.rtmp_url = url
+            raise RuntimeError(f"could not link flvmux into {self._rtmp_sink_factory}")
+        feed = EncodedFeed(video_src, lambda: force_keyframe(self._rtmp_encoder))
+        publisher = Publisher(url, output, output.get_bus(), video_src, audio_src, feed)
+        pad = sink.get_static_pad("sink")
+        if pad is not None:
+            def on_data(_pad, _info, publisher=publisher):
+                publisher.first_data = time.monotonic()
+                return Gst.PadProbeReturn.REMOVE
+
+            pad.add_probe(Gst.PadProbeType.BUFFER, on_data)
+        return publisher
+
+    def _adopt_primary(self, publisher: "Publisher") -> None:
+        """Expose the first target through the long-standing ``_rtmp_*`` attributes."""
+        self._rtmp_publisher = publisher
+        self._rtmp_pipeline = publisher.pipeline
+        self._rtmp_bus = publisher.bus
+        self._rtmp_appsrc = publisher.video_src
+        self._rtmp_audio_appsrc = publisher.audio_src
+        self._rtmp_feed = publisher.feed
+        self._rtmp_failed = False
+
+    def _add_extra_target(self, url: str) -> None:
+        state = RtmpState(url=url, state="connecting")
+        self._rtmp_extras.append(state)
+        try:
+            state.publisher = self._make_publisher(
+                url, f"anycam-rtmp-{len(self._rtmp_extras)}", f"rtmpx{len(self._rtmp_extras)}")
+        except Exception as exc:  # noqa: BLE001 - one bad target must not stop the rest
+            state.state = "failed"
+            state.error = config.redact_text(f"could not start: {exc}", url)
+
+    def start_extra_targets(self) -> None:
+        for state in self._rtmp_extras:
+            if state.publisher is not None:
+                state.publisher.pipeline.set_state(Gst.State.PLAYING)
 
     def _on_rtmp_video_sample(self, sink):
         sample = sink.emit("pull-sample")
+        if sample is None:
+            return Gst.FlowReturn.OK
         feed = self._rtmp_feed
-        if sample is not None and feed is not None and not self._rtmp_failed:
+        if feed is not None and not self._rtmp_failed:
             feed.push(sample)
+        for state in self._rtmp_extras:
+            if state.publisher is not None and not state.failed_flag:
+                state.publisher.feed.push(sample)
         return Gst.FlowReturn.OK
 
     def _on_rtmp_audio_sample(self, sink):
         sample = sink.emit("pull-sample")
-        if (sample is not None and self._rtmp_audio_appsrc is not None
-                and not self._rtmp_failed):
+        if sample is None:
+            return Gst.FlowReturn.OK
+        if self._rtmp_audio_appsrc is not None and not self._rtmp_failed:
             self._rtmp_audio_appsrc.emit("push-sample", sample)
+        for state in self._rtmp_extras:
+            publisher = state.publisher
+            if publisher is not None and publisher.audio_src is not None and not state.failed_flag:
+                publisher.audio_src.emit("push-sample", sample)
         return Gst.FlowReturn.OK
 
     def _poll_rtmp_bus(self) -> None:
-        if self._rtmp_bus is None:
-            return
-        failed = False
+        """Collect publish errors, reconnect with backoff, keep the report current."""
+        now = time.monotonic()
+        if self._rtmp_bus is not None:
+            error = self._pop_error(self._rtmp_bus)
+            if error:
+                self.report.rtmp_error = config.redact_text(error, self.rtmp)
+                self._rtmp_failed = True
+                self._rtmp_state.error = self.report.rtmp_error
+                self._teardown_rtmp()
+                self._schedule(self._rtmp_state, now)
+        state = self._rtmp_state
+        publisher = getattr(self, "_rtmp_publisher", None)
+        if publisher is not None and publisher.first_data and state.state != "live":
+            state.state = "live"
+            state.live_since = publisher.first_data
+            self.report.rtmp_error = ""
+        if state.restart_at and now >= state.restart_at and not self._stopped:
+            self._restart_primary(now)
+        for extra in self._rtmp_extras:
+            self._poll_extra(extra, now)
+        self._publish_report()
+
+    @staticmethod
+    def _pop_error(bus) -> str:
+        message = ""
         while True:
-            msg = self._rtmp_bus.pop_filtered(Gst.MessageType.ERROR)
+            msg = bus.pop_filtered(Gst.MessageType.ERROR)
             if msg is None:
                 break
             err, debug = msg.parse_error()
-            self.report.rtmp_error = config.redact_text(
-                f"{err.message} ({debug})", self.rtmp)
-            failed = True
-        if failed:
-            self._rtmp_failed = True
-            self._teardown_rtmp()
+            message = f"{err.message} ({debug})"
+        return message
 
-    def _teardown_rtmp(self) -> None:
-        """Stop publishing without letting a stuck socket block the caller."""
+    #: Reconnect delays double from RTMP_RETRY_FIRST_S up to RTMP_RETRY_MAX_S; a
+    #: stream that stayed up this long starts again from the first delay.
+    RTMP_RETRY_FIRST_S = 1.0
+    RTMP_RETRY_MAX_S = 30.0
+    RTMP_HEALTHY_S = 10.0
+
+    def _schedule(self, state: "RtmpState", now: float) -> None:
+        if state.live_since and now - state.live_since >= self.RTMP_HEALTHY_S:
+            state.failures = 0
+        delay = min(self.RTMP_RETRY_MAX_S, self.RTMP_RETRY_FIRST_S * (2 ** state.failures))
+        state.failures += 1
+        state.live_since = 0.0
+        state.state = "waiting"
+        state.restart_at = now + delay
+
+    def _restart_primary(self, now: float) -> None:
+        state = self._rtmp_state
+        state.restart_at = 0.0
+        try:
+            publisher = self._make_publisher(self.rtmp, f"anycam-rtmp-r{state.restarts + 1}",
+                                             f"rtmpr{state.restarts + 1}")
+        except Exception as exc:  # noqa: BLE001
+            state.error = config.redact_text(f"could not reconnect: {exc}", self.rtmp)
+            self.report.rtmp_error = state.error
+            self._schedule(state, now)
+            return
+        publisher.feed.skipping = True     # begin on a keyframe
+        force_keyframe(self._rtmp_encoder)
+        state.restarts += 1
+        state.state = "connecting"
+        self._adopt_primary(publisher)
+        self._start_async(publisher.pipeline)
+
+    @staticmethod
+    def _start_async(pipeline: Gst.Pipeline) -> None:
+        """set_state(PLAYING) can sit inside a socket call: keep it off this thread."""
+        threading.Thread(target=lambda: pipeline.set_state(Gst.State.PLAYING),
+                         daemon=True, name="anycam-rtmp-start").start()
+
+    def _poll_extra(self, state: "RtmpState", now: float) -> None:
+        publisher = state.publisher
+        if publisher is not None:
+            error = self._pop_error(publisher.bus)
+            if error:
+                state.error = config.redact_text(error, state.url)
+                state.failed_flag = True
+                self._discard(publisher)
+                state.publisher = None
+                self._schedule(state, now)
+            elif publisher.first_data and state.state != "live":
+                state.state = "live"
+                state.live_since = publisher.first_data
+                state.error = ""
+        if state.restart_at and now >= state.restart_at and not self._stopped:
+            state.restart_at = 0.0
+            try:
+                publisher = self._make_publisher(
+                    state.url, f"anycam-rtmp-x{id(state) % 10000}-{state.restarts + 1}",
+                    f"rtmpx{id(state) % 10000}r{state.restarts + 1}")
+            except Exception as exc:  # noqa: BLE001
+                state.error = config.redact_text(f"could not reconnect: {exc}", state.url)
+                self._schedule(state, now)
+                return
+            publisher.feed.skipping = True
+            force_keyframe(self._rtmp_encoder)
+            state.publisher, state.failed_flag = publisher, False
+            state.restarts += 1
+            state.state = "connecting"
+            self._start_async(publisher.pipeline)
+
+    @staticmethod
+    def _discard(publisher: "Publisher") -> None:
+        def shutdown() -> None:
+            try:
+                publisher.pipeline.set_state(Gst.State.NULL)
+            except Exception:  # noqa: BLE001
+                pass
+
+        threading.Thread(target=shutdown, daemon=True, name="anycam-rtmp-teardown").start()
+
+    def _publish_report(self) -> None:
+        """Per-destination status for the window (URLs redacted)."""
+        rows = []
+        for state in (self._rtmp_state, *self._rtmp_extras):
+            if not state.url:
+                continue
+            rows.append({
+                "url": config.redact_url(state.url), "state": state.state,
+                "error": config.redact_text(state.error, state.url),
+                "restarts": state.restarts,
+                "retry_in_s": max(0.0, round(state.restart_at - time.monotonic(), 1))
+                if state.restart_at else 0.0})
+        self.report.rtmp_targets = rows
+
+    def _teardown_rtmp(self, everything: bool = False) -> None:
+        """Stop publishing without letting a stuck socket block the caller.
+
+        ``everything`` also ends the extra destinations and cancels reconnects
+        (the engine is going away); otherwise only the primary leg is dropped.
+        """
+        if everything:
+            for state in self._rtmp_extras:
+                if state.publisher is not None:
+                    self._discard(state.publisher)
+                    state.publisher = None
+                state.restart_at = 0.0
+            self._rtmp_state.restart_at = 0.0
         pipeline = self._rtmp_pipeline
         if pipeline is None:
             return
