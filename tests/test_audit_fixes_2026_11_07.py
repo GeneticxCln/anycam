@@ -353,7 +353,7 @@ def test_a_mirrored_picture_is_cropped_from_the_edge_the_user_drew(monkeypatch, 
     Image.new("RGBA", (40, 20), (255, 0, 0, 255)).save(source)
     seen = []
     monkeypatch.setattr(overlay, "prepare_rgba",
-                        lambda path, w, h, crop: seen.append(crop) or Path(path))
+                        lambda path, w, h, crop, **_kw: seen.append(crop) or Path(path))
     layer = Layer("img", "image", "Pic", source=str(source),
                   crop=(0.2, 0.1, 0.0, 0.3))
     overlay.render_layer(layer, 320, 180)
