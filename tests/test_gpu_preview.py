@@ -346,10 +346,16 @@ def test_on_the_gpu_canvas_the_preview_takes_the_mixed_texture_directly():
         engine.stop()
 
 
+@needs_qml6glsink
 def test_the_preview_sinks_do_not_wait_for_preroll():
     """Regression: a sink that waits for preroll behind a queue on the canvas
     tee deadlocked startup (0 frames, then GUI hangs on scene switch and
     shutdown).  Both the GPU sink and the CPU tap must be async=false."""
+    from anycam.engine.canvas_helpers import gl_canvas_problem
+
+    problem = gl_canvas_problem()
+    if problem:
+        pytest.skip(f"no working GL canvas here: {problem}")
     handed = []
     engine = AnyCamEngine(_project(), preview=True, canvas="gpu",
                           preview_gl_sink=lambda sink: handed.append(sink) or True).build()
