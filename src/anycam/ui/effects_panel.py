@@ -91,6 +91,12 @@ class EffectsPanelMixin:
              lambda v: self._set_effect("saturation", v), None),
             ("hue", "Hue", -180, 180, int(round(fx.hue * 180)),
              lambda v: self._set_effect("hue", v), lambda v: f"{v}\u00b0"),
+            ("red_gain", "Red level", 0, 200, int(round(fx.red_gain * 100)),
+             lambda v: self._set_effect("red_gain", v), None),
+            ("green_gain", "Green level", 0, 200, int(round(fx.green_gain * 100)),
+             lambda v: self._set_effect("green_gain", v), None),
+            ("blue_gain", "Blue level", 0, 200, int(round(fx.blue_gain * 100)),
+             lambda v: self._set_effect("blue_gain", v), None),
         ):
             holder, slider, _label = _slider_row(
                 label, low, high, value, callback, display=display)
@@ -246,6 +252,7 @@ class EffectsPanelMixin:
         self.effect_category = QComboBox()
         for name in self.EFFECT_CATEGORIES:
             self.effect_category.addItem(name, name)
+        self.effect_category.setCurrentIndex(max(0, self.effect_category.findData("Looks")))
         self.effect_category.currentIndexChanged.connect(self._populate_effect_grid)
         row.addWidget(self.effect_category, 1)
         self.filter_slot = QComboBox()
@@ -302,6 +309,11 @@ class EffectsPanelMixin:
         self.effect_grid.itemClicked.connect(self._effect_item_clicked)
         self.effect_grid.installEventFilter(self)
         layout.addWidget(self.effect_grid, 1)
+
+        self.favourite_check = QCheckBox("\u2605 Favourite")
+        self.favourite_check.setToolTip("Keep the filter in this slot in the Favourites list")
+        self.favourite_check.toggled.connect(self._favourite_toggled)
+        layout.addWidget(self.favourite_check)
 
         holder, strength, label = _slider_row(
             "Strength", 0, 100, 50,
@@ -367,6 +379,16 @@ class EffectsPanelMixin:
                     film = {**neutral, "color_effect": value}
                     entries.append({"label": label, "kind": "film",
                                     "apply": film, "preview": dict(film)})
+        elif category == "Favourites":
+            for key in effect_library.favourites():
+                spec = effect_library.FILTERS[key]
+                if not effect_library.filter_available(key):
+                    continue
+                values = {"filter": spec.key, "filter_amount": spec.default}
+                entries.append({"label": spec.label, "kind": "filter",
+                                "apply": values, "preview": values,
+                                "tip": f"\u2605 {spec.description}",
+                                "amount": bool(spec.prop)})
         elif category in effect_library.FILTER_CATEGORIES:
             entries.append({"label": "No filter", "kind": "filter",
                             "apply": {"filter": "none"}, "preview": {}})
@@ -413,6 +435,32 @@ class EffectsPanelMixin:
                                 "preview": {**values, "frame_color": "#ff4d7a",
                                             "frame_width": 6}})
         return entries
+
+    def _current_filter_key(self) -> str:
+        layer = self._effects_layer()
+        if layer is None:
+            return ""
+        key = getattr(layer.effects, self._slot_attr(), "none")
+        return key if key and key != "none" else ""
+
+    def _favourite_toggled(self, starred: bool) -> None:
+        key = self._current_filter_key()
+        if not key or getattr(self, "_syncing_effects", False):
+            return
+        effect_library.set_favourite(key, bool(starred))
+        if str(self.effect_category.currentData()) == "Favourites":
+            self._populate_effect_grid()
+        self._status(("Added to" if starred else "Removed from") + " favourites")
+
+    def _sync_favourite_check(self) -> None:
+        check = getattr(self, "favourite_check", None)
+        if check is None:
+            return
+        key = self._current_filter_key()
+        check.blockSignals(True)
+        check.setEnabled(bool(key))
+        check.setChecked(bool(key) and key in effect_library.favourites())
+        check.blockSignals(False)
 
     def _slot_attr(self) -> str:
         """The Effects field of the chosen filter slot: ``filter`` or ``filter2``."""
@@ -709,7 +757,7 @@ class EffectsPanelMixin:
         fx = layer.effects
         if attr == "brightness":
             fx.brightness = max(-1.0, min(1.0, float(value) / 100.0))
-        elif attr in ("contrast", "saturation"):
+        elif attr in ("contrast", "saturation", "red_gain", "green_gain", "blue_gain"):
             setattr(fx, attr, max(0.0, min(2.0, float(value) / 100.0)))
         elif attr == "hue":
             fx.hue = max(-1.0, min(1.0, float(value) / 180.0))
@@ -831,6 +879,7 @@ class EffectsPanelMixin:
         """Mirror the selected layer's effect values into the panel."""
         if not hasattr(self, "effects_target"):
             return
+        self._sync_favourite_check()
         layer = self._effects_layer()
         self._syncing_effects = True
         try:
@@ -868,6 +917,8 @@ class EffectsPanelMixin:
             self._effect_sliders["saturation"].setValue(
                 int(round(fx.saturation * 100)))
             self._effect_sliders["hue"].setValue(int(round(fx.hue * 180)))
+            for gain in ("red_gain", "green_gain", "blue_gain"):
+                self._effect_sliders[gain].setValue(int(round(getattr(fx, gain) * 100)))
             style_index = self.effect_style.findData(fx.color_effect)
             self.effect_style.setCurrentIndex(style_index if style_index >= 0 else 0)
             self.effect_mirror.setChecked(bool(fx.mirror))

@@ -13,6 +13,7 @@ from gi.repository import Gst  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from . import effects as effect_library  # noqa: E402
+from . import effect_worker
 from .model import Effects, Layer  # noqa: E402
 from .sources import SourceChain, _add_effects, _finish_chain, make  # noqa: E402
 
@@ -54,12 +55,20 @@ def render_thumbnail(effects: Effects, sample: Image.Image,
     """``sample`` with ``effects`` applied, or ``None`` if the chain failed."""
     width, height = size
     picture = sample.convert("RGBA").resize((width, height), Image.BILINEAR)
+    if str(effects.filter).startswith("pack-") or str(effects.filter2).startswith("pack-"):
+        # A pack's code only ever runs in the worker process; a tile is not worth starting one.
+        import dataclasses
+
+        effects = dataclasses.replace(
+            effects, filter="none" if str(effects.filter).startswith("pack-") else effects.filter,
+            filter2="none" if str(effects.filter2).startswith("pack-") else effects.filter2)
     layer = Layer("thumb", "test", "thumb", effects=effects)
     try:
         chain = SourceChain()
         chain.add(make("videoconvert"))
         _add_effects(chain, layer)
-        _finish_chain(chain, width, height, 30, layer=layer)
+        with effect_worker.in_process():
+            _finish_chain(chain, width, height, 30, layer=layer)
         pipeline = Gst.Pipeline.new("anycam-thumb")
         source = make("appsrc", format=Gst.Format.TIME, is_live=False,
                       block=True)

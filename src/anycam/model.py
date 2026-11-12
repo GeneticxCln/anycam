@@ -201,6 +201,26 @@ class EditorConfig:
 
 
 @dataclass
+class MotionConfig:
+    """Act when the canvas picture moves (see anycam.motion)."""
+
+    enabled: bool = False
+    sensitivity: float = 0.5         # 0..1
+    hold_s: float = 1.0              # motion must last this long
+    cooldown_s: float = 30.0         # then stay quiet for this long
+    scene_id: str = ""               # switch to this scene ("" = do not switch)
+    notify: bool = True              # a desktop notification
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "MotionConfig":
+        motion = _coerce_fields(cls, data)
+        motion.sensitivity = max(0.0, min(1.0, motion.sensitivity))
+        motion.hold_s = max(0.0, min(60.0, motion.hold_s))
+        motion.cooldown_s = max(0.0, min(3600.0, motion.cooldown_s))
+        return motion
+
+
+@dataclass
 class Layer:
     id: str
     kind: str                        # camera|screen|image|video|network|text|logo|playlist
@@ -318,7 +338,9 @@ class Scene:
     id: str
     name: str
     layers: list[Layer] = field(default_factory=list)
-    transition: str = "cut"      # reserved: scene changes are hard cuts today
+    # How this scene arrives when it is switched to (see engine.transitions).
+    transition: str = "cut"
+    transition_ms: int = 500
     playlist: PlaylistConfig = field(default_factory=PlaylistConfig)
     # Layout template that last arranged this preset; "" means the boxes
     # were placed by hand.  Stored so switching presets restores the picker.
@@ -355,6 +377,7 @@ class Scene:
             name=name,
             layers=layers,
             transition=_coerce(data.get("transition"), "cut"),
+            transition_ms=max(100, min(5000, _coerce(data.get("transition_ms"), 500))),
             playlist=PlaylistConfig.from_dict(data.get("playlist")),
             layout=_coerce(data.get("layout"), ""),
         )
@@ -363,6 +386,7 @@ class Scene:
         return {"id": self.id, "name": self.name,
                 "layers": [l.to_dict() for l in self.layers],
                 "transition": self.transition,
+                "transition_ms": self.transition_ms,
                 "playlist": asdict(self.playlist),
                 "layout": self.layout}
 
@@ -397,9 +421,25 @@ class AudioConfig:
     mic_denoise: str = "moderate"
     mic_auto_gain: bool = False
     media_file: str = ""
-    media_loop: bool = True      # reserved: the media bed plays once today
+    media_loop: bool = True      # a single media file restarts; a playlist wraps round
     media_gain_db: float = 0.0
     media_muted: bool = False
+    # Extra audio files played after ``media_file`` in order (or shuffled).
+    media_playlist: list[str] = field(default_factory=list)
+    media_shuffle: bool = False
+    # Gate/compressor ("off", "gate", "compressor", "broadcast") and equaliser
+    # ("flat", "voice", "warm", "bright", "bass-cut") on the microphone.
+    mic_dynamics: str = "off"
+    mic_eq: str = "flat"
+    # Per-source sync offsets: audio held back by this many milliseconds, so a
+    # microphone that runs ahead of a slow capture card lines up with it.
+    mic_delay_ms: int = 0
+    desktop_delay_ms: int = 0
+    media_delay_ms: int = 0
+    # Audio output: a monitor so the streamer hears the mix, and a virtual
+    # microphone (a PipeWire source node other apps can record from).
+    monitor_device: str = ""
+    virtual_mic: bool = False
     # Desktop audio: a PipeWire/PulseAudio monitor source ("what you hear").
     desktop_device: str = ""
     desktop_gain_db: float = 0.0
@@ -407,7 +447,19 @@ class AudioConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "AudioConfig":
-        return _coerce_fields(cls, data)
+        audio = _coerce_fields(cls, data, skip=("media_playlist",))
+        raw = data.get("media_playlist") if isinstance(data, dict) else None
+        audio.media_playlist = [item for item in raw if isinstance(item, str) and item] \
+            if isinstance(raw, list) else []
+        audio.mic_dynamics = audio.mic_dynamics.strip().lower() \
+            if audio.mic_dynamics.strip().lower() in ("off", "gate", "compressor", "broadcast") \
+            else "off"
+        audio.mic_eq = audio.mic_eq.strip().lower() \
+            if audio.mic_eq.strip().lower() in ("flat", "voice", "warm", "bright", "bass-cut") \
+            else "flat"
+        for name in ("mic_delay_ms", "desktop_delay_ms", "media_delay_ms"):
+            setattr(audio, name, max(0, min(2000, int(getattr(audio, name)))))
+        return audio
 
 
 @dataclass
@@ -432,6 +484,16 @@ class OutputConfig:
     # ignored: recordings always went to ~/Videos/AnyCam regardless.
     record_dir: str = ""
     rtmp_url: str = ""
+    # Video bitrate in kbit/s for recordings and for the stream; 0 follows the
+    # codec and canvas size.  The disk guard stops a recording when the folder
+    # has less than ``record_min_free_mb`` MiB left (0 turns the guard off).
+    record_bitrate_kbps: int = 0
+    stream_bitrate_kbps: int = 0
+    record_min_free_mb: int = 500
+    # Let a paired phone switch scenes, mute and record from its browser (/remote).
+    phone_control: bool = False
+    # More destinations that receive the same encode as ``rtmp_url``.
+    rtmp_extra_urls: list[str] = field(default_factory=list)
     # H.264 encoder for recordings: auto prefers NVENC when a working NVIDIA
     # driver/plugin is present, nvenc forces it, and cpu forces x264.
     encoder: str = "auto"
@@ -439,6 +501,9 @@ class OutputConfig:
     # only when onnxruntime has the CUDA provider).  ANYCAM_EFFECTS_DEVICE
     # overrides it.
     effects_device: str = "cpu"
+    # Run the AI effects (and effect packs) in a separate process, so a crash
+    # in a model never reaches the canvas, the recording or the stream.
+    effects_isolated: bool = True
     # Person cut-out model: "mediapipe" (bundled) or "rvm" (Robust Video
     # Matting, used once downloaded from Settings).
     segmentation_model: str = "mediapipe"
@@ -449,8 +514,15 @@ class OutputConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "OutputConfig":
-        output = _coerce_fields(cls, data)
+        output = _coerce_fields(cls, data, skip=("rtmp_extra_urls",))
+        raw = data.get("rtmp_extra_urls") if isinstance(data, dict) else None
+        output.rtmp_extra_urls = ([url.strip() for url in raw if isinstance(url, str) and url.strip()]
+                                  if isinstance(raw, list) else [])
         defaults = cls()
+        for name in ("record_bitrate_kbps", "stream_bitrate_kbps"):
+            value = getattr(output, name)
+            setattr(output, name, 0 if value <= 0 else max(500, min(200_000, value)))
+        output.record_min_free_mb = max(0, min(1_000_000, output.record_min_free_mb))
         # A canvas or rate the encoder cannot use would only fail later.
         if output.canvas_w < 2 or output.canvas_h < 2:
             output.canvas_w, output.canvas_h = defaults.canvas_w, defaults.canvas_h
@@ -492,6 +564,7 @@ class Project:
     output: OutputConfig = field(default_factory=OutputConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
     editor: EditorConfig = field(default_factory=EditorConfig)
+    motion: MotionConfig = field(default_factory=MotionConfig)
     scenes: list[Scene] = field(default_factory=list)
     active_scene: str = ""
     # What loading had to drop or repair; never written back to the file.
@@ -514,6 +587,7 @@ class Project:
             "output": asdict(self.output),
             "audio": asdict(self.audio),
             "editor": asdict(self.editor),
+            "motion": asdict(self.motion),
             "scenes": [s.to_dict() for s in self.scenes],
             "active_scene": self.active_scene,
         }
@@ -543,6 +617,7 @@ class Project:
             output=OutputConfig.from_dict(data.get("output")),
             audio=AudioConfig.from_dict(data.get("audio")),
             editor=EditorConfig.from_dict(data.get("editor")),
+            motion=MotionConfig.from_dict(data.get("motion")),
             scenes=scenes,
             active_scene=_coerce(data.get("active_scene"), ""),
         )

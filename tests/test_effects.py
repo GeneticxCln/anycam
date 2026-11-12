@@ -82,7 +82,8 @@ def smpte() -> Layer:
 def test_the_library_is_large_and_every_entry_names_a_real_element():
     available = effects.available_filters()
     assert len(available) >= 25
-    assert {spec.category for spec in available} == set(effects.FILTER_CATEGORIES)
+    # "Packs" is filled by whatever the user has installed; it is empty here.
+    assert {spec.category for spec in available} == set(effects.FILTER_CATEGORIES) - {"Packs"}
     assert len(available) >= 55
     for spec in available:
         # A processor runs Python and needs no element; everything else does.

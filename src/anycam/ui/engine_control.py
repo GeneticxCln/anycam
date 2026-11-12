@@ -101,6 +101,7 @@ class EngineMixin:
                        or (recorder is not None and recorder.has_audio)),
                 # Only an explicit Go Live publishes; a saved URL is inert.
                 rtmp=self.project.output.rtmp_url if self.live else None,
+                rtmp_extra=self.project.output.rtmp_extra_urls if self.live else None,
                 screen_fds=self._screen_fds(),
                 screen_sizes=self._screen_sizes(),
                 preview_crop_layer=crop_preview,
@@ -428,6 +429,17 @@ class EngineMixin:
         # changes the image (snapshot painting, conversions) detaches first.
         image = QImage(raw, width, height, stride, qformat)
         self.preview.set_image(image, owner=raw)
+        panel = self._overlay_panel
+        if panel is not None and panel.isVisible():
+            panel.set_frame(image)
+        if self._motion_monitor is not None:
+            self._motion_frames = getattr(self, "_motion_frames", 0) + 1
+            if self._motion_frames % 3 == 0:       # a third of the frames is plenty
+                import numpy as np
+
+                channels = 4 if fmt == "RGBA" else 3
+                self.feed_motion(np.frombuffer(raw, np.uint8).reshape(height, width, channels),
+                                 time.monotonic())
 
     def _update_source_status(self) -> None:
         """A running canvas is not proof that its inputs are fresh."""
@@ -471,6 +483,23 @@ class EngineMixin:
             if state[0] != "LIVE" or (previous and previous[0] != "LIVE"):
                 self._status(message)
 
+    def _handle_rtmp_report(self) -> None:
+        """Show stream trouble; a destination that is reconnecting is not "stopped"."""
+        rtmp_error = getattr(self.engine.report, "rtmp_error", "")
+        self.update_stream_status()
+        if rtmp_error and rtmp_error != getattr(self, "_rtmp_error_shown", ""):
+            self._rtmp_error_shown = rtmp_error
+            retrying = any(row["state"] in ("waiting", "connecting")
+                           for row in self.engine.report.rtmp_targets)
+            if retrying:
+                # The engine reconnects with backoff; the stream stays "on".
+                self._status(f"Stream interrupted, reconnecting: {rtmp_error[:120]}")
+            else:
+                self.live = False
+                if hasattr(self, "live_button"):
+                    self.live_button.setText("Go Live")
+                self._status(f"Stream stopped: {rtmp_error}")
+
     def _tick(self) -> None:
         if self.engine is None:
             return
@@ -495,6 +524,10 @@ class EngineMixin:
         if self.engine.mic_level_db is not None:
             db = self.engine.mic_level_db
             self.mic_level_label.setText("muted" if db < -80 else f"{db:.0f} dB")
+        self.update_audio_meters()
+        if self._overlay_panel is not None and self._overlay_panel.isVisible():
+            self._overlay_panel.refresh()
+        self.check_disk_guard()
         self._advance_playlist(time.monotonic())
         if rec is not None:
             self._update_source_status()
@@ -521,13 +554,7 @@ class EngineMixin:
             self._handle_pipeline_error(
                 f"Pipeline error: {self.engine.report.error}")
             return
-        rtmp_error = getattr(self.engine.report, "rtmp_error", "")
-        if rtmp_error and rtmp_error != getattr(self, "_rtmp_error_shown", ""):
-            self._rtmp_error_shown = rtmp_error
-            self.live = False
-            if hasattr(self, "live_button"):
-                self.live_button.setText("Go Live")
-            self._status(f"Stream stopped: {rtmp_error}")
+        self._handle_rtmp_report()
         vcam_error = getattr(self.engine.report, "vcam_error", "")
         if vcam_error:
             if vcam_error != self._vcam_error_shown:

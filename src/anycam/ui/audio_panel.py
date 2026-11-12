@@ -5,10 +5,11 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QProgressBar, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from .. import config
+from ..engine import audio_helpers
 from .theme import STYLE  # noqa: F401
 from .layout_history import LayoutHistory  # noqa: F401
 from .preview import PreviewWidget, _PreviewOverlay  # noqa: F401
@@ -84,9 +85,134 @@ class AudioPanelMixin:
         self.auto_gain_check.toggled.connect(self._mic_processing_changed)
         grid.addWidget(self.auto_gain_check, 6, 0, 1, 2)
         layout.addWidget(box)
+        layout.addWidget(self._mixer_group())
+        layout.addWidget(self._sync_group())
+        layout.addWidget(self._outputs_group())
 
         layout.addStretch(1)
         return page
+
+    # ----------------------------------------------------------- the mixer
+    METER_INPUTS = (("mic", "Microphone"), ("desktop", "Desktop"), ("media", "Music"),
+                    ("master", "Output"))
+
+    def _mixer_group(self) -> QGroupBox:
+        box = QGroupBox("Mixer")
+        grid = QGridLayout(box)
+        self.meter_bars: dict[str, QProgressBar] = {}
+        for row, (key, label) in enumerate(self.METER_INPUTS):
+            bar = QProgressBar()
+            bar.setRange(-60, 0)
+            bar.setValue(-60)
+            bar.setTextVisible(False)
+            bar.setMaximumHeight(10)
+            bar.setAccessibleName(f"{label} level")
+            self.meter_bars[key] = bar
+            grid.addWidget(QLabel(label), row, 0)
+            grid.addWidget(bar, row, 1)
+        self.dynamics_combo = QComboBox()
+        for key, label in audio_helpers.DYNAMICS_LABELS.items():
+            self.dynamics_combo.addItem(label, key)
+        self.dynamics_combo.setCurrentIndex(max(0, self.dynamics_combo.findData(
+            self.project.audio.mic_dynamics)))
+        self.dynamics_combo.setToolTip(
+            "Noise gate silences the room between words; the compressor evens out loud peaks")
+        self.dynamics_combo.currentIndexChanged.connect(self._voice_fx_changed)
+        self.eq_combo = QComboBox()
+        for key, label in audio_helpers.EQ_LABELS.items():
+            self.eq_combo.addItem(label, key)
+        self.eq_combo.setCurrentIndex(max(0, self.eq_combo.findData(self.project.audio.mic_eq)))
+        self.eq_combo.currentIndexChanged.connect(self._voice_fx_changed)
+        row = len(self.METER_INPUTS)
+        grid.addWidget(QLabel("Gate / compressor"), row, 0)
+        grid.addWidget(self.dynamics_combo, row, 1)
+        grid.addWidget(QLabel("Equaliser"), row + 1, 0)
+        grid.addWidget(self.eq_combo, row + 1, 1)
+        return box
+
+    def _sync_group(self) -> QGroupBox:
+        box = QGroupBox("Sync offset (hold audio back)")
+        grid = QGridLayout(box)
+        self.delay_spins: dict[str, QSpinBox] = {}
+        for row, (key, label) in enumerate((("mic_delay_ms", "Microphone"),
+                                            ("desktop_delay_ms", "Desktop"),
+                                            ("media_delay_ms", "Music"))):
+            spin = QSpinBox()
+            spin.setRange(0, audio_helpers.MAX_DELAY_MS)
+            spin.setSingleStep(10)
+            spin.setSuffix(" ms")
+            spin.setKeyboardTracking(False)
+            spin.setValue(int(getattr(self.project.audio, key)))
+            spin.valueChanged.connect(lambda value, field=key: self._audio_delay_changed(field, value))
+            self.delay_spins[key] = spin
+            grid.addWidget(QLabel(label), row, 0)
+            grid.addWidget(spin, row, 1)
+        return box
+
+    def _outputs_group(self) -> QGroupBox:
+        box = QGroupBox("Audio outputs")
+        grid = QGridLayout(box)
+        self.monitor_combo = QComboBox()
+        self.monitor_combo.addItem("Off", "")
+        self.monitor_combo.addItem("Default output", "default")
+        for sink in config.list_audio_sinks():
+            self.monitor_combo.addItem(sink.description or sink.name, sink.name)
+        self.monitor_combo.setCurrentIndex(max(0, self.monitor_combo.findData(
+            self.project.audio.monitor_device)))
+        self.monitor_combo.setToolTip("Listen to the mix (what stream viewers hear)")
+        self.monitor_combo.currentIndexChanged.connect(self._audio_outputs_changed)
+        self.virtual_mic_check = QCheckBox(
+            f"Virtual microphone (\u201c{audio_helpers.VIRTUAL_MIC_NAME}\u201d for other apps)")
+        self.virtual_mic_check.setChecked(self.project.audio.virtual_mic)
+        self.virtual_mic_check.toggled.connect(self._audio_outputs_changed)
+        self.audio_output_note = QLabel("")
+        self.audio_output_note.setObjectName("muted")
+        self.audio_output_note.setWordWrap(True)
+        grid.addWidget(QLabel("Monitor"), 0, 0)
+        grid.addWidget(self.monitor_combo, 0, 1)
+        grid.addWidget(self.virtual_mic_check, 1, 0, 1, 2)
+        grid.addWidget(self.audio_output_note, 2, 0, 1, 2)
+        return box
+
+    def _voice_fx_changed(self, *_args) -> None:
+        self.project.audio.mic_dynamics = str(self.dynamics_combo.currentData() or "off")
+        self.project.audio.mic_eq = str(self.eq_combo.currentData() or "flat")
+        self._mark_dirty()
+        if self.engine is not None and self.project.audio.mic_enabled:
+            self.restart_engine()
+
+    def _audio_delay_changed(self, field: str, value: int) -> None:
+        setattr(self.project.audio, field, audio_helpers.delay_ms(value))
+        self._mark_dirty()
+        if self.engine is not None:
+            self.restart_engine()
+
+    def _audio_outputs_changed(self, *_args) -> None:
+        self.project.audio.monitor_device = str(self.monitor_combo.currentData() or "")
+        self.project.audio.virtual_mic = self.virtual_mic_check.isChecked()
+        self._mark_dirty()
+        if self.engine is not None:
+            self.restart_engine()
+
+    def update_audio_meters(self) -> None:
+        """Move the mixer bars to the engine's latest levels (UI timer)."""
+        bars = getattr(self, "meter_bars", None)
+        engine = self.engine
+        if not bars:
+            return
+        levels = engine.audio_levels() if engine is not None else {}
+        for key, bar in bars.items():
+            peak = levels.get(key, (-100.0, -100.0))[0]
+            bar.setValue(int(max(-60.0, min(0.0, peak))))
+        report = engine.report if engine is not None else None
+        if report is not None:
+            notes = [text for text in (
+                f"Monitor: {report.audio_monitor}" if report.audio_monitor else "",
+                f"Monitor unavailable: {report.audio_monitor_error}" if report.audio_monitor_error else "",
+                f"Virtual microphone: {report.virtual_mic}" if report.virtual_mic else "",
+                f"Virtual microphone unavailable: {report.virtual_mic_error}"
+                if report.virtual_mic_error else "") if text]
+            self.audio_output_note.setText("  ·  ".join(notes))
 
     def _refresh_mics(self) -> None:
         current = self.mic_combo.currentData() or self.project.audio.mic_device

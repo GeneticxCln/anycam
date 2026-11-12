@@ -201,6 +201,8 @@ _PROCESSOR_LIST = (
     _proc("zoom", "Zoom", "Framing", "zoom:", "Digital zoom into the middle", 0.3),
     _proc("auto-frame", "Auto-frame", "Framing", "autoframe:",
           "Keep your face centred as you move"),
+    _proc("round-corners", "Rounded corners", "Framing", "corners:",
+          "Round the picture's corners (a circle at full strength on a square)", 0.25),
 )
 
 from . import masks as _masks  # noqa: E402
@@ -213,7 +215,63 @@ _MASK_LIST = tuple(
 FILTERS: dict[str, FilterSpec] = {
     spec.key: spec for spec in (*_FILTER_LIST, *_PROCESSOR_LIST, *_MASK_LIST)}
 FILTER_CATEGORIES: tuple[str, ...] = (
-    "Distort", "Retro TV", "Touch-up", "Portrait", "Face", "Masks", "Framing")
+    "Distort", "Retro TV", "Touch-up", "Portrait", "Face", "Masks", "Framing", "Packs")
+_PACK_SPECS: dict[str, FilterSpec] = {}
+
+
+def reload_packs(root=None) -> list[str]:
+    """(Re)read the effect packs folder; returns what could not be loaded."""
+    from . import packs
+
+    for key in list(_PACK_SPECS):
+        FILTERS.pop(key, None)
+    _PACK_SPECS.clear()
+    found, problems = packs.discover(root)
+    for effect in found:
+        if effect.filter_key in FILTERS:
+            continue
+        spec = FilterSpec(effect.filter_key, effect.label, packs.CATEGORY, "",
+                          effect.description or f"{effect.label} (pack {effect.pack})",
+                          "", "amount", 0.0, 1.0, False, effect.default, (), effect.processor)
+        FILTERS[spec.key] = spec
+        _PACK_SPECS[spec.key] = spec
+    return problems
+
+
+# ------------------------------------------------------------- favourites
+def _favourites_path():
+    from . import config
+
+    return config.config_dir() / "favourite-effects.json"
+
+
+def favourites() -> list[str]:
+    """Keys of the filters the user starred, in the order they were starred."""
+    import json
+
+    try:
+        data = json.loads(_favourites_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    keys = [key for key in data if isinstance(key, str)] if isinstance(data, list) else []
+    return [key for key in dict.fromkeys(keys) if key in FILTERS]
+
+
+def set_favourite(key: str, starred: bool) -> list[str]:
+    """Star or unstar ``key``; returns the new list."""
+    import json
+    import os
+    import tempfile
+
+    keys = [k for k in favourites() if k != key]
+    if starred and key in FILTERS:
+        keys.append(key)
+    path = _favourites_path()
+    handle, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=".fav-")
+    with os.fdopen(handle, "w", encoding="utf-8") as stream:
+        json.dump(keys, stream)
+    os.replace(temporary, path)
+    return keys
 
 
 def filter_available(key: str) -> bool:
@@ -225,7 +283,7 @@ def filter_available(key: str) -> bool:
 
 def available_filters(category: str = "") -> list[FilterSpec]:
     """The filters that can run here, in display order."""
-    return [spec for spec in (*_FILTER_LIST, *_PROCESSOR_LIST, *_MASK_LIST)
+    return [spec for spec in (*_FILTER_LIST, *_PROCESSOR_LIST, *_MASK_LIST, *_PACK_SPECS.values())
             if (not category or spec.category == category)
             and filter_available(spec.key)]
 

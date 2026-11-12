@@ -47,6 +47,15 @@ def cmd_doctor(_args) -> int:
     return 0 if all(checks.values()) else 1
 
 
+def cmd_firstrun(_args) -> int:
+    """The first-run checklist as text; exit 1 when something required is missing."""
+    from . import firstrun
+
+    results = firstrun.checks()
+    print(firstrun.summary_text(results))
+    return 0 if firstrun.ready(results) else 1
+
+
 def cmd_elements(_args) -> int:
     """List missing GStreamer elements; exit 1 when a required one is absent."""
     report = config.check_elements()
@@ -104,6 +113,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("doctor", help="check runtime prerequisites").set_defaults(func=cmd_doctor)
     sub.add_parser("elements", help="list missing GStreamer elements").set_defaults(
         func=cmd_elements)
+    sub.add_parser("check", help="the first-run checklist: what works and how to fix the rest"
+                   ).set_defaults(func=cmd_firstrun)
 
     # Listed for `anycam --help`; the early dispatch above forwards the real
     # soak arguments to its own parser.

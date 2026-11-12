@@ -158,6 +158,7 @@ class ManyCamWindow(AnyCamWindow):
         self.scene_combo = QComboBox()
         self.scene_combo.setVisible(False)
         header.addWidget(self.scene_combo)
+        self._build_studio_controls(header)
         self.settings_button = QPushButton("Settings")
         self.settings_button.setToolTip("Sources, audio, playlist and output")
         self.settings_button.clicked.connect(lambda: self._open_settings())
@@ -1151,6 +1152,7 @@ def run_gui(project: Project | None = None) -> int:
         window.note_vcam_consumers()
         window.ensure_vcam_visible()
     QTimer.singleShot(200, window._autostart_preview)
+    QTimer.singleShot(400, window.show_first_run_check)
     # Tray icon and portal global shortcuts (both skipped where unavailable).
     QTimer.singleShot(500, window.start_desktop_integration)
     code = app.exec()

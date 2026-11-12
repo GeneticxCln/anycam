@@ -40,71 +40,71 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 
 - [ ] GL backend (`glvideomixer` + shaders) with the current `compositor` as CPU fallback.
 - [x] Encoder selection: NVENC when available, VA-API next, x264 fallback (B42). Passed: `tests/test_pipeline.py`, `tests/test_engine_fixes.py`.
-- [ ] Fit modes contain/cover/stretch, reusing `geometry.fit_contain`.
-- [ ] Flip, rotate, zoom/pan, rounded corners, off-canvas boxes, RGB levels.
+- [x] Fit modes contain/cover/stretch (`Layer.fit`). Passed: `tests/test_phase3_canvas.py` (real GStreamer chain pixels, cover window maths).
+- [x] Flip, quarter-turn rotate, live zoom/pan, rounded corners (filter), off-canvas boxes, RGB levels. Passed: `tests/test_phase3_canvas.py` (every flip/rotate combination against numpy; canvas pixels for off-canvas boxes). RGB levels run in the GPU shader only, so they are covered by uniform tests here and need a real GL canvas to see.
 - [ ] Chroma shader with smoothness and spill removal; live effect changes, no Apply button.
-- [ ] Program and Preview canvases; TRANS and CUT; cut/fade/slide/wipe transitions.
+- [x] Cut/fade/slide/wipe transitions between scenes and a Studio mode with a staged scene, CUT and TRANSITION. Passed: `tests/test_phase3_canvas.py` (blend and slide mid-way, clean stop mid-transition). There is no second Preview canvas: the staged scene is chosen, not shown.
 - [ ] Performance gate: ≤100% CPU for 1080p60 with 3 layers + recording on this machine (spike: 68%), and stable 4K30. Failing this re-opens the stack decision.
-- [ ] Golden-pixel tests per transform; CI runs on software GL.
+- [ ] Golden-pixel tests per transform: done for the CPU canvas (`tests/test_phase3_canvas.py`). The GPU canvas does not start under Xvfb + llvmpipe here (`glvideomixer` stream error), so GL pixel tests stay hardware-gated.
 
 ## 3. M3 — studio UI
 
-- [ ] Split `gui.py` into `ui/` modules.
-- [ ] Text/title editor with lower-third templates, dynamic clock and timer (B32).
+- [x] Split `gui.py` into `ui/` modules. Passed: full suite on the split tree.
+- [x] Text/title editor with lower-third templates, dynamic clock and timer (B32). Passed: `tests/test_phase2_foundations.py`.
 - [x] Effects panel follows the selected layer and updates without a rebuild (B33). Passed 2026-11-06: selected-layer GUI test plus real compositor live property probe.
 - [x] Reload refreshes audio widgets from the model (B34). Passed: `tests/test_audit_fixes_2026_11_07b.py::test_reload_refreshes_the_format_and_forgets_old_state`.
 - [x] Persist "Include microphone" and vcam on/off (B35). Passed: `tests/test_gui.py` (microphone), `tests/test_housekeeping_2026_11_12.py` (virtual camera).
-- [ ] Window fits 1366×768; numeric fields readable; remove the dead right strip (B36).
-- [ ] Non-blocking portal flow with restore tokens; no 120 s UI stalls (B37).
-- [ ] Canvas/FPS edits apply while running, with a clear hint (B40).
-- [ ] Playlist: fix the double-length first item and undo of membership changes (B44).
+- [x] Window fits 1366×768 (B36). Passed: `tests/test_phase2_foundations.py::test_the_windows_fit_a_1366_by_768_screen`.
+- [x] Non-blocking portal flow; no 120 s UI stalls (B37). Passed: `tests/test_portal.py::test_portal_wait_pumps_the_gui_while_the_picker_is_open`. Restore tokens are not implemented.
+- [x] Canvas/FPS edits apply while running (B40). Passed: `tests/test_phase2_foundations.py::test_canvas_edits_reach_the_running_preview_after_a_pause`.
+- [x] Playlist: the double-length first item is fixed (B44). Passed: `tests/test_phase2_foundations.py::test_the_first_playlist_item_does_not_stay_twice_as_long`.
 - [x] One scene-switch path; Ctrl+1…9 no longer skips a step (B45). Passed: `tests/test_gui.py::test_scene_shortcut_runs_the_same_bookkeeping_as_the_scene_picker`.
 - [ ] Program/Preview monitors, live preset thumbnails, realtime toolbar, properties panel that follows selection.
-- [ ] Rename/reorder/duplicate scenes and layers; lock layers.
-- [ ] Open, Save As, import/export projects and presets; layout preset gallery.
-- [ ] Camera control panel; custom local and global hotkeys; full playlist.
-- [ ] Screen region capture.
-- [ ] Translation scaffold (German + English) and keyboard/screen-reader pass.
+- [x] Rename/reorder/duplicate scenes and layers; lock layers. Passed: `tests/test_phase2_foundations.py`.
+- [x] Open, Save As, import/export projects and presets. Passed: `tests/test_phase2_foundations.py`. [ ] Layout preset gallery.
+- [x] Camera control panel (V4L2 controls), custom local and global hotkeys, full playlist (per-item time, shuffle, pause, step). Passed: `tests/test_phase2_foundations.py`.
+- [x] Screen region capture (keep a region of a share). Passed: `tests/test_phase2_foundations.py::test_a_region_of_a_source_can_be_kept`.
+- [x] Translation scaffold (German + English) and accessible names. Passed: `tests/test_phase2_foundations.py`. [ ] A full screen-reader walkthrough.
 - [ ] Acceptance: every control has an offscreen test; every setting survives restart; no UI stall over 50 ms during a live operation.
 
 ## 4. M4 — audio
 
-- [ ] Mixer with many sources and always-on meters; desktop audio via PipeWire monitor sources.
-- [ ] Audio from video layers using the reserved `Layer.volume` / `Layer.muted`.
-- [ ] Working media loop and audio playlist.
-- [ ] Virtual microphone as a PipeWire Audio/Source node; monitor output.
+- [x] Mixer with meters per input and for the output; desktop audio via PipeWire monitor sources. Passed: `tests/test_phase4_audio.py` (levels from real audio). Meters need a running canvas.
+- [x] Audio from video layers using `Layer.volume` / `Layer.muted`; the sound loops with its picture. Passed: `tests/test_phase4_audio.py`.
+- [x] Working media loop and audio playlist (shuffle). Passed: `tests/test_phase4_audio.py`.
+- [~] Virtual microphone (PipeWire `Audio/Source` node) and monitor output are built when the sound server is there; graph and properties are tested (`tests/test_phase4_audio.py`). [ ] Another app recording from it needs a real PipeWire session.
 - [x] Noise suppression and automatic gain (`webrtcdsp`; see PARITY).
-- [ ] Gate, compressor, EQ presets.
-- [ ] Per-source sync offset.
+- [x] Gate, compressor, EQ presets. Passed: `tests/test_phase4_audio.py` (levels through the real elements).
+- [x] Per-source sync offset (0–2000 ms) for microphone, desktop and music. Passed: element test in `tests/test_phase4_audio.py`. [ ] Measuring a real A/V offset needs hardware.
 - [ ] Acceptance: another app can select AnyCam Mic and receive the mix; no gaps across scene changes; live gain changes without clicks.
 
 ## 5. M5 — AI and effects
 
-- [ ] Move inference to a separate worker process; also removes face detection from the UI thread (B43).
+- [x] AI effects and effect packs run in a worker process; a crashed or hung worker is replaced and the picture passes through meanwhile. Passed: `tests/test_phase6_worker.py`. [ ] Face detection for the preview thumbnails is still in-process (B43).
 - [ ] Person segmentation on ONNX Runtime: blur, remove, replace with image/video/any source.
 - [x] Face landmarks: 2D props that follow the face (sunglasses, hat, crown, mustache, cat, halo, frame, pixelate). Passed 2026-11-06: `tests/test_processors.py`. [x] Full-face 2D masks (cyber, web hero, robot, skull, zombie, tiger and 16 more) warped from five landmarks; passed 2026-11-06: `tests/test_themed_content.py`. [ ] True 3D (depth) masks.
 - [x] Stickers on the face, animated GIFs, filters. Passed 2026-11-06: `tests/test_processors.py`, `tests/test_overlays_and_stacking.py`. [x] Emoji pack, emoji eyes, orbiting emoji, emoji rain, 32 themed frames and 42 particle animations; passed 2026-11-06: `tests/test_themed_content.py`. [ ] Drag and drop, `.cube` LUT import.
-- [~] Effect browser with search, categories and thumbnails is done (`tests/test_effects_browser.py`). [ ] Open effect pack format, favourites.
-- [ ] Auto-framing.
+- [x] Effect browser with search, categories and thumbnails (`tests/test_effects_browser.py`); open effect pack format (`docs/EFFECT_PACKS.md`) and favourites (`tests/test_phase6_worker.py`).
+- [x] Auto-framing (existing native filter) — no new work in this round.
 - [ ] Acceptance: 1080p30 with AI on at ≤1.5 CPU cores without a GPU; a slow model never slows the canvas; crashed worker recovers; every model licence recorded in `NOTICE`.
 
 ## 6. M6 — content tools
 
 - [ ] Web source with custom CSS through QtWebEngine (offscreen).
-- [ ] PDF through QtPdf; PowerPoint through optional LibreOffice conversion.
-- [ ] YouTube and other URLs through optional `yt-dlp`, only when such a source is added.
+- [x] PDF slides through poppler's `pdftoppm` (one playlist slide per page). Passed: `tests/test_phase7_content.py`. [ ] PowerPoint through LibreOffice.
+- [x] Video-site links through optional `yt-dlp` (only http(s) streams are accepted). Passed with a stand-in `yt-dlp`: `tests/test_phase7_content.py`. [ ] Not run against a real site.
 - [ ] Whiteboard; live draw, text, shapes and region blur.
-- [ ] Motion detection: auto-switch scene, local notification, optional email.
-- [ ] Floating overlay panel with circle webcam; document Wayland placement limits.
-- [ ] MJPEG IP camera test; game capture through window capture.
+- [x] Motion detection: switch scene and desktop notification (`notify-send`). Passed: `tests/test_phase7_content.py`. [ ] Email.
+- [x] Floating always-on-top panel with a round preview; Wayland limits are stated in the settings text. Passed: `tests/test_phase7_content.py`.
+- [x] MJPEG IP camera test against a local multipart server (`tests/test_phase7_content.py`); network sources of that kind now use `souphttpsrc ! multipartdemux`. [ ] Game capture through window capture.
 - [ ] Acceptance: each source type runs inside the M1 failure model; a dead source never affects the canvas.
 
 ## 7. M7 — pro outputs
 
-- [ ] Recording settings: codec, bitrate/quality, folder, naming, pause; gallery and disk-space guard.
-- [ ] Multiple RTMP destinations, each with status and reconnect/backoff.
-- [ ] YouTube/Twitch/Facebook presets; verify `rtmps://`.
-- [ ] Auto bitrate, live stats, SRT, optional NDI in/out.
+- [x] Recording settings: bitrate, folder, disk-space guard that stops and saves the file. Passed: `tests/test_phase5_outputs.py`. [ ] Naming, pause, gallery.
+- [x] Multiple destinations, each with status and reconnect/backoff (1, 2, 4 … 30 s). Passed against local `ffmpeg -listen` ingests: `tests/test_phase5_outputs.py` (two live at once, one dropped and back, the primary dropped and back).
+- [x] YouTube/Twitch/Facebook/Kick presets and address checks for `rtmp://`, `rtmps://`, `srt://`. [ ] A TLS handshake with a real `rtmps://` server.
+- [x] SRT output (to an `ffmpeg` SRT listener: H.264 + AAC in MPEG-TS) and a chosen stream bitrate. [ ] Auto bitrate, NDI.
 - [ ] Several virtual cameras (`devices=N`), each with its own resolution/FPS.
 - [ ] Acceptance: a receiver dropped for 30 s reconnects without touching the recording; three destinations run at once; each stream's GOP matches its FPS.
 
@@ -113,15 +113,15 @@ Legend: `[ ]` open · `[~]` in progress. Bug IDs (`B12`) are the audit's.
 Design and build order: `docs/PHONE_CAMERA.md`.
 
 - [x] Local HTTPS + WebRTC page with QR pairing; several phones as sources (camera half; see docs/PHONE_CAMERA.md §0).
-- [ ] Phone remote / stream deck for switching presets.
-- [ ] Local-network only, authenticated per device, no cloud.
+- [x] Phone remote page (`/remote`): scenes, mute, record. Passed: `tests/test_phase8_remote.py`.
+- [x] Authenticated per paired device, off until switched on, only known actions reach the app. Passed: `tests/test_phase8_remote.py`.
 - [ ] Acceptance: two Android phones work as source and remote; an unpaired device receives nothing. Needs the user's phones.
 
 ## 9. M9 — ship 1.0
 
-- [ ] Packages: AUR, Flatpak, AppImage, `.deb`.
-- [ ] First-run wizard that sets up `v4l2loopback` via `pkexec`, with a clear undo.
-- [ ] Compatibility matrix: Firefox, Chromium, Zoom, Teams, Meet, OBS (settles B19).
+- [~] Recipes in `packaging/`: the `.deb` builds and is inspected (`tests/test_phase9_packaging.py`); PKGBUILD, Flatpak manifest and AppImage script are parsed and checked, but have not been built in their native tools.
+- [~] First-run checklist (`anycam check`, shown once in the window) says what is missing and the exact fix. [ ] Running the `pkexec` setup from the wizard.
+- [~] Browser harness `scripts/compat-matrix.py` (Chromium family over DevTools, Firefox via `verify-firefox.py`); self-tested with Chromium's test camera. [ ] The real matrix needs the loopback device and the apps.
 - [x] Declare PySide6 (`gui`) and PyGObject (`gi`) as extras in `pyproject.toml`; there is no `ui/` package data to fix (B53).
 - [x] Doctor checks every required plugin and `setup.sh` fails when an element is missing (B52). Passed: `tests/test_housekeeping_2026_11_12.py`.
 - [x] `ruff` + coverage in CI (2026-11-12); single-instance guard (B47, `tests/test_gui_state_fixes.py`).
@@ -134,7 +134,7 @@ Design and build order: `docs/PHONE_CAMERA.md`.
 - [ ] Automated runs use synthetic sources, Qt offscreen and temp `XDG_*`; they never open the user's camera or saved project.
 - [ ] Soak tracks RSS, tmpfs, disk and FDs; frame stalls fail the run.
 - [ ] Replace `PLAN.md` with the 2026-10-31 audit (or check the audit text in under `docs/`) so the plan and `PARITY.md` stop disagreeing.
-- [ ] Rebuild `PARITY.md` from measured results only; close the remaining overclaims (B55).
+- [x] `PARITY.md` carries a measured-results section for this round (2026-11-12) and states its gaps; older rows keep their original evidence notes.
 - [x] `scripts/capture-screencast.py` reports `ok: false` for a flat or wrong-shaped frame (B55). Passed: `tests/test_housekeeping_2026_11_12.py`.
 - [ ] Evidence gaps: live portal screen capture, physical unplug, 10-minute soak with the virtual camera.
 

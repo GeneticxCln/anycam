@@ -37,6 +37,10 @@ class RecordTapMixin:
         bitrate = plan.bitrate
         if purpose == "rtmp":
             bitrate = encoder_bitrate(plan.codec, self.canvas_w, self.canvas_h)
+        chosen = int(getattr(self.project.output,
+                             "stream_bitrate_kbps" if purpose == "rtmp" else "record_bitrate_kbps", 0))
+        if chosen > 0:
+            bitrate = chosen              # kbit/s, like the codec defaults
         if plan.hardware and plan.factory.startswith("va"):
             # VA-API encoders: constant bitrate, a keyframe every 2 s, and the
             # fastest target usage (live, like NVENC's zerolatency/p4).

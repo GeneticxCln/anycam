@@ -41,6 +41,8 @@ from ..sources import (
     jpeg_decoder,
     make,
     make_optional,
+    is_mjpeg_stream,
+    video_has_audio,
     video_size,
 )
 
@@ -139,6 +141,14 @@ class _Built:
     check: Gst.Element | None = None
     check_size: tuple[int, int] | None = None
     dynamic_from: Gst.Element | None = None
+    # True when the source may carry sound: _build adds an audio branch that
+    # ends in an ``interaudiosink`` the canvas mixer reads (see audio_channel).
+    audio: bool = False
+
+
+def audio_channel(channel: str) -> str:
+    """Name of the inter-audio channel that carries a video capture's sound."""
+    return f"{channel}-audio"
 
 
 def _link_all(elements: list[Gst.Element], dynamic_from: Gst.Element | None) -> None:
@@ -156,9 +166,21 @@ def _on_pad_added(_bin, pad, target) -> None:
     caps = pad.get_current_caps() or pad.query_caps(None)
     if caps is None or caps.get_size() == 0:
         return
-    if not caps.get_structure(0).get_name().startswith(("video/", "audio/")):
+    if not caps.get_structure(0).get_name().startswith(("video/", "audio/", "image/")):
         return
     sink = target.get_static_pad("sink")
+    if sink is not None and not sink.is_linked():
+        pad.link(sink)
+
+
+def _on_audio_pad_added(_bin, pad, head) -> None:
+    """Link a decodebin's audio pad to the capture's audio branch."""
+    caps = pad.get_current_caps() or pad.query_caps(None)
+    if caps is None or caps.get_size() == 0:
+        return
+    if not caps.get_structure(0).get_name().startswith("audio/"):
+        return
+    sink = head.get_static_pad("sink")
     if sink is not None and not sink.is_linked():
         pad.link(sink)
 
@@ -525,6 +547,17 @@ class SourcePool:
                 for entry in self._entries.values() if entry.error}
 
     # ------------------------------------------------------------------ build
+    @staticmethod
+    def _add_audio_branch(pipeline: Gst.Pipeline, channel: str) -> Gst.Element:
+        """convert -> resample -> 48 kHz stereo -> interaudiosink; returns the head."""
+        elements = [make("audioconvert"), make("audioresample"),
+                    caps_filter("audio/x-raw,format=F32LE,rate=48000,channels=2"),
+                    make("interaudiosink", channel=channel, sync=False)]
+        for element in elements:
+            pipeline.add(element)
+        _link_all(elements, None)
+        return elements[0]
+
     def _build(self, spec: CaptureSpec) -> Entry:
         channel = self.channel_for(spec)
         built = self._elements(spec)
@@ -545,6 +578,9 @@ class SourcePool:
             index = built.elements.index(built.dynamic_from)
             built.dynamic_from.connect("pad-added", _on_pad_added,
                                        built.elements[index + 1])
+            if built.audio and Gst.ElementFactory.find("interaudiosink") is not None:
+                head = self._add_audio_branch(pipeline, audio_channel(channel))
+                built.dynamic_from.connect("pad-added", _on_audio_pad_added, head)
         entry = Entry(spec=spec, channel=channel, pipeline=pipeline,
                       source_size=built.size, camera_mode=built.camera_mode,
                       probe_error=built.probe_error)
@@ -672,12 +708,30 @@ class SourcePool:
             caps_filter(f"video/x-raw,format=RGBA,width={width},height={height},"
                         f"pixel-aspect-ratio=1/1,framerate={spec.fps}/1"),
         ]
-        return _Built(elements, (width, height), dynamic_from=decode)
+        # An audio branch with nothing linked would stop the pipeline ever reaching
+        # EOS, and the clip would not loop; only a file with sound gets one.
+        return _Built(elements, (width, height), dynamic_from=decode,
+                      audio=video_has_audio(spec.source))
 
     @staticmethod
     def _network(spec: CaptureSpec) -> _Built:
         width = max(2, spec.width)
         height = max(2, spec.height)
+        if is_mjpeg_stream(spec.source) and Gst.ElementFactory.find("multipartdemux") is not None:
+            # Phone and IP cameras ("IP Webcam", most CCTV) send MJPEG as a
+            # multipart HTTP stream; uridecodebin cannot type it and waits for ever.
+            demux = make("multipartdemux")
+            elements = [
+                make("souphttpsrc", location=spec.source, is_live=True, do_timestamp=True),
+                demux,
+                make("jpegdec"),
+                make("videoconvert"),
+                make("videoscale"),
+                make("videorate"),
+                caps_filter(f"video/x-raw,format=RGBA,width={width},height={height},"
+                            f"pixel-aspect-ratio=1/1,framerate={spec.fps}/1"),
+            ]
+            return _Built(elements, (width, height), dynamic_from=demux)
         decode = make("uridecodebin", uri=spec.source)
         elements: list[Gst.Element] = [
             decode,

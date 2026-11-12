@@ -28,6 +28,8 @@ class PhoneMixin:
 
         service = self._phone_service or default_service(
             on_event=self._phone_events.event.emit)
+        service.control_handler = self._phone_control_call
+        service.control_enabled = bool(self.project.output.phone_control)
         try:
             service.start()
         except Exception as exc:  # noqa: BLE001 - shown to the user
@@ -40,6 +42,58 @@ class PhoneMixin:
         self._phone_service = service
         self.log_event(f"phone link listening on {service.page_url()}")
         return service
+
+    # ------------------------------------------------------- remote control
+    def _phone_control_call(self, action: str, data: dict, device: str) -> dict:
+        """Called on a network thread: run the request on the UI thread and wait."""
+        from concurrent.futures import Future, TimeoutError as FutureTimeout
+
+        outcome: Future = Future()
+        self._phone_events.control.emit((action, data, device, outcome))
+        try:
+            return outcome.result(timeout=5.0)
+        except FutureTimeout:
+            return {"error": "AnyCam did not answer in time."}
+
+    def _phone_control_run(self, request) -> None:
+        action, data, device, outcome = request
+        try:
+            outcome.set_result(self.phone_control(action, data, device))
+        except Exception as exc:  # noqa: BLE001 - tell the phone, keep the window
+            outcome.set_result({"error": f"{type(exc).__name__}"})
+            self.log_event(f"phone control {action}: {exc}")
+
+    def phone_control(self, action: str, data: dict, device: str = "") -> dict:
+        """What the remote page can do; returns the state to show afterwards."""
+        if action == "scene":
+            index = next((i for i, scene in enumerate(self.project.scenes)
+                          if scene.id == data.get("scene_id")), -1)
+            if index < 0:
+                return {"error": "No such scene."}
+            self.switch_scene(index)
+        elif action == "mute":
+            self.toggle_mic_mute()
+        elif action == "record":
+            self.toggle_record()
+        elif action != "state":
+            return {"error": "Unknown action."}
+        if action != "state":
+            self.log_event(f"phone remote ({self._phone_name(device) or device}): {action}")
+        return {"scenes": [{"id": scene.id, "name": scene.name} for scene in self.project.scenes],
+                "active": self.project.active_scene, "recording": bool(self.recording),
+                "muted": bool(self.project.audio.mic_muted)}
+
+    def set_phone_control(self, enabled: bool) -> None:
+        self.project.output.phone_control = bool(enabled)
+        if self._phone_service is not None:
+            self._phone_service.control_enabled = bool(enabled)
+        self._mark_dirty()
+        if enabled:
+            service = self._phone_link(quiet=True)
+            if service is not None:
+                self._status(f"Phone remote: open {service.page_url()}remote on a paired phone")
+        else:
+            self._status("Phone remote control is off")
 
     def _stop_phone_link(self) -> None:
         service, self._phone_service = self._phone_service, None

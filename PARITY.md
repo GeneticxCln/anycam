@@ -13,13 +13,38 @@ Status legend:
 * **blocked** — implementation exists but a platform/permission limit prevents
   verification.
 
-Last updated: 2026-11-04 (KineticWE/KWin screen-capture clock fix and the Qt 6.12
+Last updated: 2026-11-12 (section 0 lists what the 2026-11-12 round measured; the older rows keep their own evidence notes). Before that: 2026-11-04 (KineticWE/KWin screen-capture clock fix and the Qt 6.12
 test environment; prior matrix 2026-10-31 covering audit M0, M1 output
 pipelines, M1 capture source pool, network/output failure gates, media-layer
 fallback/loop gates, the vcam/audio/duplicate-capture gates,
 hidden-capture/camera-mode gates, and the source-health watchdog). Evidence
 paths name the private archive `~/anycam-private-evidence/evidence/` after the
 M0 move.
+
+## 0. Measured in the 2026-11-12 round
+
+Everything here ran in this repository's test suite on a machine with no camera, no `v4l2loopback`, no
+PipeWire session and no working OpenGL canvas. "Gap" names what that leaves unproven.
+
+| Capability | Status | Evidence | Gap |
+|---|---|---|---|
+| Fit modes, flips, quarter-turn rotation, zoom/pan, boxes past the canvas edge | **verified** | `tests/test_phase3_canvas.py`: every flip/rotation compared pixel for pixel with numpy through the real GStreamer chain; canvas pixels for clipped and oversized boxes | RGB levels run only in the GPU shader (uniforms tested, picture not) |
+| Scene transitions (fade, slide, wipe) and Studio mode | **verified** | `tests/test_phase3_canvas.py`: mid-fade blend, mid-slide halves, quick second switch, stop during a transition | One canvas: the staged scene is chosen, not previewed |
+| Rounded corners | **verified** | `tests/test_phase3_canvas.py` | CPU filter, so it costs CPU per frame (`scripts/bench_canvas.py` reports the ratio) |
+| Audio meters, video-layer sound, music loop/playlist | **verified** | `tests/test_phase4_audio.py`: levels from real audio through the engine | Needs a canvas with audio running |
+| Gate, compressor, EQ presets, sync delay | **verified** (elements) | `tests/test_phase4_audio.py`: RMS through the real GStreamer elements | Microphone path untested without a microphone; real A/V offset unmeasured |
+| Monitor output and virtual microphone | **partial** | Graph, properties and error reporting tested with a stand-in server socket | No PipeWire here: no other app has recorded from the node |
+| Several stream destinations, reconnect with backoff | **verified** | `tests/test_phase5_outputs.py` against local `ffmpeg -listen` RTMP ingests: two live at once, one dropped and restored, the primary dropped and restored | Real platforms and `rtmps://` TLS untried |
+| SRT output | **verified** (loopback) | `tests/test_phase5_outputs.py`: H.264 and AAC received by an `ffmpeg` SRT listener | Real SRT receivers and network loss untried |
+| Recording bitrate, disk guard | **verified** | `tests/test_phase5_outputs.py` | Disk-full behaviour of the muxer itself untried |
+| AI effects and packs in a worker process | **verified** | `tests/test_phase6_worker.py`: frames through shared memory, crash and hang recovery, a raising effect, packs | Model speed under load and the "1.5 cores" target unmeasured |
+| PDF slides, video-site links, MJPEG cameras | **verified** | `tests/test_phase7_content.py` (a local MJPEG server; a stand-in `yt-dlp`) | No real IP camera or video site |
+| Motion detection, floating panel | **verified** | `tests/test_phase7_content.py` | Notifications need `notify-send`; Wayland may ignore always-on-top |
+| Phone remote | **verified** | `tests/test_phase8_remote.py`: unpaired refused, off by default, only known actions | No real phone browser |
+| `.deb`, PKGBUILD, Flatpak, AppImage recipes | **partial** | `tests/test_phase9_packaging.py`: the `.deb` is built and its contents checked; the others are parsed and cross-checked | Not built in `makepkg`, `flatpak-builder` or `appimagetool` |
+| First-run checklist | **verified** | `tests/test_phase9_packaging.py` | Fixes are shown, not run |
+| Browser harness | **partial** | `scripts/compat-matrix.py` self-test with Chromium's test camera | Zoom, Teams, Meet, OBS, Firefox and the AnyCam device itself still need the loopback device |
+| Not built | **not implemented** | — | Web source (needs QtWebEngine), window capture, NDI, whiteboard region blur, GL pixel tests |
 
 ## 1. Video sources
 
@@ -55,7 +80,7 @@ M0 move.
 | Text overlays | **verified** | `overlay.render_text_png` → `imagefreeze` layer | `evidence/00_skeleton/composite.png` |
 | Image/logo overlays | **verified** | `overlay.fit_rgba`, `logo`/`image` layer kind | Playlist PiP composites image overlays end-to-end (`evidence/03_playlist/rotate_*.png`) |
 | Presets | **partial** | `save_scene_preset` / `load_scene_preset`, JSON project | Model round-trip test; no GUI preset browser |
-| Live scene switching | **partial** | GUI scene list + engine restart; `Ctrl+1…9` shortcuts | Switching implemented and exercised via shortcuts; no multi-scene capture artifact |
+| Live scene switching | **verified** | Scenes swap on the running compositor (no rebuild) with optional fade/slide/wipe; `Ctrl+1…9` shortcuts | `tests/test_phase3_canvas.py` (see section 0); `tests/test_gui.py` shortcut tests; no hardware-camera capture of a switch |
 
 ## 3. Effects
 

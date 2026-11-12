@@ -15,6 +15,7 @@ from gi.repository import Gst  # noqa: E402
 
 from .. import config, overlay  # noqa: E402
 from .. import geometry
+from . import transitions
 from ..geometry import box_pixels, clamp  # noqa: E402
 from ..model import Layer, Scene  # noqa: E402
 from ..engine.source_pool import CAPTURE_KINDS, capture_spec  # noqa: E402
@@ -375,6 +376,7 @@ class LayerMixin:
             raise RuntimeError(f"could not link {layer.name} into the compositor")
         self._layer_pads[layer.id] = pad
         self._layer_chains[layer.id] = chain
+        self.ensure_layer_audio(layer)
 
         def on_first_buffer(_pad, _info, layer_id=layer.id):
             self._pads_with_data.add(layer_id)
@@ -507,7 +509,7 @@ class LayerMixin:
         be opened).  The source is acquired *before* the layer is made visible,
         so a failure leaves it cleanly hidden instead of visible with no feed.
         """
-        layer = next((l for l in self.scene.layers if l.id == layer_id), None)
+        layer = self._find_layer(layer_id)
         pad = self._layer_pads.get(layer_id)
         if layer is None or pad is None:
             return False
@@ -530,6 +532,7 @@ class LayerMixin:
             self.layer_sources[layer_id] = entry.source_size
         layer.visible = visible
         pad.set_property("alpha", float(clamp(layer.alpha)) if visible else 0.0)
+        self.apply_layer_audio(layer)
         control = getattr(self._layer_chains.get(layer_id), "control", None)
         if visible and control is not None and hasattr(control, "restart"):
             control.restart()   # a lower third slides in again each time it is shown
@@ -670,7 +673,7 @@ class LayerMixin:
         pooled capture (camera/video/network/test) is pinned for the same
         reason; its device is not reopened on re-add.
         """
-        layer = next((l for l in self.scene.layers if l.id == layer_id), None)
+        layer = self._find_layer(layer_id)
         if layer is None:
             return
         if layer.kind == "screen":
@@ -691,6 +694,7 @@ class LayerMixin:
         pad = self._layer_pads.pop(layer_id, None)
         if pad is not None:
             pad.set_property("alpha", 0.0)
+        self.drop_layer_audio(layer_id)
         removed = self._layer_chains.pop(layer_id, None)
         # A generated layer (animation, ticker, GIF, drawing) owns a feeder
         # thread.  Without this it kept drawing frames into an invisible pad
@@ -885,7 +889,17 @@ class LayerMixin:
         self.resume_vcam()
         return True
 
-    def switch_scene(self, scene: Scene) -> bool:
+    def _find_layer(self, layer_id: str) -> Layer | None:
+        """A layer of the shown scene, or of the one a transition is removing."""
+        for layer in self.scene.layers:
+            if layer.id == layer_id:
+                return layer
+        for layer in getattr(self, "_ghosts", ()):
+            if layer.id == layer_id:
+                return layer
+        return None
+
+    def switch_scene(self, scene: Scene, transition: str = "cut", seconds: float = 0.0) -> bool:
         """Show ``scene`` on the running canvas without rebuilding it.
 
         The old scene's layers are taken out (cameras stay open for a while so
@@ -894,21 +908,34 @@ class LayerMixin:
         recording, the stream and the virtual camera never see a gap or a
         timestamp reset.  Returns False when it cannot be done live (the graph
         is not running, a screen share must be set up); the caller rebuilds.
+
+        With a ``transition`` (see :mod:`anycam.engine.transitions`) the old
+        layers stay on the canvas while the new ones arrive, then go.
         """
         if self.pipeline is None or self.compositor is None or self._stopped:
             return False
         if scene is self.scene:
             return True
+        self.finish_transition()        # a quick second switch settles the first
         if any(layer.kind == "screen" for layer in scene.layers):
             return False        # a portal remote is needed per share
         old = self.scene
+        kind = transitions.transition_kind(transition)
+        ghost_ids = {layer.id for layer in old.layers if layer.id in self._layer_pads}
+        animate = (kind != "cut" and seconds > 0 and ghost_ids
+                   and not ghost_ids & {layer.id for layer in scene.layers})
         # detach_layer() hides the model's layer on the way out; the old scene
         # must come back exactly as it was when the user returns to it.
         visible = {layer.id: layer.visible for layer in old.layers}
-        for layer in list(old.layers):
-            self.detach_layer(layer.id)
-        for layer in old.layers:
-            layer.visible = visible.get(layer.id, layer.visible)
+        ghosts: list[Layer] = []
+        if animate:
+            ghosts = [layer for layer in old.layers if layer.id in ghost_ids]
+            self._ghosts = ghosts
+        else:
+            for layer in list(old.layers):
+                self.detach_layer(layer.id)
+            for layer in old.layers:
+                layer.visible = visible.get(layer.id, layer.visible)
         self.scene = scene
         self.skip_layers &= {layer.id for layer in scene.layers}
         self.report.media_errors.clear()
@@ -917,13 +944,18 @@ class LayerMixin:
         self._camera_modes.clear()
         self._pads_with_data = {layer_id for layer_id in self._pads_with_data
                                 if layer_id in self._layer_pads}
+        incoming: list[Layer] = []
         for layer in sorted(scene.layers, key=lambda item: item.z):
             if _empty_drawing(layer):
                 continue
             if not self.add_layer(layer):
+                self._ghosts = []
                 return False
+            incoming.append(layer)
         self.refresh_layer_order()
         self._sync_standby_label()
+        if animate:
+            self._begin_transition(kind, float(seconds), ghosts, incoming)
         return True
 
     def set_layer_alpha(self, layer_id: str, alpha: float) -> None:
@@ -959,7 +991,9 @@ class LayerMixin:
         layers always start at 1 and can never cover the graph's only pad if
         the scene becomes empty.
         """
-        layers = sorted(self.scene.layers, key=lambda l: l.z)
+        # Layers a transition is still removing sit underneath the new ones.
+        layers = (sorted(getattr(self, "_ghosts", ()), key=lambda l: l.z)
+                  + sorted(self.scene.layers, key=lambda l: l.z))
         for zorder, layer in enumerate(layers, start=1):
             pad = self._layer_pads.get(layer.id)
             if pad is not None:

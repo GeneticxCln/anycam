@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.geneticxcln.AnyCam</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>AnyCam</name>
+  <summary>Virtual camera studio for Linux</summary>
+  <description>
+    <p>AnyCam mixes cameras, screens, images, video and overlays into scenes and publishes the result as a
+    virtual camera, a recording or a live stream.</p>
+    <ul>
+      <li>Layers with fit modes, flips, rotation, zoom, filters, frames and chroma key</li>
+      <li>Scenes with transitions and a Studio mode</li>
+      <li>Audio mixing with meters, voice processing and a virtual microphone</li>
+      <li>Recording and streaming to several RTMP or SRT destinations</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">anycam.desktop</launchable>
+  <url type="homepage">https://github.com/GeneticxCln/anycam</url>
+  <url type="bugtracker">https://github.com/GeneticxCln/anycam/issues</url>
+  <provides><binary>anycam</binary></provides>
+  <categories><category>AudioVideo</category><category>Video</category></categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.3.2" date="2026-11-08"/>
+  </releases>
+</component>

@@ -41,9 +41,17 @@ class EngineReport:
     record_bytes: int = 0
     record_ok: bool = False
     rtmp_url: str = ""
+    # One row per destination: url (redacted), state, error, restarts, retry_in_s.
+    rtmp_targets: list[dict] = field(default_factory=list)
     audio_inputs: list[str] = field(default_factory=list)
     # What the microphone passes through before the mixer ("" = nothing).
     mic_processing: str = ""
+    # Audio outputs: the monitor the streamer listens on and the virtual
+    # microphone node; "" is fine, otherwise why one could not be made.
+    audio_monitor: str = ""
+    audio_monitor_error: str = ""
+    virtual_mic: str = ""
+    virtual_mic_error: str = ""
     samples: list[dict] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -81,7 +89,12 @@ class EngineReport:
             "record_ok": self.record_ok,
             # The URL carries the stream key; reports are shared, so mask it.
             "rtmp_url": config.redact_url(self.rtmp_url),
+            "rtmp_targets": self.rtmp_targets,
             "audio_inputs": self.audio_inputs,
             "mic_processing": self.mic_processing,
+            "audio_monitor": self.audio_monitor,
+            "audio_monitor_error": self.audio_monitor_error,
+            "virtual_mic": self.virtual_mic,
+            "virtual_mic_error": self.virtual_mic_error,
             "samples": self.samples,
         }

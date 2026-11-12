@@ -32,11 +32,12 @@ from .canvas import CanvasMixin  # noqa: E402
 from .health import HealthMixin  # noqa: E402
 from .layers import LayerMixin  # noqa: E402
 from .outputs.record_tap import RecordTapMixin  # noqa: E402
-from .outputs.stream import StreamMixin  # noqa: E402
+from .outputs.stream import RtmpState, StreamMixin  # noqa: E402
 from .outputs.taps import VcamTapMixin  # noqa: E402
+from .transitions import TransitionMixin  # noqa: E402
 
 
-class AnyCamEngine(LayerMixin, CanvasMixin, AudioMixin, VcamTapMixin, RecordTapMixin,
+class AnyCamEngine(LayerMixin, TransitionMixin, CanvasMixin, AudioMixin, VcamTapMixin, RecordTapMixin,
                    StreamMixin, HealthMixin):
     """Build and run one scene as a GStreamer compositor graph.
 
@@ -55,6 +56,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         preview: bool = False,
         audio: bool = False,
         rtmp: str | None = None,
+        rtmp_extra: list[str] | tuple[str, ...] | None = None,
         screen_node: int | None = None,
         screen_fds: dict[str, int] | None = None,
         screen_sizes: dict[str, tuple[int, int]] | None = None,
@@ -128,6 +130,8 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         self.preview = preview
         self.audio = audio
         self.rtmp = rtmp or ""
+        # More places to publish the same encode (a second platform, a backup).
+        self.rtmp_extra = [url for url in (rtmp_extra or ()) if url and url != self.rtmp]
         self.screen_node = screen_node
         self.screen_fds = dict(screen_fds or {})
         # Portal stream sizes, keyed by layer id: used to crop a screen layer
@@ -141,6 +145,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         self.bus: Gst.Bus | None = None
         self.chains: list[SourceChain] = []
         self._layer_pads: dict[str, Gst.Pad] = {}
+        self._ghosts: list = []        # the outgoing scene's layers during a transition
         # Permanent zorder=0 standby.  It is deliberately not a scene layer:
         # no remove/add/layout operation can ever detach this pad.
         self._background_pad: Gst.Pad | None = None
@@ -156,6 +161,11 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         self._preview_gate_open = False
         self._preview_gate_deadline = 0.0
         self.media_volume: Gst.Element | None = None
+        self._layer_audio: dict[str, tuple] = {}
+        self._audio_levels: dict[str, tuple[float, float, float]] = {}
+        self._media_items: list[str] = []
+        self._media_index = 0
+        self._media_eos = False
         self.audio_tee: Gst.Element | None = None
         # Live output taps.  A valve lets the GUI stop feeding the recorder or
         # vcam without rebuilding (and therefore interrupting) the canvas.
@@ -178,6 +188,12 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         self._rtmp_appsrc: Gst.Element | None = None
         self._rtmp_audio_appsrc: Gst.Element | None = None
         self._rtmp_failed = False
+        self._canvas_base = None
+        self._rtmp_state = RtmpState()
+        self._rtmp_extras: list[RtmpState] = []
+        self._rtmp_publisher = None
+        self._rtmp_sink_factory = "rtmp2sink"
+        self._rtmp_with_audio = False
         self._rtmp_encoder: Gst.Element | None = None
         self._rtmp_feed: EncodedFeed | None = None
         self._stopped = False
@@ -237,7 +253,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
             self.pipeline.set_state(Gst.State.NULL)
         if self._vcam_pipeline is not None:
             self._vcam_pipeline.set_state(Gst.State.NULL)
-        self._teardown_rtmp()
+        self._teardown_rtmp(everything=True)
         if self._owns_pool:
             self.pool.stop()
         self._close_screen_fds()
@@ -412,6 +428,11 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         # Prefer the system clock: a USB/PipeWire microphone's clock can start
         # late and would delay the first composited frame (and the recording).
         self.pipeline.use_clock(Gst.SystemClock.obtain())
+        # The publish legs are separate pipelines fed canvas timestamps; giving
+        # them the canvas's base time makes those timestamps their running time.
+        self._canvas_base = Gst.SystemClock.obtain().get_time()
+        self.pipeline.set_start_time(Gst.CLOCK_TIME_NONE)
+        self.pipeline.set_base_time(self._canvas_base)
         # Captures must be live before the canvas prerolls, or the compositor
         # sees no active pad and the first preview frame is late.
         self.pool.start()
@@ -419,6 +440,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
             self._vcam_pipeline.set_state(Gst.State.PLAYING)
         if self._rtmp_pipeline is not None:
             self._rtmp_pipeline.set_state(Gst.State.PLAYING)
+        self.start_extra_targets()
         result = self.pipeline.set_state(Gst.State.PLAYING)
         if result == Gst.StateChangeReturn.FAILURE:
             self.report.error = "pipeline failed to start"
@@ -427,9 +449,26 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
             raise RuntimeError(self.report.error)
         return self
 
+    def _note_level(self, msg, struct) -> None:
+        """Record a ``level`` meter reading under the input it belongs to."""
+        source = msg.src.get_name() if msg.src is not None else ""
+        name = source[:-len("_level")] if source.endswith("_level") else source
+        peaks, rms = struct.get_value("peak"), struct.get_value("rms")
+        try:
+            peak = max(float(value) for value in peaks) if peaks else -100.0
+            loud = max(float(value) for value in rms) if rms else -100.0
+        except (TypeError, ValueError):
+            return
+        self._audio_levels[name] = (peak, loud, time.monotonic())
+        if name == "mic":
+            self.mic_level_db = peak
+            self.report.mic_level_db = peak
+
     def pump(self, timeout_ms: int = 50) -> list[Gst.Message]:
         if self.bus is None:
             return []
+        self.poll_transition()
+        self.service_media()
         messages: list[Gst.Message] = []
         deadline = time.monotonic() + timeout_ms / 1000.0
         while True:
@@ -458,13 +497,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
             elif msg.type == Gst.MessageType.ELEMENT:
                 struct = msg.get_structure()
                 if struct is not None and struct.get_name() == "level":
-                    peaks = struct.get_value("peak")
-                    if peaks:
-                        try:
-                            self.mic_level_db = float(peaks[0])
-                            self.report.mic_level_db = self.mic_level_db
-                        except (TypeError, ValueError):
-                            pass
+                    self._note_level(msg, struct)
             if time.monotonic() >= deadline:
                 break
         self._poll_vcam_bus()
@@ -495,6 +528,10 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         # report (0 frames, 100% dropped).  Stopping is final.
         if self.pipeline is None or self._stopped:
             return self.report.as_dict()
+        run = self._transition
+        if run is not None:
+            run.stop.set()                 # no pad is touched once teardown starts
+            self._transition = None
         self.report.stopped = time.monotonic()
         elapsed = self.report.stopped - self._start_time
         stop_frames = self._frame_count
@@ -551,7 +588,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
             self._vcam_pipeline.send_event(Gst.Event.new_eos())
             self._vcam_pipeline.set_state(Gst.State.NULL)
             self._vcam_bus = None
-        self._teardown_rtmp()
+        self._teardown_rtmp(everything=True)
         # The graph is gone: a late add_layer()/start() must see that.
         self._stopped = True
         self._release_graph()

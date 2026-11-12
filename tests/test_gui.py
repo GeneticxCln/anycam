@@ -417,7 +417,9 @@ def test_numeric_box_and_crop_fields_apply_and_clamp(app):
         window.box_spins["x"].setValue(0.5)
         assert layer.box[0] == pytest.approx(0.5)
         window.box_spins["w"].setValue(0.9)
-        assert layer.box[2] == pytest.approx(0.5)
+        assert layer.box[2] == pytest.approx(0.9)       # may run past the canvas edge
+        window.box_spins["w"].setValue(4.0)
+        assert layer.box[2] == pytest.approx(4.0)       # up to four canvases wide
 
         window.crop_spins["l"].setValue(0.3)
         assert layer.crop[0] == pytest.approx(0.3)

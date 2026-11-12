@@ -8,7 +8,7 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QDialog,
     QDialogButtonBox, QFormLayout, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox,
+    QListWidget, QMessageBox,
     QPushButton, QScrollArea, QSlider, QVBoxLayout, QWidget,
 )
 
@@ -259,3 +259,48 @@ class CameraGridDialog(QDialog):
                                 "Each grid cell must use a different camera.")
             return
         self.accept()
+
+
+
+class FirstRunDialog(QDialog):
+    """Shown once: what is ready on this machine and how to fix what is not."""
+
+    def __init__(self, results, parent=None) -> None:
+        from .. import firstrun
+
+        super().__init__(parent)
+        self.setWindowTitle("Welcome to AnyCam")
+        self.results = results
+        layout = QVBoxLayout(self)
+        ok = firstrun.ready(results)
+        heading = QLabel("Everything AnyCam needs is here." if ok else
+                         "A few things need attention before AnyCam can run everything.")
+        heading.setWordWrap(True)
+        heading.setObjectName("title")
+        layout.addWidget(heading)
+        self.rows = QListWidget()
+        for check in results:
+            mark = "\u2713" if check.ok else ("\u2717" if check.required else "\u2022")
+            text = f"{mark}  {check.title} \u2014 {check.detail}"
+            if check.fix:
+                text += f"\n      {check.fix}"
+            self.rows.addItem(text)
+        layout.addWidget(self.rows, 1)
+        buttons = QHBoxLayout()
+        copy = QPushButton("Copy report")
+        copy.clicked.connect(self.copy_report)
+        done = QPushButton("Start")
+        done.setObjectName("primary")
+        done.clicked.connect(self.accept)
+        buttons.addWidget(copy)
+        buttons.addStretch(1)
+        buttons.addWidget(done)
+        layout.addLayout(buttons)
+        self.resize(640, 420)
+
+    def copy_report(self) -> None:
+        from PySide6.QtGui import QGuiApplication
+
+        from .. import firstrun
+
+        QGuiApplication.clipboard().setText(firstrun.summary_text(self.results))

@@ -316,3 +316,258 @@ def test_effects_levels_round_trip():
 
     fx = Effects.from_dict({"red_gain": 1.25, "blue_gain": "x"})
     assert fx.red_gain == 1.25 and fx.blue_gain == 1.0
+
+
+# ---------------------------------------------------------------- transitions
+from anycam.engine import transitions  # noqa: E402
+
+
+def test_transition_steps_start_at_the_old_scene_and_end_at_the_new_one():
+    for kind in transitions.TRANSITIONS:
+        start = transitions.step_at(kind, 0.0, 320, 180)
+        end = transitions.step_at(kind, 1.0, 320, 180)
+        assert (start.in_dx, start.in_dy) != (0, 0) or kind in ("cut", "fade")
+        assert (end.in_dx, end.in_dy) == (0, 0), kind
+        assert end.in_alpha == 1.0, kind
+        assert start.out_alpha == 1.0 or kind == "cut"
+    fade_mid = transitions.step_at("fade", 0.5, 320, 180)
+    assert fade_mid.out_alpha == 0.5 and fade_mid.in_alpha == 0.5
+    slide = transitions.step_at("slide-left", 0.5, 320, 180)
+    assert slide.out_dx == -160 and slide.in_dx == 160
+    wipe = transitions.step_at("wipe-down", 0.5, 320, 180)
+    assert wipe.out_dy == 0 and wipe.in_dy == -90
+
+
+def test_transition_inputs_are_sanitised():
+    assert transitions.transition_kind("SLIDE-LEFT") == "slide-left"
+    assert transitions.transition_kind("explode") == "cut"
+    assert transitions.transition_seconds(500) == 0.5
+    assert transitions.transition_seconds(1e9) == transitions.MAX_SECONDS
+    assert transitions.transition_seconds("x") == 0.5
+    assert transitions.ease(-1) == 0.0 and transitions.ease(2) == 1.0
+
+
+def test_scene_transition_fields_round_trip():
+    scene = Scene("s", "S")
+    scene.transition, scene.transition_ms = "slide-left", 800
+    again = Scene.from_dict(scene.to_dict())
+    assert (again.transition, again.transition_ms) == ("slide-left", 800)
+    assert Scene.from_dict({"id": "x", "name": "x", "transition_ms": 99999}).transition_ms == 5000
+
+
+def two_scene_project() -> tuple[Project, Scene, Scene]:
+    project = scene_project(Layer("a", "test", "A", source="red", box=(0, 0, 1, 1), z=1))
+    first = project.scenes[0]
+    second = Scene("scene_b", "B")
+    second.add_layer(Layer("b", "test", "B", source="blue", box=(0, 0, 1, 1), z=1))
+    project.scenes.append(second)
+    return project, first, second
+
+
+def is_blue(rgb) -> bool:
+    return rgb[2] > 200 and rgb[0] < 60 and rgb[1] < 60
+
+
+def test_a_fade_blends_both_scenes_then_leaves_only_the_new_one():
+    project, _first, second = two_scene_project()
+    with Shot(project) as shot:
+        before = shot.settle(0.8)
+        assert is_red(colour_at(before, 0.5, 0.5))
+        assert shot.engine.switch_scene(second, "fade", 1.5)
+        assert shot.engine.transitioning
+        end = time.monotonic() + 0.75
+        while time.monotonic() < end:
+            shot.engine.pump(30)
+        mid = colour_at(shot.pixels, 0.5, 0.5)
+        assert mid[0] > 40 and mid[2] > 40, f"expected a red/blue blend, got {mid}"
+        end = time.monotonic() + 1.5
+        while shot.engine.transitioning and time.monotonic() < end + 1.5:
+            shot.engine.pump(30)
+        pixels = shot.settle(0.5)
+        assert not shot.engine.transitioning
+        assert is_blue(colour_at(pixels, 0.5, 0.5))
+        assert "a" not in shot.engine._layer_pads and "b" in shot.engine._layer_pads
+
+
+def test_a_slide_pushes_the_old_scene_out_to_the_left():
+    project, _first, second = two_scene_project()
+    with Shot(project) as shot:
+        shot.settle(0.8)
+        assert shot.engine.switch_scene(second, "slide-left", 1.6)
+        end = time.monotonic() + 0.8
+        while time.monotonic() < end:
+            shot.engine.pump(30)
+        mid = shot.pixels
+        # Halfway: the old red scene fills the left, the new blue one the right.
+        assert is_red(colour_at(mid, 0.15, 0.5)) or colour_at(mid, 0.15, 0.5)[0] > 150
+        assert is_blue(colour_at(mid, 0.85, 0.5)) or colour_at(mid, 0.85, 0.5)[2] > 150
+        while shot.engine.transitioning:
+            shot.engine.pump(30)
+        assert is_blue(colour_at(shot.settle(0.5), 0.05, 0.5))
+
+
+def test_a_second_switch_settles_the_first_and_cut_is_instant():
+    project, first, second = two_scene_project()
+    with Shot(project) as shot:
+        shot.settle(0.6)
+        assert shot.engine.switch_scene(second, "fade", 3.0)
+        assert shot.engine.switch_scene(first, "cut", 0.0)
+        assert not shot.engine.transitioning
+        pixels = shot.settle(0.8)
+        assert is_red(colour_at(pixels, 0.5, 0.5))
+        assert set(shot.engine._layer_pads) == {"a"}
+
+
+def test_stopping_mid_transition_is_clean():
+    project, _first, second = two_scene_project()
+    shot = Shot(project)
+    shot.engine.start()
+    shot.settle(0.6)
+    assert shot.engine.switch_scene(second, "fade", 3.0)
+    shot.engine.stop()
+    assert shot.engine._transition is None
+
+
+# ------------------------------------------------------------------- the panels
+@pytest.fixture
+def isolated_dirs(tmp_path, monkeypatch):
+    for name in ("CACHE", "CONFIG", "STATE", "DATA"):
+        monkeypatch.setenv(f"XDG_{name}_HOME", str(tmp_path / name.lower()))
+    monkeypatch.setenv("XDG_VIDEOS_DIR", str(tmp_path / "videos"))
+    monkeypatch.delenv("ANYCAM_LANG", raising=False)
+    monkeypatch.setenv("LANG", "C")
+    return tmp_path
+
+
+@pytest.fixture
+def window(isolated_dirs):
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    from anycam.gui_many import ManyCamWindow
+
+    QApplication.instance() or QApplication([])
+    project = Project(name="p3")
+    first = Scene("scene_a", "Alpha")
+    first.add_layer(Layer("l1", "test", "Ball", source="ball", box=(0, 0, 0.5, 0.5)))
+    second = Scene("scene_b", "Beta")
+    second.add_layer(Layer("l3", "test", "Bars", source="smpte"))
+    project.scenes, project.active_scene = [first, second], first.id
+    win = ManyCamWindow(project)
+    win.headless = True
+    win._persist = False
+    yield win
+    win.engine = None
+    win.close()
+
+
+def test_frame_controls_write_the_selected_layer(window):
+    layer = window.scene.layers[0]
+    window.preview.selected_id = layer.id
+    window._sync_transform_fields()
+    window.fit_combo.setCurrentIndex(window.fit_combo.findData("cover"))
+    window.flip_h_check.setChecked(True)
+    window.rotation_combo.setCurrentIndex(window.rotation_combo.findData(270))
+    window.zoom_spin.setValue(2.0)
+    window.pan_spins["x"].setValue(0.25)
+    assert (layer.fit, layer.flip_h, layer.rotation, layer.zoom, layer.pan[0]) == (
+        "cover", True, 270, 2.0, 0.25)
+    window.preview.selected_id = ""
+    window._sync_transform_fields()
+    assert not window.fit_combo.isEnabled()
+
+
+def test_box_fields_accept_a_position_off_the_canvas(window):
+    layer = window.scene.layers[0]
+    window.preview.selected_id = layer.id
+    window._sync_transform_fields()
+    window.box_spins["x"].setValue(-0.5)
+    window.box_spins["w"].setValue(2.0)
+    assert layer.box[0] == -0.5 and layer.box[2] == 2.0
+
+
+def test_the_scene_tab_sets_how_a_scene_arrives(window):
+    window.transition_combo.setCurrentIndex(window.transition_combo.findData("slide-left"))
+    window.transition_ms.setValue(900)
+    assert (window.scene.transition, window.scene.transition_ms) == ("slide-left", 900)
+    window.transition_combo.setCurrentIndex(window.transition_combo.findData("cut"))
+    assert not window.transition_ms.isEnabled()
+
+
+def test_rgb_sliders_write_the_effect_levels(window):
+    layer = window.scene.layers[0]
+    window.preview.selected_id = layer.id
+    window._sync_effects_controls()
+    window._effect_sliders["red_gain"].setValue(150)
+    window._effect_sliders["blue_gain"].setValue(40)
+    assert layer.effects.red_gain == 1.5 and layer.effects.blue_gain == 0.4
+
+
+def test_studio_mode_stages_a_scene_and_takes_it_with_cut_or_transition(window):
+    taken = []
+
+    class FakeEngine:
+        def switch_scene(self, scene, kind="cut", seconds=0.0):
+            taken.append((scene.id, kind, seconds))
+            return True
+
+        def source_sizes(self):
+            return {}
+
+        def set_layer_visible(self, *_args):
+            return True
+
+        def stop(self):
+            return {}
+
+    window.studio_check.setChecked(True)
+    assert window.next_scene_combo.isVisibleTo(window)
+    assert window.next_scene_combo.currentData() == "scene_b"
+    window.engine = FakeEngine()
+    window.take_next_scene(cut=True)
+    assert taken[-1] == ("scene_b", "cut", 0.0)
+    assert window.project.active_scene == "scene_b"
+    # Back to Alpha, whose own transition is a 700 ms slide.
+    window.project.scenes[0].transition, window.project.scenes[0].transition_ms = "slide-up", 700
+    window._refresh_next_scene()
+    window.take_next_scene(cut=False)
+    assert taken[-1] == ("scene_a", "slide-up", 0.7)
+    # A scene whose transition is "cut" still gets a fade from the Transition button.
+    window.project.scenes[1].transition = "cut"
+    window._refresh_next_scene()
+    window.take_next_scene(cut=False)
+    assert taken[-1] == ("scene_b", "fade", 0.5)
+    window.engine = None
+
+
+# ------------------------------------------------------------ rounded corners
+def test_rounded_corners_clear_the_corners_and_keep_the_middle():
+    from PIL import Image
+
+    from anycam import effects, processors
+
+    assert "round-corners" in effects.FILTERS
+    processor = processors.make_processor("corners:", 1.0)
+    picture = Image.new("RGBA", (64, 64), (200, 30, 30, 255))
+    out = np.array(processor.process(picture, 0.0))
+    assert out[0, 0, 3] == 0 and out[0, 63, 3] == 0 and out[63, 0, 3] == 0
+    assert out[32, 32, 3] == 255 and out[32, 1, 3] > 200      # the edge midpoints stay
+    assert (out[32, 32, :3] == (200, 30, 30)).all()
+    processor.set_amount(0.0)
+    assert np.array(processor.process(picture, 0.0))[0, 0, 3] == 255
+    # A rectangle rounds by its short side.
+    wide = processors.RoundCorners(0.5).process(Image.new("RGBA", (128, 32), (9, 9, 9, 255)), 0)
+    assert np.array(wide)[0, 0, 3] == 0 and np.array(wide)[16, 64, 3] == 255
+
+
+def test_the_relative_benchmark_runs_and_reports_ratios():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent.parent / "scripts" / "bench_canvas.py"
+    spec = importlib.util.spec_from_file_location("bench_canvas", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    row = module.run_case("baseline", 0.5)
+    assert row["fps"] > 5 and row["cpu_s_per_frame"] > 0
+    assert set(module.CASES) >= {"baseline", "four-layers", "rotated-cover"}

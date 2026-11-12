@@ -882,6 +882,61 @@ def video_size(path: str) -> tuple[int, int] | None:
     return None
 
 
+_MJPEG_CACHE: dict[str, bool] = {}
+
+
+def is_mjpeg_stream(url: str, timeout: float = 3.0) -> bool:
+    """Whether an http(s) address answers with a multipart MJPEG stream.
+
+    Only the response headers are read.  Any failure counts as "no" so the
+    generic decoder still gets its turn.
+    """
+    from urllib.parse import urlsplit
+
+    if urlsplit(url).scheme not in ("http", "https"):
+        return False
+    if url in _MJPEG_CACHE:
+        return _MJPEG_CACHE[url]
+    import urllib.request
+
+    found = False
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "AnyCam"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:   # noqa: S310
+            found = "multipart/x-mixed-replace" in str(response.headers.get("Content-Type", "")).lower()
+    except Exception:  # noqa: BLE001 - unreachable or odd: let the generic path try
+        found = False
+    _MJPEG_CACHE[url] = found
+    return found
+
+
+_AUDIO_PROBE_CACHE: dict[tuple[str, float], bool] = {}
+
+
+def video_has_audio(path: str) -> bool:
+    """Whether a video file carries an audio stream (probed once per file version)."""
+    import subprocess
+
+    source = Path(path).expanduser()
+    try:
+        mtime = source.stat().st_mtime
+    except OSError:
+        return False
+    key = (str(source.resolve()), mtime)
+    if key in _AUDIO_PROBE_CACHE:
+        return _AUDIO_PROBE_CACHE[key]
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+             "stream=codec_type", "-of", "csv=p=0", str(source)],
+            capture_output=True, text=True, timeout=5)
+        found = proc.returncode == 0 and "audio" in proc.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        found = False
+    _AUDIO_PROBE_CACHE[key] = found
+    return found
+
+
 def _image_pixel_size(path: Path) -> tuple[int, int] | None:
     """Natural pixel size of an image file, or ``None`` when unreadable."""
     try:

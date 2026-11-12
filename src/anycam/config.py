@@ -130,6 +130,11 @@ def redact_text(text: str, *urls: str) -> str:
             continue
         text = text.replace(url, redact_url(url))
         parts = urlsplit(url)
+        # An SRT passphrase travels in the query string.
+        for pair in parts.query.split("&"):
+            name, _, value = pair.partition("=")
+            if name.lower() in ("passphrase", "streamid", "key") and len(value) >= 4:
+                text = text.replace(value, "***")
         # The userinfo pattern below removes ``user:pw@`` wherever it appears;
         # this catches the bare password, but not a short one that would also
         # match ordinary words.
@@ -344,6 +349,20 @@ def list_audio_sources() -> list[AudioSource]:
         )
         sources.append(AudioSource(name=name, description=description, is_monitor=is_monitor))
     return sources
+
+
+def list_audio_sinks() -> list[AudioSource]:
+    """Playback devices (for the audio monitor); empty when pactl cannot list them."""
+    code, out = run(["pactl", "-f", "json", "list", "sinks"])
+    if code != 0:
+        return []
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return []
+    return [AudioSource(name=item.get("name", ""), description=item.get("description", ""),
+                        is_monitor=False)
+            for item in data if isinstance(item, dict) and item.get("name")]
 
 
 def microphone() -> str:
@@ -968,3 +987,26 @@ def system_summary() -> dict:
         "session": os.environ.get("XDG_SESSION_TYPE", ""),
         "desktop": os.environ.get("XDG_CURRENT_DESKTOP", ""),
     }
+
+
+def disk_free_mb(path) -> int:
+    """MiB free on the filesystem holding ``path`` (its nearest existing parent)."""
+    import shutil
+
+    target = Path(path).expanduser()
+    while not target.exists() and target != target.parent:
+        target = target.parent
+    try:
+        return int(shutil.disk_usage(target).free // (1024 * 1024))
+    except OSError:
+        return 1 << 30        # unknown: do not block a recording on a failed probe
+
+
+def disk_guard(path, minimum_mb: int) -> str:
+    """"" when ``path`` has at least ``minimum_mb`` MiB free, else a message."""
+    if minimum_mb <= 0:
+        return ""
+    free = disk_free_mb(path)
+    if free >= minimum_mb:
+        return ""
+    return f"only {free} MiB free where recordings are saved (the limit is {minimum_mb} MiB)"
