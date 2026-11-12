@@ -490,6 +490,8 @@ class OutputConfig:
     record_bitrate_kbps: int = 0
     stream_bitrate_kbps: int = 0
     record_min_free_mb: int = 500
+    # Let a paired phone switch scenes, mute and record from its browser (/remote).
+    phone_control: bool = False
     # More destinations that receive the same encode as ``rtmp_url``.
     rtmp_extra_urls: list[str] = field(default_factory=list)
     # H.264 encoder for recordings: auto prefers NVENC when a working NVIDIA

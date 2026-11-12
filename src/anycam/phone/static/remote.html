@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111318">
+<title>AnyCam remote</title>
+<style>
+  :root { color-scheme: dark; --bg: #111318; --panel: #1b1e26; --text: #e8e9ee;
+          --muted: #9aa0ad; --accent: #6aa5ff; --ok: #4fd18b; --bad: #ff6b6b; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); padding: 16px 16px 32px;
+         font: 16px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 12px; }
+  h2 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; margin: 20px 0 8px; }
+  #message { color: var(--muted); min-height: 1.4em; }
+  #message.error { color: var(--bad); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(8.5rem, 1fr)); gap: 10px; }
+  button { min-height: 56px; border: 0; border-radius: 12px; background: #2a2f3b; color: var(--text);
+           font: inherit; padding: 8px 12px; }
+  button.on { background: var(--accent); color: #0b1020; font-weight: 600; }
+  button.rec.on { background: var(--bad); color: #fff; }
+  button:disabled { opacity: .45; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+  <h1>AnyCam remote</h1>
+  <div id="message" role="status">Connecting…</div>
+  <h2>Scenes</h2>
+  <div id="scenes" class="grid"></div>
+  <h2>Controls</h2>
+  <div class="grid">
+    <button id="mute">Microphone</button>
+    <button id="record" class="rec">Record</button>
+  </div>
+  <p><a href="/">Phone camera</a></p>
+  <script src="remote.js"></script>
+</body>
+</html>

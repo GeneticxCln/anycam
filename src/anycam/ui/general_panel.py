@@ -49,6 +49,20 @@ class GeneralPanelMixin:
 
         layout.addWidget(self._motion_group())
 
+        remote_box = QGroupBox("Phone remote")
+        remote_layout = QVBoxLayout(remote_box)
+        self.phone_control_check = QCheckBox(
+            "Let paired phones switch scenes, mute and record (page: /remote)")
+        self.phone_control_check.setChecked(self.project.output.phone_control)
+        self.phone_control_check.toggled.connect(self.set_phone_control)
+        remote_note = QLabel("A phone must be paired first (Add \u2192 Phone camera). Control stays on your "
+                             "local network and only works for paired phones.")
+        remote_note.setObjectName("muted")
+        remote_note.setWordWrap(True)
+        remote_layout.addWidget(self.phone_control_check)
+        remote_layout.addWidget(remote_note)
+        layout.addWidget(remote_box)
+
         panel_box = QGroupBox("Floating panel")
         panel_layout = QVBoxLayout(panel_box)
         self.panel_check = QCheckBox("Show a small always-on-top panel (round preview, record, mute, scenes)")

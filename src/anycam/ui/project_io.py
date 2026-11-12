@@ -339,3 +339,6 @@ class ProjectIOMixin:
         self.music_list.clear()
         self.music_list.addItems(audio.media_playlist)
         self.load_motion_widgets()
+        quietly(self.phone_control_check, lambda w: w.setChecked(out.phone_control))
+        if self._phone_service is not None:
+            self._phone_service.control_enabled = bool(out.phone_control)

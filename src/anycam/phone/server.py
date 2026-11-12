@@ -34,7 +34,12 @@ MAX_CONNECTIONS = 32
 HANDSHAKE_TIMEOUT_S = 15
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/index.html": ("index.html", "text/html; charset=utf-8"),
-          "/phone.js": ("phone.js", "text/javascript; charset=utf-8")}
+          "/phone.js": ("phone.js", "text/javascript; charset=utf-8"),
+          "/remote": ("remote.html", "text/html; charset=utf-8"),
+          "/remote.js": ("remote.js", "text/javascript; charset=utf-8")}
+
+# What a paired phone may ask the remote page to do (everything else is refused).
+CONTROL_ACTIONS = ("scene", "mute", "record")
 
 EventHandler = Callable[[str, str, str], None]
 
@@ -159,6 +164,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(401, {"error": "not paired"})
             return self._json(200, {"device": device,
                                     "name": self.server.service.pairing.name(device)})
+        if path == "/api/control/state":
+            device = self._device()
+            if device is None:
+                return self._json(401, {"error": "not paired"})
+            reply = self.server.service.control("state", {}, device)
+            return self._json(200 if "error" not in reply else 403, reply)
         static = STATIC.get(path)
         if static is None:
             return self._send(404, b"not found", "text/plain")
@@ -187,6 +198,19 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             name = service.pairing.name(device)
             service.emit("paired", device)
             return self._json(200, {"device": device, "secret": secret, "name": name})
+        if path == "/api/control":
+            device = self._device()
+            if device is None:
+                return self._json(401, {"error": "not paired"})
+            try:
+                data = json.loads(body or b"{}")
+            except ValueError:
+                return self._json(400, {"error": "bad request"})
+            action = data.get("action") if isinstance(data, dict) else None
+            if action not in CONTROL_ACTIONS:
+                return self._json(400, {"error": "unknown action"})
+            reply = service.control(action, data, device)
+            return self._json(200 if "error" not in reply else 403, reply)
         if path == "/api/whip":
             device = self._device()
             if device is None:
@@ -232,6 +256,10 @@ class PhoneService:
         self._lock = threading.Lock()
         self.receivers: dict[str, object] = {}
         self._sessions: dict[str, str] = {}
+        # The remote page: off until the user allows it, then ``control_handler``
+        # (set by the window) runs each request on the UI thread.
+        self.control_enabled = False
+        self.control_handler: Callable[[str, dict, str], dict] | None = None
 
     # -------------------------------------------------------------- lifecycle
     @property
@@ -296,6 +324,19 @@ class PhoneService:
             self.on_event(event, device, detail or name)
         except Exception as exc:  # noqa: BLE001
             print(f"[phone] event handler failed: {exc}", file=sys.stderr, flush=True)
+
+    def control(self, action: str, data: dict, device: str) -> dict:
+        """Run a remote-control request; ``{"error": ...}`` when it is not allowed."""
+        if not self.control_enabled:
+            return {"error": "Remote control is switched off in AnyCam."}
+        handler = self.control_handler
+        if handler is None:
+            return {"error": "AnyCam is not ready for remote control."}
+        try:
+            return handler(action, {key: data.get(key) for key in ("scene_id", "value")}, device)
+        except Exception as exc:  # noqa: BLE001 - never a stack trace to a phone
+            print(f"[phone] control {action}: {exc}", file=sys.stderr, flush=True)
+            return {"error": "AnyCam could not do that."}
 
     def forget(self, device: str) -> None:
         self._drop(device)

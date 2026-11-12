@@ -89,6 +89,7 @@ class AnyCamWindow(GeneralPanelMixin, EffectsPanelMixin, DrawMixin, BackdropMixi
         self._phone_dialog: PhonePairDialog | None = None
         self._phone_events = PhoneEvents(self)
         self._phone_events.event.connect(self._on_phone_event)
+        self._phone_events.control.connect(self._phone_control_run)
         # Desktop integration (tray icon, portal global shortcuts); started by
         # run_gui for the real window, never for tests or screenshots.
         self._tray = None

@@ -23,6 +23,7 @@ class PhoneEvents(QObject):
     """Carries phone-link events from network threads to the UI thread."""
 
     event = Signal(str, str, str)  # event, device id, name/detail
+    control = Signal(object)       # a remote-control request, run on the UI thread
 
 
 class PhonePairDialog(QDialog):
