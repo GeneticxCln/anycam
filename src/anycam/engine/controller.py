@@ -188,6 +188,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         self._rtmp_appsrc: Gst.Element | None = None
         self._rtmp_audio_appsrc: Gst.Element | None = None
         self._rtmp_failed = False
+        self._canvas_base = None
         self._rtmp_state = RtmpState()
         self._rtmp_extras: list[RtmpState] = []
         self._rtmp_publisher = None
@@ -427,6 +428,11 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         # Prefer the system clock: a USB/PipeWire microphone's clock can start
         # late and would delay the first composited frame (and the recording).
         self.pipeline.use_clock(Gst.SystemClock.obtain())
+        # The publish legs are separate pipelines fed canvas timestamps; giving
+        # them the canvas's base time makes those timestamps their running time.
+        self._canvas_base = Gst.SystemClock.obtain().get_time()
+        self.pipeline.set_start_time(Gst.CLOCK_TIME_NONE)
+        self.pipeline.set_base_time(self._canvas_base)
         # Captures must be live before the canvas prerolls, or the compositor
         # sees no active pad and the first preview frame is late.
         self.pool.start()

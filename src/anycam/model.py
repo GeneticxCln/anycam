@@ -464,6 +464,12 @@ class OutputConfig:
     # ignored: recordings always went to ~/Videos/AnyCam regardless.
     record_dir: str = ""
     rtmp_url: str = ""
+    # Video bitrate in kbit/s for recordings and for the stream; 0 follows the
+    # codec and canvas size.  The disk guard stops a recording when the folder
+    # has less than ``record_min_free_mb`` MiB left (0 turns the guard off).
+    record_bitrate_kbps: int = 0
+    stream_bitrate_kbps: int = 0
+    record_min_free_mb: int = 500
     # More destinations that receive the same encode as ``rtmp_url``.
     rtmp_extra_urls: list[str] = field(default_factory=list)
     # H.264 encoder for recordings: auto prefers NVENC when a working NVIDIA
@@ -488,6 +494,10 @@ class OutputConfig:
         output.rtmp_extra_urls = ([url.strip() for url in raw if isinstance(url, str) and url.strip()]
                                   if isinstance(raw, list) else [])
         defaults = cls()
+        for name in ("record_bitrate_kbps", "stream_bitrate_kbps"):
+            value = getattr(output, name)
+            setattr(output, name, 0 if value <= 0 else max(500, min(200_000, value)))
+        output.record_min_free_mb = max(0, min(1_000_000, output.record_min_free_mb))
         # A canvas or rate the encoder cannot use would only fail later.
         if output.canvas_w < 2 or output.canvas_h < 2:
             output.canvas_w, output.canvas_h = defaults.canvas_w, defaults.canvas_h

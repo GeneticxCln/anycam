@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
-from .. import config, overlay
+from .. import config, overlay, streaming
 from ..engine.outputs.recorder import Recorder
 from ..engine.outputs.vcam import VcamOutput
 from ..pipeline import recording_codec
@@ -28,6 +28,10 @@ class OutputsMixin:
         url = self.rtmp_edit.text().strip()
         if not self.live and not url:
             self._status("Set an RTMP URL before going live")
+            return
+        problem = streaming.validate_stream_url(url) if not self.live else ""
+        if problem:
+            self._status(f"Cannot go live: {problem}")
             return
         self.live = not self.live
         self.live_button.setText("Stop stream" if self.live else "Go Live")
@@ -457,6 +461,11 @@ class OutputsMixin:
                 self.engine.detach_recorder()
             self._finish_recorder()
             return
+        problem = config.disk_guard(config.recordings_dir(self.project.output.record_dir),
+                                    self.project.output.record_min_free_mb)
+        if problem:
+            self._status(f"Recording not started: {problem}")
+            return
         self.recording = True
         self._segment_index = 0
         self.recording_segments = []
@@ -488,6 +497,25 @@ class OutputsMixin:
             self.record_button.setText("Record")
         else:
             self._status(f"Recording to {self._recording_path}")
+
+    DISK_CHECK_EVERY_S = 5.0
+
+    def check_disk_guard(self, now: float | None = None) -> bool:
+        """Stop a recording that is about to fill the disk; True when it did."""
+        import time as _time
+
+        now = _time.monotonic() if now is None else now
+        if not self.recording or now - getattr(self, "_disk_checked", 0.0) < self.DISK_CHECK_EVERY_S:
+            return False
+        self._disk_checked = now
+        problem = config.disk_guard(config.recordings_dir(self.project.output.record_dir),
+                                    self.project.output.record_min_free_mb)
+        if not problem:
+            return False
+        self.toggle_record()
+        self._status(f"Recording stopped and saved: {problem}")
+        self.log_event(f"recording stopped by the disk guard: {problem}")
+        return True
 
     def toggle_vcam(self) -> None:
         self.vcam_on = not self.vcam_on

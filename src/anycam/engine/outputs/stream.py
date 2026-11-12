@@ -12,6 +12,7 @@ gi.require_version("GstVideo", "1.0")
 from gi.repository import Gst  # noqa: E402
 
 from ... import config  # noqa: E402
+from ...streaming import is_srt  # noqa: E402
 from ...sources import (caps_filter, make)
 from ...engine.encoders import (ENCODER_FACTORIES, ENCODER_PARSERS, ENCODER_BITRATES, ENCODER_LABELS, _NVENC_TTL_S, _nvenc_seen, encoder_bitrate, nvenc_available, _probe_nvenc, _va_encodes, va_factory, va_present, EncoderPlan, _requested_codec, _wants_va, encoder_plan, recording_codec, EncodedFeed, force_keyframe)  # noqa: E402,F401
 from ...engine.report import (EngineReport)  # noqa: E402,F401
@@ -19,6 +20,24 @@ from ...engine.audio_helpers import (MIC_DENOISE_LEVELS, mic_dsp_wanted, describ
 from ...engine.canvas_helpers import (GL_MIXER_LATENCY_NS, canvas_requested, gl_canvas_problem, _empty_drawing)  # noqa: E402,F401
 
 Gst.init(None)
+
+
+# Video encoders stamp DTS/PTS a long way ahead (1000 hours) so that DTS can
+# never be negative.  FLV ignores the base; an MPEG-TS muxer on a live clock would
+# wait that long before sending anything, so the SRT leg takes it off again.
+ENCODER_TS_OFFSET = 1000 * 3600 * Gst.SECOND
+
+
+def without_encoder_offset(sample):
+    """A copy of ``sample`` whose timestamps no longer carry the encoder's offset."""
+    buffer = sample.get_buffer()
+    if buffer is None or buffer.pts == Gst.CLOCK_TIME_NONE or buffer.pts < ENCODER_TS_OFFSET // 2:
+        return sample
+    copy = buffer.copy()
+    copy.pts = buffer.pts - ENCODER_TS_OFFSET
+    if buffer.dts != Gst.CLOCK_TIME_NONE:
+        copy.dts = max(0, buffer.dts - ENCODER_TS_OFFSET)
+    return Gst.Sample.new(copy, sample.get_caps(), sample.get_segment(), None)
 
 
 @dataclass
@@ -32,6 +51,7 @@ class Publisher:
     audio_src: Gst.Element | None
     feed: EncodedFeed
     first_data: float = 0.0
+    srt: bool = False
 
 
 @dataclass
@@ -76,12 +96,14 @@ class StreamMixin:
         # Check before attaching the canvas branch: a missing plugin used to
         # abort the whole build and leave a recording session running with no
         # preview.  Report it and keep the other outputs alive instead.
-        sink_factory = ("rtmp2sink" if Gst.ElementFactory.find("rtmp2sink")
-                        else "rtmpsink")
+        srt = is_srt(url)
+        sink_factory = ("srtsink" if srt else
+                        "rtmp2sink" if Gst.ElementFactory.find("rtmp2sink") else "rtmpsink")
         # FLV/RTMP carries H.264/AAC, not HEVC or AV1.  A saved H.265/AV1
         # recording preference therefore selects H.264 NVENC for this branch.
         plan = encoder_plan(self._encoder_preference(), purpose="rtmp")
-        missing = [name for name in (sink_factory, "flvmux", plan.factory, plan.parser)
+        missing = [name for name in (sink_factory, "mpegtsmux" if srt else "flvmux",
+                                     plan.factory, plan.parser)
                    if Gst.ElementFactory.find(name) is None]
         if missing:
             self.report.rtmp_error = (
@@ -140,40 +162,72 @@ class StreamMixin:
         output = Gst.Pipeline.new(name)
         video_src = make("appsrc", f"{prefix}_video_src", format=Gst.Format.TIME,
                          is_live=True)
-        video_src.set_property(
-            "caps", Gst.Caps.from_string("video/x-h264,stream-format=avc,alignment=au"))
+        # MPEG-TS leaves the caps unset: they come, with the encoder's
+        # codec_data, from the first sample (h264parse needs that to convert).
+        if not is_srt(url):
+            video_src.set_property("caps", Gst.Caps.from_string(
+                "video/x-h264,stream-format=avc,alignment=au"))
         video_src.set_property("max-buffers", 8)
         video_src.set_property("block", False)
-        mux = make("flvmux", f"{prefix}_mux", streamable=True)
-        sink = make(self._rtmp_sink_factory, f"{prefix}_sink", location=url, sync=False)
+        srt = is_srt(url)
+        if srt:
+            # MPEG-TS wants Annex-B H.264 and ADTS AAC, not the FLV forms.
+            # 7 TS packets = 1316 bytes: SRT's live mode drops larger messages,
+            # and an I-frame is far bigger than that.
+            mux = make("mpegtsmux", f"{prefix}_mux", alignment=7)
+            sink = make("srtsink", f"{prefix}_sink", uri=url, sync=False)
+        else:
+            mux = make("flvmux", f"{prefix}_mux", streamable=True)
+            sink = make(self._rtmp_sink_factory, f"{prefix}_sink", location=url, sync=False)
         output.add(video_src)
         output.add(mux)
         output.add(sink)
-        if not video_src.link(mux):
+        if srt:
+            parse = make("h264parse", f"{prefix}_ts_parse", config_interval=-1)
+            annexb = caps_filter("video/x-h264,stream-format=byte-stream,alignment=au",
+                                 f"{prefix}_annexb")
+            output.add(parse)
+            output.add(annexb)
+            if not (video_src.link(parse) and parse.link(annexb) and annexb.link(mux)):
+                raise RuntimeError("could not link SRT video into mpegtsmux")
+        elif not video_src.link(mux):
             raise RuntimeError("could not link RTMP video into flvmux")
         audio_src = None
         if self._rtmp_with_audio:
             audio_src = make("appsrc", f"{prefix}_audio_src", format=Gst.Format.TIME,
                              is_live=True)
-            audio_src.set_property(
-                "caps", Gst.Caps.from_string("audio/mpeg,mpegversion=4,stream-format=raw"))
+            if not srt:
+                audio_src.set_property("caps", Gst.Caps.from_string(
+                    "audio/mpeg,mpegversion=4,stream-format=raw"))
             audio_src.set_property("max-buffers", 2)
             audio_src.set_property("block", False)
             self._set_leaky(audio_src)
             output.add(audio_src)
-            if not audio_src.link(mux):
+            if srt:
+                aparse = make("aacparse", f"{prefix}_ts_aparse")
+                adts = caps_filter("audio/mpeg,mpegversion=4,stream-format=adts",
+                                   f"{prefix}_adts")
+                output.add(aparse)
+                output.add(adts)
+                if not (audio_src.link(aparse) and aparse.link(adts) and adts.link(mux)):
+                    raise RuntimeError("could not link SRT audio into mpegtsmux")
+            elif not audio_src.link(mux):
                 raise RuntimeError("could not link RTMP audio into flvmux")
         if not mux.link(sink):
             raise RuntimeError(f"could not link flvmux into {self._rtmp_sink_factory}")
+        if self._canvas_base is not None:
+            output.use_clock(Gst.SystemClock.obtain())
+            output.set_start_time(Gst.CLOCK_TIME_NONE)
+            output.set_base_time(self._canvas_base)
         feed = EncodedFeed(video_src, lambda: force_keyframe(self._rtmp_encoder))
-        publisher = Publisher(url, output, output.get_bus(), video_src, audio_src, feed)
+        publisher = Publisher(url, output, output.get_bus(), video_src, audio_src, feed, srt=srt)
         pad = sink.get_static_pad("sink")
         if pad is not None:
             def on_data(_pad, _info, publisher=publisher):
                 publisher.first_data = time.monotonic()
                 return Gst.PadProbeReturn.REMOVE
 
-            pad.add_probe(Gst.PadProbeType.BUFFER, on_data)
+            pad.add_probe(Gst.PadProbeType.BUFFER | Gst.PadProbeType.BUFFER_LIST, on_data)
         return publisher
 
     def _adopt_primary(self, publisher: "Publisher") -> None:
@@ -206,11 +260,14 @@ class StreamMixin:
         if sample is None:
             return Gst.FlowReturn.OK
         feed = self._rtmp_feed
+        publisher = self._rtmp_publisher
         if feed is not None and not self._rtmp_failed:
-            feed.push(sample)
+            feed.push(without_encoder_offset(sample)
+                      if publisher is not None and publisher.srt else sample)
         for state in self._rtmp_extras:
             if state.publisher is not None and not state.failed_flag:
-                state.publisher.feed.push(sample)
+                state.publisher.feed.push(
+                    without_encoder_offset(sample) if state.publisher.srt else sample)
         return Gst.FlowReturn.OK
 
     def _on_rtmp_audio_sample(self, sink):

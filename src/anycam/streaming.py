@@ -15,7 +15,11 @@ PRESETS: dict[str, tuple[str, str]] = {
     "kick": ("Kick", "rtmps://fa723fc1b171.global-contribute.live-video.net:443/app"),
     "custom": ("Custom", ""),
 }
-SCHEMES = ("rtmp", "rtmps")
+SCHEMES = ("rtmp", "rtmps", "srt")
+
+
+def is_srt(url: str) -> bool:
+    return (url or "").strip().lower().startswith("srt://")
 
 
 def preset_url(preset: str, key: str) -> str:
@@ -41,7 +45,8 @@ def validate_stream_url(url: str) -> str:
     text = (url or "").strip()
     if not text:
         return "the stream address is empty"
-    if any(ch in text for ch in " \t\r\n\"'`;|&<>\\"):
+    forbidden = " \t\r\n\"'`;|<>\\" + ("" if is_srt(text) else "&")
+    if any(ch in text for ch in forbidden):
         return "the stream address contains spaces or shell characters"
     try:
         parts = urlsplit(text)
@@ -49,11 +54,13 @@ def validate_stream_url(url: str) -> str:
     except ValueError:
         return "the stream address is not a valid URL"
     if parts.scheme.lower() not in SCHEMES:
-        return "the stream address must start with rtmp:// or rtmps://"
+        return "the stream address must start with rtmp://, rtmps:// or srt://"
     if not parts.hostname:
         return "the stream address has no host"
     if port is not None and not 0 < port < 65536:
         return "the stream address has an invalid port"
+    if parts.scheme.lower() == "srt":
+        return "" if port else "an srt:// address needs a port, like srt://host:9000"
     if parts.path.strip("/") == "":
         return "the stream address has no application or stream key"
     return ""

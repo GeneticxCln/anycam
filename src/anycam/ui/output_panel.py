@@ -5,11 +5,12 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QComboBox, QGridLayout, QGroupBox, QLabel, QLineEdit,
+    QComboBox, QGridLayout, QGroupBox, QLabel, QLineEdit, QListWidget,
     QPushButton, QSpinBox,
     QVBoxLayout, QWidget,
 )
 
+from .. import config, streaming
 from ..engine.outputs.vcam import pipewire_available
 from ..pipeline import nvenc_available, va_present
 from .theme import STYLE  # noqa: F401
@@ -30,19 +31,180 @@ class OutputPanelMixin:
         self.rtmp_edit.setPlaceholderText("rtmp://host/live/stream-key")
         self.rtmp_edit.textChanged.connect(lambda *_: self._mark_dirty())
         grid.addWidget(QLabel("RTMP URL"), 0, 0)
-        grid.addWidget(self.rtmp_edit, 0, 1)
+        grid.addWidget(self.rtmp_edit, 0, 1, 1, 2)
+        self.stream_preset = QComboBox()
+        for key, (label, _base) in streaming.PRESETS.items():
+            self.stream_preset.addItem(label, key)
+        self.stream_key_edit = QLineEdit()
+        self.stream_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.stream_key_edit.setPlaceholderText("stream key")
+        preset, key = streaming.split_url(self.project.output.rtmp_url)
+        self.stream_preset.setCurrentIndex(max(0, self.stream_preset.findData(preset)))
+        if preset != "custom":
+            self.stream_key_edit.setText(key)
+        self.stream_preset.currentIndexChanged.connect(self._stream_preset_changed)
+        self.stream_key_edit.textEdited.connect(self._stream_preset_changed)
+        grid.addWidget(QLabel("Platform"), 1, 0)
+        grid.addWidget(self.stream_preset, 1, 1)
+        grid.addWidget(self.stream_key_edit, 1, 2)
+        self.stream_bitrate = QSpinBox()
+        self.stream_bitrate.setRange(0, 200_000)
+        self.stream_bitrate.setSingleStep(500)
+        self.stream_bitrate.setSpecialValueText("Automatic")
+        self.stream_bitrate.setSuffix(" kbit/s")
+        self.stream_bitrate.setValue(self.project.output.stream_bitrate_kbps)
+        self.stream_bitrate.setKeyboardTracking(False)
+        self.stream_bitrate.valueChanged.connect(self._stream_bitrate_changed)
+        grid.addWidget(QLabel("Video bitrate"), 2, 0)
+        grid.addWidget(self.stream_bitrate, 2, 1, 1, 2)
+        grid.addWidget(QLabel("Also publish to"), 3, 0)
+        self.extra_list = QListWidget()
+        self.extra_list.setMaximumHeight(70)
+        self.extra_list.addItems(self.project.output.rtmp_extra_urls)
+        grid.addWidget(self.extra_list, 3, 1, 1, 2)
+        self.extra_edit = QLineEdit()
+        self.extra_edit.setPlaceholderText("another rtmp:// or rtmps:// address")
+        self.extra_edit.returnPressed.connect(self._add_extra_destination)
+        add = QPushButton("Add")
+        add.clicked.connect(self._add_extra_destination)
+        remove = QPushButton("Remove")
+        remove.clicked.connect(self._remove_extra_destination)
+        grid.addWidget(self.extra_edit, 4, 1)
+        grid.addWidget(add, 4, 2)
+        grid.addWidget(remove, 5, 2)
         self.live_button = QPushButton("Go Live")
         self.live_button.setObjectName("primary")
         self.live_button.clicked.connect(self.toggle_live)
-        grid.addWidget(self.live_button, 1, 0, 1, 2)
+        grid.addWidget(self.live_button, 6, 0, 1, 3)
+        self.stream_status = QLabel("")
+        self.stream_status.setWordWrap(True)
+        grid.addWidget(self.stream_status, 7, 0, 1, 3)
         live_note = QLabel("The saved URL is used only while Go Live is on; "
-                           "starting preview never publishes.")
+                           "starting preview never publishes. A dropped connection is "
+                           "retried after 1, 2, 4 \u2026 30 seconds.")
         live_note.setObjectName("muted")
         live_note.setWordWrap(True)
-        grid.addWidget(live_note, 2, 0, 1, 2)
+        grid.addWidget(live_note, 8, 0, 1, 3)
         layout.addWidget(box)
         layout.addStretch(1)
         return page
+
+    def _recording_group(self) -> QGroupBox:
+        box = QGroupBox("Recording")
+        grid = QGridLayout(box)
+        self.record_dir_edit = QLineEdit(self.project.output.record_dir)
+        self.record_dir_edit.setPlaceholderText(str(config.recordings_dir("")))
+        self.record_dir_edit.editingFinished.connect(self._recording_settings_changed)
+        browse = QPushButton("Browse")
+        browse.clicked.connect(self._pick_record_dir)
+        self.record_bitrate = QSpinBox()
+        self.record_bitrate.setRange(0, 200_000)
+        self.record_bitrate.setSingleStep(500)
+        self.record_bitrate.setSpecialValueText("Automatic")
+        self.record_bitrate.setSuffix(" kbit/s")
+        self.record_bitrate.setValue(self.project.output.record_bitrate_kbps)
+        self.record_bitrate.setKeyboardTracking(False)
+        self.record_bitrate.valueChanged.connect(self._recording_settings_changed)
+        self.record_min_free = QSpinBox()
+        self.record_min_free.setRange(0, 1_000_000)
+        self.record_min_free.setSingleStep(100)
+        self.record_min_free.setSpecialValueText("Off")
+        self.record_min_free.setSuffix(" MiB")
+        self.record_min_free.setValue(self.project.output.record_min_free_mb)
+        self.record_min_free.setKeyboardTracking(False)
+        self.record_min_free.valueChanged.connect(self._recording_settings_changed)
+        self.record_free_label = QLabel("")
+        self.record_free_label.setObjectName("muted")
+        grid.addWidget(QLabel("Save to"), 0, 0)
+        grid.addWidget(self.record_dir_edit, 0, 1)
+        grid.addWidget(browse, 0, 2)
+        grid.addWidget(QLabel("Video bitrate"), 1, 0)
+        grid.addWidget(self.record_bitrate, 1, 1, 1, 2)
+        grid.addWidget(QLabel("Stop when free space is under"), 2, 0)
+        grid.addWidget(self.record_min_free, 2, 1, 1, 2)
+        grid.addWidget(self.record_free_label, 3, 0, 1, 3)
+        self._update_record_free()
+        return box
+
+    def _pick_record_dir(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+
+        path = QFileDialog.getExistingDirectory(self, "Recordings folder",
+                                                self.record_dir_edit.text() or "")
+        if path:
+            self.record_dir_edit.setText(path)
+            self._recording_settings_changed()
+
+    def _recording_settings_changed(self, *_args) -> None:
+        out = self.project.output
+        out.record_dir = self.record_dir_edit.text().strip()
+        out.record_bitrate_kbps = int(self.record_bitrate.value())
+        out.record_min_free_mb = int(self.record_min_free.value())
+        self._update_record_free()
+        self._mark_dirty()
+
+    def _update_record_free(self) -> None:
+        folder = config.recordings_dir(self.project.output.record_dir)
+        self.record_free_label.setText(
+            f"{config.disk_free_mb(folder) / 1024:.1f} GiB free in {folder}")
+
+    def _stream_preset_changed(self, *_args) -> None:
+        preset = str(self.stream_preset.currentData() or "custom")
+        if preset == "custom":
+            return
+        self.rtmp_edit.setText(streaming.preset_url(preset, self.stream_key_edit.text()))
+
+    def _stream_bitrate_changed(self, value: int) -> None:
+        self.project.output.stream_bitrate_kbps = int(value)
+        self._mark_dirty()
+
+    def add_extra_destination(self, url: str) -> str:
+        """Add a destination; returns "" or why it was refused."""
+        url = url.strip()
+        problem = streaming.validate_stream_url(url)
+        if not problem and (url == self.rtmp_edit.text().strip()
+                            or url in self.project.output.rtmp_extra_urls):
+            problem = "that address is already in the list"
+        if problem:
+            self._status(problem)
+            return problem
+        self.project.output.rtmp_extra_urls.append(url)
+        self.extra_list.addItem(url)
+        self._mark_dirty()
+        if self.live and self.engine is not None:
+            self.restart_engine()
+        return ""
+
+    def _add_extra_destination(self) -> None:
+        if not self.add_extra_destination(self.extra_edit.text()):
+            self.extra_edit.clear()
+
+    def _remove_extra_destination(self) -> None:
+        row = self.extra_list.currentRow()
+        if row < 0 or row >= len(self.project.output.rtmp_extra_urls):
+            return
+        del self.project.output.rtmp_extra_urls[row]
+        self.extra_list.takeItem(row)
+        self._mark_dirty()
+        if self.live and self.engine is not None:
+            self.restart_engine()
+
+    def update_stream_status(self) -> None:
+        label = getattr(self, "stream_status", None)
+        if label is None:
+            return
+        rows = self.engine.report.rtmp_targets if self.engine is not None else []
+        icons = {"live": "\u25cf live", "connecting": "\u25cc connecting",
+                 "waiting": "\u21bb reconnecting", "failed": "\u2715 failed", "off": "off"}
+        lines = []
+        for row in rows:
+            text = f"{icons.get(row['state'], row['state'])}  {row['url']}"
+            if row["state"] == "waiting" and row.get("retry_in_s"):
+                text += f"  (retry in {row['retry_in_s']:.0f} s)"
+            if row["error"] and row["state"] != "live":
+                text += f"\n    {row['error'][:140]}"
+            lines.append(text)
+        label.setText("\n".join(lines))
 
     def _output_tab(self) -> QWidget:
         page = QWidget()
@@ -114,6 +276,8 @@ class OutputPanelMixin:
         encoder_note.setWordWrap(True)
         encoder_grid.addWidget(encoder_note, 1, 0, 1, 2)
         layout.addWidget(encoder_box)
+
+        layout.addWidget(self._recording_group())
 
         effects_box = QGroupBox("AI effects")
         effects_grid = QGridLayout(effects_box)
