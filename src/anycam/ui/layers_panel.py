@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .. import animated, config, geometry
+from .. import animated, config, content, geometry
 from ..geometry import clamp
 from ..model import (Layer, new_id)
 from .theme import STYLE  # noqa: F401
@@ -448,6 +448,14 @@ class LayersMixin:
                 if not ok:
                     return None
             uri = source.strip()
+            if content.needs_resolving(uri):
+                # A video-site page is not a stream: ask yt-dlp for the real address.
+                self._status("Looking up the stream\u2026")
+                resolved, problem = self._run_with_ui(lambda: content.resolve_stream(uri))
+                if problem:
+                    self._status(problem)
+                    return None
+                uri = resolved
             parsed = urlparse(uri)
             if (parsed.scheme.lower() not in ("rtsp", "rtsps", "http", "https")
                     or not parsed.netloc):

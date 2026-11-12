@@ -1,15 +1,24 @@
 """Settings > General: language, project files and keyboard shortcuts."""
 from __future__ import annotations
 
+import shutil
+import subprocess
+
+import numpy as np
 from PySide6.QtGui import QKeySequence
-from PySide6.QtWidgets import (QComboBox, QGroupBox, QHBoxLayout, QHeaderView, QKeySequenceEdit,
-                               QLabel, QPushButton, QTableWidget, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QGroupBox,
+                               QHBoxLayout, QHeaderView, QKeySequenceEdit, QLabel, QPushButton,
+                               QSlider, QTableWidget, QVBoxLayout, QWidget)
+from PySide6.QtCore import Qt
 
 from .. import a11y, hotkeys, i18n
+from ..motion import MotionMonitor
 
 
 class GeneralPanelMixin:
     """Language, project files and the shortcut editor, and the final UI polish pass."""
+
+    _motion_monitor = None
 
     def _general_tab(self) -> QWidget:
         page = QWidget()
@@ -37,6 +46,20 @@ class GeneralPanelMixin:
             button.clicked.connect(lambda _checked=False, h=handler: h())
             files_layout.addWidget(button)
         layout.addWidget(files)
+
+        layout.addWidget(self._motion_group())
+
+        panel_box = QGroupBox("Floating panel")
+        panel_layout = QVBoxLayout(panel_box)
+        self.panel_check = QCheckBox("Show a small always-on-top panel (round preview, record, mute, scenes)")
+        self.panel_check.toggled.connect(self.set_overlay_panel)
+        panel_note = QLabel("Wayland desktops may ignore always-on-top and where the panel is placed; "
+                            "drag it where you want it.")
+        panel_note.setObjectName("muted")
+        panel_note.setWordWrap(True)
+        panel_layout.addWidget(self.panel_check)
+        panel_layout.addWidget(panel_note)
+        layout.addWidget(panel_box)
 
         keys_box = QGroupBox("Keyboard shortcuts")
         keys_layout = QVBoxLayout(keys_box)
@@ -106,3 +129,151 @@ class GeneralPanelMixin:
             changed += i18n.apply(target, catalog)
             a11y.apply(target)
         return changed
+
+
+    # ------------------------------------------------------ floating panel
+    _overlay_panel = None
+
+    def set_overlay_panel(self, shown: bool) -> None:
+        from .overlay_panel import OverlayPanel
+
+        if shown and self._overlay_panel is None:
+            self._overlay_panel = OverlayPanel(self)
+        if self._overlay_panel is not None:
+            if shown:
+                self._overlay_panel.refresh()
+                self._overlay_panel.show()
+            else:
+                self._overlay_panel.hide()
+        if hasattr(self, "panel_check") and self.panel_check.isChecked() != bool(shown):
+            self.panel_check.blockSignals(True)
+            self.panel_check.setChecked(bool(shown))
+            self.panel_check.blockSignals(False)
+
+    # ------------------------------------------------------ motion detection
+    def _motion_group(self) -> QGroupBox:
+        box = QGroupBox("Motion detection")
+        grid = QGridLayout(box)
+        motion = self.project.motion
+        self.motion_check = QCheckBox("Watch the canvas for movement")
+        self.motion_check.setChecked(motion.enabled)
+        self.motion_sensitivity = QSlider(Qt.Orientation.Horizontal)
+        self.motion_sensitivity.setRange(0, 100)
+        self.motion_sensitivity.setValue(int(round(motion.sensitivity * 100)))
+        self.motion_hold = QDoubleSpinBox()
+        self.motion_hold.setRange(0.0, 60.0)
+        self.motion_hold.setSuffix(" s")
+        self.motion_hold.setValue(motion.hold_s)
+        self.motion_cooldown = QDoubleSpinBox()
+        self.motion_cooldown.setRange(0.0, 3600.0)
+        self.motion_cooldown.setSuffix(" s")
+        self.motion_cooldown.setValue(motion.cooldown_s)
+        self.motion_scene = QComboBox()
+        self.motion_notify = QCheckBox("Show a desktop notification")
+        self.motion_notify.setChecked(motion.notify)
+        self.motion_level_label = QLabel("")
+        self.motion_level_label.setObjectName("muted")
+        self.refresh_motion_scenes()
+        for widget, signal in ((self.motion_check, "toggled"), (self.motion_sensitivity, "valueChanged"),
+                               (self.motion_hold, "valueChanged"), (self.motion_cooldown, "valueChanged"),
+                               (self.motion_scene, "currentIndexChanged"), (self.motion_notify, "toggled")):
+            getattr(widget, signal).connect(self._motion_settings_changed)
+        grid.addWidget(self.motion_check, 0, 0, 1, 2)
+        grid.addWidget(QLabel("Sensitivity"), 1, 0)
+        grid.addWidget(self.motion_sensitivity, 1, 1)
+        grid.addWidget(QLabel("Must last"), 2, 0)
+        grid.addWidget(self.motion_hold, 2, 1)
+        grid.addWidget(QLabel("Then wait"), 3, 0)
+        grid.addWidget(self.motion_cooldown, 3, 1)
+        grid.addWidget(QLabel("Switch to scene"), 4, 0)
+        grid.addWidget(self.motion_scene, 4, 1)
+        grid.addWidget(self.motion_notify, 5, 0, 1, 2)
+        grid.addWidget(self.motion_level_label, 6, 0, 1, 2)
+        self._motion_monitor = None
+        self._motion_settings_changed()
+        return box
+
+    def load_motion_widgets(self) -> None:
+        """Show the (just loaded) project's motion settings."""
+        motion = self.project.motion
+        widgets = (self.motion_check, self.motion_sensitivity, self.motion_hold,
+                   self.motion_cooldown, self.motion_scene, self.motion_notify)
+        for widget in widgets:
+            widget.blockSignals(True)
+        self.motion_check.setChecked(motion.enabled)
+        self.motion_sensitivity.setValue(int(round(motion.sensitivity * 100)))
+        self.motion_hold.setValue(motion.hold_s)
+        self.motion_cooldown.setValue(motion.cooldown_s)
+        self.motion_notify.setChecked(motion.notify)
+        self.refresh_motion_scenes()
+        for widget in widgets:
+            widget.blockSignals(False)
+        self._motion_settings_changed()
+
+    def refresh_motion_scenes(self) -> None:
+        combo = getattr(self, "motion_scene", None)
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Stay on this scene", "")
+        for scene in self.project.scenes:
+            combo.addItem(scene.name, scene.id)
+        combo.setCurrentIndex(max(0, combo.findData(self.project.motion.scene_id)))
+        combo.blockSignals(False)
+
+    def _motion_settings_changed(self, *_args) -> None:
+        motion = self.project.motion
+        motion.enabled = self.motion_check.isChecked()
+        motion.sensitivity = self.motion_sensitivity.value() / 100.0
+        motion.hold_s = float(self.motion_hold.value())
+        motion.cooldown_s = float(self.motion_cooldown.value())
+        motion.scene_id = str(self.motion_scene.currentData() or "")
+        motion.notify = self.motion_notify.isChecked()
+        if motion.enabled:
+            monitor = self._motion_monitor
+            if monitor is None:
+                monitor = self._motion_monitor = MotionMonitor()
+            monitor.set_sensitivity(motion.sensitivity)
+            monitor.hold_s, monitor.cooldown_s = motion.hold_s, motion.cooldown_s
+        else:
+            self._motion_monitor = None
+            self.motion_level_label.setText("")
+        self._mark_dirty()
+
+    def feed_motion(self, rgba: np.ndarray, now: float) -> bool:
+        """One preview frame for the motion watch; True when it acted."""
+        monitor = self._motion_monitor
+        if monitor is None:
+            return False
+        fired = monitor.update(rgba, now)
+        self.motion_level_label.setText(f"Movement now: {monitor.level * 100:.1f} % of the picture")
+        if fired:
+            self._motion_triggered()
+        return fired
+
+    def _motion_triggered(self) -> None:
+        motion = self.project.motion
+        target = next((i for i, scene in enumerate(self.project.scenes)
+                       if scene.id == motion.scene_id), -1)
+        message = "Motion detected"
+        if target >= 0 and self.project.scenes[target].id != self.project.active_scene:
+            self.switch_scene(target)
+            message += f" \u2013 switched to {self.project.scenes[target].name}"
+        self._status(message)
+        self.log_event(f"motion: {message}")
+        if motion.notify:
+            self.desktop_notify("AnyCam", message)
+
+    @staticmethod
+    def desktop_notify(title: str, body: str) -> bool:
+        """A desktop notification through notify-send, when there is one."""
+        tool = shutil.which("notify-send")
+        if tool is None:
+            return False
+        try:
+            subprocess.Popen([tool, "--app-name=AnyCam", title, body],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            return False
+        return True

@@ -41,6 +41,7 @@ from ..sources import (
     jpeg_decoder,
     make,
     make_optional,
+    is_mjpeg_stream,
     video_has_audio,
     video_size,
 )
@@ -165,7 +166,7 @@ def _on_pad_added(_bin, pad, target) -> None:
     caps = pad.get_current_caps() or pad.query_caps(None)
     if caps is None or caps.get_size() == 0:
         return
-    if not caps.get_structure(0).get_name().startswith(("video/", "audio/")):
+    if not caps.get_structure(0).get_name().startswith(("video/", "audio/", "image/")):
         return
     sink = target.get_static_pad("sink")
     if sink is not None and not sink.is_linked():
@@ -716,6 +717,21 @@ class SourcePool:
     def _network(spec: CaptureSpec) -> _Built:
         width = max(2, spec.width)
         height = max(2, spec.height)
+        if is_mjpeg_stream(spec.source) and Gst.ElementFactory.find("multipartdemux") is not None:
+            # Phone and IP cameras ("IP Webcam", most CCTV) send MJPEG as a
+            # multipart HTTP stream; uridecodebin cannot type it and waits for ever.
+            demux = make("multipartdemux")
+            elements = [
+                make("souphttpsrc", location=spec.source, is_live=True, do_timestamp=True),
+                demux,
+                make("jpegdec"),
+                make("videoconvert"),
+                make("videoscale"),
+                make("videorate"),
+                caps_filter(f"video/x-raw,format=RGBA,width={width},height={height},"
+                            f"pixel-aspect-ratio=1/1,framerate={spec.fps}/1"),
+            ]
+            return _Built(elements, (width, height), dynamic_from=demux)
         decode = make("uridecodebin", uri=spec.source)
         elements: list[Gst.Element] = [
             decode,

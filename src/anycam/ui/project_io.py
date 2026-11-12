@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QFileDialog
 
-from .. import config
+from .. import config, effect_worker, streaming
 from ..model import (Project, default_project, load_scene_preset, new_id,
                      save_scene_preset)
 from .theme import STYLE  # noqa: F401
@@ -182,6 +182,7 @@ class ProjectIOMixin:
         self.media_gain_slider.setValue(int(self.project.audio.media_gain_db))
         self.media_gain_slider.blockSignals(False)
         self.media_gain_label.setText(f"{self.project.audio.media_gain_db:+.0f} dB")
+        self._load_extended_widgets()
         for combo, value in ((self.denoise_combo, self.project.audio.mic_denoise),
                              (self.effects_device_combo, self.project.output.effects_device),
                              (self.segmentation_combo, self.project.output.segmentation_model)):
@@ -304,3 +305,37 @@ class ProjectIOMixin:
         extra = f" ({len(warnings)} repaired)" if warnings else ""
         self._status(f"Imported scene {scene.name}{extra}")
         return True
+
+    def _load_extended_widgets(self) -> None:
+        """Mirror the settings added after the first windows (stream, recording, audio
+        processing, music playlist, AI isolation, motion) from the loaded project."""
+        out, audio = self.project.output, self.project.audio
+
+        def quietly(widget, setter):
+            widget.blockSignals(True)
+            setter(widget)
+            widget.blockSignals(False)
+
+        quietly(self.stream_bitrate, lambda w: w.setValue(out.stream_bitrate_kbps))
+        preset, key = streaming.split_url(out.rtmp_url)
+        quietly(self.stream_preset, lambda w: w.setCurrentIndex(max(0, w.findData(preset))))
+        quietly(self.stream_key_edit, lambda w: w.setText(key if preset != "custom" else ""))
+        self.extra_list.clear()
+        self.extra_list.addItems(out.rtmp_extra_urls)
+        quietly(self.record_dir_edit, lambda w: w.setText(out.record_dir))
+        quietly(self.record_bitrate, lambda w: w.setValue(out.record_bitrate_kbps))
+        quietly(self.record_min_free, lambda w: w.setValue(out.record_min_free_mb))
+        self._update_record_free()
+        quietly(self.effects_isolated_check, lambda w: w.setChecked(out.effects_isolated))
+        effect_worker.set_isolation(out.effects_isolated)
+        quietly(self.dynamics_combo, lambda w: w.setCurrentIndex(max(0, w.findData(audio.mic_dynamics))))
+        quietly(self.eq_combo, lambda w: w.setCurrentIndex(max(0, w.findData(audio.mic_eq))))
+        for field, spin in self.delay_spins.items():
+            quietly(spin, lambda w, f=field: w.setValue(int(getattr(audio, f))))
+        quietly(self.monitor_combo, lambda w: w.setCurrentIndex(max(0, w.findData(audio.monitor_device))))
+        quietly(self.virtual_mic_check, lambda w: w.setChecked(audio.virtual_mic))
+        quietly(self.media_loop_check, lambda w: w.setChecked(audio.media_loop))
+        quietly(self.media_shuffle_check, lambda w: w.setChecked(audio.media_shuffle))
+        self.music_list.clear()
+        self.music_list.addItems(audio.media_playlist)
+        self.load_motion_widgets()

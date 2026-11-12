@@ -429,6 +429,17 @@ class EngineMixin:
         # changes the image (snapshot painting, conversions) detaches first.
         image = QImage(raw, width, height, stride, qformat)
         self.preview.set_image(image, owner=raw)
+        panel = self._overlay_panel
+        if panel is not None and panel.isVisible():
+            panel.set_frame(image)
+        if self._motion_monitor is not None:
+            self._motion_frames = getattr(self, "_motion_frames", 0) + 1
+            if self._motion_frames % 3 == 0:       # a third of the frames is plenty
+                import numpy as np
+
+                channels = 4 if fmt == "RGBA" else 3
+                self.feed_motion(np.frombuffer(raw, np.uint8).reshape(height, width, channels),
+                                 time.monotonic())
 
     def _update_source_status(self) -> None:
         """A running canvas is not proof that its inputs are fresh."""
@@ -514,6 +525,8 @@ class EngineMixin:
             db = self.engine.mic_level_db
             self.mic_level_label.setText("muted" if db < -80 else f"{db:.0f} dB")
         self.update_audio_meters()
+        if self._overlay_panel is not None and self._overlay_panel.isVisible():
+            self._overlay_panel.refresh()
         self.check_disk_guard()
         self._advance_playlist(time.monotonic())
         if rec is not None:

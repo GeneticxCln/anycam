@@ -201,6 +201,26 @@ class EditorConfig:
 
 
 @dataclass
+class MotionConfig:
+    """Act when the canvas picture moves (see anycam.motion)."""
+
+    enabled: bool = False
+    sensitivity: float = 0.5         # 0..1
+    hold_s: float = 1.0              # motion must last this long
+    cooldown_s: float = 30.0         # then stay quiet for this long
+    scene_id: str = ""               # switch to this scene ("" = do not switch)
+    notify: bool = True              # a desktop notification
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "MotionConfig":
+        motion = _coerce_fields(cls, data)
+        motion.sensitivity = max(0.0, min(1.0, motion.sensitivity))
+        motion.hold_s = max(0.0, min(60.0, motion.hold_s))
+        motion.cooldown_s = max(0.0, min(3600.0, motion.cooldown_s))
+        return motion
+
+
+@dataclass
 class Layer:
     id: str
     kind: str                        # camera|screen|image|video|network|text|logo|playlist
@@ -542,6 +562,7 @@ class Project:
     output: OutputConfig = field(default_factory=OutputConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
     editor: EditorConfig = field(default_factory=EditorConfig)
+    motion: MotionConfig = field(default_factory=MotionConfig)
     scenes: list[Scene] = field(default_factory=list)
     active_scene: str = ""
     # What loading had to drop or repair; never written back to the file.
@@ -564,6 +585,7 @@ class Project:
             "output": asdict(self.output),
             "audio": asdict(self.audio),
             "editor": asdict(self.editor),
+            "motion": asdict(self.motion),
             "scenes": [s.to_dict() for s in self.scenes],
             "active_scene": self.active_scene,
         }
@@ -593,6 +615,7 @@ class Project:
             output=OutputConfig.from_dict(data.get("output")),
             audio=AudioConfig.from_dict(data.get("audio")),
             editor=EditorConfig.from_dict(data.get("editor")),
+            motion=MotionConfig.from_dict(data.get("motion")),
             scenes=scenes,
             active_scene=_coerce(data.get("active_scene"), ""),
         )

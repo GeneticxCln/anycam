@@ -38,7 +38,11 @@ class PlaylistMixin:
         add.clicked.connect(self._add_playlist_items)
         clear = QPushButton("Clear")
         clear.clicked.connect(self._clear_playlist)
+        pdf = QPushButton("+ PDF slides")
+        pdf.setToolTip("Every page of a PDF becomes a slide, stepped by hand")
+        pdf.clicked.connect(self._pick_pdf)
         row.addWidget(add)
+        row.addWidget(pdf)
         row.addWidget(clear)
         layout.addLayout(row)
         item_row = QHBoxLayout()
@@ -206,6 +210,34 @@ class PlaylistMixin:
         self._store_playlist_state()
         self.playlist_last = time.monotonic()
         self._mark_dirty()
+
+    def add_pdf_slides(self, path: str) -> int:
+        """Put each page of a PDF in the playlist, paused so the pages are stepped by hand."""
+        from .. import content
+
+        pages, error = self._run_with_ui(lambda: content.pdf_pages(path))
+        if error:
+            self._status(error)
+            return 0
+        for page in pages:
+            layer = Layer(new_id("layer"), "image", f"{Path(path).stem} p{pages.index(page) + 1}",
+                          source=str(page), box=(0.0, 0.0, 1.0, 1.0), z=2,
+                          visible=not self.playlist_ids)
+            self.scene.add_layer(layer)
+            self.playlist_ids.append(layer.id)
+            self.playlist_list.addItem(f"{layer.name}  \u00b7  slide")
+        self.playlist_pause.setChecked(True)
+        self._store_playlist_state()
+        self._mark_dirty()
+        if self.engine is not None:
+            self.restart_engine()
+        self._status(f"{len(pages)} slides added; step them with the playlist next/previous keys")
+        return len(pages)
+
+    def _pick_pdf(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Choose a PDF", "", "PDF (*.pdf)")
+        if path:
+            self.add_pdf_slides(path)
 
     def _add_playlist_items(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(

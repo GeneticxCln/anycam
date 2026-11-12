@@ -882,6 +882,34 @@ def video_size(path: str) -> tuple[int, int] | None:
     return None
 
 
+_MJPEG_CACHE: dict[str, bool] = {}
+
+
+def is_mjpeg_stream(url: str, timeout: float = 3.0) -> bool:
+    """Whether an http(s) address answers with a multipart MJPEG stream.
+
+    Only the response headers are read.  Any failure counts as "no" so the
+    generic decoder still gets its turn.
+    """
+    from urllib.parse import urlsplit
+
+    if urlsplit(url).scheme not in ("http", "https"):
+        return False
+    if url in _MJPEG_CACHE:
+        return _MJPEG_CACHE[url]
+    import urllib.request
+
+    found = False
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "AnyCam"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:   # noqa: S310
+            found = "multipart/x-mixed-replace" in str(response.headers.get("Content-Type", "")).lower()
+    except Exception:  # noqa: BLE001 - unreachable or odd: let the generic path try
+        found = False
+    _MJPEG_CACHE[url] = found
+    return found
+
+
 _AUDIO_PROBE_CACHE: dict[tuple[str, float], bool] = {}
 
 
