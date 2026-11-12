@@ -1,0 +1,39 @@
+# Build: flatpak-builder --user --install --force-clean build packaging/flatpak/io.github.geneticxcln.AnyCam.yml
+# The sandbox cannot load kernel modules, so a v4l2loopback virtual camera must already exist on the host;
+# the PipeWire camera backend works without it.
+app-id: io.github.geneticxcln.AnyCam
+runtime: org.kde.Platform
+runtime-version: '6.8'
+sdk: org.kde.Sdk
+base: io.qt.PySide.BaseApp
+base-version: '6.8'
+command: anycam
+finish-args:
+  - --share=ipc
+  - --share=network            # RTMP/SRT streaming and the phone link
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=all               # cameras and /dev/video* loopback devices
+  - --filesystem=xdg-videos
+  - --talk-name=org.freedesktop.portal.Desktop
+  - --filesystem=xdg-run/pipewire-0
+modules:
+  - name: python-deps
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-index --find-links="file://${PWD}" --prefix=${FLATPAK_DEST} numpy Pillow psutil cryptography segno
+    sources:
+      - type: file
+        url: https://files.pythonhosted.org/packages/source/p/psutil/psutil-6.1.0.tar.gz
+        sha256: 353815f59a7f64cdaca1c0307ee13558a0512f6db064e92fe833784f08539c7a
+  - name: anycam
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-deps --no-build-isolation --prefix=${FLATPAK_DEST} .
+      - install -Dm644 anycam.desktop ${FLATPAK_DEST}/share/applications/io.github.geneticxcln.AnyCam.desktop
+      - install -Dm644 packaging/metainfo/io.github.geneticxcln.AnyCam.metainfo.xml ${FLATPAK_DEST}/share/metainfo/io.github.geneticxcln.AnyCam.metainfo.xml
+      - install -Dm644 src/anycam/assets/anycam-logo.png ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/io.github.geneticxcln.AnyCam.png
+    sources:
+      - type: dir
+        path: ../..

@@ -36,6 +36,11 @@ class GeneralPanelMixin:
         language_layout.addWidget(self.language_combo, 1)
         layout.addWidget(language_box)
 
+        check_button = QPushButton("Check this computer\u2026")
+        check_button.setToolTip("Is the camera, virtual camera, sound and screen capture ready?")
+        check_button.clicked.connect(lambda: self.show_first_run_check(force=True))
+        language_layout.addWidget(check_button)
+
         files = QGroupBox("Project")
         files_layout = QHBoxLayout(files)
         for label, handler in (("Open…", lambda: self.open_project()),
@@ -144,6 +149,19 @@ class GeneralPanelMixin:
             a11y.apply(target)
         return changed
 
+
+    # ---------------------------------------------------------- first run
+    def show_first_run_check(self, force: bool = False) -> bool:
+        """The welcome checklist, once (or on demand); True when it was shown."""
+        from .. import firstrun
+        from .dialogs import FirstRunDialog
+
+        if self.headless or (firstrun.already_shown() and not force):
+            return False
+        dialog = FirstRunDialog(firstrun.checks(), self)
+        firstrun.mark_shown()
+        dialog.exec()
+        return True
 
     # ------------------------------------------------------ floating panel
     _overlay_panel = None
