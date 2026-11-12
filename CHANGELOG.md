@@ -14,6 +14,19 @@ All notable changes. Versions follow `pyproject.toml`; each `vX.Y.Z` tag publish
 - The virtual camera's on/off choice is remembered across launches.
 - CI runs `ruff` (defect rules) and reports coverage.
 - Added `CONTRIBUTING.md`, `SECURITY.md` and `NOTICE`.
+- Audio: a meter per input and for the output, the sound of video layers (volume, mute), music loop,
+  shuffle and playlist, gate/compressor/EQ presets, sync offsets, a monitor output and a virtual microphone.
+- Streaming: several destinations from one encode, each with status and reconnect (1–30 s backoff); YouTube,
+  Twitch, Facebook and Kick presets; `rtmps://` and `srt://` addresses; SRT output; stream and recording
+  bitrate; a disk guard that stops and saves a recording before the disk fills.
+- AI effects and effect packs run in a worker process; a crash or hang there only costs the effect. Effect
+  packs (`docs/EFFECT_PACKS.md`) and favourites.
+- Content: PDF slides, video-site links through `yt-dlp`, MJPEG IP cameras, motion detection (switch scene,
+  notification), a floating always-on-top panel.
+- Phone remote (`/remote`) for scenes, mute and record over the paired HTTPS link; off until switched on.
+- Packaging recipes (`packaging/`), `anycam check` and a first-run checklist, `scripts/compat-matrix.py`.
+- Fixed: a silent video clip no longer stops looping; a GL conversion probe can no longer hang the
+  diagnostics; the playlist timer follows the caller's clock.
 - Layers have a fit mode (contain, cover, stretch), flips, a quarter-turn rotation, zoom and pan; zoom and
   pan change live. A layer box may leave the canvas (numeric entry), and RGB levels join the colour sliders
   (GPU canvas).
