@@ -68,6 +68,43 @@ def test_pdf_problems_are_explained(tmp_path, monkeypatch):
     assert "poppler" in content.pdf_pages(str(broken))[1]
 
 
+def test_a_timed_out_pdf_render_is_never_cached(tmp_path, monkeypatch):
+    """A partial render used to be served from the cache forever (item 11)."""
+    from pathlib import Path
+
+    from anycam import config
+
+    slides = tmp_path / "slides.pdf"
+    slides.write_bytes(b"%PDF-1.4\n% the fake renderer never reads it\n")
+    attempts = []
+
+    def timed_out(command, **_kwargs):
+        attempts.append(command)
+        folder = Path(command[-1]).parent
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "page-1.png").write_bytes(b"partial")
+        raise subprocess.TimeoutExpired(command, 180)
+
+    monkeypatch.setattr(content, "pdf_available", lambda: True)
+    monkeypatch.setattr(content.subprocess, "run", timed_out)
+    pages, error = content.pdf_pages(str(slides), dpi=72)
+    assert pages == [] and "timed out" in error
+    cache = config.cache_dir() / "pdf"
+    assert list(cache.rglob("page-*.png")) == []       # partial pages removed
+    assert not list(cache.rglob(".complete"))          # nothing says "cached"
+
+    def rendered(command, **_kwargs):
+        attempts.append(command)
+        folder = Path(command[-1]).parent
+        (folder / "page-1.png").write_bytes(b"done")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(content.subprocess, "run", rendered)
+    pages, error = content.pdf_pages(str(slides), dpi=72)
+    assert error == "" and len(pages) == 1
+    assert len(attempts) == 2                          # the failure left nothing to reuse
+
+
 # ----------------------------------------------------------------------- yt-dlp
 def fake_ytdlp(tmp_path, monkeypatch, body: str) -> None:
     script = tmp_path / "bin" / "yt-dlp"

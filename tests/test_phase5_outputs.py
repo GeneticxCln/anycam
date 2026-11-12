@@ -216,6 +216,68 @@ def test_backoff_doubles_to_a_ceiling_and_resets_after_a_healthy_run():
     assert state.restart_at - 100.0 == 1
 
 
+def test_teardown_forgets_the_publisher_but_keeps_the_encoder():
+    """A stale publisher must not flip a torn-down stream back to "live", and
+    a reconnect still needs the encoder for force_keyframe (items 5 and 6)."""
+    from anycam.engine.outputs.stream import RtmpState, StreamMixin
+
+    class FakePipeline:
+        def __init__(self):
+            self.events = []
+            self.states = []
+
+        def send_event(self, event):
+            self.events.append(event)
+
+        def set_state(self, state):
+            self.states.append(state)
+
+    engine = StreamMixin()
+    encoder = object()
+    engine._rtmp_pipeline = FakePipeline()
+    engine._rtmp_bus = object()
+    engine._rtmp_appsrc = object()
+    engine._rtmp_audio_appsrc = object()
+    engine._rtmp_feed = object()
+    engine._rtmp_publisher = object()
+    engine._rtmp_encoder = encoder
+    engine._rtmp_extras = []
+    engine._rtmp_state = RtmpState(url="rtmp://x/y/z", state="live", publisher=object())
+
+    engine._teardown_rtmp()
+
+    assert engine._rtmp_publisher is None
+    assert engine._rtmp_state.publisher is None     # no stale first_data can say "live"
+    assert engine._rtmp_encoder is encoder          # the canvas still owns it
+    assert engine._rtmp_pipeline is None
+
+
+def test_a_reconnect_forces_a_keyframe_from_the_encoder_kept_in_the_canvas(monkeypatch):
+    from types import SimpleNamespace
+
+    from anycam.engine.outputs import stream as stream_module
+    from anycam.engine.outputs.stream import RtmpState, StreamMixin
+
+    engine = StreamMixin()
+    encoder = object()
+    engine._rtmp_encoder = encoder
+    engine.rtmp = "rtmp://127.0.0.1/live/x"
+    engine._rtmp_state = RtmpState(url=engine.rtmp, state="waiting")
+    engine._rtmp_extras = []
+    forced = []
+    monkeypatch.setattr(stream_module, "force_keyframe", lambda element: forced.append(element))
+    publisher = SimpleNamespace(pipeline=object(), bus=object(), video_src=object(),
+                                audio_src=None, feed=SimpleNamespace(skipping=False))
+    monkeypatch.setattr(engine, "_make_publisher", lambda *args, **kwargs: publisher)
+    monkeypatch.setattr(engine, "_start_async", lambda pipeline: None)
+
+    engine._restart_primary(time.monotonic())
+
+    assert forced == [encoder]
+    assert engine._rtmp_state.restarts == 1
+    assert engine._rtmp_state.state == "connecting"
+
+
 # --------------------------------------------------- recording quality and guard
 def test_the_disk_guard_compares_free_space_with_the_limit(monkeypatch, tmp_path):
     import shutil

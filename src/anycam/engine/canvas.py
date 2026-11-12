@@ -193,8 +193,10 @@ class CanvasMixin:
             return False
         caps = self._preview_caps
         if caps is not None:
-            caps.set_property("caps", Gst.Caps.from_string(
-                caps_string(size[0], size[1], self.fps)))
+            text = caps_string(size[0], size[1], self.fps)
+            if getattr(self, "_preview_caps_on_gpu", False):
+                text = text.replace("video/x-raw,", "video/x-raw(memory:GLMemory),", 1)
+            caps.set_property("caps", Gst.Caps.from_string(text))
         return True
 
     def _build_preview(self) -> None:
@@ -220,6 +222,10 @@ class CanvasMixin:
         if sink is None:
             return False
         sink.set_property("sync", False)
+        # A sink that waits for preroll behind a queue on the canvas tee
+        # deadlocks startup: it parks in its preroll wait, the mixer blocks in
+        # a query on that queue, and the pipeline never reaches PLAYING.
+        sink.set_property("async", False)
         try:
             attached = bool(self.preview_gl_sink(sink))
         except Exception as exc:  # noqa: BLE001 - the image preview takes over
@@ -241,8 +247,7 @@ class CanvasMixin:
             self._link([queue, sink])
             self._branch_count += 1
             self._preview_gl_sink_element = sink
-            self._appsink = None
-            self._pending_sample = None
+            self._build_cpu_preview_tap(gl=True)
             return True
         queue = self._branch("preview", max_buffers=1, max_time_ns=0)
         queue.set_property("leaky", 2)
@@ -252,9 +257,58 @@ class CanvasMixin:
         self._add(no_pool, upload, convert, sink)
         self._link([queue, no_pool, upload, convert, sink])
         self._preview_gl_sink_element = sink
-        self._appsink = None
-        self._pending_sample = None
+        self._build_cpu_preview_tap(gl=False)
         return True
+
+    def _build_cpu_preview_tap(self, *, gl: bool) -> None:
+        """A small CPU branch feeding _on_preview_sample alongside the GPU view.
+
+        Motion detection and the floating panel are fed from on_frame, which
+        only fires from this appsink; with _appsink=None they got zero frames
+        under the GPU preview (audit item 4).
+
+        On the GPU canvas the frame is scaled to preview size on the GPU and
+        only that small texture is downloaded.  Scaling the canvas's full-size
+        downloaded frames on the CPU, beside the encoder reading the same
+        frames, segfaulted inside the scaler in about half of the runs once an
+        NVENC recording was active (GPU preview, GPU canvas); the same graph
+        with x264, or without the tap, never crashed.
+        """
+        preview_w, preview_h = self._preview_size()
+        self._preview_caps_on_gpu = gl
+        sink = make("appsink", "preview_cpu_sink", emit_signals=True,
+                    max_buffers=2, drop=True, sync=False)
+        # Not async, for the same preroll deadlock as the GPU preview sink.
+        sink.set_property("async", False)
+        if gl:
+            queue = make("queue", "queue_preview_cpu", max_size_buffers=1,
+                         max_size_time=0, max_size_bytes=0)
+            queue.set_property("leaky", 2)
+            scale = make("glcolorscale", "preview_cpu_glscale")
+            caps = caps_filter(
+                caps_string(preview_w, preview_h, self.fps).replace(
+                    "video/x-raw,", "video/x-raw(memory:GLMemory),", 1),
+                "preview_caps")
+            download = make("gldownload", "preview_cpu_download")
+            raw = caps_filter("video/x-raw,format=RGBA", "preview_cpu_format")
+            self._add(queue, scale, caps, download, raw, sink)
+            tee_pad = self._gl_tee.request_pad_simple("src_%u")
+            if tee_pad is None or tee_pad.link(queue.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+                raise RuntimeError("could not branch the CPU preview tap off the GL canvas")
+            self._link([queue, scale, caps, download, raw, sink])
+            self._branch_count += 1
+        else:
+            head = self._branch("preview_cpu", max_buffers=1, max_time_ns=0)
+            head.set_property("leaky", 2)
+            # The tee already carries RGBA, so only a scale is needed.
+            scale = make("videoscale")
+            caps = caps_filter(caps_string(preview_w, preview_h, self.fps), "preview_caps")
+            self._add(scale, caps, sink)
+            self._link([head, scale, caps, sink])
+        self._preview_caps = caps
+        self._on(sink, "new-sample", self._on_preview_sample)
+        self._appsink = sink
+        self._pending_sample = None
 
     @property
     def preview_gl_frames(self) -> int:

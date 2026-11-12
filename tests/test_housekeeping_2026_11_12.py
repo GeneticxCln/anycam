@@ -360,6 +360,43 @@ def test_stopping_the_engine_keeps_the_window_responsive():
         app.processEvents()
 
 
+def test_a_failing_engine_step_still_marks_the_window_closing(monkeypatch):
+    """A stop that raises must not leave _closing False: the rest of the
+    teardown would then inline blocking work on the GUI thread (item 3)."""
+    from types import SimpleNamespace
+
+    from anycam.ui.engine_control import EngineMixin
+
+    saved = []
+
+    class Fake(EngineMixin):
+        def __init__(self):
+            self._closing = False
+            self.engine = object()              # so the engine step runs
+            self.timer = SimpleNamespace(stop=lambda: None)
+            self._camera_watch = SimpleNamespace(stop=lambda: None)
+            self._transform_timer = SimpleNamespace(stop=lambda: None)
+            self._autosave_timer = SimpleNamespace(stop=lambda: None)
+            self.preview = SimpleNamespace(cancel_pending_edits=lambda: None)
+            self._stop_thumbnails = lambda: None
+            self._finish_recorder = lambda: None
+            self._finish_vcam_output = lambda: None
+            self._stop_phone_link = lambda: None
+            self._stop_desktop_integration = lambda: None
+            self._source_pool = SimpleNamespace(stop=lambda: None)
+            self._save_if_needed = lambda: saved.append("project")
+            self._close_screen_sessions = lambda: None
+
+        def stop_engine(self):
+            raise RuntimeError("the pipeline will not stop")
+
+    fake = Fake()
+    fake._teardown()
+
+    assert fake._closing is True
+    assert saved == ["project"]                 # later steps still ran
+
+
 # ------------------------------------------------- camera loss and return, live
 def test_a_lost_camera_becomes_a_card_and_comes_back_without_a_rebuild():
     pytest.importorskip("gi")

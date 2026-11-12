@@ -239,6 +239,7 @@ class StreamMixin:
         self._rtmp_audio_appsrc = publisher.audio_src
         self._rtmp_feed = publisher.feed
         self._rtmp_failed = False
+        self._rtmp_state.publisher = publisher
 
     def _add_extra_target(self, url: str) -> None:
         state = RtmpState(url=url, state="connecting")
@@ -431,7 +432,11 @@ class StreamMixin:
         self._rtmp_appsrc = None
         self._rtmp_audio_appsrc = None
         self._rtmp_feed = None
-        self._rtmp_encoder = None
+        # Keep _rtmp_encoder: it lives in the canvas graph, and _restart_primary
+        # needs it for force_keyframe (audit item 6).  Clear publisher refs so
+        # a stale first_data cannot flip state back to "live" (item 5).
+        self._rtmp_publisher = None
+        self._rtmp_state.publisher = None
 
         def shutdown() -> None:
             try:

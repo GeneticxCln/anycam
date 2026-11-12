@@ -148,6 +148,7 @@ class RemoteProcessor:
         self._starting = False
         self._retry_at = 0.0
         self._ready_at = 0.0
+        self._last_good = None
         self._closed = False
         self._spawn()
 
@@ -242,13 +243,25 @@ class RemoteProcessor:
             except (OSError, ValueError):
                 pass
 
+    def _held(self, image: Image.Image) -> Image.Image:
+        """The last processed frame, so effects never leak the raw picture.
+
+        During startup (~0.2 s) and restart backoff (1-10 s) the unprocessed
+        frame used to pass through, flashing face/background effects off
+        (audit item 8).  Holding the last good frame keeps the effect on;
+        only the very first frames (no good frame yet) pass through.
+        """
+        if self._last_good is not None and self._last_good.size == image.size:
+            return self._last_good.copy()
+        return image
+
     def process(self, image: Image.Image, now: float) -> Image.Image:
         with self._lock:
             conn = self._conn
         if conn is None:
             if not self._starting and time.monotonic() >= self._retry_at and not self._closed:
                 self._spawn()
-            return image                       # not up (yet): the picture goes through
+            return self._held(image)
         width, height = image.size
         size = width * height * 4
         try:
@@ -260,17 +273,19 @@ class RemoteProcessor:
             conn.send(("frame", self._shm.name, width, height, now))
             if not conn.poll(self.FRAME_TIMEOUT_S):
                 self._lose_worker("the effect worker stopped answering")
-                return image
+                return self._held(image)
             reply = conn.recv()
         except (EOFError, OSError, BrokenPipeError):
             self._lose_worker("the effect worker exited")
-            return image
+            return self._held(image)
         if reply[0] != "done":
             self.last_error = str(reply[1]) if len(reply) > 1 else "frame failed"
-            return image
+            return self._held(image)
         if self.failures and time.monotonic() - self._ready_at > 10.0:
             self.failures = 0                  # it has been healthy: start the backoff over
-        return Image.frombytes("RGBA", (width, height), bytes(self._shm.buf[:size]))
+        result = Image.frombytes("RGBA", (width, height), bytes(self._shm.buf[:size]))
+        self._last_good = result.copy()
+        return result
 
     def _release_block(self) -> None:
         if self._shm is not None:

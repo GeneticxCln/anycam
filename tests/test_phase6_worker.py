@@ -292,7 +292,10 @@ def test_the_favourite_star_follows_the_selected_filter(window):
 
 
 def test_the_isolation_setting_reaches_the_worker_switch(window):
-    assert window.effects_isolated_check.isChecked() and effect_worker.isolation_enabled()
+    assert not window.effects_isolated_check.isChecked() and not effect_worker.isolation_enabled()
+    window.effects_isolated_check.setChecked(True)
+    assert window.project.output.effects_isolated is True
+    assert effect_worker.isolation_enabled() and effect_worker.wants_isolation("background:blur")
     window.effects_isolated_check.setChecked(False)
     assert window.project.output.effects_isolated is False
     assert not effect_worker.wants_isolation("background:blur")
@@ -305,3 +308,33 @@ def test_packs_appear_in_the_categories_and_the_settings_summary(window, tmp_pat
     assert "Inverter" in [entry["label"] for entry in window._effect_entries]
     assert "1 effect pack entry" in window._packs_summary()
     effects.reload_packs(tmp_path / "none")
+
+
+def test_a_worker_restart_holds_the_last_processed_frame():
+    """While the worker starts or backs off, the raw picture used to pass
+    through and flash the effect off (audit item 8)."""
+    import threading
+
+    processed = picture((200, 30, 30, 255))
+    processor = object.__new__(RemoteProcessor)
+    processor._lock = threading.Lock()
+    processor._conn = None
+    processor._starting = True          # no spawn attempt from this test
+    processor._retry_at = float("inf")
+    processor._closed = True
+    processor._last_good = processed
+
+    raw = picture((30, 30, 200, 255))
+    assert pixel(processor.process(raw, 0.0)) == (200, 30, 30, 255)
+
+    resized = picture((30, 30, 200, 255), size=(16, 12))
+    assert processor.process(resized, 0.0) is resized   # a resize cannot be held
+
+    fresh = object.__new__(RemoteProcessor)
+    fresh._lock = threading.Lock()
+    fresh._conn = None
+    fresh._starting = True
+    fresh._retry_at = float("inf")
+    fresh._closed = True
+    fresh._last_good = None
+    assert fresh.process(raw, 0.0) is raw               # first frames still pass through
