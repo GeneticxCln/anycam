@@ -252,6 +252,7 @@ class EffectsPanelMixin:
         self.effect_category = QComboBox()
         for name in self.EFFECT_CATEGORIES:
             self.effect_category.addItem(name, name)
+        self.effect_category.setCurrentIndex(max(0, self.effect_category.findData("Looks")))
         self.effect_category.currentIndexChanged.connect(self._populate_effect_grid)
         row.addWidget(self.effect_category, 1)
         self.filter_slot = QComboBox()

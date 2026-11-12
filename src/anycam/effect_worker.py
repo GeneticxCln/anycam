@@ -46,10 +46,32 @@ def isolation_enabled() -> bool:
     return _enabled
 
 
+_local = threading.local()
+
+
+class in_process:
+    """Context: processors built in this thread stay in-process (one-off renders).
+
+    A thumbnail is drawn once and thrown away; waiting for a worker to start
+    would only return the untouched picture.  Packs are the exception: their
+    code is never run in the main process, so a pack tile is drawn from the
+    original picture.
+    """
+
+    def __enter__(self):
+        _local.depth = getattr(_local, "depth", 0) + 1
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        _local.depth -= 1
+
+
 def wants_isolation(spec_name: str) -> bool:
     kind = spec_name.partition(":")[0]
     if kind == "pack":
         return True              # third-party code never runs in the main process
+    if getattr(_local, "depth", 0) > 0:
+        return False
     return isolation_enabled() and kind in ISOLATED_KINDS
 
 
