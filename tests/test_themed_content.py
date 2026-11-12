@@ -478,6 +478,19 @@ def _preview_pixels(win):
     return raw.reshape(image.height(), image.bytesPerLine())[:, :image.width() * 3].astype(int)
 
 
+def _wait_for_frame(win, app, timeout=20.0):
+    """Pump until the preview shows a frame; the first canvas of a process
+    runs the GL probe and can take longer than a fixed pause."""
+    import time
+
+    from tests.test_effects_browser import pump
+
+    end = time.monotonic() + timeout
+    while win.preview.image is None and time.monotonic() < end:
+        pump(app, 0.1)
+    assert win.preview.image is not None, "the canvas never delivered a frame"
+
+
 def _motion(win, app):
     from tests.test_effects_browser import pump
 
@@ -492,7 +505,8 @@ def test_animations_keep_working_after_one_is_cleared_in_the_running_app(window)
 
     win, app = window
     win.start_engine()
-    pump(app, 1.5)
+    _wait_for_frame(win, app)
+    pump(app, 0.5)
     baseline = _motion(win, app)                          # the test pattern itself moves a little
     _click(win, app, "Emoji rain", "Pizza")
     pump(app, 0.8)

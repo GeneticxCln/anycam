@@ -230,6 +230,36 @@ def test_audio_outputs_are_built_only_when_the_server_is_there(tmp_path, monkeyp
         engine.stop()
 
 
+def test_monitoring_the_desktop_capture_sink_is_refused_as_feedback(tmp_path, monkeypatch):
+    """Monitoring to the sink whose monitor source is captured as desktop
+    audio loops; the guard must refuse it (audit item 9)."""
+    from anycam.engine import audio as audio_module
+
+    tone = write_tone(tmp_path / "t.wav", seconds=0.3)
+    monkeypatch.setattr(audio_module, "audio_server_socket", lambda kind: "/run/fake")
+    for desktop in ("alsa_output.speakers", "alsa_output.speakers.monitor"):
+        project = audio_project(media_file=tone, monitor_device="alsa_output.speakers",
+                                desktop_device=desktop)
+        engine = AnyCamEngine(project, preview=True, audio=True,
+                              on_frame=lambda _sample: None).build()
+        try:
+            assert "feedback" in engine.report.audio_monitor_error, desktop
+            assert engine.pipeline.get_by_name("audio_monitor_sink") is None, desktop
+        finally:
+            engine.stop()
+
+    # A different output device is not a loop and still gets the monitor sink.
+    project = audio_project(media_file=tone, monitor_device="alsa_output.speakers",
+                            desktop_device="alsa_output.headphones.monitor")
+    engine = AnyCamEngine(project, preview=True, audio=True,
+                          on_frame=lambda _sample: None).build()
+    try:
+        assert "feedback" not in engine.report.audio_monitor_error
+        assert engine.pipeline.get_by_name("audio_monitor_sink") is not None
+    finally:
+        engine.stop()
+
+
 # ------------------------------------------------------------- video-layer sound
 import shutil  # noqa: E402
 import subprocess  # noqa: E402

@@ -1,4 +1,6 @@
 # AnyCam runtime and tooling
+.idea/
+.shiki/
 .venv/
 __pycache__/
 *.pyc

@@ -61,7 +61,15 @@ class AudioMixin:
 
     def _build_audio(self) -> None:
         assert self.pipeline is not None
-        mixer = make("audiomixer", "audio_mixer", ignore_inactive_pads=True)
+        # Not ignore_inactive_pads: when the mixer's first (timed) aggregation
+        # runs before any input has delivered a buffer, every pad counts as
+        # inactive, the mixer answers "we're EOS" and pauses its output task for
+        # good.  The input that is still waiting for it then blocks in a query
+        # on the mixer for ever (no audio, and engine.stop hangs in the audio
+        # EOS push).  Measured with the GPU preview: 6 of 8 starts dead with
+        # True, 0 of 8 with False.  A live mixer outputs at its deadline either
+        # way, so a slow microphone does not stall it.
+        mixer = make("audiomixer", "audio_mixer", ignore_inactive_pads=False)
         self._add(mixer)
         self.audio_mixer = mixer
         # A silent always-on input keeps audiomixer producing buffers while a
@@ -196,8 +204,12 @@ class AudioMixin:
         prefix = f"layeraudio_{layer_id}_"
         members = [element for element in self.pipeline.children
                    if element.get_name().startswith(prefix)]
-        for element in members:
-            element.set_state(Gst.State.NULL)
+        # Unlink the last element from the mixer before stopping.  (Video
+        # layer chains are stopped first, see _dispose_chain; this path was
+        # checked with a clip that has sound: no pipeline error on removal.)
+        # The mixer pad is released only after the stop (releasing first broke
+        # re-add).
+        mixer_pads = []
         for element in members:
             pad = element.get_static_pad("src")
             peer = pad.get_peer() if pad is not None else None
@@ -205,7 +217,11 @@ class AudioMixin:
                 continue
             pad.unlink(peer)
             if peer.get_parent_element() is self.audio_mixer:
-                self.audio_mixer.release_request_pad(peer)
+                mixer_pads.append(peer)
+        for element in members:
+            element.set_state(Gst.State.NULL)
+        for peer in mixer_pads:
+            self.audio_mixer.release_request_pad(peer)
         for element in members:
             self.pipeline.remove(element)
 
@@ -315,6 +331,14 @@ class AudioMixin:
         if self.audio_mixer is None or not self.report.audio_inputs:
             return None
         master = make("level", "master_level", interval=100_000_000, post_messages=True)
+        # Pin the mixer's output.  When the mixer aggregates before any input
+        # has caps it outputs its default 44100 Hz and then switches to the
+        # inputs' 48000 Hz; the AAC encoder follows with a new stream, and the
+        # recorder (one audio track, one rate) ended its audio after the first
+        # few buffers.  Seen with the GPU preview, whose slower start makes the
+        # first aggregation early.
+        mixer_caps = caps_filter("audio/x-raw,format=F32LE,rate=48000,channels=2",
+                                 "audio_mixer_caps")
         raw = make("tee", "audio_raw_tee", allow_not_linked=True)
         queue = make("queue", "audio_encode_queue", max_size_time=2 * Gst.SECOND,
                      max_size_buffers=0, max_size_bytes=0)
@@ -322,8 +346,8 @@ class AudioMixin:
         aenc = make("avenc_aac", "audio_shared_enc", bitrate=128000)
         aparse = make("aacparse", "audio_shared_parse")
         tee = make("tee", "audio_shared_tee")
-        self._add(master, raw, queue, aconv, aenc, aparse, tee)
-        self._link([self.audio_mixer, master, raw, queue, aconv, aenc, aparse, tee])
+        self._add(mixer_caps, master, raw, queue, aconv, aenc, aparse, tee)
+        self._link([self.audio_mixer, mixer_caps, master, raw, queue, aconv, aenc, aparse, tee])
         self.audio_tee = tee
         self._audio_raw_tee = raw
         self._build_audio_outputs(raw)
@@ -347,7 +371,18 @@ class AudioMixin:
         report = self.report
         if audio.monitor_device:
             device = "" if audio.monitor_device == "default" else audio.monitor_device
-            if not audio_server_socket("pulse"):
+            # Feedback guard: monitoring to the device whose monitor source is
+            # captured as desktop audio loops (audit item 9).  PulseAudio names
+            # a sink's monitor source "<sink>.monitor".
+            desktop = (audio.desktop_device or "").strip()
+            monitor = (audio.monitor_device or "").strip()
+            desktop_sink = desktop[:-8] if desktop.endswith(".monitor") else desktop
+            if desktop and monitor and monitor != "default" and (
+                    monitor == desktop_sink or desktop == f"{monitor}.monitor"):
+                report.audio_monitor_error = (
+                    "monitor output would play into the desktop-audio capture "
+                    "(feedback loop); monitor disabled")
+            elif not audio_server_socket("pulse"):
                 report.audio_monitor_error = "no PulseAudio/PipeWire-Pulse server is running"
             elif Gst.ElementFactory.find("pulsesink") is None:
                 report.audio_monitor_error = "GStreamer pulsesink is not installed"

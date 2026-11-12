@@ -2,8 +2,25 @@
 
 All notable changes. Versions follow `pyproject.toml`; each `vX.Y.Z` tag publishes a GitHub Release.
 
-## Unreleased
+## 1.4.0 - 2026-11-12
 
+- Audit fixes (2026-11-12, 11 items): the GPU preview no longer crashes on startup with an `ImportError`
+  (`from . import gl_preview` had no module); switching scenes with the GPU preview no longer deadlocks the
+  GUI thread (the preview sinks no longer wait for preroll, which stalled canvas startup; layer chains are
+  stopped before they are unlinked, and layer audio unlinks before it stops); quitting
+  with the GPU preview no longer blocks for >8 s (the shutdown flag is set after the engine step, even when
+  it fails); motion detection and the floating panel get frames again under the GPU preview through a small
+  CPU tap (on the GPU canvas it scales on the GPU and downloads a small texture: scaling full-size frames on
+  the CPU segfaulted about every other run during an NVENC recording); recordings made with the GPU preview
+  no longer lose their sound after the first few buffers (the audio mixer's output is pinned to 48000 Hz;
+  an early first aggregation had made it 44100 Hz and then switched); a stale publisher can no longer flip a torn-down stream back to "live"; a reconnect now forces a
+  keyframe from the retained encoder; effects no longer flash off while the worker starts or restarts (the
+  last good frame is held); monitoring to the sink whose monitor source is the desktop capture no longer
+  feeds back; a failed or timed-out `pdftoppm` render no longer leaves partial pages cached forever; and the
+  PKGBUILD installs the AppStream metainfo only when the tarball has it and checks with `python-pytest`.
+- **Changed:** AI effects now run in-process by default (measured 21–27 ms/frame through the worker against
+  0–5 ms in-process at 1080p). Effect packs still always use a worker; **Settings → AI effects** can isolate
+  all AI effects again.
 - Audit fixes (2026-11-11): see `docs/REGRESSIONS.md` for the list. Highlights: the frame overlay is no
   longer re-rendered on every colour-slider change, "Allow phones" works with ufw on Debian/Ubuntu, capture
   errors keep the device or file path, `~/` video paths work, network streams reconnect with backoff,
@@ -19,8 +36,8 @@ All notable changes. Versions follow `pyproject.toml`; each `vX.Y.Z` tag publish
 - Streaming: several destinations from one encode, each with status and reconnect (1–30 s backoff); YouTube,
   Twitch, Facebook and Kick presets; `rtmps://` and `srt://` addresses; SRT output; stream and recording
   bitrate; a disk guard that stops and saves a recording before the disk fills.
-- AI effects and effect packs run in a worker process; a crash or hang there only costs the effect. Effect
-  packs (`docs/EFFECT_PACKS.md`) and favourites.
+- Effect packs always run in a worker process, and AI effects can (off by default); a crash or hang there
+  only costs the effect. Effect packs (`docs/EFFECT_PACKS.md`) and favourites.
 - Content: PDF slides, video-site links through `yt-dlp`, MJPEG IP cameras, motion detection (switch scene,
   notification), a floating always-on-top panel.
 - Phone remote (`/remote`) for scenes, mute and record over the paired HTTPS link; off until switched on.

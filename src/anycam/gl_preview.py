@@ -179,6 +179,31 @@ def make_video_view(parent):
     return view
 
 
+def view_ready(view) -> bool:
+    """True once the Quick view has a live scene graph and a shown window.
+
+    ``qml6glsink`` takes Qt's GL context from the item's window.  Attaching
+    while that context is still being created used to build a GPU canvas that
+    reported ``preview_backend == "gpu"``, raised no error, and never produced
+    a frame (measured on the reference machine; the mixer then sat waiting for
+    a context that never arrived).  A later scene switch could block stopping
+    those layers.
+    """
+    try:
+        if not view.isVisible():
+            return False
+        window = view.quickWindow() if hasattr(view, "quickWindow") else None
+        if window is None:
+            # Not a QQuickWidget (or a test double): nothing more to check.
+            return True
+        # A QQuickWidget renders into its own offscreen QQuickWindow, which is
+        # therefore never "visible" or "exposed"; only the scene graph tells
+        # whether the GL context the sink shares exists yet.
+        return bool(window.isSceneGraphInitialized())
+    except Exception:  # noqa: BLE001 - the image preview takes over
+        return False
+
+
 def attach_sink(sink: Gst.Element, view) -> bool:
     """Point ``qml6glsink``'s ``widget`` property at the view's video item.
 
@@ -194,7 +219,7 @@ def attach_sink(sink: Gst.Element, view) -> bool:
         # The sink takes Qt's GL context from the item's window, which Qt
         # Quick creates once the (visible) view has rendered; without it the
         # pipeline fails to start ("failed to retrieve wrapped context").
-        if not view.isVisible():
+        if not view.isVisible() or not view_ready(view):
             return False
         _g_object_set()(_pointer_of(sink), b"widget",
                         int(shiboken6.getCppPointer(item)[0]), None)

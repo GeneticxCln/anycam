@@ -93,7 +93,7 @@ rest of the session. `ANYCAM_CANVAS=cpu|gpu` overrides the setting.
 ## Install and run
 
 ```bash
-pip install anycam-1.3.2.tar.gz     # from the GitHub release, or from a checkout:
+pip install anycam-1.4.0.tar.gz     # from the GitHub release, or from a checkout:
 ./scripts/setup.sh                  # creates .venv with system site-packages
 ./scripts/anycam-gui                # the studio (or: python -m anycam gui)
 ./scripts/install-desktop.sh        # optional: add it to the app menu
@@ -136,7 +136,7 @@ Keys: `Ctrl+P` preview, `Ctrl+R` record, `Ctrl+Shift+V` virtual camera, `F5` sna
 
 ## Releases
 
-**v1.3.2** is the current release (v1.3.1, v1.3.0, v1.2.1, v1.2.0, v1.1.0, v1.0.3, v1.0.2, v1.0.1 and v1.0.0 came before); **Settings → About** shows the version and what
+**v1.4.0** is the current release (v1.3.2, v1.3.1, v1.3.0, v1.2.1, v1.2.0, v1.1.0, v1.0.3, v1.0.2, v1.0.1 and v1.0.0 came before); **Settings → About** shows the version and what
 it runs on. Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`: it builds the
 tarball and wheel, checks the bundled assets, smoke-tests a clean install and publishes a
 GitHub Release with `SHA256SUMS`. To release, bump `version` in `pyproject.toml` and
@@ -169,7 +169,7 @@ permission through the portal.
   clicks or voices; there is no echo cancelling. Changing it restarts the canvas, like
   changing the microphone does.
 - **Canvas:** one virtual camera, and one canvas size and FPS for all layers; two filter slots
-  per layer. A scene change rebuilds the graph (a hard cut) and starts a new recording segment.
+  per layer. Most scene and layer changes reposition pads without rebuilding the graph; only structural changes rebuild it, and a rebuild starts a new recording segment.
 - **Virtual camera:** with `exclusive_caps=1`, Chromium apps list AnyCam only while AnyCam is
   running. An app that was already open when AnyCam started may need its camera list
   reopened. The setup will not reload the driver while another app's v4l2loopback camera
@@ -192,7 +192,7 @@ permission through the portal.
 ## Develop
 
 ```bash
-.venv/bin/python -m pytest tests     # 899 tests; the GUI and engine tests run offscreen
+.venv/bin/python -m pytest tests     # 1231 tests; the GUI and engine tests run offscreen
 ```
 
 ### Reproduce CI locally

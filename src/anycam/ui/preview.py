@@ -118,7 +118,7 @@ class PreviewWidget(QWidget):
     # ------------------------------------------------------------ GPU view
     def enable_gpu(self) -> bool:
         """Add the GPU video view and its overlay; False leaves the image path."""
-        from . import gl_preview
+        from .. import gl_preview
 
         if self.video_view is not None:
             return True

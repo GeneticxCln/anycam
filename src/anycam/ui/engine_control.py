@@ -119,14 +119,28 @@ class EngineMixin:
             self.engine = candidate.build()
             self.engine.start()
             gpu = getattr(self.engine, "preview_backend", "") == "gpu"
+            if gpu:
+                self._gpu_preview_tries = 0
             if self.preview.video_view is not None and not gpu:
-                if not self.preview.video_view.isVisible():
-                    # Built while the window was hidden (tray, or a shortcut
-                    # or tray action triggered a rebuild): the GPU view had
-                    # no GL context to share.  That is not a failure of the
-                    # GPU preview; rebuild with it once the window shows.
-                    self._gpu_preview_pending = True
-                    self.log_event("preview: window hidden; GPU preview resumes when it is shown")
+                from .. import gl_preview
+
+                ready = gl_preview.view_ready(self.preview.video_view)
+                tries = getattr(self, "_gpu_preview_tries", 0)
+                if not self.preview.video_view.isVisible() or not ready:
+                    # The Quick view has no GL context yet.  Building the GPU
+                    # canvas now produced one that reported "gpu", raised no
+                    # error and never delivered a frame; retry shortly with
+                    # the image preview running in the meantime.
+                    if tries < 4:
+                        self._gpu_preview_tries = tries + 1
+                        self._gpu_preview_pending = True
+                        self.log_event(
+                            "preview: the Qt Quick view is not ready yet; image preview meanwhile")
+                        QTimer.singleShot(250, self._resume_gpu_preview)
+                    else:
+                        self.log_event(
+                            "preview: GPU preview never became ready; using the image preview")
+                        self.preview.disable_gpu()
                 else:
                     self.log_event("preview: GPU preview did not start; using the image preview")
                     self.preview.disable_gpu()
@@ -209,7 +223,7 @@ class EngineMixin:
             # ``self.engine`` is cleared first so no timer touches a graph
             # that is shutting down.
             engine, self.engine = self.engine, None
-            report = self._run_with_ui(engine.stop)
+            report = self._run_with_ui(engine.stop) or {}
             if report.get("record_path"):
                 self.recording_segments.append(report["record_path"])
                 self._status(f"Saved {report['record_path']}")
@@ -250,7 +264,6 @@ class EngineMixin:
         not stop, a phone link that raises) used to skip the rest, including
         the project save and the recording's finalisation.
         """
-        self._closing = True           # no nested event loops while quitting
         steps = (
             ("thumbnails", self._stop_thumbnails),
             ("preview timer", self.timer.stop),
@@ -267,11 +280,19 @@ class EngineMixin:
             ("project save", self._save_if_needed),
             ("screen sessions", self._close_screen_sessions),
         )
+        # _closing is set only after the engine step: setting it first made
+        # _run_with_ui inline engine.stop() on the GUI thread, which blocked
+        # shutdown for >8 s with the GPU preview (audit item 3).  It is set in
+        # a finally block so a failing stop still keeps the rest of the
+        # teardown off the inline path.
         for name, step in steps:
             try:
                 step()
             except Exception as exc:  # noqa: BLE001 - keep shutting down
                 print(f"[shutdown] {name} failed: {exc!r}", file=sys.stderr, flush=True)
+            finally:
+                if name == "engine":
+                    self._closing = True
 
     def shutdown(self) -> None:
         """Backstop for QApplication.aboutToQuit and headless teardown."""
@@ -302,13 +323,20 @@ class EngineMixin:
         # switch in the middle of a privileged operation).  Portal shortcuts
         # check ``_ui_blocked`` for the same reason.
         self._ui_blocked = getattr(self, "_ui_blocked", 0) + 1
+        deadline = time.monotonic() + 25.0
         try:
             thread.start()
-            while thread.is_alive():
+            while thread.is_alive() and time.monotonic() < deadline:
                 if app is not None:
                     app.processEvents(
                         QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
                 thread.join(0.02)
+            if thread.is_alive():
+                # A stop that waits on the GPU/driver must not freeze the
+                # window for ever.  The worker is a daemon and the engine is
+                # already forgotten, so the session can rebuild.
+                print("[shutdown] a blocking step did not finish; continuing without it",
+                      file=sys.stderr, flush=True)
         finally:
             self._ui_blocked -= 1
         if "error" in result:
@@ -373,10 +401,31 @@ class EngineMixin:
         self.frame_ready.emit()
 
     def _resume_gpu_preview(self) -> None:
-        if (self.engine is not None and self.preview.video_view is not None
-                and self.preview.video_view.isVisible()
-                and getattr(self.engine, "preview_backend", "") != "gpu"):
-            self.restart_engine()
+        from .. import gl_preview
+
+        view = self.preview.video_view
+        if (self.engine is None or view is None
+                or getattr(self.engine, "preview_backend", "") == "gpu"):
+            return
+        if not view.isVisible():
+            return
+        if not gl_preview.view_ready(view):
+            # Qt Quick has not rendered yet; a GPU graph built now would never
+            # receive frames.  Keep the image preview until it has.
+            if getattr(self, "_gpu_preview_tries", 0) < 4:
+                self._gpu_preview_tries += 1
+                QTimer.singleShot(250, self._resume_gpu_preview)
+            else:
+                # Giving up must remove the Quick view: left on top it shows
+                # its "Preview stopped" card over the running image preview,
+                # which reads as if the camera had stopped.
+                self._gpu_preview_pending = False
+                self.log_event(
+                    "preview: GPU preview never became ready; using the image preview")
+                self.preview.disable_gpu()
+            return
+        self._gpu_preview_pending = False
+        self.restart_engine()
 
     def _setup_preview_output(self) -> None:
         """Resize following and the GPU preview, for either window's preview."""
@@ -483,6 +532,37 @@ class EngineMixin:
             if state[0] != "LIVE" or (previous and previous[0] != "LIVE"):
                 self._status(message)
 
+    def _recover_stalled_gpu_canvas(self, rec: dict) -> bool:
+        """Fall back to the image preview when a GPU canvas delivers nothing.
+
+        Measured on the reference machine: the engine builds the GL graph,
+        reports ``preview_backend == "gpu"`` and no error, the sources deliver
+        frames, yet no compositor buffer ever arrives (the GL context was not
+        ready when the mixer started).  The window then sits on "Preview
+        stopped", and stopping a layer later can block on the same context.
+        One restart with the image preview keeps the studio usable.
+        """
+        if self.engine is None or getattr(self.engine, "preview_backend", "") != "gpu":
+            self._gpu_stalled_since = 0.0
+            return False
+        report = self.engine.report
+        delivering = any(entry.get("frames") for entry in report.source_health.values())
+        if rec.get("instant_fps", 0) > 0 or not delivering or report.stalled_sources:
+            self._gpu_stalled_since = 0.0
+            return False
+        now = time.monotonic()
+        since = getattr(self, "_gpu_stalled_since", 0.0)
+        if not since:
+            self._gpu_stalled_since = now
+            return False
+        if now - since < 3.0:
+            return False
+        self._gpu_stalled_since = 0.0
+        self.log_event("preview: GPU canvas produced no frames; using the image preview")
+        self.preview.disable_gpu()
+        self.restart_engine()
+        return True
+
     def _handle_rtmp_report(self) -> None:
         """Show stream trouble; a destination that is reconnecting is not "stopped"."""
         rtmp_error = getattr(self.engine.report, "rtmp_error", "")
@@ -530,6 +610,8 @@ class EngineMixin:
         self.check_disk_guard()
         self._advance_playlist(time.monotonic())
         if rec is not None:
+            if self._recover_stalled_gpu_canvas(rec):
+                return
             self._update_source_status()
             stats = (f"{rec['instant_fps']:5.1f} fps · {rec['frames']} frames · "
                      f"CPU {rec['cpu_pct']}% · RSS {rec['rss_mib']} MiB")

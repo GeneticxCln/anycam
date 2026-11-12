@@ -37,7 +37,10 @@ def pdf_pages(path: str, dpi: int = 110, max_pages: int = MAX_PDF_PAGES) -> tupl
     digest = hashlib.sha1(f"{source.resolve()}|{stat.st_mtime_ns}|{stat.st_size}|{dpi}".encode()
                           ).hexdigest()[:16]
     folder = config.cache_dir() / "pdf" / digest
-    pages = sorted(folder.glob("page-*.png"))
+    # Only a render that completed is reused: pages are written only after a
+    # successful pdftoppm, so a timed-out partial render is never cached
+    # forever (audit item 11).
+    pages = sorted(folder.glob("page-*.png")) if (folder / ".complete").exists() else []
     if not pages:
         folder.mkdir(parents=True, exist_ok=True)
         try:
@@ -46,10 +49,16 @@ def pdf_pages(path: str, dpi: int = 110, max_pages: int = MAX_PDF_PAGES) -> tupl
                  str(source), str(folder / "page")],
                 capture_output=True, text=True, timeout=180)
         except (OSError, subprocess.TimeoutExpired) as exc:
+            for partial in folder.glob("page-*.png"):
+                partial.unlink(missing_ok=True)
             return [], f"pdftoppm failed: {exc}"
         if result.returncode != 0:
+            for partial in folder.glob("page-*.png"):
+                partial.unlink(missing_ok=True)
             return [], "pdftoppm could not read the file: " + (result.stderr.strip()[-160:] or "unknown error")
         pages = sorted(folder.glob("page-*.png"))
+        if pages:
+            (folder / ".complete").write_text("done\n")
     return (pages, "") if pages else ([], "the PDF has no pages")
 
 
