@@ -231,5 +231,8 @@ def test_a_real_browser_runs_the_check_page_with_its_test_camera():
         outcome = compat.run_chromium(name, binary, url, fake=True, timeout=45)
     finally:
         server.shutdown()
+    if outcome.state == "error" and "did not start" in outcome.detail:
+        # e.g. a snap-packaged /usr/bin/chromium that cannot open a DevTools port here.
+        pytest.skip(f"{name} cannot be driven on this machine: {outcome.detail}")
     assert outcome.state == "ok", outcome
     assert outcome.mode == "fake-device" and outcome.devices
