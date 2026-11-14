@@ -202,10 +202,14 @@ Design and build order: `docs/PHONE_CAMERA.md`.
 
 ## 10. Verification and documentation debt
 
+> **Feature freeze (2026-11-14):** no new user-facing feature until Phases 1-3 of
+> `plans/pending/product-hardening.md` (keyring, crash safety, encoder probe) are merged. Fixes and the plan's own
+> steps only.
+
 - [ ] Every **R** bug from the audit keeps its own regression test; every **I** bug is reproduced first or closed as not-a-bug in `docs/REGRESSIONS.md`.
 - [ ] Automated runs use synthetic sources, Qt offscreen and temp `XDG_*`; they never open the user's camera or saved project.
 - [ ] Soak tracks RSS, tmpfs, disk and FDs; frame stalls fail the run.
-- [ ] Replace `PLAN.md` with the 2026-10-31 audit (or check the audit text in under `docs/`) so the plan and `PARITY.md` stop disagreeing.
+- [ ] Replace `PLAN.md` with the 2026-10-31 audit (or check the audit text in under `docs/`) so the plan and `PARITY.md` stop disagreeing. (Planned: `plans/pending/product-hardening.md` step 4.2.)
 - [x] `PARITY.md` carries a measured-results section for this round (2026-11-12) and states its gaps; older rows keep their original evidence notes.
 - [x] `scripts/capture-screencast.py` reports `ok: false` for a flat or wrong-shaped frame (B55). Passed: `tests/test_housekeeping_2026_11_12.py`.
 - [ ] Evidence gaps: live portal screen capture, physical unplug, 10-minute soak with the virtual camera; the 2026-11-12 GPU-preview smoke (section 11).
