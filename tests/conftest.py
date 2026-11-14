@@ -66,3 +66,14 @@ def hardware_free_environment(request):
         yield True
     finally:
         patch.undo()
+
+
+@pytest.fixture(autouse=True)
+def memory_keyring():
+    """Tests never touch the real desktop keyring: each gets its own in-memory one."""
+    from anycam import credentials
+
+    store = credentials.MemoryStore()
+    credentials.set_store(store)
+    yield store
+    credentials.set_store(None)
