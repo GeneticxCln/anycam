@@ -2,7 +2,7 @@
 
 All notable changes. Versions follow `pyproject.toml`; each `vX.Y.Z` tag publishes a GitHub Release.
 
-## Unreleased
+## 1.5.0 - 2026-11-14
 
 - **Keyring.** Stream keys (RTMP and extra destinations), SRT passphrases and stream ids, and network
   camera passwords are kept in the desktop keyring (Secret Service through libsecret), not in the project

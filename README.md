@@ -40,7 +40,7 @@ no Wine.
 ## Quick start
 
 ```bash
-pip install anycam-1.4.0.tar.gz     # from the GitHub release, or from a checkout:
+pip install anycam-1.5.0.tar.gz     # from the GitHub release, or from a checkout:
 ./scripts/setup.sh                  # creates .venv with system site-packages
 ./scripts/anycam-gui                # the studio (or: python -m anycam gui)
 ./scripts/install-desktop.sh        # optional: add it to the app menu
@@ -230,7 +230,7 @@ Effect packs are third-party code and always run in a separate worker process.
 
 ## Releases
 
-**v1.4.0** is the current version; **Settings → About** shows the version and what it runs
+**v1.5.0** is the current version; **Settings → About** shows the version and what it runs
 on. Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`: it builds the tarball and
 wheel, checks the bundled assets, smoke-tests a clean install and publishes a GitHub Release
 with `SHA256SUMS`. To release, bump `version` in `pyproject.toml` and `VERSION` in
