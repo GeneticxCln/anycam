@@ -74,6 +74,37 @@ def cmd_demo(args) -> int:
     return demo_main(args.demo_args)
 
 
+def cmd_encoders(args) -> int:
+    from .engine import encoders
+
+    if args.json:
+        return encoders.probe_main()    # the child the app runs; one line per encoder
+    answers = encoders.probe_results(block=True, force=args.again)
+    for name in encoders.candidate_encoders():
+        entry = answers.get(name, {})
+        print(f"{name:12} {'ok' if entry.get('ok') else 'no: ' + entry.get('reason', '')}")
+    return 0
+
+
+def cmd_ctl(args) -> int:
+    from . import ctl
+
+    return ctl.main(args.action, " ".join(args.argument))
+
+
+def cmd_repair(args) -> int:
+    from . import repair
+
+    problems = repair.check()
+    if not problems:
+        print("Nothing to repair: the project, hotkeys and phones files all read.")
+        return 0
+    for problem, moved in repair.repair(problems):
+        print(f"{problem.kind}: {problem.path} {problem.why}; "
+              + (f"set aside in {moved.parent}" if moved else "could not be moved"))
+    return 0
+
+
 def cmd_gui(args) -> int:
     if args.screenshot:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -93,7 +124,7 @@ def cmd_gui(args) -> int:
 
     if args.screenshot:
         return run_screenshot(args.screenshot, args.seconds, source=args.source)
-    return run_gui()
+    return run_gui(safe_mode=bool(getattr(args, "safe_mode", False)))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -118,6 +149,16 @@ def main(argv: list[str] | None = None) -> int:
 
     # Listed for `anycam --help`; the early dispatch above forwards the real
     # soak arguments to its own parser.
+    encoders_cmd = sub.add_parser("encoders", help="test-encode with every encoder (what Auto may choose from)")
+    encoders_cmd.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    encoders_cmd.add_argument("--again", action="store_true", help="ignore the cached answer")
+    encoders_cmd.set_defaults(func=cmd_encoders)
+    ctl_cmd = sub.add_parser("ctl", help="control the running window: record, mute, scene <name>, state, list")
+    ctl_cmd.add_argument("action", help="an action id (try: anycam ctl list)")
+    ctl_cmd.add_argument("argument", nargs="*", help="for scene: its name, number or id")
+    ctl_cmd.set_defaults(func=cmd_ctl)
+    sub.add_parser("repair", help="set aside project/hotkeys/phones files that no longer read"
+                   ).set_defaults(func=cmd_repair)
     sub.add_parser("soak", help="long-run acceptance test (drops + memory)")
 
     demo = sub.add_parser("demo", help="headless camera -> composition -> MP4 / vcam")
@@ -130,6 +171,9 @@ def main(argv: list[str] | None = None) -> int:
     gui.add_argument("--source", default="", help="use the headless demo scene (camera, testsrc, or a media path)")
     gui.add_argument("--ui", choices=("manycam", "classic"), default="manycam",
                      help="UI layout: manycam (default) or classic")
+    gui.add_argument("--safe-mode", action="store_true",
+                     help="start with the CPU canvas and image preview, no virtual camera, phone link "
+                          "or AI effects (nothing is changed in the project)")
     gui.set_defaults(func=cmd_gui)
 
     args = parser.parse_args(argv)

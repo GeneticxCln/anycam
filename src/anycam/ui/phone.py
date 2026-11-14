@@ -66,22 +66,20 @@ class PhoneMixin:
     def phone_control(self, action: str, data: dict, device: str = "") -> dict:
         """What the remote page can do; returns the state to show afterwards."""
         if action == "scene":
-            index = next((i for i, scene in enumerate(self.project.scenes)
-                          if scene.id == data.get("scene_id")), -1)
-            if index < 0:
+            if self.ctl_scene_index(str(data.get("scene_id") or ""), ids_only=True) < 0:
                 return {"error": "No such scene."}
-            self.switch_scene(index)
-        elif action == "mute":
-            self.toggle_mic_mute()
-        elif action == "record":
-            self.toggle_record()
-        elif action != "state":
+            reply = self.ctl_dispatch({"action": "scene", "argument": data.get("scene_id")})
+        elif action in ("mute", "record"):
+            reply = self.ctl_dispatch({"action": action})
+        elif action == "state":
+            reply = {"ok": True}
+        else:
             return {"error": "Unknown action."}
+        if not reply.get("ok"):
+            return {"error": "AnyCam could not do that."}
         if action != "state":
             self.log_event(f"phone remote ({self._phone_name(device) or device}): {action}")
-        return {"scenes": [{"id": scene.id, "name": scene.name} for scene in self.project.scenes],
-                "active": self.project.active_scene, "recording": bool(self.recording),
-                "muted": bool(self.project.audio.mic_muted)}
+        return self.ctl_state()
 
     def set_phone_control(self, enabled: bool) -> None:
         self.project.output.phone_control = bool(enabled)
