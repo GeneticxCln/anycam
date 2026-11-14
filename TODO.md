@@ -197,7 +197,7 @@ Design and build order: `docs/PHONE_CAMERA.md`.
 - [x] Doctor checks every required plugin and `setup.sh` fails when an element is missing (B52). Passed: `tests/test_housekeeping_2026_11_12.py`.
 - [x] `ruff` + coverage in CI (2026-11-12); single-instance guard (B47, `tests/test_gui_state_fixes.py`).
 - [x] `NOTICE`, `CHANGELOG`, `CONTRIBUTING`, `SECURITY` (2026-11-12). [ ] User docs; screenshots from synthetic sources only.
-- [~] 1.4.0: `pyproject.toml`, `config.py`, the PKGBUILD and the AppStream metainfo say 1.4.0, and the CHANGELOG has its section. The tag and release wait for the hardware gates in section 11.
+- [x] 1.4.0 is tagged (`v1.4.0`); 1.5.0 (keyring, crash safety, encoder probe, `anycam ctl`) is tagged 2026-11-14. The hardware gates in section 11 are still open.
 - [ ] Publish the repo only when the user says so.
 
 ## 10. Verification and documentation debt

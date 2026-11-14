@@ -1,6 +1,6 @@
 # Maintainer: AnyCam contributors
 pkgname=anycam
-pkgver=1.4.0
+pkgver=1.5.0
 pkgrel=1
 pkgdesc='Linux-native virtual camera studio'
 arch=('any')
