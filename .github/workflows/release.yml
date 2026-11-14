@@ -3,13 +3,20 @@ name: Release
 # Pushing a version tag (v1.0.0, v1.1.0, ...) builds the source tarball and the
 # wheel, checks that the bundled emoji, models and styles made it in, installs the
 # wheel into a clean environment as a smoke test, and publishes a GitHub Release
-# with SHA256SUMS.  Run it by hand from the Actions tab to build the files
-# without publishing.
+# with SHA256SUMS.  It also builds the .deb and the Arch package and attaches
+# them.  Run it by hand from the Actions tab to build the files without
+# publishing, or give it an existing tag to build that tag's packages and
+# attach them to its release.
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag (v1.5.0) to build and publish; empty builds without publishing"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -20,6 +27,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: actions/setup-python@v5
         with:
@@ -84,9 +93,68 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  deb:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Build the .deb
+        run: packaging/deb/build.sh deb-out
+
+      - name: Inspect it
+        run: |
+          ls -l deb-out
+          dpkg-deb --info deb-out/*.deb
+          dpkg-deb --contents deb-out/*.deb | grep -E 'usr/bin/anycam|dist-packages/anycam/credentials.py'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anycam-deb
+          path: deb-out/*.deb
+          if-no-files-found: error
+
+  arch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    container: archlinux:latest
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --noconfirm base-devel git sudo
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: makepkg
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          version=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
+          mkdir /tmp/pkg
+          git archive --format=tar.gz --prefix="anycam-$version/" HEAD -o "/tmp/pkg/anycam-$version.tar.gz"
+          cp packaging/arch/PKGBUILD /tmp/pkg/PKGBUILD
+          sed -i 's|^source=.*|source=("anycam-$pkgver.tar.gz")|' /tmp/pkg/PKGBUILD
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chown -R builder /tmp/pkg
+          su builder -c 'cd /tmp/pkg && makepkg -s --noconfirm'
+
+      - name: The package installs and starts
+        run: |
+          pacman -U --noconfirm /tmp/pkg/*.pkg.tar.zst
+          QT_QPA_PLATFORM=offscreen anycam --help
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anycam-arch
+          path: /tmp/pkg/*.pkg.tar.zst
+          if-no-files-found: error
+
   release:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, deb, arch]
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -94,13 +162,22 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: anycam-dist
+          pattern: anycam-*
+          merge-multiple: true
           path: dist
+
+      - name: Checksums of everything that is attached
+        working-directory: dist
+        run: |
+          rm -f SHA256SUMS
+          sha256sum anycam* | tee SHA256SUMS
 
       - name: Publish the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          GITHUB_REF_NAME="$TAG"
           version="${GITHUB_REF_NAME#v}"
           cat > notes.md <<NOTES
           Linux-native virtual camera studio: cameras, screens, video, overlays, face masks,
@@ -114,7 +191,9 @@ jobs:
           \`\`\`
 
           PyGObject and the GStreamer plugins come from your distribution (see the README's
-          Requirements). Verify the download with \`sha256sum -c SHA256SUMS\`.
+          Requirements). Debian and Ubuntu: \`sudo apt install ./anycam_${version}_all.deb\`.
+          Arch: \`sudo pacman -U anycam-${version}-1-any.pkg.tar.zst\`. Verify the downloads
+          with \`sha256sum -c SHA256SUMS\`.
 
           NOTES
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
