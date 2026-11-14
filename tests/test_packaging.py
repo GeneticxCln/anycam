@@ -36,7 +36,7 @@ def test_the_desktop_file_names_a_real_icon_and_command():
     assert (ROOT / "src" / "anycam" / "assets" / "anycam-logo.png").is_file()
 
 
-@pytest.mark.parametrize("script", ["deb/build.sh", "appimage/build.sh"])
+@pytest.mark.parametrize("script", ["deb/build.sh", "unsupported/appimage/build.sh"])
 def test_build_scripts_parse_and_pass_shellcheck(script):
     path = PACKAGING / script
     subprocess.run(["bash", "-n", str(path)], check=True)
@@ -55,7 +55,7 @@ def test_the_pkgbuild_parses_and_tracks_the_version():
 
 def test_the_flatpak_manifest_lists_what_the_app_needs():
     yaml = pytest.importorskip("yaml")
-    manifest = yaml.safe_load((PACKAGING / "flatpak" / "io.github.geneticxcln.AnyCam.yml").read_text())
+    manifest = yaml.safe_load((PACKAGING / "unsupported" / "flatpak" / "io.github.geneticxcln.AnyCam.yml").read_text())
     assert manifest["app-id"] == "io.github.geneticxcln.AnyCam" and manifest["command"] == "anycam"
     permissions = " ".join(manifest["finish-args"])
     for needed in ("--device=all", "--share=network", "--socket=pulseaudio"):

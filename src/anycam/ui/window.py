@@ -27,6 +27,7 @@ from .layout_history import LayoutHistory  # noqa: F401
 from .preview import PreviewWidget, _PreviewOverlay  # noqa: F401
 from .dialogs import CameraGridDialog, OverlayDialog, _slider_row  # noqa: F401
 from .cameras import _CAMERA_LOSS  # noqa: F401
+from .ctl import CtlMixin  # noqa: E402
 from .effects_panel import EffectsPanelMixin  # noqa: E402
 from .general_panel import GeneralPanelMixin  # noqa: E402
 from .draw_panel import DrawMixin  # noqa: E402
@@ -46,7 +47,7 @@ from .desktop import DesktopMixin  # noqa: E402
 from .phone import PhoneMixin  # noqa: E402
 
 
-class AnyCamWindow(GeneralPanelMixin, EffectsPanelMixin, DrawMixin, BackdropMixin, AudioPanelMixin, PlaylistMixin, OutputPanelMixin, SceneMixin, LayersMixin, UndoMixin, CameraMixin, ScreenMixin, OutputsMixin, ProjectIOMixin, EngineMixin, DesktopMixin, PhoneMixin,
+class AnyCamWindow(CtlMixin, GeneralPanelMixin, EffectsPanelMixin, DrawMixin, BackdropMixin, AudioPanelMixin, PlaylistMixin, OutputPanelMixin, SceneMixin, LayersMixin, UndoMixin, CameraMixin, ScreenMixin, OutputsMixin, ProjectIOMixin, EngineMixin, DesktopMixin, PhoneMixin,
                   QMainWindow):
     """The standalone studio window."""
 

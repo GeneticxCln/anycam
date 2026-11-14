@@ -1312,10 +1312,13 @@ def build_processor_bin(name: str, amount: float, bin_name: str, width: int,
     """A bin that runs processor ``name``; returns ``(bin, runner)``."""
     if name.partition(":")[0] in NATIVE_FRAMING:
         return build_framing_bin(name, amount, bin_name, width, height, fps)
-    from . import effect_worker
+    from . import effect_worker, safemode
 
-    processor = (effect_worker.RemoteProcessor(name, amount)
-                 if effect_worker.wants_isolation(name) else make_processor(name, amount))
+    if safemode.active() and name.partition(":")[0] in effect_worker.ISOLATED_KINDS:
+        processor = Processor(amount)    # safe mode: AI effects pass the picture through
+    else:
+        processor = (effect_worker.RemoteProcessor(name, amount)
+                     if effect_worker.wants_isolation(name) else make_processor(name, amount))
 
     def make(factory, element_name=None):
         element = Gst.ElementFactory.make(factory, element_name)

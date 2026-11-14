@@ -698,3 +698,24 @@ Fixed:
 Still open: `engine.stop()` (up to ~4 s) and `Recorder.stop()` (up to 5 s) block
 the GUI thread while they finalise; moving them off-thread needs the M1
 controller split.
+
+## 2026-11-14: stream keys in the project file
+
+- **Problem.** `rtmp_url`, `rtmp_extra_urls` and network layer sources were written to the project file,
+  its `.bak` and any `.corrupt` copy with the stream key, SRT passphrase or camera password in plain text
+  (the file was owner-only, but copying or sharing it leaked the secret).
+- **Fix.** `anycam.credentials` keeps them in the desktop keyring; `Project.save` and `save_scene_preset`
+  write `${secret:<id>}` references and `Project.load` resolves them and migrates older files.
+- **Tests.** `tests/test_credentials.py`.
+
+## 2026-11-14: crashes left no trace, and a broken encoder driver could take the app down
+
+- **Problem.** Diagnostics lived in memory, so a crash lost them; a run that died was not noticed by the next
+  start; a project that failed to load fell back to defaults without offering the last good copy; and the
+  VA-API test encode ran inside the app, while NVENC was only checked with `nvidia-smi`.
+- **Fix.** `anycam.applog` (file log plus `faulthandler`), `anycam.crashguard` (marker with a stage),
+  `anycam.safemode`, `anycam.repair` and `ui/project_io._recover_project`; encoder probing moved to the
+  `anycam encoders --json` child (`engine/encoders.py`).
+- **Tests.** `tests/test_applog.py`, `tests/test_crash_guard.py`, `tests/test_encoders.py`,
+  `tests/test_ctl.py`, `tests/test_recording_summary.py`.
+

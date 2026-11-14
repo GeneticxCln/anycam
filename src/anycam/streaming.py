@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from urllib.parse import urlsplit
 
+from . import credentials
+
 # (label, ingest URL base).  The stream key is appended after a slash.
 PRESETS: dict[str, tuple[str, str]] = {
     "youtube": ("YouTube", "rtmp://a.rtmp.youtube.com/live2"),
@@ -45,6 +47,8 @@ def validate_stream_url(url: str) -> str:
     text = (url or "").strip()
     if not text:
         return "the stream address is empty"
+    if credentials.has_reference(text):
+        return "the stream key is not in your keyring on this computer: enter it again"
     forbidden = " \t\r\n\"'`;|<>\\" + ("" if is_srt(text) else "&")
     if any(ch in text for ch in forbidden):
         return "the stream address contains spaces or shell characters"

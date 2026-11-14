@@ -11,7 +11,7 @@ import platform
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import config
+from . import config, credentials
 
 
 @dataclass(frozen=True)
@@ -109,6 +109,17 @@ def checks(elements: dict | None = None, cameras: list[str] | None = None,
                                            "arch": "gst-plugin-pipewire",
                                            "fedora": "pipewire-gstreamer",
                                            "suse": "gstreamer-plugin-pipewire"}),
+        required=False))
+
+    keyring_ok = credentials.available()
+    found.append(Check(
+        "keyring", "Keyring for stream keys", keyring_ok,
+        "stream keys and passwords are kept in your desktop keyring" if keyring_ok
+        else "no keyring answers; stream keys stay in the project file (owner-only)",
+        "" if keyring_ok else install_hint({"debian": "gnome-keyring gir1.2-secret-1",
+                                            "arch": "gnome-keyring libsecret",
+                                            "fedora": "gnome-keyring libsecret",
+                                            "suse": "gnome-keyring typelib-1_0-Secret-1"}),
         required=False))
 
     found.append(Check(

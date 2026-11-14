@@ -17,8 +17,6 @@ from .engine.encoders import (  # noqa: F401
     ENCODER_PARSERS,
     ENCODER_BITRATES,
     ENCODER_LABELS,
-    _NVENC_TTL_S,
-    _nvenc_seen,
     encoder_bitrate,
     nvenc_available,
     _probe_nvenc,

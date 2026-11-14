@@ -2,6 +2,33 @@
 
 All notable changes. Versions follow `pyproject.toml`; each `vX.Y.Z` tag publishes a GitHub Release.
 
+## Unreleased
+
+- **Keyring.** Stream keys (RTMP and extra destinations), SRT passphrases and stream ids, and network
+  camera passwords are kept in the desktop keyring (Secret Service through libsecret), not in the project
+  file. A saved project holds `${secret:<id>}` references; the app resolves them when it opens the file.
+  Opening an older project moves its secrets across and scrubs the file, its `.bak` and its `.corrupt` copy.
+  With no keyring the secret stays in the owner-only file, as before. A project opened on a computer whose
+  keyring lacks the entry asks for the key again.
+- **Crash safety.** Everything printed to stderr is also written to `~/.local/state/anycam/anycam.log`
+  (masked, rotated), and a native crash leaves every thread's stack there. A marker file notices an unclean
+  exit and the stage it happened in; the next start offers **safe mode** (`anycam gui --safe-mode`: CPU
+  canvas, image preview, no virtual camera, phone link or AI effects; nothing is saved to the project).
+  A project that will not load is moved to `set-aside/` (never deleted) and the last good `.bak` is offered.
+  New: `anycam repair`. Diagnostics gets **Open log folder** and **Copy log**.
+- **Encoder probing out of process.** `anycam encoders` encodes a few frames with every encoder in a child
+  process; a crash or hang there cannot reach the app. NVENC is now judged by a real test encode, not by
+  `nvidia-smi`. The answer is cached until the AnyCam version, GStreamer, the kernel or a graphics driver
+  changes. Settings → Output lists only encoders that passed, says why the others did not, and can test again.
+- **`anycam ctl`.** Drive the running window from a terminal or a key binding (`record`, `mute`,
+  `scene <name>`, `state`, `list`, and every hotkey action). The instance socket is owner-only and the phone
+  remote now runs through the same action table.
+- **After Stop**, the window says how long the recording is, its size and picture size, and whether it has
+  sound or was not closed cleanly, with **Play** and **Show in folder**.
+- Housekeeping: test files are named after features, plans live in `plans/`, `docs/MANUAL.md` is the user
+  guide, and the Flatpak and AppImage recipes (never built) moved to `packaging/unsupported/`. CI gains a
+  real-keyring job and an Arch `makepkg` job (neither seen green on GitHub yet).
+
 ## 1.4.0 - 2026-11-12
 
 - Audit fixes (2026-11-12, 11 items): the GPU preview no longer crashes on startup with an `ImportError`

@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QApplication, QMessageBox,
 )
 
-from .. import config
+from .. import config, crashguard, safemode
 from ..pipeline import AnyCamEngine
 from ..pool import SCREEN_IDLE_GRACE_S
 from .theme import STYLE  # noqa: F401
@@ -34,8 +34,8 @@ class EngineMixin:
         if missing:
             self._lost_cameras.update(missing)
             self._camera_watch.start()
-        if any(layer.kind == "phone" for scene in self.project.scenes
-               for layer in scene.layers):
+        if not safemode.active() and any(layer.kind == "phone" for scene in self.project.scenes
+                                         for layer in scene.layers):
             # A saved scene with a phone: listen so the phone can reconnect.
             self._phone_link(quiet=True)
         if not self._ensure_screen_sessions():
@@ -85,6 +85,7 @@ class EngineMixin:
         crop_preview = self.preview.selected_id if self.preview.edit_mode == "crop" else ""
         self._crop_preview_layer_id = crop_preview
         candidate = None
+        crashguard.stage("building the canvas and preview")
         try:
             candidate = AnyCamEngine(
                 self.project,
@@ -118,6 +119,7 @@ class EngineMixin:
             # fallback below, which needs the engine to know its canvas.
             self.engine = candidate.build()
             self.engine.start()
+            crashguard.stage("running")
             gpu = getattr(self.engine, "preview_backend", "") == "gpu"
             if gpu:
                 self._gpu_preview_tries = 0

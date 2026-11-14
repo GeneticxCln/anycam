@@ -22,6 +22,7 @@ from .engine.outputs.recorder import Recorder  # noqa: F401
 from .engine.outputs.vcam import VcamOutput  # noqa: F401
 from .engine.source_pool import SCREEN_IDLE_GRACE_S, SourcePool  # noqa: F401
 from .pipeline import AnyCamEngine, nvenc_available, recording_codec, va_present  # noqa: F401
+from .ui import startup
 from .ui.effect_presets import EFFECT_PRESETS, EFFECT_STYLES  # noqa: F401
 from .ui.theme import (  # noqa: F401
     STYLE,
@@ -53,13 +54,16 @@ from .ui.window import (  # noqa: F401
 from .ui.cameras import _CAMERA_LOSS  # noqa: F401
 
 
-def run_gui(project: Project | None = None) -> int:
+def run_gui(project: Project | None = None, safe_mode: bool = False) -> int:
     _register_freeze_dump()
     app = QApplication(sys.argv[:1])
     primary, instance_server = claim_gui_instance()
     if not primary:
         return 0
+    safe_mode = startup.begin(safe_mode)
     window = AnyCamWindow(project)
+    if safe_mode:
+        window.setWindowTitle(window.windowTitle() + " (safe mode)")
     if instance_server is not None:
         instance_server.setParent(window)
         window._instance_server = instance_server
@@ -67,13 +71,15 @@ def run_gui(project: Project | None = None) -> int:
     app.aboutToQuit.connect(window.shutdown)
     window.show()
     # Hold the loopback node from launch: apps that remember "AnyCam" must be
-    # able to open it before the preview is started.
-    if window.hold_vcam_device():
+    # able to open it before the preview is started.  Safe mode holds nothing.
+    if not safe_mode and window.hold_vcam_device():
         if window.project.output.vcam_enabled:
             window.feed_held_vcam()
         window.note_vcam_consumers()
         window.ensure_vcam_visible()
+    startup.mark_ready()
     code = app.exec()
+    startup.finish()
     # GStreamer 1.28's v4l2src segfaults during Python/GStreamer teardown on
     # this machine (niri/Wayland + GStreamer 1.28.8). Skip cleanup and let the
     # OS reclaim resources; the app has already written everything it needs.

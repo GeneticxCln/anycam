@@ -508,9 +508,9 @@ def test_corrupt_project_is_preserved_on_load(tmp_path, monkeypatch):
     window = AnyCamWindow()
     try:
         assert window._load_warning
-        preserved = path.with_name("project.json.corrupt")
-        assert preserved.exists()
-        assert "not json" in preserved.read_text()
+        preserved = list((config.config_dir() / "set-aside").glob("*/project.json"))
+        assert preserved, "the unreadable project is moved to set-aside, never deleted"
+        assert "not json" in preserved[0].read_text()
     finally:
         window._persist = False
         window.close()

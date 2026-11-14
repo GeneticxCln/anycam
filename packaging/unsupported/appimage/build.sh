@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Build an AppImage with python-appimage (pip install python-appimage appimage-builder tools needed).
-# Usage: packaging/appimage/build.sh [python-version]   (default 3.12)
+# Usage: packaging/unsupported/appimage/build.sh [python-version]   (default 3.12)
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-root="$(cd "$here/../.." && pwd)"
+root="$(cd "$here/../../.." && pwd)"
 py="${1:-3.12}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT

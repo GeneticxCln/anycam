@@ -22,6 +22,9 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+# The encoder probe starts a child process; tests ask for it explicitly.
+os.environ.setdefault("ANYCAM_ENCODER_PROBE", "off")
+
 HARDWARE_FREE_ENV = "ANYCAM_TEST_ENV"
 HARDWARE_FREE_VALUES = {"ci", "none", "hardware-free"}
 
@@ -66,3 +69,28 @@ def hardware_free_environment(request):
         yield True
     finally:
         patch.undo()
+
+
+@pytest.fixture(autouse=True)
+def memory_keyring():
+    """Tests never touch the real desktop keyring: each gets its own in-memory one."""
+    from anycam import credentials
+
+    store = credentials.MemoryStore()
+    credentials.set_store(store)
+    credentials._known_ids.clear()
+    yield store
+    credentials.set_store(None)
+
+
+@pytest.fixture(autouse=True)
+def forget_encoder_probe():
+    """Each test starts with no probe answer in memory."""
+    try:
+        from anycam.engine import encoders
+    except Exception:  # noqa: BLE001 - GStreamer bindings missing
+        yield
+        return
+    encoders.forget_probe()
+    yield
+    encoders.forget_probe()

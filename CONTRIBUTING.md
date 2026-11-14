@@ -32,6 +32,11 @@ never open your real camera or your saved project.
 - Every file the app writes under the config, state or cache directories is written atomically, and anything
   that can hold a secret (stream URLs, phone secrets) is owner-only.
 - Keep `TODO.md` honest: tick items only with a test or a measurement behind them.
+- One feature or one fix per pull request, at most about 400 changed lines of code (tests and assets not
+  counted). A larger change is split into steps that each land green.
+- Name a test file after the feature it covers (`tests/test_recorder.py`), never after an audit, a review or
+  a phase. Where a test came from goes in its docstring and in `docs/REGRESSIONS.md`.
+- Plans live in `plans/pending/` while open and move to `plans/archive/` with a short execution record.
 
 ## Releasing
 

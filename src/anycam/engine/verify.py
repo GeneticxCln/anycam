@@ -93,3 +93,54 @@ def verify_mp4(path: str, *, width: int = 1920, height: int = 1080, fps: int = 6
     )
     return ok, {**info, "duration": duration, "rate": rate,
                 "frames": frames, "recorded_fps": round(recorded_fps, 3), "ok": ok}
+
+
+def summarize_recording(path: str, finalised: bool = True) -> dict:
+    """What a person wants to know about a recording that was just stopped.
+
+    Cheap on purpose (one ``ffprobe``, no packet counting), so it can run
+    straight after Stop.  ``ok`` is false, with ``problem`` saying why, for a
+    file that does not open, has no picture or no length.
+    """
+    import os
+
+    info = ffprobe(path)
+    result = {"path": path, "ok": False, "problem": "", "seconds": 0.0, "width": 0, "height": 0,
+              "audio": False, "size_mb": 0.0, "closed_cleanly": bool(finalised)}
+    try:
+        result["size_mb"] = round(os.path.getsize(path) / 1_048_576, 1)
+    except OSError:
+        result["problem"] = "the file is missing"
+        return result
+    if "error" in info:
+        result["problem"] = "the file does not open: " + (info["error"].splitlines() or ["unknown error"])[0]
+        return result
+    video = next((s for s in info["streams"] if s["codec_type"] == "video"), None)
+    result["audio"] = any(s["codec_type"] == "audio" for s in info["streams"])
+    try:
+        result["seconds"] = float(info["format"].get("duration") or 0)
+    except (TypeError, ValueError):
+        result["seconds"] = 0.0
+    if video is None:
+        result["problem"] = "the file has no picture"
+        return result
+    result["width"], result["height"] = int(video.get("width") or 0), int(video.get("height") or 0)
+    if result["seconds"] <= 0:
+        result["problem"] = "the file has no length"
+        return result
+    result["ok"] = True
+    if not finalised:
+        result["problem"] = "the recording was not closed cleanly; it plays up to its last fragment"
+    return result
+
+
+def describe_recording(summary: dict) -> str:
+    """One line for the status bar."""
+    name = summary["path"].rsplit("/", 1)[-1]
+    if not summary["ok"]:
+        return f"Recording {name} has a problem: {summary['problem']}."
+    minutes, seconds = divmod(int(round(summary["seconds"])), 60)
+    sound = "with sound" if summary["audio"] else "no sound"
+    text = (f"Saved {name}: {minutes}:{seconds:02d}, {summary['width']}x{summary['height']}, "
+            f"{sound}, {summary['size_mb']} MB.")
+    return text + (f" Warning: {summary['problem']}." if summary["problem"] else "")

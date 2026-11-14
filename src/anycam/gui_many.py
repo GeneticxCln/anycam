@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import config
+from .ui import startup
 from .gui import (
     AnyCamWindow, PreviewWidget, claim_gui_instance, serve_instance_requests,
 )
@@ -501,6 +502,20 @@ class ManyCamWindow(AnyCamWindow):
         layout.addStretch(1)
         return page
 
+    def _open_log_folder(self) -> None:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        from . import applog
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(applog.log_path().parent)))
+
+    def _copy_log(self) -> None:
+        from . import applog
+
+        QApplication.clipboard().setText(applog.tail(400))
+        self._status("The last 400 log lines are on the clipboard.")
+
     def _build_diagnostics_log(self, layout) -> None:
         """Session log: rebuilds, screen-capture reuse and vcam recovery."""
         title = QLabel("Session log")
@@ -513,6 +528,15 @@ class ManyCamWindow(AnyCamWindow):
         self.diag_log.setPlaceholderText(
             "Virtual camera, screen capture and rebuild events appear here.")
         layout.addWidget(self.diag_log, 1)
+        log_row = QHBoxLayout()
+        open_log = QPushButton("Open log folder")
+        open_log.clicked.connect(self._open_log_folder)
+        copy_log = QPushButton("Copy log")
+        copy_log.clicked.connect(self._copy_log)
+        log_row.addWidget(open_log)
+        log_row.addWidget(copy_log)
+        log_row.addStretch(1)
+        layout.addLayout(log_row)
         pending = getattr(self, "_pending_log_lines", [])
         self._pending_log_lines = []
         for line in pending:
@@ -1125,12 +1149,15 @@ class ManyCamWindow(AnyCamWindow):
             self.toggle_engine()
 
 
-def run_gui(project: Project | None = None) -> int:
+def run_gui(project: Project | None = None, safe_mode: bool = False) -> int:
     app = QApplication(sys.argv[:1])
     primary, instance_server = claim_gui_instance()
     if not primary:
         return 0
+    safe_mode = startup.begin(safe_mode)
     window = ManyCamWindow(project)
+    if safe_mode:
+        window.setWindowTitle(window.windowTitle() + " (safe mode)")
     if instance_server is not None:
         instance_server.setParent(window)
         window._instance_server = instance_server
@@ -1139,11 +1166,12 @@ def run_gui(project: Project | None = None) -> int:
     window.show()
     # The driver must be right before the node is held: the one-time setup
     # may reload v4l2loopback, which needs the device closed.
-    window.setup_vcam_if_needed()
+    if not safe_mode:
+        window.setup_vcam_if_needed()
     # Hold the loopback node from launch: apps that remember "AnyCam" must be
     # able to select it before the first source starts the preview, and an
-    # open that already failed needs its re-select hint.
-    if window.hold_vcam_device():
+    # open that already failed needs its re-select hint.  Safe mode holds nothing.
+    if not safe_mode and window.hold_vcam_device():
         # The card is a placeholder: once a source exists and the preview
         # starts, the held node follows the canvas without a second click
         # (unless the user turned the virtual camera off last time).
@@ -1151,11 +1179,18 @@ def run_gui(project: Project | None = None) -> int:
             window.feed_held_vcam()
         window.note_vcam_consumers()
         window.ensure_vcam_visible()
-    QTimer.singleShot(200, window._autostart_preview)
+    if safe_mode:
+        window._status("Safe mode: CPU canvas, image preview, no virtual camera, phone link or AI "
+                       "effects. Start the preview yourself; restart AnyCam to leave safe mode.")
+    else:
+        QTimer.singleShot(200, window._autostart_preview)
     QTimer.singleShot(400, window.show_first_run_check)
     # Tray icon and portal global shortcuts (both skipped where unavailable).
-    QTimer.singleShot(500, window.start_desktop_integration)
+    if not safe_mode:
+        QTimer.singleShot(500, window.start_desktop_integration)
+    startup.mark_ready()
     code = app.exec()
+    startup.finish()
     os._exit(code if code is not None else 0)
 
 
