@@ -89,7 +89,7 @@ def test_ai_effects_pass_the_picture_through_in_safe_mode(clean_safe_mode):
     try:
         assert type(runner.processor) is processors.Processor
     finally:
-        runner.processor.close()
+        runner.stop()          # its worker thread must not outlive the test
 
 
 def test_safe_mode_changes_nothing_in_the_saved_project(state, clean_safe_mode):
