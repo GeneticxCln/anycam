@@ -10,10 +10,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .. import config, effect_worker, packs, streaming
+from .. import config, credentials, effect_worker, packs, streaming
 from .. import effects as effect_library
 from ..engine.outputs.vcam import pipewire_available
-from ..pipeline import nvenc_available, va_present
 from .theme import STYLE  # noqa: F401
 from .layout_history import LayoutHistory  # noqa: F401
 from .preview import PreviewWidget, _PreviewOverlay  # noqa: F401
@@ -42,7 +41,7 @@ class OutputPanelMixin:
         preset, key = streaming.split_url(self.project.output.rtmp_url)
         self.stream_preset.setCurrentIndex(max(0, self.stream_preset.findData(preset)))
         if preset != "custom":
-            self.stream_key_edit.setText(key)
+            self.stream_key_edit.setText("" if credentials.has_reference(key) else key)
         self.stream_preset.currentIndexChanged.connect(self._stream_preset_changed)
         self.stream_key_edit.textEdited.connect(self._stream_preset_changed)
         grid.addWidget(QLabel("Platform"), 1, 0)
@@ -258,38 +257,21 @@ class OutputPanelMixin:
         encoder_box = QGroupBox("Video encoder")
         encoder_grid = QGridLayout(encoder_box)
         self.encoder_combo = QComboBox()
-        for label, value in (
-            ("Auto (NVENC, then VA-API, then x264)", "auto"),
-            ("NVIDIA NVENC H.264", "nvenc"),
-            ("NVIDIA NVENC H.265 (HEVC)", "nvenc_h265"),
-            ("NVIDIA NVENC AV1", "nvenc_av1"),
-            ("Intel/AMD VA-API H.264", "vaapi"),
-            ("Intel/AMD VA-API H.265 (HEVC)", "vaapi_h265"),
-            ("Intel/AMD VA-API AV1", "vaapi_av1"),
-            ("CPU x264", "cpu"),
-        ):
-            # VA-API choices only where the encoders are installed.
-            if value.startswith("vaapi"):
-                codec = {"vaapi": "h264", "vaapi_h265": "h265", "vaapi_av1": "av1"}[value]
-                if not va_present(codec):
-                    continue
-            self.encoder_combo.addItem(label, value)
-        saved_encoder = str(self.project.output.encoder or "auto").lower()
-        chosen = self.encoder_combo.findData(saved_encoder)
-        self.encoder_combo.setCurrentIndex(chosen if chosen >= 0 else 0)
+        self._populate_encoders(str(self.project.output.encoder or "auto").lower())
         self.encoder_combo.currentIndexChanged.connect(self._encoder_changed)
         encoder_grid.addWidget(QLabel("Encoder"), 0, 0)
         encoder_grid.addWidget(self.encoder_combo, 0, 1)
-        nv_ready = nvenc_available()
-        encoder_note = QLabel(
-            "NVENC detected. Recording can use H.264, H.265 or AV1 on the GPU "
-            "through CUDA; missing codecs fall back to H.264 NVENC, then x264. "
-            "RTMP/FLV always streams H.264." if nv_ready else
-            "NVENC was not detected. Auto records with CPU x264; install the "
-            "GStreamer nvcodec plugin and an NVIDIA driver to enable GPU encoding.")
+        encoder_note = QLabel(self._encoder_summary())
         encoder_note.setObjectName("muted")
         encoder_note.setWordWrap(True)
+        self.encoder_note = encoder_note
         encoder_grid.addWidget(encoder_note, 1, 0, 1, 2)
+        self.encoder_retest = QPushButton("Test encoders again")
+        self.encoder_retest.setToolTip(
+            "Encodes a few frames with every encoder in a separate process; one that crashes "
+            "cannot take AnyCam down")
+        self.encoder_retest.clicked.connect(self._retest_encoders)
+        encoder_grid.addWidget(self.encoder_retest, 2, 0, 1, 2)
         layout.addWidget(encoder_box)
 
         layout.addWidget(self._recording_group())
@@ -460,6 +442,74 @@ class OutputPanelMixin:
         layout.addWidget(reload_button)
         layout.addStretch(1)
         return page
+
+    _ENCODER_CHOICES = (
+        ("Auto (NVENC, then VA-API, then x264)", "auto", ()),
+        ("NVIDIA NVENC H.264", "nvenc", ("nvh264enc",)),
+        ("NVIDIA NVENC H.265 (HEVC)", "nvenc_h265", ("nvh265enc",)),
+        ("NVIDIA NVENC AV1", "nvenc_av1", ("nvav1enc",)),
+        ("Intel/AMD VA-API H.264", "vaapi", ("vah264enc", "vah264lpenc")),
+        ("Intel/AMD VA-API H.265 (HEVC)", "vaapi_h265", ("vah265enc", "vah265lpenc")),
+        ("Intel/AMD VA-API AV1", "vaapi_av1", ("vaav1enc", "vaav1lpenc")),
+        ("CPU x264", "cpu", ()),
+    )
+
+    def _populate_encoders(self, selected: str) -> None:
+        """List only the encoders that encoded a test clip (all of them until the probe has run)."""
+        from ..engine import encoders
+
+        answers = encoders.probe_results()
+        self.encoder_combo.blockSignals(True)
+        self.encoder_combo.clear()
+        for label, value, factories in self._ENCODER_CHOICES:
+            if answers is not None and factories and not any(
+                    answers.get(name, {}).get("ok") for name in factories):
+                continue
+            self.encoder_combo.addItem(label, value)
+        chosen = self.encoder_combo.findData(selected)
+        if chosen < 0 and selected not in ("", "auto"):
+            # A saved choice the machine cannot run is kept visible, not silently swapped.
+            for label, value, _factories in self._ENCODER_CHOICES:
+                if value == selected:
+                    self.encoder_combo.addItem(f"{label} (not working here)", value)
+                    chosen = self.encoder_combo.findData(selected)
+        self.encoder_combo.setCurrentIndex(chosen if chosen >= 0 else 0)
+        self.encoder_combo.blockSignals(False)
+
+    def _encoder_summary(self) -> str:
+        from ..engine import encoders
+
+        answers = encoders.probe_results()
+        if answers is None:
+            return "Checking which encoders work on this computer; until then Auto records with CPU x264."
+        working = [name for name, entry in answers.items() if entry.get("ok") and name != encoders.X264]
+        lines = [("These encoders passed a test: " + ", ".join(working) + ".") if working else
+                 "No hardware encoder passed a test; Auto records with CPU x264."]
+        problems = {name: why for name, why in encoders.encoder_problems().items()
+                    if why != "plugin not installed"}
+        if problems:
+            lines.append("Did not work: " + "; ".join(f"{name} ({why})" for name, why in problems.items()) + ".")
+        lines.append("RTMP/FLV always streams H.264.")
+        return " ".join(lines)
+
+    def _retest_encoders(self) -> None:
+        from PySide6.QtCore import QTimer
+
+        from ..engine import encoders
+
+        self.encoder_retest.setEnabled(False)
+        self.encoder_note.setText("Testing every encoder…")
+        encoders.start_background_probe(force=True)
+
+        def finished() -> None:
+            if encoders.probe_running():
+                QTimer.singleShot(500, finished)
+                return
+            self._populate_encoders(str(self.encoder_combo.currentData() or "auto"))
+            self.encoder_note.setText(self._encoder_summary())
+            self.encoder_retest.setEnabled(True)
+
+        QTimer.singleShot(500, finished)
 
     def _encoder_changed(self, _index: int = 0) -> None:
         value = str(self.encoder_combo.currentData() or "auto").lower()

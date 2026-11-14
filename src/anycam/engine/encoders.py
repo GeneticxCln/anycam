@@ -1,11 +1,15 @@
 """Hardware and software video encoder selection, shared by recording and streaming."""
 from __future__ import annotations
 
-import functools
+import hashlib
+import json
 import os
-import shutil
+import platform
 import subprocess
+import sys
+import threading
 import time
+from pathlib import Path
 from dataclasses import dataclass
 
 import gi
@@ -13,6 +17,8 @@ import gi
 gi.require_version("Gst", "1.0")
 gi.require_version("GstVideo", "1.0")
 from gi.repository import GLib, Gst, GstVideo  # noqa: E402
+
+from .. import config  # noqa: E402
 
 
 
@@ -41,8 +47,6 @@ _H265_ALIASES = {"h265", "hevc", "nvh265", "nvenc_h265", "nvenc_hevc",
 _AV1_ALIASES = {"av1", "nvav1", "nvenc_av1", "av1_nvenc"}
 
 
-_NVENC_TTL_S = 60.0
-_nvenc_seen: dict[str, tuple[float, bool]] = {}
 
 
 
@@ -60,65 +64,220 @@ def encoder_bitrate(codec: str, width: int, height: int) -> int:
     return max(1000, int(round(base * scale / 1000.0)) * 1000)
 
 
-def nvenc_available(codec: str = "h264") -> bool:
-    """Whether NVENC for ``codec`` can run on this machine right now.
+# ------------------------------------------------------- encoder probing
+#
+# Whether an encoder really works is found by encoding a few frames in a child
+# process (``anycam encoders --json``): a driver that crashes or hangs costs the
+# probe, never the app.  The answer is cached on disk until the AnyCam version,
+# GStreamer, the kernel or a graphics driver changes.  The functions the rest of
+# the app already calls read that answer and never block.
 
-    The GStreamer factory alone is not enough: a headless host can install
-    ``nvcodec`` without a usable NVIDIA driver.  ``nvidia-smi`` is the cheap
-    runtime check; selection still falls back to x264 if it cannot run.  The
-    answer is kept for a minute: every recording and stream build asked, and
-    each ask ran ``nvidia-smi`` (up to its 2 s timeout) on the GUI thread.
-    """
-    now = time.monotonic()
-    seen = _nvenc_seen.get(codec)
-    if seen is not None and now - seen[0] < _NVENC_TTL_S:
-        return seen[1]
-    answer = _probe_nvenc(codec)
-    _nvenc_seen[codec] = (now, answer)
-    return answer
+PROBE_TIMEOUT_S = 10.0
+PROBE_MARK = "ANYCAM-PROBE "
+X264 = "x264enc"
+_PROBE_FRAMES = 5
+_PROBE_WAIT_S = 4
 
-
-def _probe_nvenc(codec: str) -> bool:
-    factory = ENCODER_FACTORIES.get(codec, "")
-    if not factory or Gst.ElementFactory.find(factory) is None:
-        return False
-    if shutil.which("nvidia-smi") is None:
-        return False
-    try:
-        probe = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=2,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return probe.returncode == 0 and bool(probe.stdout.strip())
+_results: dict[str, dict] | None = None
+_probe_thread: threading.Thread | None = None
+_probe_lock = threading.Lock()
 
 
-@functools.lru_cache(maxsize=None)
-def _va_encodes(factory: str) -> bool:
-    """A real VA-API encode of a few frames (cached).
+def candidate_encoders() -> list[str]:
+    """Every encoder factory the probe tries, in a stable order."""
+    names = list(ENCODER_FACTORIES.values())
+    for factories in VA_FACTORIES.values():
+        names.extend(factories)
+    names.append(X264)
+    return names
 
-    A present element proves nothing: a missing or broken VA driver only fails
-    once frames arrive.  This runs once per encoder per session.
-    """
+
+def _upload_for(factory: str) -> str:
+    if factory.startswith("va"):
+        return ("vapostproc ! " if Gst.ElementFactory.find("vapostproc")
+                else "videoconvert ! video/x-raw,format=NV12 ! ")
+    return "videoconvert ! video/x-raw,format=NV12 ! "
+
+
+def test_encode(factory: str) -> str:
+    """Encode a few frames; "" when it worked, otherwise why not.  Run in the child."""
     if Gst.ElementFactory.find(factory) is None:
-        return False
-    upload = "vapostproc ! " if Gst.ElementFactory.find("vapostproc") else (
-        "videoconvert ! video/x-raw,format=NV12 ! ")
+        return "plugin not installed"
     try:
         pipeline = Gst.parse_launch(
-            "videotestsrc num-buffers=5 ! video/x-raw,width=320,height=240,framerate=30/1 ! "
-            f"{upload}{factory} ! fakesink")
-    except GLib.Error:
-        return False
+            f"videotestsrc num-buffers={_PROBE_FRAMES} ! "
+            "video/x-raw,width=320,height=240,framerate=30/1 ! "
+            f"{_upload_for(factory)}{factory} ! fakesink")
+    except GLib.Error as exc:
+        return f"could not be built: {exc.message}"
     bus = pipeline.get_bus()
     pipeline.set_state(Gst.State.PLAYING)
     try:
         message = bus.timed_pop_filtered(
-            5 * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
+            _PROBE_WAIT_S * Gst.SECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
     finally:
         pipeline.set_state(Gst.State.NULL)
-    return message is not None and message.type == Gst.MessageType.EOS
+    if message is None:
+        return "did not finish in time"
+    if message.type == Gst.MessageType.ERROR:
+        error, _debug = message.parse_error()
+        return error.message or "encoding failed"
+    return ""
+
+
+def probe_main() -> int:
+    """The child: one ``ANYCAM-PROBE {json}`` line per encoder, flushed as it finishes."""
+    for factory in candidate_encoders():
+        reason = test_encode(factory)
+        print(PROBE_MARK + json.dumps({"factory": factory, "ok": not reason, "reason": reason}),
+              flush=True)
+    return 0
+
+
+def run_probe(timeout: float = PROBE_TIMEOUT_S, command: list[str] | None = None) -> dict[str, dict]:
+    """Run the child and collect its answers; what it did not answer is "probe crashed"."""
+    command = command or [sys.executable, "-m", "anycam", "encoders", "--json"]
+    found: dict[str, dict] = {}
+    why = "the probe did not finish"
+    try:
+        child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    except OSError as exc:
+        child = None
+        why = f"the probe could not start ({exc.strerror or exc})"
+    output = ""
+    if child is not None:
+        try:
+            output, _ = child.communicate(timeout=timeout)
+            if child.returncode != 0:
+                why = f"the probe crashed (exit {child.returncode})"
+        except subprocess.TimeoutExpired:
+            child.kill()
+            output, _ = child.communicate()
+            why = f"the probe stopped after {timeout:.0f} s"
+    for line in (output or "").splitlines():
+        if line.startswith(PROBE_MARK):
+            try:
+                entry = json.loads(line[len(PROBE_MARK):])
+                found[str(entry["factory"])] = {"ok": bool(entry["ok"]), "reason": str(entry.get("reason", ""))}
+            except (ValueError, KeyError, TypeError):
+                continue
+    for factory in candidate_encoders():
+        found.setdefault(factory, {"ok": False, "reason": why})
+    return found
+
+
+def fingerprint() -> str:
+    """Changes when a driver or library the answer depends on changes."""
+    parts = [config.VERSION, Gst.version_string(), platform.release(),
+             os.environ.get("LIBVA_DRIVER_NAME", "")]
+    try:
+        parts.append(Path("/sys/module/nvidia/version").read_text().strip())
+    except OSError:
+        parts.append("")
+    for folder in ("/usr/lib/dri", "/usr/lib64/dri", "/usr/lib/x86_64-linux-gnu/dri"):
+        try:
+            for entry in sorted(Path(folder).glob("*_drv_video.so")):
+                parts.append(f"{entry.name}:{int(entry.stat().st_mtime)}")
+        except OSError:
+            continue
+    return hashlib.sha1("|".join(parts).encode()).hexdigest()
+
+
+def _cache_path() -> Path:
+    return config.cache_dir() / "encoders.json"
+
+
+def load_cache() -> dict[str, dict] | None:
+    try:
+        data = json.loads(_cache_path().read_text(encoding="utf-8"))
+        if data.get("fingerprint") == fingerprint() and isinstance(data.get("results"), dict):
+            return data["results"]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return None
+
+
+def save_cache(results: dict[str, dict]) -> None:
+    path = _cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_name(path.name + ".tmp")
+        temp.write_text(json.dumps({"fingerprint": fingerprint(), "probed_at": time.time(),
+                                    "results": results}, indent=2), encoding="utf-8")
+        os.replace(temp, path)
+    except OSError:
+        pass
+
+
+def probe_results(block: bool = False, force: bool = False) -> dict[str, dict] | None:
+    """The answer for every candidate, or ``None`` while it is not known yet.
+
+    With ``block`` a missing answer is probed now (up to ``PROBE_TIMEOUT_S``).
+    ``force`` ignores what is cached.
+    """
+    global _results
+    if _results is not None and not force:
+        return _results
+    if not force:
+        cached = load_cache()
+        if cached is not None:
+            _results = cached
+            return _results
+    if block:
+        _results = run_probe()
+        save_cache(_results)
+        return _results
+    return None
+
+
+def start_background_probe(force: bool = False) -> None:
+    """Probe on a thread (the child does the risky part); no-op when already known."""
+    global _probe_thread
+    if os.environ.get("ANYCAM_ENCODER_PROBE", "").lower() in ("off", "0", "no"):
+        return
+    with _probe_lock:
+        if _probe_thread is not None and _probe_thread.is_alive():
+            return
+        if not force and probe_results() is not None:
+            return
+        _probe_thread = threading.Thread(target=lambda: probe_results(block=True, force=True),
+                                         name="encoder-probe", daemon=True)
+        _probe_thread.start()
+
+
+def probe_running() -> bool:
+    return _probe_thread is not None and _probe_thread.is_alive()
+
+
+def forget_probe() -> None:
+    """For tests and "Test again": drop the in-memory answer."""
+    global _results
+    _results = None
+
+
+def encoder_works(factory: str) -> bool:
+    answers = probe_results()
+    return bool(answers and answers.get(factory, {}).get("ok"))
+
+
+def encoder_problems() -> dict[str, str]:
+    """``factory -> why not`` for every candidate that failed (empty until probed)."""
+    answers = probe_results() or {}
+    return {name: entry.get("reason", "") for name, entry in answers.items() if not entry.get("ok")}
+
+
+def nvenc_available(codec: str = "h264") -> bool:
+    """Whether NVENC for ``codec`` encoded a test clip (from the cached probe)."""
+    return _probe_nvenc(codec)
+
+
+def _probe_nvenc(codec: str) -> bool:
+    factory = ENCODER_FACTORIES.get(codec, "")
+    return bool(factory) and encoder_works(factory)
+
+
+def _va_encodes(factory: str) -> bool:
+    return encoder_works(factory)
 
 
 def va_factory(codec: str) -> str:
@@ -220,6 +379,9 @@ def encoder_plan(preference: str, *, purpose: str = "record") -> EncoderPlan:
                                plan.bitrate, note)
 
     note = "No hardware encoder · CPU x264"
+    if probe_results() is None:
+        note += " (encoder check not finished)"
+        start_background_probe()
     if effective != "h264":
         note = f"{ENCODER_LABELS[effective]} unavailable · " + note
     elif purpose == "rtmp" and requested != "h264":
