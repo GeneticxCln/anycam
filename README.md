@@ -50,14 +50,16 @@ On first launch AnyCam shows a checklist of what works on your machine and the e
 command to fix what does not. Run it any time with `anycam check`, or from **Settings →
 General → Check this computer**.
 
-Packaging recipes for Debian/Ubuntu, Arch, Flatpak and AppImage are in
-[packaging/](packaging/).
+Packaging recipes for Debian/Ubuntu (`.deb`) and Arch (`PKGBUILD`) are in
+[packaging/](packaging/); the Flatpak and AppImage recipes in
+[packaging/unsupported/](packaging/unsupported/) have never been built.
 
 ## Requirements
 
 Developed on CachyOS (Arch), KDE/Wayland, NVIDIA, GStreamer 1.28, and used by the author with a
 real webcam as a virtual camera in Discord and Telegram. The automated tests use synthetic
-sources and the offscreen GUI; raw measurements are in [docs/EVIDENCE.md](docs/EVIDENCE.md).
+sources and the offscreen GUI; raw measurements are in [docs/EVIDENCE.md](docs/EVIDENCE.md). A task-by-task guide is in
+[docs/MANUAL.md](docs/MANUAL.md).
 
 - Python 3.11+ and GStreamer with `base good bad ugly libav opengl pulse`
 - PyGObject (from your distribution, not PyPI)
@@ -155,6 +157,10 @@ things. Details: [docs/PHONE_CAMERA.md](docs/PHONE_CAMERA.md).
 | `anycam elements` | list missing GStreamer elements |
 | `anycam sources` | list cameras and microphones |
 | `anycam probe` | print the detected system and devices as JSON |
+| `anycam ctl <action>` | drive the running window: `record`, `mute`, `scene <name>`, `state`, `list` |
+| `anycam encoders` | test-encode with every encoder (what Auto may choose from) |
+| `anycam repair` | set aside project, hotkeys or phones files that no longer read |
+| `anycam gui --safe-mode` | start with the CPU canvas, image preview and no virtual camera, phone link or AI effects |
 | `anycam soak` | long-run acceptance test (drops and memory) |
 
 ## Keyboard shortcuts
@@ -169,7 +175,9 @@ focus go through the desktop portal (KDE, Hyprland): `Ctrl+Alt+1…9` scenes,
 
 ## Privacy
 
-Everything stays local: no telemetry, no accounts, no update checks. Privileged changes are
+Everything stays local: no telemetry, no accounts, no update checks. Stream keys, SRT passphrases and
+camera passwords are kept in your desktop keyring (gnome-keyring, KWallet or KeePassXC), not in the project
+file; without a keyring they stay in the owner-only file. Privileged changes are
 the one-time virtual camera setup and, only if you click **Allow phones**, a ufw or
 firewalld rule for TCP 8443; both go through the normal password prompt. The phone link
 runs only after you add a phone (or open a scene with one): HTTPS on your LAN address,
@@ -190,9 +198,10 @@ Effect packs are third-party code and always run in a separate worker process.
   be started in the test environment, so RGB levels and GPU pixel output are untested; the
   CUDA path is covered with a simulated provider only; VA-API with simulated hardware.
   [PARITY.md](PARITY.md) lists each claim with its evidence and gap.
-- **Packaging:** the `.deb` is built and inspected by the tests; the PKGBUILD, Flatpak
-  manifest and AppImage script are parsed and cross-checked but not yet built with their own
-  tools.
+- **Packaging:** the `.deb` is built and inspected by the tests. The PKGBUILD was built with
+  `makepkg` on 2026-11-14 (the package installs the wheel, desktop file and metainfo) and has a CI
+  job that is not yet seen green on GitHub. The Flatpak manifest and AppImage script are in
+  `packaging/unsupported/`: parsed and cross-checked, never built.
 - **Effects:** every effect fits a 1080p60 frame on the reference machine, but they still
   use CPU on worker threads as well as per frame. AI effects run in-process by default
   because the worker costs about 21–27 ms per 1080p frame; **Settings → Output → AI effects** can

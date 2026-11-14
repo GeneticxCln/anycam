@@ -1,4 +1,4 @@
-# Build: flatpak-builder --user --install --force-clean build packaging/flatpak/io.github.geneticxcln.AnyCam.yml
+# Build: flatpak-builder --user --install --force-clean build packaging/unsupported/flatpak/io.github.geneticxcln.AnyCam.yml
 # The sandbox cannot load kernel modules, so a v4l2loopback virtual camera must already exist on the host;
 # the PipeWire camera backend works without it.
 app-id: io.github.geneticxcln.AnyCam
@@ -36,4 +36,4 @@ modules:
       - install -Dm644 src/anycam/assets/anycam-logo.png ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/io.github.geneticxcln.AnyCam.png
     sources:
       - type: dir
-        path: ../..
+        path: ../../..

@@ -5,7 +5,7 @@ Backlog from the 2026-10-31 full audit (55 bugs, M0–M9), the 2026-11-11 audit
 the 11-item fixes; suite **1231 collected, the full run passing** (four
 hardware/packaging tests skip without their hardware).
 
-`PLAN.md` is the older 2026-10-30 plan; this file tracks the newer audits' open
+`plans/archive/2026-10-30-remediation.md` is the older 2026-10-30 plan; open plans are in `plans/pending/`; this file tracks the newer audits' open
 side. Closed items live in `docs/REGRESSIONS.md` and are not repeated here.
 
 Legend: `[ ]` open · `[~]` in progress · `[x]` done. Bug IDs (`B12`) are the
@@ -190,7 +190,7 @@ Design and build order: `docs/PHONE_CAMERA.md`.
 
 ## 9. M9 — ship 1.0
 
-- [~] Recipes in `packaging/`: the `.deb` builds and is inspected (`tests/test_phase9_packaging.py`); PKGBUILD, Flatpak manifest and AppImage script are parsed and checked, but have not been built in their native tools. The PKGBUILD tolerates a tarball without `packaging/metainfo/` and declares `checkdepends` (item 10).
+- [~] Recipes in `packaging/`: the `.deb` builds and is inspected (`tests/test_phase9_packaging.py`); the PKGBUILD built with `makepkg` on 2026-11-14 and has a CI job (not yet seen green); the Flatpak manifest and AppImage script moved to `packaging/unsupported/`, parsed and checked, never built. The PKGBUILD tolerates a tarball without `packaging/metainfo/` and declares `checkdepends` (item 10).
 - [~] First-run checklist (`anycam check`, shown once in the window) says what is missing and the exact fix. [ ] Running the `pkexec` setup from the wizard.
 - [~] Browser harness `scripts/compat-matrix.py` (Chromium family over DevTools, Firefox via `verify-firefox.py`); self-tested with Chromium's test camera. [ ] The real matrix needs the loopback device and the apps.
 - [x] Declare PySide6 (`gui`) and PyGObject (`gi`) as extras in `pyproject.toml`; there is no `ui/` package data to fix (B53).
@@ -202,14 +202,19 @@ Design and build order: `docs/PHONE_CAMERA.md`.
 
 ## 10. Verification and documentation debt
 
+- [ ] CI jobs `test-keyring` and `pkgbuild` have not run on GitHub yet; remove their `continue-on-error` once green.
+- [ ] Split the descriptively renamed test files (`tests/test_screen_*`, `test_input_validation_and_resilience.py`, ...) into one file per feature; their fixtures differ, so it needs care.
+- [ ] VA-API encoders and a real gnome-keyring are untested on hardware here (the encoder probe and keyring are tested with simulated children and an in-memory store; KWallet and NVENC were run once).
+- [ ] "What are you making?" setup (`plans/archive/product-hardening.md`, step 6.2).
+
 > **Feature freeze (2026-11-14):** no new user-facing feature until Phases 1-3 of
-> `plans/pending/product-hardening.md` (keyring, crash safety, encoder probe) are merged. Fixes and the plan's own
+> `plans/archive/product-hardening.md` (keyring, crash safety, encoder probe) are merged. Fixes and the plan's own
 > steps only.
 
 - [ ] Every **R** bug from the audit keeps its own regression test; every **I** bug is reproduced first or closed as not-a-bug in `docs/REGRESSIONS.md`.
 - [ ] Automated runs use synthetic sources, Qt offscreen and temp `XDG_*`; they never open the user's camera or saved project.
 - [ ] Soak tracks RSS, tmpfs, disk and FDs; frame stalls fail the run.
-- [ ] Replace `PLAN.md` with the 2026-10-31 audit (or check the audit text in under `docs/`) so the plan and `PARITY.md` stop disagreeing. (Planned: `plans/pending/product-hardening.md` step 4.2.)
+- [x] `PLAN.md` moved to `plans/archive/` and `docs/UPGRADE_PLAN.md` to `plans/pending/` (2026-11-14), so the root and `docs/` hold only current documents.
 - [x] `PARITY.md` carries a measured-results section for this round (2026-11-12) and states its gaps; older rows keep their original evidence notes.
 - [x] `scripts/capture-screencast.py` reports `ok: false` for a flat or wrong-shaped frame (B55). Passed: `tests/test_housekeeping_2026_11_12.py`.
 - [ ] Evidence gaps: live portal screen capture, physical unplug, 10-minute soak with the virtual camera; the 2026-11-12 GPU-preview smoke (section 11).

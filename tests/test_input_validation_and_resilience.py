@@ -746,23 +746,6 @@ def test_reconnect_backoff_doubles_and_resets_after_a_healthy_run():
 
 
 # ------------------------------------------------------------ blocking work
-def test_the_nvenc_probe_is_remembered_for_a_minute(monkeypatch):
-    pytest.importorskip("gi")
-    from anycam import pipeline
-
-    calls = []
-    monkeypatch.setattr("anycam.engine.encoders._nvenc_seen", {})
-    monkeypatch.setattr("anycam.engine.encoders._probe_nvenc",
-                        lambda codec: calls.append(codec) or True)
-    assert pipeline.nvenc_available("h264") and pipeline.nvenc_available("h264")
-    assert calls == ["h264"]
-    pipeline.nvenc_available("h265")
-    assert calls == ["h264", "h265"]
-    monkeypatch.setattr("anycam.engine.encoders._NVENC_TTL_S", 0.0)
-    pipeline.nvenc_available("h264")
-    assert calls == ["h264", "h265", "h264"]
-
-
 def test_a_slow_firewall_check_does_not_hold_up_the_dialog(monkeypatch):
     pytest.importorskip("PySide6")
     import threading

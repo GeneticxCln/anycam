@@ -2,7 +2,7 @@
 
 Written 2026-11-14 from a side-by-side read of AnyCam 1.4.0 (`master` at `1fed2e6`) and
 [28allday/omabroadcast](https://github.com/28allday/omabroadcast) 0.1.0 (`827031a`).
-Status: **proposal, waiting for approval.** Nothing below has been built yet.
+Status: **done 2026-11-14** (approved with all recommended answers). See "Execution record" at the end.
 
 AnyCam is ahead on engineering discipline: 1,251 tests, two CI jobs, defect lint, atomic
 owner-only saves, log redaction and a regression log. omabroadcast has no tests, no CI and a
@@ -335,10 +335,44 @@ is reversible, because a reference can be resolved back into an inline value.
 
 | Phase | Status |
 | --- | --- |
-| 0 Guardrails | Not started |
-| 1 Secrets out of project files | Not started |
-| 2 Crash safety | Not started |
-| 3 Encoder probing out of process | Not started |
-| 4 Test and documentation hygiene | Not started |
-| 5 Control from outside | Not started |
-| 6 Small product additions | Not started |
+| 0 Guardrails | Done |
+| 1 Secrets out of project files | Done (CI real-keyring job not yet seen green) |
+| 2 Crash safety | Done |
+| 3 Encoder probing out of process | Done |
+| 4 Test and documentation hygiene | Done, with the 4.1 deviation below |
+| 5 Control from outside | Done |
+| 6 Small product additions | 6.1 done; 6.2 deferred (D11) |
+
+## Execution record
+
+What shipped: every step of Phases 0-5 and step 6.1. Verification: the full suite on a snapshot of the
+final tree (`pytest tests --no-hardware`) and `ruff check src`; new tests in `tests/test_credentials.py`,
+`test_applog.py`, `test_crash_guard.py`, `test_encoders.py`, `test_ctl.py`, `test_recording_summary.py`,
+`test_repo_hygiene.py`. The real encoder probe ran on the reference machine: NVENC H.264/H.265/AV1 and x264
+passed, VA-API not installed. The real KWallet round trip ran once. `makepkg` built the PKGBUILD locally.
+
+Deviations from the plan:
+
+- **D2, where references resolve.** References are resolved when a project file is read and made when it is
+  written (`Project.load`, `Project.save`, `save_scene_preset`), not when an output is built. The engine and
+  UI keep seeing real URLs. Cost: a locked keyring may prompt for unlock at project open.
+- **Secret ids** are random UUIDs remembered per run (`credentials._known_ids`), not derived from the secret.
+  An entry whose stream key was later changed stays in the keyring (no pruning).
+- **5.1, socket location.** The instance socket kept its existing name in the temp directory, now with
+  `UserAccessOption`; it did not move to `$XDG_RUNTIME_DIR`, which would have changed single-instance
+  semantics. `ctl.socket_path()` mirrors Qt's path rule.
+- **2.4**, restoring the backup is offered in a dialog on a real desktop and automatic on Qt's offscreen
+  platform. The unreadable file is moved to `set-aside/` instead of a `.corrupt` sibling (one existing test
+  was updated for that).
+- **3.2**, with no probe answer yet, the first recording uses x264 and the plan note says the check is not
+  finished; the probe starts when the GUI starts. The old "NVENC probe is remembered for a minute" test was
+  removed with the in-process probe.
+- **4.1, no split.** The dated test files were renamed to descriptive names, not split into one file per
+  feature: each file has its own fixtures and helpers (`isolated`, `make_project`, `app` differ between
+  files), so merging them into feature files would have shadowed fixtures. All 1,294 collected test names are
+  unchanged. `tests/test_repo_hygiene.py` stops dated names coming back. A real split stays open.
+- **4.4**, the PKGBUILD CI job and the real-keyring CI job are `continue-on-error` until they have run green
+  on GitHub.
+- **Version** is not bumped; the changes sit under "Unreleased" in the CHANGELOG (assumption 5 awaits a release).
+- **Open question answered** (Phase 2 fog): native text written straight to file descriptor 2 is not captured
+  in the log; it still reaches the terminal. Stated in `applog.py`.
