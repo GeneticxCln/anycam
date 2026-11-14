@@ -6,11 +6,13 @@ import threading
 import time
 from pathlib import Path
 
+from PySide6.QtCore import Qt
+
 from PySide6.QtWidgets import (
     QMessageBox,
 )
 
-from .. import config, overlay, streaming
+from .. import config, crashguard, overlay, streaming
 from ..engine.outputs.recorder import Recorder
 from ..engine.outputs.vcam import VcamOutput
 from ..pipeline import recording_codec
@@ -103,9 +105,49 @@ class OutputsMixin:
                 self.recording_segments.append(path)
             warning = str(report.get("warning") or "")
             self._status(f"Saved {path}" + (f" ({warning})" if warning else ""))
+            self._check_recording(path, bool(report.get("finalised", True)))
         else:
             self._status(
                 f"Recording failed: {report.get('error') or 'no frames'}")
+
+    def _check_recording(self, path: str, finalised: bool) -> None:
+        """Look at the file just written, say what is in it, and offer to play it."""
+        from ..engine import verify
+
+        summary = self._run_with_ui(lambda: verify.summarize_recording(path, finalised))
+        self.last_recording_summary = summary
+        self._status(verify.describe_recording(summary))
+        self.log_event(verify.describe_recording(summary))
+        self._offer_recording(summary)
+
+    def _offer_recording(self, summary: dict) -> None:
+        """A small notice with Play and Show in folder (not where nobody can click)."""
+        from PySide6.QtWidgets import QApplication, QMessageBox
+
+        app = QApplication.instance()
+        if (getattr(self, "headless", False) or getattr(self, "_closing", False) or app is None
+                or app.platformName() in ("offscreen", "minimal")):
+            return
+        from ..engine import verify
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information if summary["ok"] else QMessageBox.Icon.Warning)
+        box.setWindowTitle("Recording saved" if summary["ok"] else "Recording problem")
+        box.setText(verify.describe_recording(summary))
+        play = box.addButton("Play", QMessageBox.ButtonRole.AcceptRole)
+        folder = box.addButton("Show in folder", QMessageBox.ButtonRole.ActionRole)
+        box.addButton("Close", QMessageBox.ButtonRole.RejectRole)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.buttonClicked.connect(lambda button: self._open_recording(summary["path"], button is folder))
+        del play
+        box.open()
+
+    def _open_recording(self, path: str, folder: bool) -> None:
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        target = str(Path(path).parent) if folder else path
+        QDesktopServices.openUrl(QUrl.fromLocalFile(target))
 
     def show_vcam_hint(self, text: str) -> None:
         """Keep a dismissible hint above the preview until replaced."""
@@ -127,6 +169,7 @@ class OutputsMixin:
         """
         if self._vcam_output is not None and self._vcam_output.active:
             return True
+        crashguard.stage("holding the virtual camera")
         device = self.project.output.vcam_device or config.loopback_device()
         output = VcamOutput()
         if not output.start(device, self.project.output.canvas_w,

@@ -3,10 +3,12 @@ from __future__ import annotations
 
 
 import fcntl
+import json
 import os
 import sys
 import time
 
+from PySide6.QtCore import QTimer
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from .. import config
@@ -93,6 +95,8 @@ def claim_gui_instance(name: str = INSTANCE_SERVER
     # socket file left behind belongs to a crashed instance.
     QLocalServer.removeServer(name)
     server = QLocalServer()
+    # Only this user may connect: the socket carries commands.
+    server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
     if not server.listen(name):
         print(f"[guard] single-instance socket failed: {server.errorString()}",
               file=sys.stderr, flush=True)
@@ -103,15 +107,60 @@ def claim_gui_instance(name: str = INSTANCE_SERVER
     return True, server
 
 
+MAX_REQUEST = 64 * 1024
+
+
+class _Request:
+    """One client of the instance socket: ``show`` raises the window, a JSON line runs an action."""
+
+    def __init__(self, connection, window) -> None:
+        self.connection, self.window = connection, window
+        self.buffer = b""
+        self.handled = False
+        connection.readyRead.connect(self.read)
+        connection.disconnected.connect(connection.deleteLater)
+        QTimer.singleShot(2000, self.give_up)
+
+    def read(self) -> None:
+        if self.handled:
+            return
+        self.buffer += bytes(self.connection.readAll())
+        text = self.buffer.lstrip()
+        if text.startswith(b"show"):
+            self.handled = True
+            _raise_window(self.window)
+            self.connection.disconnectFromServer()
+        elif b"\n" in text or len(self.buffer) > MAX_REQUEST:
+            self.handled = True
+            reply = self.run(text.split(b"\n", 1)[0])
+            self.connection.write(json.dumps(reply).encode() + b"\n")
+            self.connection.flush()
+            self.connection.disconnectFromServer()
+
+    def run(self, line: bytes) -> dict:
+        try:
+            request = json.loads(line.decode("utf-8"))
+        except ValueError:
+            return {"ok": False, "error": "a request is one JSON object per line"}
+        return self.window.ctl_dispatch(request)
+
+    def give_up(self) -> None:
+        if not self.handled:
+            self.handled = True
+            try:
+                self.connection.disconnectFromServer()
+            except RuntimeError:
+                pass          # already deleted
+
+
 def serve_instance_requests(server: QLocalServer, window) -> None:
-    """Raise the window when a second launch connects to this instance."""
+    """Serve the instance socket: a second launch raises the window, ``anycam ctl`` runs actions."""
     def on_connection() -> None:
         while server.hasPendingConnections():
             connection = server.nextPendingConnection()
             if connection is not None:
-                connection.disconnectFromServer()
-                connection.deleteLater()
-        _raise_window(window)
+                window._instance_requests = [r for r in getattr(window, "_instance_requests", [])
+                                             if not r.handled] + [_Request(connection, window)]
 
     server.newConnection.connect(on_connection)
 

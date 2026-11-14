@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import QFileDialog
 
-from .. import config, effect_worker, streaming
+from .. import config, credentials, effect_worker, model, repair, streaming
 from ..model import (Project, default_project, load_scene_preset, new_id,
                      save_scene_preset)
 from .theme import STYLE  # noqa: F401
@@ -40,14 +40,48 @@ class ProjectIOMixin:
                        if len(project.load_warnings) > 3 else ""))
             return project
         except Exception as exc:  # noqa: BLE001 - a corrupt save must not brick the app
-            # Keep the unreadable file: the next autosave writes defaults over
-            # the path, and the old project may still be recoverable by hand.
+            return self._recover_project(path, exc)
+
+    def _recover_project(self, path: Path, exc: Exception) -> Project:
+        """The project file does not load: set it aside, offer the last good copy, else defaults.
+
+        The unreadable file goes to ``set-aside/`` (never deleted), because the next
+        autosave would otherwise write over the only copy.
+        """
+        backup = path.with_name(path.name + ".bak")
+        backup_ok = backup.exists() and not repair.readable_object(backup)
+        moved = repair.set_aside(path)
+        if moved is not None:
+            model.scrub_secrets_in_file(moved)
+        where = f" (kept in {moved})" if moved is not None else ""
+        if backup_ok and self._offer_backup(path):
             try:
-                shutil.copy2(path, path.with_name(f"{path.name}.corrupt"))
-            except OSError:
-                pass
-            self._load_warning = f"Could not load {path}: {exc}. Using defaults."
-            return default_project()
+                project = Project.load(backup)
+            except Exception:  # noqa: BLE001 - fall through to defaults
+                project = None
+            if project is not None:
+                try:
+                    shutil.copy2(backup, path)
+                except OSError:
+                    pass
+                self._load_warning = (f"Could not load {path.name}: {exc}. Restored the last good "
+                                      f"copy{where}.")
+                return project
+        self._load_warning = f"Could not load {path}: {exc}. Using defaults{where}."
+        return default_project()
+
+    def _offer_backup(self, path: Path) -> bool:
+        """Ask whether to restore the last good copy; automatic where no one can answer."""
+        from PySide6.QtWidgets import QApplication, QMessageBox
+
+        app = QApplication.instance()
+        if app is None or app.platformName() in ("offscreen", "minimal"):
+            return True
+        answer = QMessageBox.question(
+            None, "Project could not be loaded",
+            f"{path.name} could not be read. Restore the last good copy?\n\n"
+            "The unreadable file is kept in your config folder (set-aside).")
+        return answer == QMessageBox.StandardButton.Yes
 
     def _write_project(self) -> Path:
         """Synchronise the widgets into the model and save the project."""
@@ -319,7 +353,8 @@ class ProjectIOMixin:
         quietly(self.stream_bitrate, lambda w: w.setValue(out.stream_bitrate_kbps))
         preset, key = streaming.split_url(out.rtmp_url)
         quietly(self.stream_preset, lambda w: w.setCurrentIndex(max(0, w.findData(preset))))
-        quietly(self.stream_key_edit, lambda w: w.setText(key if preset != "custom" else ""))
+        quietly(self.stream_key_edit, lambda w: w.setText(
+            key if preset != "custom" and not credentials.has_reference(key) else ""))
         self.extra_list.clear()
         self.extra_list.addItems(out.rtmp_extra_urls)
         quietly(self.record_dir_edit, lambda w: w.setText(out.record_dir))
