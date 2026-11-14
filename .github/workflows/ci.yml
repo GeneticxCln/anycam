@@ -24,7 +24,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             python3 python3-pip python3-gi python3-gi-cairo \
-            gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-gdkpixbuf-2.0 \
+            gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-gdkpixbuf-2.0 gir1.2-secret-1 \
             v4l-utils gstreamer1.0-tools gstreamer1.0-plugins-base \
             gstreamer1.0-x gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
@@ -107,7 +107,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             python3 python3-pip python3-gi python3-gi-cairo \
-            gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-gdkpixbuf-2.0 \
+            gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-gdkpixbuf-2.0 gir1.2-secret-1 \
             v4l-utils gstreamer1.0-tools gstreamer1.0-plugins-base \
             gstreamer1.0-x gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
@@ -151,3 +151,65 @@ jobs:
           name: pytest-report-no-hardware
           path: report.xml
           if-no-files-found: warn
+
+  # The keyring wrapper against a real Secret Service: gnome-keyring inside a
+  # throwaway D-Bus session, unlocked with a throwaway password.  The other
+  # jobs run the same tests against the in-memory keyring and skip the real
+  # one.  Not yet seen green on GitHub: remove continue-on-error once it is.
+  test-keyring:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    continue-on-error: true
+    env:
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            python3 python3-pip python3-gi gir1.2-secret-1 gnome-keyring dbus-user-session
+
+      - name: Install Python dependencies
+        run: /usr/bin/python3 -m pip install --break-system-packages pytest
+
+      - name: The credentials tests against a real keyring
+        run: |
+          dbus-run-session -- bash -c '
+            echo -n "ci-throwaway" | gnome-keyring-daemon --unlock --components=secrets > /dev/null
+            ANYCAM_TEST_KEYRING=1 /usr/bin/python3 -m pytest tests/test_credentials.py -o addopts="" -v
+          '
+
+  # The Arch recipe built from this checkout (not the release tarball it
+  # names), then installed.  Built once by hand with makepkg on 2026-11-14; not
+  # yet seen green on GitHub: remove continue-on-error once it is.
+  pkgbuild:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    continue-on-error: true
+    container: archlinux:latest
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --noconfirm base-devel git sudo
+
+      - uses: actions/checkout@v4
+
+      - name: makepkg
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          version=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
+          mkdir /tmp/pkg
+          git archive --format=tar.gz --prefix="anycam-$version/" HEAD -o "/tmp/pkg/anycam-$version.tar.gz"
+          cp packaging/arch/PKGBUILD /tmp/pkg/PKGBUILD
+          sed -i 's|^source=.*|source=("anycam-$pkgver.tar.gz")|' /tmp/pkg/PKGBUILD
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chown -R builder /tmp/pkg
+          su builder -c 'cd /tmp/pkg && makepkg -s --noconfirm'
+
+      - name: The package installs and starts
+        run: |
+          pacman -U --noconfirm /tmp/pkg/*.pkg.tar.zst
+          QT_QPA_PLATFORM=offscreen anycam --help
+

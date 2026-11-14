@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-from . import geometry
+from . import credentials, geometry
 
 
 def new_id(prefix: str) -> str:
@@ -292,6 +292,8 @@ class Layer:
                 continue
             setattr(layer, item.name,
                     _coerce(data[item.name], getattr(layer, item.name)))
+        if layer.kind == "network" and isinstance(layer.source, str):
+            layer.source = credentials.reveal(layer.source)
         layer.box = _quad(data.get("box"), layer.box)
         layer.crop = _quad(data.get("crop"), layer.crop)
         layer.effects = Effects.from_dict(data.get("effects"))
@@ -518,8 +520,10 @@ class OutputConfig:
     def from_dict(cls, data: dict[str, Any] | None) -> "OutputConfig":
         output = _coerce_fields(cls, data, skip=("rtmp_extra_urls",))
         raw = data.get("rtmp_extra_urls") if isinstance(data, dict) else None
-        output.rtmp_extra_urls = ([url.strip() for url in raw if isinstance(url, str) and url.strip()]
+        output.rtmp_extra_urls = ([credentials.reveal(url.strip()) for url in raw
+                                   if isinstance(url, str) and url.strip()]
                                   if isinstance(raw, list) else [])
+        output.rtmp_url = credentials.reveal(output.rtmp_url)
         defaults = cls()
         for name in ("record_bitrate_kbps", "stream_bitrate_kbps"):
             value = getattr(output, name)
@@ -641,7 +645,7 @@ class Project:
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = json.dumps(self.to_dict(), indent=2) + "\n"
+        data = json.dumps(protected_project(self.to_dict()), indent=2) + "\n"
         temp = path.with_name(path.name + ".tmp")
         payload = data.encode("utf-8")
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -670,6 +674,7 @@ class Project:
 
     @classmethod
     def load(cls, path: str | Path) -> "Project":
+        migrate_secrets(path)
         return cls.from_dict(json.loads(Path(path).read_text()))
 
 
@@ -758,6 +763,83 @@ def default_project(name: str = "AnyCam") -> Project:
     return project
 
 
+_QUOTED_URL = re.compile(r'"((?:rtmps?|srt|rtsps?|https?)://[^"\\]+)"', re.IGNORECASE)
+
+
+def scrub_secrets_in_file(path: str | Path) -> bool:
+    """Move the secrets in one saved file to the keyring; True when the file was rewritten.
+
+    A file that parses is protected field by field.  One that does not (a
+    ``.corrupt`` copy) has every quoted URL in it protected as text.  Nothing
+    changes when no keyring works: the file keeps its secrets, as before.
+    """
+    path = Path(path)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return False
+    if "://" not in raw:
+        return False
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        out = json.dumps(protected_project(data), indent=2) + "\n"
+    elif data is None:
+        out = _QUOTED_URL.sub(
+            lambda m: '"' + credentials.protect(m.group(1), stream=m.group(1).lower().startswith("rtmp"),
+                                                label="AnyCam stream key") + '"', raw)
+    else:
+        return False
+    if out == raw or (data is not None and json.loads(out) == data):
+        return False
+    temp = path.with_name(path.name + ".tmp")
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(out)
+        os.replace(temp, path)
+    except OSError:
+        return False
+    return True
+
+
+def migrate_secrets(path: str | Path) -> bool:
+    """Scrub a project file and its ``.bak`` and ``.corrupt`` copies (see above)."""
+    path = Path(path)
+    changed = False
+    for candidate in (path, path.with_name(path.name + ".bak"), path.with_name(path.name + ".corrupt")):
+        changed = scrub_secrets_in_file(candidate) or changed
+    return changed
+
+
+def protected_layer(layer: dict[str, Any]) -> dict[str, Any]:
+    """A layer's saved form with its URL secrets moved to the keyring."""
+    if layer.get("kind") == "network" and isinstance(layer.get("source"), str):
+        layer = dict(layer, source=credentials.protect(layer["source"], label="AnyCam camera password"))
+    return layer
+
+
+def protected_scene(scene: dict[str, Any]) -> dict[str, Any]:
+    return dict(scene, layers=[protected_layer(layer) for layer in scene.get("layers", [])])
+
+
+def protected_project(data: dict[str, Any]) -> dict[str, Any]:
+    """``Project.to_dict()`` as it is written to a file: no stream key, SRT passphrase
+    or camera password in it, only references into the desktop keyring."""
+    output = dict(data.get("output", {}))
+    label = "AnyCam stream key"
+    if isinstance(output.get("rtmp_url"), str):
+        output["rtmp_url"] = credentials.protect(output["rtmp_url"], stream=True, label=label)
+    if isinstance(output.get("rtmp_extra_urls"), list):
+        output["rtmp_extra_urls"] = [
+            credentials.protect(url, stream=True, label=label) if isinstance(url, str) else url
+            for url in output["rtmp_extra_urls"]]
+    return dict(data, output=output,
+                scenes=[protected_scene(scene) for scene in data.get("scenes", [])])
+
+
 def save_scene_preset(scene: Scene, directory: str | Path) -> Path:
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -770,7 +852,7 @@ def save_scene_preset(scene: Scene, directory: str | Path) -> Path:
     temp = path.with_name(path.name + ".tmp")
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(scene.to_dict(), indent=2) + "\n")
+        handle.write(json.dumps(protected_scene(scene.to_dict()), indent=2) + "\n")
     os.chmod(temp, 0o600)
     os.replace(temp, path)
     return path

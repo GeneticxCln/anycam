@@ -12,7 +12,10 @@ library's.
 """
 from __future__ import annotations
 
+import re
+import sys
 import threading
+import uuid
 from typing import Protocol
 
 SCHEMA_NAME = "io.github.geneticxcln.AnyCam.Secret"
@@ -182,3 +185,95 @@ def set_store(store: Store | None) -> None:
 
 def available() -> bool:
     return get_store().available()
+
+
+# ------------------------------------------------------- secrets inside URLs
+#
+# A saved project never holds a stream key, passphrase or camera password: the
+# URL keeps a reference, ``rtmp://host/app/${secret:<id>}``, and the value lives
+# in the keyring.  In memory a project always holds the real URL, so the engine
+# needs no change: references are resolved when a file is read (``reveal``) and
+# made when one is written (``protect``).
+
+REF = re.compile(r"\$\{secret:([A-Za-z0-9-]{8,64})\}")
+
+_USERINFO_PASSWORD = re.compile(r"(?P<pre>\b[A-Za-z][A-Za-z0-9+.-]*://[^/\s:@]*:)(?P<value>[^/\s@]+)(?=@)")
+_QUERY_SECRET = re.compile(r"(?P<pre>[?&](?:passphrase|streamid|key)=)(?P<value>[^&#\s]+)", re.IGNORECASE)
+_STREAM_KEY = re.compile(r"(?P<pre>^rtmps?://[^/\s]+(?:/[^/\s?#]+)+/)(?P<value>[^/\s?#]+)(?=[?#]|$)", re.IGNORECASE)
+
+# secret value -> id, so saving the same secret again reuses its keyring entry.
+_known_ids: dict[str, str] = {}
+_warned_inline = False
+
+
+def has_reference(text: str) -> bool:
+    return bool(REF.search(text or ""))
+
+
+def _spans(text: str, stream: bool):
+    patterns = [_USERINFO_PASSWORD, _QUERY_SECRET] + ([_STREAM_KEY] if stream else [])
+    found = []
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            found.append(match.span("value"))
+    return sorted(found)
+
+
+def contains_secret(text: str, stream: bool = False) -> bool:
+    """Whether ``text`` carries an inline secret (one that is not yet a reference)."""
+    return any(not REF.fullmatch(text[a:b]) for a, b in _spans(text or "", stream))
+
+
+def reveal(text: str) -> str:
+    """Put the real secrets back in place of references; unknown ones stay as written."""
+    if not text or "${secret:" not in text:
+        return text
+
+    def swap(match):
+        value = get_store().lookup(match.group(1))
+        if value is None:
+            return match.group(0)
+        _known_ids.setdefault(value, match.group(1))
+        return value
+
+    return REF.sub(swap, text)
+
+
+def protect(text: str, stream: bool = False, label: str = "AnyCam secret") -> str:
+    """``text`` with its inline secrets moved to the keyring and replaced by references.
+
+    With no working keyring the secret stays where it is (the project file is
+    owner-only), and one line says so per run.
+    """
+    global _warned_inline
+    if not text:
+        return text
+    pieces = []
+    last = 0
+    store = get_store()
+    for start, end in _spans(text, stream):
+        value = text[start:end]
+        if REF.fullmatch(value):
+            continue
+        secret_id = _known_ids.get(value)
+        if secret_id is not None and store.lookup(secret_id) != value:
+            secret_id = None  # the entry was deleted or changed behind our back
+        if secret_id is None:
+            new_id = _known_ids.get(value) or str(uuid.uuid4())
+            if not store.store(new_id, label, value):
+                if not _warned_inline:
+                    _warned_inline = True
+                    print("[credentials] no working keyring: stream keys and passwords stay in the "
+                          f"project file ({store.error or 'not available'})", file=sys.stderr, flush=True)
+                continue
+            _known_ids[value] = secret_id = new_id
+        pieces.append(text[last:start])
+        pieces.append("${secret:" + secret_id + "}")
+        last = end
+    pieces.append(text[last:])
+    return "".join(pieces)
+
+
+def known_secrets() -> list[str]:
+    """Every secret value this run has stored or revealed (for masking in the log)."""
+    return list(_known_ids)
