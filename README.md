@@ -232,8 +232,9 @@ Effect packs are third-party code and always run in a separate worker process.
 
 **v1.5.0** is the current version; **Settings → About** shows the version and what it runs
 on. Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`: it builds the tarball and
-wheel, checks the bundled assets, smoke-tests a clean install and publishes a GitHub Release
-with `SHA256SUMS`. To release, bump `version` in `pyproject.toml` and `VERSION` in
+wheel, checks the bundled assets, smoke-tests a clean install, builds the `.deb` and the Arch
+package, and publishes a GitHub Release with all of them and `SHA256SUMS`. To attach packages to
+an existing tag, run the workflow from the Actions tab with that tag. To release, bump `version` in `pyproject.toml` and `VERSION` in
 `src/anycam/config.py`, commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
 See [CHANGELOG.md](CHANGELOG.md).
 
