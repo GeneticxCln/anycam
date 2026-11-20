@@ -1116,8 +1116,6 @@ def test_source_status_reports_stale_and_recovers_without_restarting(app):
 
 
 def test_desktop_only_audio_enables_engine_and_recorder(app, monkeypatch, tmp_path):
-    from anycam import gui
-
     window = _window(_camera_project(1), app)
     window.project.audio.desktop_device = "synthetic.monitor"
     window.project.audio.media_file = ""

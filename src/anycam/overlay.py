@@ -25,8 +25,11 @@ from .geometry import crop_pixels
 # but a crop drag writes a new box-sized PNG per step.  Keep the cache bounded.
 OVERLAY_CACHE_MAX_BYTES = 256 * 1024 * 1024
 OVERLAY_CACHE_MAX_FILES = 1500
+BACKGROUND_CACHE_MAX_BYTES = 128 * 1024 * 1024
+BACKGROUND_CACHE_MAX_FILES = 200
 _PRUNE_INTERVAL_S = 30.0
 _last_prune = 0.0
+_last_bg_prune = 0.0
 
 
 def save_png_atomic(image: Image.Image, out: Path) -> Path:
@@ -91,6 +94,21 @@ def _maybe_prune(keep: Path) -> None:
         return
     _last_prune = now
     prune_overlay_cache(keep=keep)
+
+
+def _maybe_prune_backgrounds(keep: Path) -> None:
+    """Prune cached backgrounds at most every ``_PRUNE_INTERVAL_S`` seconds."""
+    global _last_bg_prune
+    now = time.monotonic()
+    if now - _last_bg_prune < _PRUNE_INTERVAL_S:
+        return
+    _last_bg_prune = now
+    prune_overlay_cache(
+        directory=config.cache_dir() / "backgrounds",
+        max_bytes=BACKGROUND_CACHE_MAX_BYTES,
+        max_files=BACKGROUND_CACHE_MAX_FILES,
+        keep=keep,
+    )
 
 
 _FONT_CANDIDATES = (
@@ -185,6 +203,7 @@ def render_text_png(
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     save_png_atomic(image, out)
+    _maybe_prune(out)
     return out
 
 
@@ -461,6 +480,7 @@ def render_window_frame(
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     save_png_atomic(image, out)
+    _maybe_prune(out)
     return out
 
 
@@ -475,6 +495,7 @@ def _frames_revision() -> str:
         return "0"
 
 
+@functools.lru_cache(maxsize=1)
 def _stages_revision() -> str:
     """A short hash of ``stages.py``: any painter change renders anew."""
     from . import stages
@@ -518,6 +539,7 @@ def render_background(name: str, width: int, height: int,
             out.parent.mkdir(parents=True, exist_ok=True)
             picture = stages.STATIC[name](width, height)
             save_png_atomic(picture.convert("RGB"), out)
+            _maybe_prune_backgrounds(out)
         return out
     palettes = {
         "Aurora": ((8, 20, 35), (24, 82, 92), (94, 234, 208)),
@@ -577,6 +599,7 @@ def render_background(name: str, width: int, height: int,
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     save_png_atomic(image.convert("RGB"), out)
+    _maybe_prune_backgrounds(out)
     return out
 
 
@@ -625,6 +648,7 @@ def render_face_frame(
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     save_png_atomic(image, out)
+    _maybe_prune(out)
     return out
 
 
@@ -699,6 +723,7 @@ def render_camera_placeholder(
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     save_png_atomic(image, out)
+    _maybe_prune(out)
     return out
 
 
@@ -729,6 +754,12 @@ def _fingerprint(source: Path) -> str:
     return hashlib.sha1(seed.encode()).hexdigest()[:16]
 
 
+def _safe_stem(source: Path) -> str:
+    """Short, filesystem-safe prefix for cache filenames (never ENAMETOOLONG)."""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", source.stem).strip("._-")
+    return cleaned[:40] or "img"
+
+
 def fit_rgba(source: Path, width: int, height: int, out: Path | None = None) -> Path:
     """Fit an image/logo into a layer box, preserving aspect, transparent fill."""
     width, height = max(8, int(width)), max(8, int(height))
@@ -740,7 +771,7 @@ def fit_rgba(source: Path, width: int, height: int, out: Path | None = None) -> 
     canvas.paste(resized, ((width - resized.width) // 2, (height - resized.height) // 2), resized)
     if out is None:
         out = (config.cache_dir() / "overlays"
-               / f"img-{source.stem}-{_fingerprint(source)}-{width}x{height}.png")
+               / f"img-{_safe_stem(source)}-{_fingerprint(source)}-{width}x{height}.png")
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     save_png_atomic(canvas, out)
@@ -790,6 +821,16 @@ def prepare_rgba(source: Path, width: int, height: int,
     image the user picked, not of the (smaller) layer box.
     """
     width, height = max(8, int(width)), max(8, int(height))
+    if out is None:
+        crop_key = "-".join(f"{value:.4f}" for value in crop)
+        if transform is not None:
+            crop_key += "-" + "-".join(str(part) for part in transform)
+        key_hash = hashlib.sha1(crop_key.encode()).hexdigest()[:12]
+        cached = (config.cache_dir() / "overlays"
+                  / f"img-{_safe_stem(source)}-{_fingerprint(source)}-{width}x{height}-{key_hash}.png")
+        if cached.is_file() and cached.stat().st_size > 0:
+            return cached
+        out = cached
     with Image.open(source) as opened:
         # Phone photos carry their rotation in EXIF; without this a portrait
         # shot lands sideways in the composition.
@@ -807,12 +848,6 @@ def prepare_rgba(source: Path, width: int, height: int,
         canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         canvas.paste(resized, ((width - resized.width) // 2,
                                (height - resized.height) // 2), resized)
-    if out is None:
-        crop_key = "-".join(f"{value:.4f}" for value in crop)
-        if transform is not None:
-            crop_key += "-" + "-".join(str(part) for part in transform)
-        out = (config.cache_dir() / "overlays"
-               / f"img-{source.stem}-{_fingerprint(source)}-{width}x{height}-{crop_key}.png")
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     save_png_atomic(canvas, out)
@@ -840,14 +875,14 @@ def image_size(layer) -> tuple[int, int] | None:
 
 
 def layer_pixels(layer, canvas_w: int, canvas_h: int) -> tuple[int, int, int, int]:
-    from .geometry import clamp
+    from .geometry import BOX_POSITION_RANGE, BOX_SIZE_RANGE, clamp
 
     x, y, w, h = layer.box
     return (
-        int(round(clamp(x) * canvas_w)),
-        int(round(clamp(y) * canvas_h)),
-        max(8, int(round(clamp(w, 0.01, 1.0) * canvas_w))),
-        max(8, int(round(clamp(h, 0.01, 1.0) * canvas_h))),
+        int(round(clamp(x, *BOX_POSITION_RANGE) * canvas_w)),
+        int(round(clamp(y, *BOX_POSITION_RANGE) * canvas_h)),
+        max(8, int(round(clamp(w, *BOX_SIZE_RANGE) * canvas_w))),
+        max(8, int(round(clamp(h, *BOX_SIZE_RANGE) * canvas_h))),
     )
 
 

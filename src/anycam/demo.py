@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -10,52 +12,99 @@ from pathlib import Path
 import gi
 
 gi.require_version("Gst", "1.0")
-from gi.repository import Gst  # noqa: E402
+gi.require_version("GstVideo", "1.0")
+from gi.repository import Gst, GstVideo  # noqa: E402
 
 from . import config
-from .model import Layer, Project, default_project
+from .model import Layer, Project, default_project, normalize_output
 from .pipeline import AnyCamEngine, verify_mp4
 
 
-def _save_frame(sample, path: str) -> None:
+def _extract_rgba(sample) -> tuple[bytes, int, int, int] | None:
+    """Copy RGBA bytes and geometry out of a GstSample on the streaming thread."""
+    if sample is None:
+        return None
+    buf = sample.get_buffer()
+    caps = sample.get_caps()
+    if buf is None or caps is None or caps.get_size() == 0:
+        return None
+    struct = caps.get_structure(0)
+    ok_w, width = struct.get_int("width")
+    ok_h, height = struct.get_int("height")
+    if not (ok_w and ok_h) or width <= 0 or height <= 0:
+        return None
+    meta = GstVideo.buffer_get_video_meta(buf)
+    stride = 0
+    if meta is not None and len(meta.stride) > 0 and meta.stride[0] >= width * 4:
+        stride = int(meta.stride[0])
+    ok, info = buf.map(Gst.MapFlags.READ)
+    if not ok:
+        return None
+    try:
+        raw = bytes(info.data)
+    finally:
+        buf.unmap(info)
+    if stride == 0:
+        stride = len(raw) // height
+    if stride < width * 4 or len(raw) < stride * height:
+        return None
+    return raw, width, height, stride
+
+
+def _write_rgba_png(raw: bytes, width: int, height: int, stride: int, path: str) -> None:
     from PIL import Image
     import numpy as np
 
-    buf = sample.get_buffer()
-    caps = sample.get_caps().get_structure(0)
-    width = caps.get_value("width")
-    height = caps.get_value("height")
-    ok, info = buf.map(Gst.MapFlags.READ)
-    if not ok:
+    arr = np.frombuffer(raw, dtype=np.uint8, count=height * stride).reshape(height, stride)
+    arr = arr[:, : width * 4].reshape(height, width, 4)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(arr, "RGBA").save(path)
+
+
+def _save_frame(sample, path: str) -> None:
+    extracted = _extract_rgba(sample)
+    if extracted is None:
         return
-    try:
-        stride = width * 4  # preview caps are always RGBA
-        arr = np.frombuffer(info.data, dtype=np.uint8).reshape(height, stride)
-        arr = arr[:, : width * 4].reshape(height, width, 4)
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Image.fromarray(arr, "RGBA").save(path)
-    finally:
-        buf.unmap(info)
+    _write_rgba_png(*extracted, path)
 
 
 VIDEO_SUFFIXES = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v"}
+_NETWORK_SCHEMES = (
+    "http://", "https://", "rtsp://", "rtsps://",
+    "rtmp://", "rtmps://", "srt://", "udp://",
+)
 
 
 def _is_video(path: str) -> bool:
     return Path(path).suffix.lower() in VIDEO_SUFFIXES
 
 
+def _parse_quad(text: str, flag: str, parser: argparse.ArgumentParser
+                ) -> tuple[float, float, float, float]:
+    parts = [part.strip() for part in text.split(",")]
+    if len(parts) != 4:
+        parser.error(f"{flag} expects 4 comma-separated numbers")
+    try:
+        values = tuple(float(part) for part in parts)
+    except ValueError:
+        parser.error(f"{flag} expects 4 finite numbers")
+    if not all(math.isfinite(value) for value in values):
+        parser.error(f"{flag} expects 4 finite numbers")
+    return values  # type: ignore[return-value]
+
+
 def build_demo_project(source: str, canvas_w: int, canvas_h: int, fps: int) -> Project:
     project = default_project("AnyCam demo")
-    project.output.canvas_w = canvas_w
-    project.output.canvas_h = canvas_h
-    project.output.fps = fps
+    project.output.canvas_w = int(canvas_w)
+    project.output.canvas_h = int(canvas_h)
+    project.output.fps = int(fps)
+    normalize_output(project.output)
     scene = project.scene
     if source != "camera":
         scene.layers = [l for l in scene.layers if l.kind != "camera"]
         if source == "testsrc":
             kind = "test"
-        elif source.startswith(("http://", "https://", "rtsp://", "rtsps://")):
+        elif source.lower().startswith(_NETWORK_SCHEMES):
             kind = "network"
         elif _is_video(source):
             kind = "video"
@@ -110,6 +159,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     project = build_demo_project(args.source, args.width, args.height, args.fps)
+    args.width = project.output.canvas_w
+    args.height = project.output.canvas_h
+    args.fps = project.output.fps
     if args.audio_file:
         project.audio.media_file = args.audio_file
     if args.mic_device:
@@ -119,8 +171,8 @@ def main(argv: list[str] | None = None) -> int:
     project.audio.media_gain_db = args.media_gain
     playlist_ids: list[str] = []
     if args.playlist:
-        box = tuple(float(v) for v in args.playlist_box.split(","))
-        for index, path in enumerate(p for p in args.playlist.split(",") if p.strip()):
+        box = _parse_quad(args.playlist_box, "--playlist-box", parser)
+        for index, path in enumerate(p.strip() for p in args.playlist.split(",") if p.strip()):
             kind = "video" if _is_video(path) else "image"
             layer = Layer(f"playlist_{index}", kind, Path(path).stem, source=path,
                           box=box, z=25, visible=(index == 0))
@@ -136,24 +188,31 @@ def main(argv: list[str] | None = None) -> int:
             fx.contrast = args.contrast
             fx.saturation = args.saturation
             if args.crop:
-                source_layer.crop = tuple(float(v) for v in args.crop.split(","))
+                source_layer.crop = _parse_quad(args.crop, "--crop", parser)
             if args.chroma:
                 fx.chroma_enabled = True
                 fx.chroma_key = args.chroma
                 fx.chroma_similarity = args.chroma_similarity
     shot_state = {"done": False, "path": args.shot}
     shot_series = {"last": -1.0}
+    png_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    pending_shots: list[concurrent.futures.Future] = []
+
+    def _queue_shot(sample, dest: str) -> None:
+        extracted = _extract_rgba(sample)
+        if extracted is not None:
+            pending_shots.append(png_pool.submit(_write_rgba_png, *extracted, dest))
 
     def on_frame(sample):
         elapsed = time.monotonic() - engine._start_time
         if shot_state["path"] and not shot_state["done"] and elapsed >= args.shot_at:
-            _save_frame(sample, shot_state["path"])
+            _queue_shot(sample, shot_state["path"])
             shot_state["done"] = True
         if args.shots_prefix and args.shots_every > 0:
             index = int(elapsed // args.shots_every)
             if index > shot_series["last"] and elapsed >= args.shots_every:
                 shot_series["last"] = index
-                _save_frame(sample, f"{args.shots_prefix}{index:02d}.png")
+                _queue_shot(sample, f"{args.shots_prefix}{index:02d}.png")
 
     # --audio is the only thing that opens the microphone; an audio bed or a
     # stream must not capture it implicitly.
@@ -171,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         engine.build()
     except Exception as exc:  # noqa: BLE001 - surfaced as an explicit failure
+        png_pool.shutdown(wait=False)
         if engine.report.vcam_error:
             print(f"VCAM BLOCKED: {engine.report.vcam_error}", file=sys.stderr)
             return 3
@@ -183,9 +243,17 @@ def main(argv: list[str] | None = None) -> int:
             for position, layer_id in enumerate(playlist_ids):
                 engine.set_layer_visible(layer_id, position == index)
 
-    report = engine.run(args.seconds, tick_cb=on_tick, sample_cb=lambda rec: print(
-        f"t={rec['t']:6.1f}s frames={rec['frames']:5d} fps={rec['fps']:6.2f} "
-        f"cpu={rec['cpu_pct']} rss={rec['rss_mib']}MiB", flush=True))
+    try:
+        report = engine.run(args.seconds, tick_cb=on_tick, sample_cb=lambda rec: print(
+            f"t={rec['t']:6.1f}s frames={rec['frames']:5d} fps={rec['fps']:6.2f} "
+            f"cpu={rec['cpu_pct']} rss={rec['rss_mib']}MiB", flush=True))
+    finally:
+        png_pool.shutdown(wait=True)
+        for fut in pending_shots:
+            try:
+                fut.result()
+            except Exception as exc:  # noqa: BLE001
+                print(f"WARNING: failed to save PNG frame: {exc}", file=sys.stderr)
     if shot_state["path"] and not shot_state["done"]:
         print("WARNING: no composited frame captured", file=sys.stderr)
 
@@ -199,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
             report["error"] = report.get("error") or "MP4 verification failed"
     if args.json:
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.json).write_text(json.dumps(result, indent=2) + "\n")
+        Path(args.json).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2))
 
     if report.get("error"):

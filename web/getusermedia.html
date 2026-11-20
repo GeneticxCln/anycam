@@ -12,7 +12,7 @@
          font:14px/1.45 "Noto Sans","DejaVu Sans",system-ui,sans-serif; }
   header { display:flex; align-items:center; gap:12px; padding:14px 20px;
            border-bottom:1px solid var(--line); background:var(--panel); }
-  header img { width:30px; height:30px; }
+  header svg { width:30px; height:30px; flex-shrink:0; }
   h1 { font-size:17px; margin:0; letter-spacing:.2px; }
   .tag { color:var(--accent); font-weight:700; font-size:12px; letter-spacing:.12em; }
   main { max-width:1020px; margin:0 auto; padding:20px; }
@@ -37,7 +37,11 @@
 </head>
 <body>
 <header>
-  <img src="../assets/anycam-logo.png" alt="">
+  <svg viewBox="0 0 32 32" aria-hidden="true">
+    <rect x="2" y="2" width="28" height="28" rx="8" fill="#142329" stroke="#5eead0" stroke-width="2"/>
+    <circle cx="16" cy="16" r="7" fill="none" stroke="#5eead0" stroke-width="2"/>
+    <circle cx="16" cy="16" r="2.6" fill="#5eead0"/>
+  </svg>
   <h1>AnyCam</h1><span class="tag">GETUSERMEDIA CHECK</span>
 </header>
 <main>
@@ -46,7 +50,7 @@
     <button id="stop">Stop</button>
     <button id="grab">Save frame</button>
     <select id="device" aria-label="Camera"></select>
-    <label><input type="checkbox" id="prefer"> prefer “AnyCam” by label</label>
+    <label><input type="checkbox" id="prefer" checked> prefer “AnyCam” by label</label>
   </div>
 
   <div class="stage"><video id="video" autoplay playsinline muted></video></div>
@@ -70,15 +74,28 @@
 const $ = (id) => document.getElementById(id);
 const log = (msg) => { $("log").textContent += msg + "\n"; };
 let stream = null;
+let manualSelection = false;
 
 function isAnyCam(device) {
   return /anycam/i.test(device.label || "");
 }
 
-async function listDevices() {
+function hasMediaDevices() {
+  if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+    return true;
+  }
+  log("navigator.mediaDevices is unavailable (open this page over https:// or http://localhost).");
+  return false;
+}
+
+async function listDevices(preferredDeviceId = "") {
+  if (!hasMediaDevices()) {
+    return [];
+  }
+  const select = $("device");
+  const previous = preferredDeviceId || select.value;
   const devices = await navigator.mediaDevices.enumerateDevices();
   const cameras = devices.filter(d => d.kind === "videoinput");
-  const select = $("device");
   select.innerHTML = "";
   for (const cam of cameras) {
     const option = document.createElement("option");
@@ -90,10 +107,15 @@ async function listDevices() {
   const anycam = cameras.find(isAnyCam);
   $("found").textContent = anycam ? "yes" : "no";
   $("found").className = anycam ? "ok" : "bad";
-  if (anycam) {
+  const stillPresent = previous && cameras.some(cam => cam.deviceId === previous);
+  if (stillPresent && (manualSelection || !$("prefer").checked || !anycam)) {
+    select.value = previous;
+  } else if (anycam && $("prefer").checked) {
     select.value = anycam.deviceId;
     log(`AnyCam device: ${anycam.label}`);
-  } else {
+  } else if (stillPresent) {
+    select.value = previous;
+  } else if (!anycam) {
     log(cameras.length ? "AnyCam not found. Run scripts/enable-v4l2loopback.sh and start AnyCam." :
                          "No video inputs visible.");
   }
@@ -101,6 +123,9 @@ async function listDevices() {
 }
 
 async function start() {
+  if (!hasMediaDevices()) {
+    return;
+  }
   stop();
   const deviceId = $("device").value;
   try {
@@ -112,9 +137,9 @@ async function start() {
     const video = $("video");
     video.srcObject = stream;
     await video.play();
-    await listDevices();
     const track = stream.getVideoTracks()[0];
     const settings = track.getSettings();
+    await listDevices(settings.deviceId || deviceId);
     $("label").textContent = track.label || "(unlabelled)";
     $("size").textContent = `${settings.width || "?"} × ${settings.height || "?"}`;
     $("fps").textContent = settings.frameRate ? settings.frameRate.toFixed(1) + " fps" : "—";
@@ -144,9 +169,26 @@ function grab() {
 $("start").addEventListener("click", start);
 $("stop").addEventListener("click", stop);
 $("grab").addEventListener("click", grab);
-$("device").addEventListener("change", start);
-navigator.mediaDevices.addEventListener("devicechange", listDevices);
-listDevices().catch(err => log("enumerateDevices failed: " + err));
+$("device").addEventListener("change", () => {
+  manualSelection = true;
+  start();
+});
+$("prefer").addEventListener("change", () => {
+  if ($("prefer").checked) {
+    manualSelection = false;
+  }
+  listDevices().then(() => {
+    if (stream && $("prefer").checked) {
+      start();
+    }
+  }).catch(err => log("enumerateDevices failed: " + err));
+});
+if (hasMediaDevices()) {
+  navigator.mediaDevices.addEventListener("devicechange", () => {
+    listDevices().catch(err => log("enumerateDevices failed: " + err));
+  });
+  listDevices().catch(err => log("enumerateDevices failed: " + err));
+}
 </script>
 </body>
 </html>

@@ -24,19 +24,30 @@ CANVAS_FPS = 60
 
 def _xdg(env: str, default: str) -> Path:
     value = os.environ.get(env)
-    return Path(value) if value else Path.home() / default
+    if value:
+        path = Path(value)
+        if path.is_absolute():
+            return path
+    return Path.home() / default
+
+
+def _ensure_private_dir(path: Path) -> Path:
+    existed = path.exists()
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not existed:
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+    return path
 
 
 def state_dir() -> Path:
-    path = _xdg("XDG_STATE_HOME", ".local/state") / APP_ID
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return _ensure_private_dir(_xdg("XDG_STATE_HOME", ".local/state") / APP_ID)
 
 
 def config_dir() -> Path:
-    path = _xdg("XDG_CONFIG_HOME", ".config") / APP_ID
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    return _ensure_private_dir(_xdg("XDG_CONFIG_HOME", ".config") / APP_ID)
 
 
 def data_dir() -> Path:
@@ -64,7 +75,7 @@ def xdg_videos_dir() -> Path:
         return Path(env).expanduser()
     config_file = _xdg("XDG_CONFIG_HOME", ".config") / "user-dirs.dirs"
     try:
-        for line in config_file.read_text().splitlines():
+        for line in config_file.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if line.startswith("XDG_VIDEOS_DIR="):
                 value = line.split("=", 1)[1].strip().strip('"')
@@ -89,7 +100,10 @@ def redact_url(url: str) -> str:
         return ""
     from urllib.parse import urlsplit, urlunsplit
 
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return "***"
     if not parts.scheme or not parts.netloc:
         return "***"
     segments = [segment for segment in parts.path.split("/") if segment]
@@ -107,10 +121,20 @@ def host_of(url: str) -> str:
     """
     from urllib.parse import urlsplit
 
-    return urlsplit(url).netloc.rpartition("@")[2]
+    try:
+        netloc = urlsplit(url).netloc
+    except ValueError:
+        return ""
+    return netloc.rpartition("@")[2]
 
 
-_USERINFO = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/\s@]+@")
+# Greedy [^/\s]+@ strips up to the LAST '@' before '/' or whitespace, so
+# passwords containing an unencoded '@' (rtsp://user:a@b@host/) are scrubbed.
+_USERINFO = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.-]*://)[^/\s]+@")
+_SECRET_QUERY_PARAMS = frozenset({
+    "passphrase", "streamid", "key", "token", "password", "pass", "pwd",
+    "secret", "auth", "sig",
+})
 
 
 def redact_text(text: str, *urls: str) -> str:
@@ -123,29 +147,69 @@ def redact_text(text: str, *urls: str) -> str:
     """
     if not text:
         return text
-    from urllib.parse import urlsplit
+    from urllib.parse import unquote, urlsplit
 
     for url in urls:
         if not url:
             continue
         text = text.replace(url, redact_url(url))
-        parts = urlsplit(url)
-        # An SRT passphrase travels in the query string.
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            continue
+        # SRT passphrases and tokens travel in the query string.
         for pair in parts.query.split("&"):
             name, _, value = pair.partition("=")
-            if name.lower() in ("passphrase", "streamid", "key") and len(value) >= 4:
-                text = text.replace(value, "***")
+            if name.lower() in _SECRET_QUERY_PARAMS:
+                for candidate in (value, unquote(value)):
+                    if len(candidate) >= 4:
+                        text = text.replace(candidate, "***")
         # The userinfo pattern below removes ``user:pw@`` wherever it appears;
-        # this catches the bare password, but not a short one that would also
-        # match ordinary words.
-        if parts.password and len(parts.password) >= 4:
-            text = text.replace(parts.password, "***")
+        # this catches the bare password (raw and URL-unquoted), including when
+        # the password contains an unencoded '@'.
+        passwords: set[str] = set()
+        if parts.password:
+            passwords.add(parts.password)
+        if "@" in parts.netloc:
+            userinfo = parts.netloc.rpartition("@")[0]
+            if ":" in userinfo:
+                passwords.add(userinfo.partition(":")[2])
+        for pw in list(passwords):
+            passwords.add(unquote(pw))
+        for pw in sorted(passwords, key=len, reverse=True):
+            if len(pw) >= 4:
+                text = text.replace(pw, "***")
         segments = [segment for segment in parts.path.split("/") if segment]
         # A short last segment ("live") is a path, not a key; masking it would
         # garble unrelated words in the message.
         if parts.scheme and segments and len(segments[-1]) >= 6:
             text = text.replace(segments[-1], "***")
     return _USERINFO.sub(lambda match: match.group("scheme"), text)
+
+
+def _write_private_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    except BaseException:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def screen_token_path() -> Path:
@@ -155,7 +219,7 @@ def screen_token_path() -> Path:
 def load_screen_restore_token() -> str:
     """The portal restore token saved by an earlier launch, or ""."""
     try:
-        return screen_token_path().read_text().strip()
+        return screen_token_path().read_text(encoding="utf-8").strip()
     except OSError:
         return ""
 
@@ -169,13 +233,8 @@ def save_screen_restore_token(token: str) -> None:
     token = (token or "").strip()
     if not token:
         return
-    path = screen_token_path()
-    temp = path.with_name(path.name + ".tmp")
     try:
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as handle:
-            handle.write(token + "\n")
-        os.replace(temp, path)
+        _write_private_text(screen_token_path(), token + "\n")
     except OSError:
         pass
 
@@ -201,10 +260,11 @@ def remember_project_path(path: Path) -> None:
     """Make ``path`` the project opened at the next launch (the default clears it)."""
     pointer = _last_project_pointer()
     try:
-        if Path(path) == project_path():
+        resolved = Path(path).expanduser().resolve()
+        if resolved == project_path().resolve():
             pointer.unlink(missing_ok=True)
         else:
-            pointer.write_text(str(Path(path)) + "\n", encoding="utf-8")
+            _write_private_text(pointer, str(resolved) + "\n")
     except OSError:
         pass
 
@@ -227,6 +287,25 @@ def run(cmd: list[str], timeout: float = 5.0) -> tuple[int, str]:
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 127, str(exc)
+
+
+_default_run = run
+
+
+def _run_stdout(cmd: list[str], timeout: float = 5.0) -> tuple[int, str]:
+    """Run ``cmd`` and return only stdout (honours monkeypatched ``config.run``)."""
+    if run is not _default_run:
+        return run(cmd, timeout=timeout)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, proc.stdout or ""
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return 127, str(exc)
+
+
+def _video_sort_key(entry: Path) -> tuple[int, str]:
+    match = re.search(r"video(\d+)$", entry.name, re.ASCII)
+    return (int(match.group(1)) if match else 10**9, entry.name)
 
 
 @dataclass
@@ -257,10 +336,10 @@ def list_video_devices() -> list[CameraInfo]:
     devices: list[CameraInfo] = []
     if not Path("/sys/class/video4linux").exists():
         return devices
-    for entry in sorted(Path("/sys/class/video4linux").glob("video*")):
+    for entry in sorted(Path("/sys/class/video4linux").glob("video*"), key=_video_sort_key):
         dev = f"/dev/{entry.name}"
         try:
-            name = (entry / "name").read_text(errors="replace").strip()
+            name = (entry / "name").read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             name = ""      # the node vanished (unplug) between glob and read
         code, out = run(["v4l2-ctl", "-d", dev, "--list-formats"])
@@ -330,18 +409,28 @@ class AudioSource:
 
 
 def list_audio_sources() -> list[AudioSource]:
-    code, out = run(["pactl", "-f", "json", "list", "sources"])
+    code, out = _run_stdout(["pactl", "-f", "json", "list", "sources"])
     if code != 0:
         return []
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
         return []
+    if not isinstance(data, list):
+        return []
     sources = []
     for item in data:
-        props = item.get("properties") or {}
+        if not isinstance(item, dict):
+            continue
+        props = item.get("properties")
+        if not isinstance(props, dict):
+            props = {}
         name = item.get("name", "")
         description = item.get("description", "")
+        if not isinstance(name, str) or not name:
+            continue
+        if not isinstance(description, str):
+            description = ""
         is_monitor = (
             props.get("device.class") == "monitor"
             or name.endswith(".monitor")
@@ -353,16 +442,21 @@ def list_audio_sources() -> list[AudioSource]:
 
 def list_audio_sinks() -> list[AudioSource]:
     """Playback devices (for the audio monitor); empty when pactl cannot list them."""
-    code, out = run(["pactl", "-f", "json", "list", "sinks"])
+    code, out = _run_stdout(["pactl", "-f", "json", "list", "sinks"])
     if code != 0:
         return []
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
         return []
-    return [AudioSource(name=item.get("name", ""), description=item.get("description", ""),
+    if not isinstance(data, list):
+        return []
+    return [AudioSource(name=item.get("name", ""),
+                        description=item.get("description", "")
+                        if isinstance(item.get("description"), str) else "",
                         is_monitor=False)
-            for item in data if isinstance(item, dict) and item.get("name")]
+            for item in data if isinstance(item, dict) and isinstance(item.get("name"), str)
+            and item.get("name")]
 
 
 def microphone() -> str:
@@ -380,17 +474,34 @@ def microphone() -> str:
     return ""
 
 
+def _is_physical_video_node(name: str) -> bool:
+    """True when sysfs shows ``name`` (e.g. 'video10') is a non-virtual device."""
+    sys_entry = Path("/sys/class/video4linux") / name
+    if not sys_entry.exists():
+        return False
+    try:
+        real = str(sys_entry.resolve())
+    except OSError:
+        return False
+    return "/devices/virtual/video4linux/" not in real
+
+
 def loopback_device() -> str:
-    """Return the first AnyCam/v4l2loopback node, or the conventional /dev/video10."""
+    """Return the first AnyCam/v4l2loopback node, or a free conventional slot."""
     env = os.environ.get("ANYCAM_VCAM")
     if env:
         return env
     for cam in list_video_devices():
         if "anycam" in (cam.name or "").lower():
             return cam.device
-    if Path("/dev/video10").exists():
+    if not Path("/dev/video10").exists() or not _is_physical_video_node("video10"):
         return "/dev/video10"
-    return "/dev/video10"
+    # /dev/video10 belongs to a real hardware camera: pick an unused slot.
+    for number in range(11, 64):
+        candidate = f"/dev/video{number}"
+        if not Path(candidate).exists():
+            return candidate
+    return ""
 
 
 def screen_flip_method(value: str | None = None) -> str:
@@ -437,7 +548,7 @@ def ensure_vcam_device(device: str | None = None, *, prompt: bool = True) -> str
     dev = device or loopback_device()
     if Path(dev).exists():
         return ""
-    match = re.search(r"video(\d+)$", dev)
+    match = re.search(r"video(\d+)$", dev, re.ASCII)
     if match is None:
         return f"virtual camera device {dev} does not exist"
     number = match.group(1)
@@ -478,7 +589,7 @@ def vcam_exclusive_caps(
     if not path:
         return None
     try:
-        values = Path(path).read_text()
+        values = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
     flags = [value.strip() for value in values.split(",")]
@@ -486,16 +597,25 @@ def vcam_exclusive_caps(
     # node is not always the module's first device: find its slot through
     # video_nr, and fall back to the first value only when it is not listed.
     index = 0
-    match = re.search(r"video(\d+)$", str(device or loopback_device()))
+    match = re.search(r"video(\d+)$", str(device or loopback_device()), re.ASCII)
     if match is not None:
         try:
             numbers = [value.strip() for value in
-                       (Path(path).parent / "video_nr").read_text().split(",")]
+                       (Path(path).parent / "video_nr").read_text(
+                           encoding="utf-8", errors="replace").split(",")]
         except OSError:
             numbers = []
         if match.group(1) in numbers:
             index = numbers.index(match.group(1))
     return index < len(flags) and flags[index] == "Y"
+
+
+def _udev_capture_only(caps: str | None) -> bool:
+    """True when udev announces capture without video_output (what Chromium wants)."""
+    if not caps:
+        return False
+    tokens = {tok for tok in caps.split(":") if tok}
+    return "capture" in tokens and "video_output" not in tokens
 
 
 def vcam_udev_capabilities(device: str | None = None) -> str | None:
@@ -530,17 +650,17 @@ def refresh_vcam_udev(device: str | None = None, *, prompt: bool = True) -> str:
     """
     dev = device or loopback_device()
     current = vcam_udev_capabilities(dev)
-    if current is not None and "capture" in current:
+    if _udev_capture_only(current):
         return ""
     if trigger_vcam_uevent(dev):
         # The setup's udev rule lets the desktop user announce the change
         # without root; udev re-reads the capabilities asynchronously.
         for _ in range(40):
             current = vcam_udev_capabilities(dev)
-            if current is not None and "capture" in current:
+            if _udev_capture_only(current):
                 return ""
             time.sleep(0.05)
-    match = re.search(r"video(\d+)$", dev)
+    match = re.search(r"video(\d+)$", dev, re.ASCII)
     if match is None:
         return f"virtual camera device {dev} is not a video node"
     number = match.group(1)
@@ -566,7 +686,7 @@ def refresh_vcam_udev(device: str | None = None, *, prompt: bool = True) -> str:
     # udev updates the database asynchronously after the change event.
     for _ in range(40):
         current = vcam_udev_capabilities(dev)
-        if current is not None and "capture" in current:
+        if _udev_capture_only(current):
             return ""
         time.sleep(0.05)
     return (f"{dev} still reports {current or 'no capabilities'}; "
@@ -584,7 +704,7 @@ def other_virtual_cameras(device: str | None = None,
     own = Path(device or loopback_device()).name
     found: list[str] = []
     try:
-        entries = sorted(Path(sysfs).glob("video*"))
+        entries = sorted(Path(sysfs).glob("video*"), key=_video_sort_key)
     except OSError:
         return found
     for entry in entries:
@@ -592,7 +712,7 @@ def other_virtual_cameras(device: str | None = None,
             continue
         try:
             real = str(entry.resolve())
-            name = (entry / "name").read_text(errors="replace").strip()
+            name = (entry / "name").read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             continue
         if "/devices/virtual/video4linux/" in real:
@@ -611,7 +731,7 @@ def reload_vcam_module(device: str | None = None, *,
     retried.  Returns "" on success, a reason otherwise.
     """
     dev = device or loopback_device()
-    match = re.search(r"video(\d+)$", dev)
+    match = re.search(r"video(\d+)$", dev, re.ASCII)
     if match is None:
         return f"virtual camera device {dev} is not a video node"
     number = match.group(1)
@@ -665,6 +785,7 @@ VCAM_SETUP_BUSY = 3
 VCAM_SETUP_OVERRIDDEN = 4
 
 VCAM_SETUP_SCRIPT = r"""set -e
+mkdir -p /etc/modules-load.d /etc/modprobe.d /etc/udev/rules.d
 # Files an earlier AnyCam build of this setup wrote under another name.
 rm -f /etc/modprobe.d/anycam-v4l2loopback.conf /etc/modules-load.d/anycam-v4l2loopback.conf
 cat > {modprobe} <<'ANYCAM'
@@ -683,7 +804,27 @@ cat > {rule} <<'ANYCAM'
 ACTION=="add", SUBSYSTEM=="video4linux", ATTR{{name}}=="AnyCam", RUN+="/bin/sh -c 'chgrp video /sys%p/uevent; chmod 0664 /sys%p/uevent'"
 ANYCAM
 udevadm control --reload || true
-caps=$(cut -c1 /sys/module/v4l2loopback/parameters/exclusive_caps 2>/dev/null || true)
+slot_caps() {{
+  [ -r /sys/module/v4l2loopback/parameters/exclusive_caps ] || return 0
+  ec=$(cat /sys/module/v4l2loopback/parameters/exclusive_caps 2>/dev/null || true)
+  vn=$(cat /sys/module/v4l2loopback/parameters/video_nr 2>/dev/null || true)
+  idx=1
+  if [ -n "$vn" ]; then
+    i=1
+    oldifs=$IFS
+    IFS=,
+    for n in $vn; do
+      if [ "$n" = "{number}" ]; then
+        idx=$i
+        break
+      fi
+      i=$((i + 1))
+    done
+    IFS=$oldifs
+  fi
+  printf '%s\n' "$ec" | cut -d, -f"$idx"
+}}
+caps=$(slot_caps)
 if [ "$caps" != "Y" ]; then
   if [ -d /sys/module/v4l2loopback ] && ! modprobe -r v4l2loopback; then
     exit {busy}
@@ -695,7 +836,7 @@ uevent=/sys/class/video4linux/video{number}/uevent
 if [ -e "$uevent" ]; then
   chgrp video "$uevent" && chmod 0664 "$uevent"
 fi
-caps=$(cut -c1 /sys/module/v4l2loopback/parameters/exclusive_caps 2>/dev/null || true)
+caps=$(slot_caps)
 [ "$caps" = "Y" ] || exit {overridden}
 """
 
@@ -708,7 +849,7 @@ def trigger_vcam_uevent(device: str | None = None) -> bool:
     """
     path = Path("/sys/class/video4linux") / Path(device or loopback_device()).name / "uevent"
     try:
-        path.write_text("change\n")
+        path.write_text("change\n", encoding="utf-8")
     except OSError:
         return False
     return True
@@ -744,7 +885,7 @@ def _effective_exclusive_caps(config_text: str, index: int = 0) -> bool | None:
 
 def _device_slot(config_text: str, device: str) -> int:
     """Which per-device slot of the module options belongs to ``device``."""
-    match = re.search(r"video(\d+)$", str(device or ""))
+    match = re.search(r"video(\d+)$", str(device or ""), re.ASCII)
     if match is None:
         return 0
     numbers: list[str] = []
@@ -763,8 +904,10 @@ def _vcam_configured_permanently(device: str | None = None) -> bool:
     return _effective_exclusive_caps(out, _device_slot(out, device or "")) is True
 
 
-def vcam_caps_overrides(dirs: tuple[str, ...] = ("/etc/modprobe.d", "/usr/lib/modprobe.d",
-                                                 "/run/modprobe.d")) -> list[str]:
+def vcam_caps_overrides(
+    dirs: tuple[str, ...] = ("/etc/modprobe.d", "/usr/lib/modprobe.d", "/run/modprobe.d"),
+    device: str | None = None,
+) -> list[str]:
     """Config files other than AnyCam's that set exclusive_caps to 0."""
     found: list[str] = []
     for directory in dirs:
@@ -776,10 +919,11 @@ def vcam_caps_overrides(dirs: tuple[str, ...] = ("/etc/modprobe.d", "/usr/lib/mo
             if conf == VCAM_MODPROBE_CONF:
                 continue
             try:
-                text = conf.read_text(errors="replace")
+                text = conf.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            if _effective_exclusive_caps(text) is False:
+            slot = _device_slot(text, device or "")
+            if _effective_exclusive_caps(text, slot) is False:
                 found.append(str(conf))
     return found
 
@@ -809,7 +953,7 @@ def setup_vcam_system(device: str | None = None) -> str:
     success, a reason otherwise.
     """
     dev = device or loopback_device()
-    match = re.search(r"video(\d+)$", dev)
+    match = re.search(r"video(\d+)$", dev, re.ASCII)
     if match is None:
         return f"virtual camera device {dev} is not a video node"
     number = match.group(1)
@@ -831,7 +975,7 @@ def setup_vcam_system(device: str | None = None) -> str:
                 "has the virtual camera open, so the driver could not be "
                 "reloaded. Close its camera and try again, or reboot")
     if result.returncode == VCAM_SETUP_OVERRIDDEN:
-        overrides = vcam_caps_overrides()
+        overrides = vcam_caps_overrides(device=dev)
         return ("the driver was reloaded but another setting forces "
                 "exclusive_caps=0" + (": " + ", ".join(overrides) if overrides else "")
                 + ". Remove that line and run the setup again")
@@ -868,7 +1012,7 @@ def vcam_consumers(device: str | None = None, proc: str = "/proc") -> list[str]:
     except OSError:
         return names
     for entry in entries:
-        if not entry.name.isdigit() or int(entry.name) == mine:
+        if not (entry.name.isascii() and entry.name.isdigit()) or int(entry.name) == mine:
             continue
         try:
             fds = list((entry / "fd").iterdir())
@@ -885,7 +1029,7 @@ def vcam_consumers(device: str | None = None, proc: str = "/proc") -> list[str]:
         if not opened:
             continue
         try:
-            name = (entry / "comm").read_text().strip()
+            name = (entry / "comm").read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
             name = ""
         if name and name not in names:

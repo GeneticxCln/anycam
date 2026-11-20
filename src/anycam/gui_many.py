@@ -17,7 +17,7 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QTimer
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSize, Qt, QThread, QTimer
 from PySide6.QtGui import QColor, QCursor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -44,7 +44,8 @@ from PySide6.QtWidgets import (
 from . import config
 from .ui import startup
 from .gui import (
-    AnyCamWindow, PreviewWidget, claim_gui_instance, serve_instance_requests,
+    AnyCamWindow, PreviewWidget, _register_freeze_dump, claim_gui_instance,
+    serve_instance_requests,
 )
 from .layouts import GRID_KINDS, LAYOUT_PRESETS, layout_preset
 from .model import Layer, Project, Scene, empty_project, new_id
@@ -127,7 +128,8 @@ def _overlap(a, b) -> float:
 class ManyCamWindow(AnyCamWindow):
     # ------------------------------------------------------------------- ui
     def _load_saved_project(self) -> Project:
-        path = config.project_path()
+        path = config.current_project_path()
+        self.project_file = path
         if not path.exists():
             return empty_project()
         project = super()._load_saved_project()
@@ -459,6 +461,19 @@ class ManyCamWindow(AnyCamWindow):
         """Show session events in the Diagnostics tab as they happen."""
         super().log_event(message)
         line = f"{time.strftime('%H:%M:%S')}  {message}"
+        try:
+            on_gui = QThread.currentThread() is self.thread()
+        except RuntimeError:
+            return
+        if on_gui:
+            self._append_log_line(line)
+        else:
+            try:
+                self.log_event_received.emit(line)
+            except RuntimeError:
+                pass
+
+    def _append_log_line(self, line: str) -> None:
         widget = getattr(self, "diag_log", None)
         if widget is None:
             pending = getattr(self, "_pending_log_lines", None)
@@ -1145,12 +1160,17 @@ class ManyCamWindow(AnyCamWindow):
     # --------------------------------------------------------------- runtime
     def _autostart_preview(self) -> None:
         # An empty preset stays stopped until the first source is chosen.
+        if (getattr(self, "_ui_blocked", 0) or getattr(self, "_closing", False)):
+            return
         if self.engine is None and self.isVisible() and self.scene.layers:
             self.toggle_engine()
 
 
 def run_gui(project: Project | None = None, safe_mode: bool = False) -> int:
+    _register_freeze_dump()
     app = QApplication(sys.argv[:1])
+    app.setApplicationName("AnyCam")
+    app.setDesktopFileName("anycam")
     primary, instance_server = claim_gui_instance()
     if not primary:
         return 0

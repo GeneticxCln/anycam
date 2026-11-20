@@ -19,6 +19,7 @@ from . import config
 
 DEFAULT = "en"
 _SOURCE = "_anycam_source"
+_APPLIED = "_anycam_applied"
 
 
 def catalog_dir() -> Path:
@@ -76,10 +77,20 @@ def save_language(language: str) -> None:
     """Remember the choice (owner-only file next to the other settings)."""
     if language not in available_languages():
         language = DEFAULT
+    target = _setting_path()
+    temp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     try:
-        _setting_path().write_text(language + "\n", encoding="utf-8")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(language + "\n")
+        os.chmod(temp, 0o600)
+        os.replace(temp, target)
     except OSError:
-        pass
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _plain(text: str) -> str:
@@ -102,14 +113,32 @@ def _lookup(catalog: dict[str, str], source: str) -> str:
 
 
 def _remember(obj, attribute: str, current: str) -> str:
-    """The English original of ``attribute`` of ``obj`` (stored on first sight)."""
+    """The English original of ``attribute`` of ``obj`` (stored on first sight).
+
+    If the application updated the widget to a live dynamic string (e.g.
+    ``Stop preview``, ``LIVE``, or live FPS stats) since our last ``apply()``,
+    adopt that new string as the source instead of overwriting it with a stale
+    initial label.
+    """
     store = obj.property(_SOURCE) or {}
     if not isinstance(store, dict):
         store = {}
-    if attribute not in store:
+    applied = obj.property(_APPLIED) or {}
+    if not isinstance(applied, dict):
+        applied = {}
+    if attribute not in store or (
+            attribute in applied and applied[attribute] != current):
         store[attribute] = current
         obj.setProperty(_SOURCE, store)
     return store[attribute]
+
+
+def _record_applied(obj, attribute: str, value: str) -> None:
+    applied = obj.property(_APPLIED) or {}
+    if not isinstance(applied, dict):
+        applied = {}
+    applied[attribute] = value
+    obj.setProperty(_APPLIED, applied)
 
 
 def apply(root, catalog: dict[str, str]) -> int:
@@ -130,6 +159,7 @@ def apply(root, catalog: dict[str, str]) -> int:
         if wanted != current:
             setter(wanted)
             changed += 1
+        _record_applied(obj, attribute, wanted)
 
     widgets = [root] + root.findChildren(QWidget)
     for widget in widgets:
@@ -152,6 +182,7 @@ def apply(root, catalog: dict[str, str]) -> int:
                 if wanted != current:
                     widget.setTabText(index, wanted)
                     changed += 1
+                _record_applied(bar, key, wanted)
         if isinstance(widget, QMenu):
             set_text(widget, "title", widget.title, widget.setTitle)
         set_text(widget, "tooltip", widget.toolTip, widget.setToolTip)

@@ -9,14 +9,17 @@ advertise the exact MJPG mode we prefer.
 """
 from __future__ import annotations
 
+import base64
 import functools
+import hashlib
 import itertools
-
 import os
 import re
 import sys
+import time
 import weakref
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 
 import gi
@@ -90,6 +93,37 @@ class CameraMode:
     width: int
     height: int
     fps: int
+    fps_num: int = 0
+    fps_den: int = 1
+
+    @property
+    def framerate(self) -> str:
+        """Exact GStreamer rational framerate string (e.g. ``30000/1001`` or ``30/1``)."""
+        if self.fps_num > 0 and self.fps_den > 0:
+            return f"{self.fps_num}/{self.fps_den}"
+        return f"{self.fps}/1"
+
+
+_NTSC_RATES: tuple[tuple[int, int], ...] = (
+    (24000, 1001),
+    (30000, 1001),
+    (60000, 1001),
+    (120000, 1001),
+)
+
+
+def _rational_fps(fps_float: float) -> tuple[int, int]:
+    """Convert a floating-point fps reported by v4l2-ctl to an exact fraction."""
+    if fps_float <= 0:
+        return (1, 1)
+    for num, den in _NTSC_RATES:
+        if abs(fps_float - num / den) < 0.02:
+            return (num, den)
+    nearest = int(round(fps_float))
+    if nearest >= 1 and abs(fps_float - nearest) < 1e-3:
+        return (nearest, 1)
+    frac = Fraction(fps_float).limit_denominator(1001)
+    return (max(1, frac.numerator), max(1, frac.denominator))
 
 
 _LAST_PROBE_ERROR: dict[str, str] = {}
@@ -132,10 +166,12 @@ def camera_modes(device: str) -> list[CameraMode]:
         m = re.search(r"Interval:\s+Discrete\s+([\d.]+)s\s+\(([\d.]+)\s+fps\)", line)
         if m and fmt and size:
             try:
-                fps = int(round(float(m.group(2))))
+                fps_float = float(m.group(2))
             except ValueError:
                 continue
-            modes.append(CameraMode(fmt, size[0], size[1], fps))
+            fps = max(1, int(round(fps_float)))
+            fps_num, fps_den = _rational_fps(fps_float)
+            modes.append(CameraMode(fmt, size[0], size[1], fps, fps_num, fps_den))
     return modes
 
 
@@ -500,6 +536,71 @@ def _set_frame_picture(frame: Gst.Element, path) -> None:
     _frame_shown[frame] = key
 
 
+def _rgb_luts(gains: tuple[float, float, float]):
+    import numpy as np
+
+    ramp = np.arange(256, dtype=np.float32)
+    return tuple(
+        np.clip(np.round(ramp * float(gain)), 0, 255).astype(np.uint8)
+        for gain in gains
+    )
+
+
+def _remove_cpu_rgb_probe(elements: dict) -> None:
+    probe_info = elements.pop("rgb_probe", None)
+    if probe_info is not None:
+        pad, probe_id, _state = probe_info
+        try:
+            pad.remove_probe(probe_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _apply_cpu_rgb_gains(elements: dict, gains: tuple[float, float, float]) -> None:
+    """Apply RGB channel gains on the CPU canvas via a zero-overhead-when-unused probe."""
+    if elements.get("gl_balance") is not None or all(abs(g - 1.0) < 1e-4 for g in gains):
+        _remove_cpu_rgb_probe(elements)
+        return
+    pad = elements.get("rgb_pad")
+    if pad is None:
+        return
+    luts = _rgb_luts(gains)
+    existing = elements.get("rgb_probe")
+    if existing is not None:
+        existing[2]["luts"] = luts
+        return
+    state = {"luts": luts}
+
+    def on_buffer(_pad, info):
+        import numpy as np
+
+        buf = info.get_buffer()
+        if buf is None:
+            return Gst.PadProbeReturn.OK
+        ok, mapped = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.PadProbeReturn.OK
+        try:
+            raw = mapped.data
+            if len(raw) < 4 or len(raw) % 4 != 0:
+                return Gst.PadProbeReturn.OK
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 4).copy()
+        finally:
+            buf.unmap(mapped)
+        r_lut, g_lut, b_lut = state["luts"]
+        arr[:, 0] = r_lut[arr[:, 0]]
+        arr[:, 1] = g_lut[arr[:, 1]]
+        arr[:, 2] = b_lut[arr[:, 2]]
+        out = buf.copy_deep()
+        out.fill(0, arr.tobytes())
+        info.set_buffer(out)
+        return Gst.PadProbeReturn.OK
+
+    probe_id = pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
+    if probe_id:
+        elements["rgb_probe"] = (pad, probe_id, state)
+
+
 def apply_effects(elements: dict, fx: Effects) -> None:
     """Apply an Effects model to a live rack without renegotiating the graph."""
     if not elements:
@@ -512,6 +613,7 @@ def apply_effects(elements: dict, fx: Effects) -> None:
     saturation = max(0.0, min(2.0, _effect_number(getattr(fx, "saturation", 1.0), 1.0)))
     hue = max(-1.0, min(1.0, _effect_number(getattr(fx, "hue", 0.0), 0.0)))
     mirror = bool(getattr(fx, "mirror", False))
+    gains = rgb_gains(fx)
     # On the GPU canvas the colour step and the mirror run as shaders after the
     # upload whenever that gives the same picture: a colour look on the CPU
     # cost ~13 ms per 1080p frame on the source thread.  Otherwise the CPU
@@ -519,12 +621,11 @@ def apply_effects(elements: dict, fx: Effects) -> None:
     gpu = elements.get("gl_balance") is not None and gpu_colour_is_equivalent(fx)
     gl_balance = elements.get("gl_balance")
     if gl_balance is not None:
-        # RGB levels have no CPU element, so they always run in the shader.
-        gains = rgb_gains(fx)
         if gpu:
             _set_balance_uniforms(gl_balance, brightness, contrast, saturation, hue, gains)
         else:
             _set_balance_uniforms(gl_balance, 0.0, 1.0, 1.0, 0.0, gains)
+    _apply_cpu_rgb_gains(elements, gains)
     gl_flip = elements.get("gl_flip")
     # The GPU mirror only exists when the layer's crop is left/right symmetric
     # (see _link_to_mixer); otherwise the CPU mirror, which runs before the
@@ -579,8 +680,12 @@ def apply_effects(elements: dict, fx: Effects) -> None:
             print(f"[frame] could not draw {frame_style} at {width}x{height}: {exc}",
                   file=sys.stderr, flush=True)
             frame_style = "none"
-            path = overlay.render_window_frame(width, height, "none")
-        _set_frame_picture(frame, path)
+            try:
+                path = overlay.render_window_frame(width, height, "none")
+            except OSError:
+                path = None
+        if path is not None:
+            _set_frame_picture(frame, path)
         # A transparent PNG plus alpha=0 is a true bypass for the common case.
         frame.set_property("alpha", 0.0 if frame_style == "none" else 1.0)
 
@@ -780,6 +885,10 @@ def _finish_chain(chain: SourceChain, width: int, height: int, fps: int, *,
     chain.add(tail)
     chain.tail = tail
     if layer is not None:
+        rgb_pad = tail.get_static_pad("sink")
+        if rgb_pad is not None:
+            chain.effects["rgb_pad"] = rgb_pad
+            chain.cleanup.append(lambda fx_map=chain.effects: _remove_cpu_rgb_probe(fx_map))
         apply_effects(chain.effects, getattr(layer, "effects", None) or Effects())
 
 
@@ -798,14 +907,14 @@ def camera_chain(device: str, width: int, height: int, fps: int, layer=None,
     chain.add(src)
     chain.pause_elements.append(src)
     if mode.pixel_format in ("MJPG", "JPEG"):
-        caps = caps_filter(f"image/jpeg,width={mode.width},height={mode.height},framerate={mode.fps}/1")
+        caps = caps_filter(f"image/jpeg,width={mode.width},height={mode.height},framerate={mode.framerate}")
         chain.add(caps, jpeg_decoder())
     elif mode.pixel_format == "H264":
-        caps = caps_filter(f"video/x-h264,width={mode.width},height={mode.height},framerate={mode.fps}/1")
+        caps = caps_filter(f"video/x-h264,width={mode.width},height={mode.height},framerate={mode.framerate}")
         chain.add(caps, make("h264parse"), make("avdec_h264"))
     else:
         fmt = _gst_raw_format(mode.pixel_format)
-        caps = caps_filter(f"video/x-raw,format={fmt},width={mode.width},height={mode.height},framerate={mode.fps}/1")
+        caps = caps_filter(f"video/x-raw,format={fmt},width={mode.width},height={mode.height},framerate={mode.framerate}")
         chain.add(caps)
     chain.add(make("videoconvert"))
     _add_effects(chain, layer)
@@ -882,31 +991,61 @@ def video_size(path: str) -> tuple[int, int] | None:
     return None
 
 
-_MJPEG_CACHE: dict[str, bool] = {}
+_MJPEG_CACHE: dict[str, tuple[bool, float]] = {}
+_MJPEG_TRANSIENT_TTL_S = 10.0
 
 
 def is_mjpeg_stream(url: str, timeout: float = 3.0) -> bool:
     """Whether an http(s) address answers with a multipart MJPEG stream.
 
-    Only the response headers are read.  Any failure counts as "no" so the
-    generic decoder still gets its turn.
+    Only the response headers are read.  Supports HTTP Basic Auth embedded in
+    URL userinfo without leaking credentials into cache keys, and avoids
+    permanently caching transient connection/timeout failures.
     """
-    from urllib.parse import urlsplit
-
-    if urlsplit(url).scheme not in ("http", "https"):
-        return False
-    if url in _MJPEG_CACHE:
-        return _MJPEG_CACHE[url]
+    from urllib.error import HTTPError
+    from urllib.parse import unquote, urlsplit, urlunsplit
     import urllib.request
 
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        return False
+    cache_key = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    now = time.monotonic()
+    cached = _MJPEG_CACHE.get(cache_key)
+    if cached is not None:
+        if isinstance(cached, tuple):
+            value, expires = cached
+            if now < expires:
+                return value
+        else:
+            return bool(cached)
+
+    headers = {"User-Agent": "AnyCam"}
+    request_url = url
+    if parts.username is not None or parts.password is not None:
+        user = unquote(parts.username or "")
+        password = unquote(parts.password or "")
+        token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+        headers["Authorization"] = f"Basic {token}"
+        host = parts.netloc.rpartition("@")[2]
+        request_url = urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+
     found = False
+    definitive = False
     try:
-        request = urllib.request.Request(url, headers={"User-Agent": "AnyCam"})
+        request = urllib.request.Request(request_url, headers=headers)
         with urllib.request.urlopen(request, timeout=timeout) as response:   # noqa: S310
             found = "multipart/x-mixed-replace" in str(response.headers.get("Content-Type", "")).lower()
+            definitive = True
+    except HTTPError as exc:
+        found = False
+        # 5xx / 408 / 429 are transient; other 4xx responses are definitive.
+        definitive = 400 <= exc.code < 500 and exc.code not in (408, 429)
     except Exception:  # noqa: BLE001 - unreachable or odd: let the generic path try
         found = False
-    _MJPEG_CACHE[url] = found
+        definitive = False
+    expires = float("inf") if definitive else (now + _MJPEG_TRANSIENT_TTL_S)
+    _MJPEG_CACHE[cache_key] = (found, expires)
     return found
 
 
@@ -1091,12 +1230,24 @@ def screen_chain(node_id: int, width: int, height: int, fps: int, layer=None,
                    max_size_bytes=0, max_size_time=0, silent=True))
     gl_ready = all(Gst.ElementFactory.find(name) is not None
                    for name in ("glupload", "glcolorconvert", "gldownload"))
-    gl_scale = gl_ready and Gst.ElementFactory.find("glcolorscale") is not None
+    flip_method = config.screen_flip_method(flip)
+    rotates_axes = flip_method in (
+        "clockwise", "counterclockwise",
+        "upper-left-diagonal", "upper-right-diagonal",
+    )
+    layer_crop = getattr(layer, "crop", None) or (0.0, 0.0, 0.0, 0.0)
+    has_crop = any(v != 0.0 for v in layer_crop)
+    has_transform = layer is not None and geometry.has_transform(layer)
+    # Scaling before videoflip/crop/zoom distorts rotated dimensions and loses
+    # resolution on cropped/zoomed regions; keep native resolution until after.
+    gl_scale = (gl_ready and Gst.ElementFactory.find("glcolorscale") is not None
+                and not rotates_axes and not has_crop and not has_transform)
     # Some portal/compositor combinations report a 1x1 stream or the logical
     # size instead of the buffer size.  Building the letterbox from that
     # stretches the picture, which is how a window share ends up filling only
     # part of the box; fall back to the box itself when the size is unusable.
-    if expected_size and expected_size[0] > 1 and expected_size[1] > 1:
+    has_expected = bool(expected_size and expected_size[0] > 1 and expected_size[1] > 1)
+    if has_expected:
         source_w, source_h = int(expected_size[0]), int(expected_size[1])
     else:
         source_w, source_h = int(width), int(height)
@@ -1111,7 +1262,8 @@ def screen_chain(node_id: int, width: int, height: int, fps: int, layer=None,
         chain.add(make("glcolorconvert"), make("gldownload"))
         if gl_scale:
             chain.add(caps_filter(
-                f"video/x-raw,format=RGBA,width={max(2, fit.w)},height={max(2, fit.h)}"))
+                f"video/x-raw,format=RGBA,width={max(2, fit.w)},height={max(2, fit.h)},"
+                "pixel-aspect-ratio=1/1"))
     else:
         src.set_property("always-copy", True)
     # A window share must not come out upside down.  Honour the compositor's
@@ -1119,7 +1271,7 @@ def screen_chain(node_id: int, width: int, height: int, fps: int, layer=None,
     # still rotating the buffer, so screen_flip_method() also accepts a forced
     # correction through ANYCAM_SCREEN_FLIP.
     if Gst.ElementFactory.find("videoflip") is not None:
-        chain.add(make("videoflip", method=config.screen_flip_method(flip)))
+        chain.add(make("videoflip", method=flip_method))
     chain.add(make("videoconvert"))
     chain.add(caps_filter("video/x-raw,format=RGBA"))
     chain.check_element = src
@@ -1127,10 +1279,13 @@ def screen_chain(node_id: int, width: int, height: int, fps: int, layer=None,
     _add_effects(chain, layer)
     # Crop against the frame the crop was computed on: the fitted size when the
     # GPU already scaled it, the native size otherwise.
-    crop_base = (fit.w, fit.h) if gl_scale else (source_w, source_h)
+    crop_base = (fit.w, fit.h) if gl_scale else (
+        (source_h, source_w) if rotates_axes else (source_w, source_h))
     chain.add(*_crop_chain(layer, crop_base[0], crop_base[1]))
     cropped_w, cropped_h = cropped_size(layer, crop_base[0], crop_base[1])
     fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height, rate=False, layer=layer)
+    if not gl_scale:
+        chain.add(caps_filter("video/x-raw,format=RGBA,pixel-aspect-ratio=1/1"))
     # The canvas layer_tail owns the output rate.  A forced framerate here
     # makes a damage-driven DMA-BUF screencast emit one frame and then stall.
     # The same applies to videorate: a screencast advertises framerate=0/1
@@ -1314,7 +1469,10 @@ def layer_tail(layer, source_size: tuple[int, int], width: int, height: int,
     chain.add(src, buffer, rate, make("videoconvert"))
     _add_effects(chain, layer)
     src_w, src_h = source_size
-    chain.add(*_crop_chain(layer, src_w, src_h))
+    crop_elements = _crop_chain(layer, src_w, src_h)
+    if crop_elements:
+        chain.effects["crop"] = crop_elements[0]
+    chain.add(*crop_elements)
     cropped_w, cropped_h = cropped_size(layer, src_w, src_h)
     live = getattr(layer, "kind", "") in LIVE_KINDS
     fitted = _fit_letterbox(chain, cropped_w, cropped_h, width, height,

@@ -347,7 +347,7 @@ def test_a_va_encoder_gets_live_settings_and_a_gpu_upload(monkeypatch):
 
 
 def test_the_va_input_path_without_vapostproc_converts_to_nv12(monkeypatch):
-    pipeline_module = _fake_elements(monkeypatch, {"vah264enc"})
+    _fake_elements(monkeypatch, {"vah264enc"})
     elements = AnyCamEngine._encoder_input(True, "rec", "vah264enc")
     names = [e.get_factory().get_name() for e in elements]
     assert names == ["videoconvert", "capsfilter"]

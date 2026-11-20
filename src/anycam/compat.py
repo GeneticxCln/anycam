@@ -2,16 +2,19 @@
 
 Runs ``web/vcam-check.html`` in each browser it can find and records what the
 browser saw, so "works in Chrome/Firefox/..." is a table of measured results
-rather than a claim.  Chromium-family browsers are driven with ``--dump-dom``;
-Firefox goes through ``scripts/verify-firefox.py``.  ``fake=True`` gives
-Chromium its built-in test camera instead of the AnyCam device: it proves the
-harness and the browser work, and is reported as such, never as AnyCam support.
+rather than a claim.  Chromium-family browsers are driven over Chrome DevTools
+Protocol (CDP); Firefox goes through ``scripts/verify-firefox.py``.
+``fake=True`` gives Chromium its built-in test camera instead of the AnyCam
+device: it proves the harness and the browser work, and is reported as such,
+never as AnyCam support.
 """
 from __future__ import annotations
 
 import http.server
 import json
+import os
 import re
+import select
 import shutil
 import subprocess
 import threading
@@ -99,7 +102,10 @@ class _Cdp:
         parts = urlsplit(ws_url)
         self.sock = socket.create_connection((parts.hostname, parts.port), timeout=timeout)
         key = base64.b64encode(os.urandom(16)).decode()
-        self.sock.sendall((f"GET {parts.path} HTTP/1.1\r\nHost: {parts.netloc}\r\nUpgrade: websocket\r\n"
+        path = parts.path or "/"
+        if parts.query:
+            path = f"{path}?{parts.query}"
+        self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: {parts.netloc}\r\nUpgrade: websocket\r\n"
                            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
                            "Sec-WebSocket-Version: 13\r\n\r\n").encode())
         header = b""
@@ -122,14 +128,12 @@ class _Cdp:
         data, self.buffer = self.buffer[:count], self.buffer[count:]
         return data
 
-    def _send(self, text: str) -> None:
-        import os
+    def _send_frame(self, opcode: int, payload: bytes) -> None:
         import struct
 
-        payload = text.encode()
         mask = os.urandom(4)
         length = len(payload)
-        head = bytes([0x81])
+        head = bytes([0x80 | (opcode & 0x0F)])
         if length < 126:
             head += bytes([0x80 | length])
         elif length < 65536:
@@ -138,22 +142,41 @@ class _Cdp:
             head += bytes([0x80 | 127]) + struct.pack(">Q", length)
         self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
 
+    def _send(self, text: str) -> None:
+        self._send_frame(0x1, text.encode("utf-8"))
+
     def _receive(self) -> str:
         import struct
 
         message = b""
         while True:
             first, second = self._read(2)
+            opcode = first & 0x0F
+            masked = bool(second & 0x80)
             length = second & 0x7F
             if length == 126:
                 length = struct.unpack(">H", self._read(2))[0]
             elif length == 127:
                 length = struct.unpack(">Q", self._read(8))[0]
+            mask = self._read(4) if masked else b""
             payload = self._read(length)
-            if first & 0x0F in (1, 0):
+            if masked:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == 0x8:
+                try:
+                    self._send_frame(0x8, b"")
+                except OSError:
+                    pass
+                raise OSError("DevTools closed the WebSocket")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode in (0x1, 0x0):
                 message += payload
                 if first & 0x80:
-                    return message.decode()
+                    return message.decode("utf-8")
 
     def call(self, method: str, **params):
         self.next_id += 1
@@ -195,27 +218,64 @@ def run_chromium(name: str, binary: str, url: str, *, fake: bool, timeout: float
     if fake:
         command.append("--use-fake-device-for-media-stream")
     command.append(url)
-    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     cdp = None
+    draining = False
+
+    def _drain_stderr(stream) -> None:
+        try:
+            while stream.read(4096):
+                pass
+        except OSError:
+            pass
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
     try:
         port = 0
         deadline = time.monotonic() + 20
-        while time.monotonic() < deadline and not port:
-            line = process.stderr.readline()
-            match = re.search(r"DevTools listening on ws://127\.0\.0\.1:(\d+)/", line)
-            if match:
-                port = int(match.group(1))
-            elif not line and process.poll() is not None:
-                break
+        stderr = process.stderr
+        buf = b""
+        if stderr is not None:
+            fd = stderr.fileno()
+            while time.monotonic() < deadline and not port:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                ready, _, _ = select.select([fd], [], [], min(0.25, remaining))
+                if ready:
+                    chunk = os.read(fd, 4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    text = buf.decode("utf-8", errors="replace")
+                    match = re.search(r"DevTools listening on ws://127\.0\.0\.1:(\d+)/", text)
+                    if match:
+                        port = int(match.group(1))
+                        break
+                elif process.poll() is not None:
+                    break
         if not port:
             outcome.state, outcome.detail = "error", "the browser did not start"
             return outcome
+        if stderr is not None:
+            # Keep draining stderr so a verbose browser cannot fill the 64 KiB pipe and deadlock.
+            draining = True
+            threading.Thread(target=_drain_stderr, args=(stderr,), daemon=True).start()
         page_ws = ""
         while time.monotonic() < deadline and not page_ws:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=5) as response:
-                for target in json.load(response):
-                    if target.get("type") == "page" and "vcam-check" in target.get("url", ""):
-                        page_ws = target["webSocketDebuggerUrl"]
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=5) as response:
+                    for target in json.load(response):
+                        if target.get("type") == "page" and "vcam-check" in target.get("url", ""):
+                            ws_url = target.get("webSocketDebuggerUrl")
+                            if ws_url:
+                                page_ws = ws_url
+            except OSError:
+                pass
             if not page_ws:
                 time.sleep(0.2)
         if not page_ws:
@@ -241,6 +301,15 @@ def run_chromium(name: str, binary: str, url: str, *, fake: bool, timeout: float
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             process.kill()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        if not draining and process.stderr is not None:
+            try:
+                process.stderr.close()
+            except OSError:
+                pass
         shutil.rmtree(profile, ignore_errors=True)
     return outcome
 
@@ -252,7 +321,17 @@ def run_firefox(url_script: Path = ROOT / "scripts" / "verify-firefox.py", out: 
         outcome.state, outcome.detail = "not found", "firefox is not installed"
         return outcome
     out = out or Path("evidence") / "compat-firefox"
-    result = subprocess.run([str(url_script), "--out", str(out)], capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            [str(url_script), "--out", str(out)],
+            capture_output=True, text=True, timeout=90,
+        )
+    except subprocess.TimeoutExpired:
+        outcome.state, outcome.detail = "error", "firefox verification timed out"
+        return outcome
+    except OSError as exc:
+        outcome.state, outcome.detail = "error", str(exc)
+        return outcome
     codes = {0: "ok", 1: "failed", 2: "not found", 3: "failed"}
     outcome.state = codes.get(result.returncode, "error")
     outcome.detail = (result.stdout.strip().splitlines() or [""])[-1][:200]
@@ -265,6 +344,7 @@ def matrix(fake: bool = False, include_firefox: bool = True) -> list[Outcome]:
         rows = [run_chromium(name, binary, url, fake=fake) for name, binary in find_chromium_family()]
     finally:
         server.shutdown()
+        server.server_close()
     if include_firefox and not fake:
         rows.append(run_firefox())
     if not rows:

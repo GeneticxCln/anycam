@@ -7,10 +7,13 @@ an agent is installed, it is started and the command is asked for once more.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import time
 from pathlib import Path
+
+_TRUSTED_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # Password-prompt agents a desktop may have installed but not running.
 POLKIT_AGENTS = (
@@ -57,14 +60,21 @@ def run_as_root(args: list[str], *, timeout: float = 180) -> subprocess.Complete
     if shutil.which("pkexec") is None:
         raise RuntimeError("pkexec is not installed")
     command = ["pkexec", *args]
-    result = subprocess.run(command, capture_output=True, text=True,
-                            timeout=timeout, check=False)
+    env = {**os.environ, "PATH": _TRUSTED_PATH}
+    # Detach stdin and controlling terminal so pkexec never hangs waiting for
+    # a password on terminal input when no graphical polkit agent is running.
+    result = subprocess.run(command, stdin=subprocess.DEVNULL,
+                            capture_output=True, text=True,
+                            timeout=timeout, check=False,
+                            start_new_session=True, env=env)
     agent = installed_agent()
     if result.returncode != 0 and no_agent(result.stderr) and agent:
         start_agent(agent)
         time.sleep(AGENT_START_S)
-        result = subprocess.run(command, capture_output=True, text=True,
-                                timeout=timeout, check=False)
+        result = subprocess.run(command, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True,
+                                timeout=timeout, check=False,
+                                start_new_session=True, env=env)
     return result
 
 

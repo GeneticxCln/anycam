@@ -70,9 +70,17 @@ const fail = (err) => {
 
     set({found: true, label: cam.label});
     state("opening " + cam.label + "…");
+    const params = new URLSearchParams(window.location.search);
+    const positiveInt = (key, fallback) => {
+      const value = Number.parseInt(params.get(key) || "", 10);
+      return Number.isFinite(value) && value > 0 ? value : fallback;
+    };
+    const wantW = positiveInt("width", 1280);
+    const wantH = positiveInt("height", 720);
+    const wantFps = positiveInt("fps", 30);
     const stream = await navigator.mediaDevices.getUserMedia({
       video: {deviceId: {exact: cam.deviceId},
-              width: {ideal: 1280}, height: {ideal: 720}, frameRate: {ideal: 30}},
+              width: {ideal: wantW}, height: {ideal: wantH}, frameRate: {ideal: wantFps}},
       audio: false,
     });
     const video = document.createElement("video");

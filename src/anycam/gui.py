@@ -57,6 +57,8 @@ from .ui.cameras import _CAMERA_LOSS  # noqa: F401
 def run_gui(project: Project | None = None, safe_mode: bool = False) -> int:
     _register_freeze_dump()
     app = QApplication(sys.argv[:1])
+    app.setApplicationName("AnyCam")
+    app.setDesktopFileName("anycam")
     primary, instance_server = claim_gui_instance()
     if not primary:
         return 0

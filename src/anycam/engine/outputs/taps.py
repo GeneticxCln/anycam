@@ -49,10 +49,10 @@ class VcamTapMixin:
             out_h = int(getattr(self.vcam_output, "height", self.canvas_h))
             out_fps = int(getattr(self.vcam_output, "fps", self.fps))
             caps_text = caps_string(out_w, out_h, out_fps, "RGBA")
-            queue = self._branch("vcam")
+            queue = make("queue", "queue_vcam", max_size_buffers=4,
+                         max_size_time=200_000_000)
             queue.set_property("leaky", 2)  # downstream: drop old buffers
             valve = make("valve", "vcam_valve", drop=False)
-            self._vcam_valve = valve
             # 4-tap scaling keeps a downscaled 4K canvas crisp when the
             # existing vcam mode is smaller than the current canvas.
             scale = make("videoscale", "vcam_scale", method=2)
@@ -60,9 +60,13 @@ class VcamTapMixin:
             caps = caps_filter(caps_text, "vcam_caps")
             appsink = make("appsink", "vcam_appsink", emit_signals=True,
                            max_buffers=2, drop=True, sync=False)
-            self._add(valve, scale, rate, caps, appsink)
-            self._link([queue, valve, scale, rate, caps, appsink])
+            appsink.set_property("async", False)
             self._on(appsink, "new-sample", self._on_vcam_sample)
+            self._attach_tee_branch(
+                self.tee, [queue, valve, scale, rate, caps, appsink],
+                count_branch=True)
+            self._vcam_valve = valve
+            self._vcam_caps_filter = caps
             self._notify_canvas_attached(True)
             self.report.vcam_active = True
             return
@@ -77,17 +81,21 @@ class VcamTapMixin:
         fmt = config.vcam_pixel_format(device)
         caps_text = caps_string(self.canvas_w, self.canvas_h, self.fps, fmt)
 
-        queue = self._branch("vcam")
+        queue = make("queue", "queue_vcam", max_size_buffers=4,
+                     max_size_time=200_000_000)
         queue.set_property("leaky", 2)  # downstream: drop old buffers
         valve = make("valve", "vcam_valve", drop=False)
-        self._vcam_valve = valve
         convert = make("videoconvert")
         caps = caps_filter(caps_text, "vcam_caps")
         appsink = make("appsink", "vcam_appsink", emit_signals=True,
                        max_buffers=2, drop=True, sync=False)
-        self._add(valve, convert, caps, appsink)
-        self._link([queue, valve, convert, caps, appsink])
+        appsink.set_property("async", False)
         self._on(appsink, "new-sample", self._on_vcam_sample)
+        self._attach_tee_branch(
+            self.tee, [queue, valve, convert, caps, appsink],
+            count_branch=True)
+        self._vcam_valve = valve
+        self._vcam_caps_filter = caps
 
         vcam = Gst.Pipeline.new("anycam-vcam")
         appsrc = make("appsrc", "vcam_appsrc",
@@ -111,6 +119,8 @@ class VcamTapMixin:
 
     def attach_vcam(self, output: VcamOutput) -> bool:
         """Resume the vcam tap for ``output`` without rebuilding the canvas."""
+        if self.pipeline is None or self._stopped:
+            return False
         if not output.active:
             self.report.vcam_error = output.error or "virtual camera is not running"
             return False
@@ -120,6 +130,15 @@ class VcamTapMixin:
         if self._vcam_valve is None:
             self._build_vcam()
         else:
+            caps_el = getattr(self, "_vcam_caps_filter", None)
+            if caps_el is not None:
+                out_w = int(getattr(output, "width", self.canvas_w))
+                out_h = int(getattr(output, "height", self.canvas_h))
+                out_fps = int(getattr(output, "fps", self.fps))
+                new_caps = Gst.Caps.from_string(caps_string(out_w, out_h, out_fps, "RGBA"))
+                old_caps = caps_el.get_property("caps")
+                if old_caps is None or not old_caps.is_equal(new_caps):
+                    caps_el.set_property("caps", new_caps)
             self._vcam_valve.set_property("drop", False)
             self.report.vcam_active = True
         self._notify_canvas_attached(self._vcam_valve is not None)

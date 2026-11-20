@@ -53,8 +53,9 @@ class Effect:
 ## Safety
 
 Pack code never runs inside AnyCam's main process. It runs in an effect worker: frames pass through shared
-memory, a crash or a hang there (more than 1.5 s on one frame) costs the effect, the picture passes through
-unchanged, and the worker is restarted after 1, 2, 4 ... 10 seconds. The same isolation is available for
-the built-in AI effects under Settings -> Output -> AI effects.
+memory, a crash or a hang there (more than 1.5 s on one frame) restarts the worker after 1, 2, 4 ... 10 seconds,
+and while it starts or backs off AnyCam holds the last processed frame (same-size frames only, so effects do not
+flash off; only the initial frames before any processed frame exists pass through unchanged). The same isolation
+is available for the built-in AI effects under Settings -> Output -> AI effects.
 
 Problems with a pack (unreadable `pack.json`, a bad name, a missing file) are listed in the same place.

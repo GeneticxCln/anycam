@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 
+import json
+import os
 import shutil
 from pathlib import Path
 
@@ -9,8 +11,7 @@ from pathlib import Path
 from PySide6.QtWidgets import QFileDialog
 
 from .. import config, credentials, effect_worker, model, repair, streaming
-from ..model import (Project, default_project, load_scene_preset, new_id,
-                     save_scene_preset)
+from ..model import (Project, default_project, load_scene_preset, new_id)
 from .theme import STYLE  # noqa: F401
 from .layout_history import LayoutHistory  # noqa: F401
 from .preview import PreviewWidget, _PreviewOverlay  # noqa: F401
@@ -118,7 +119,11 @@ class ProjectIOMixin:
         self._autosave_timer.start()
 
     def _autosave(self) -> None:
-        if not self._persist or self.headless or not self._dirty:
+        if (not self._persist or self.headless or not self._dirty
+                or getattr(self, "_closing", False)):
+            return
+        if getattr(self, "_ui_blocked", 0):
+            self._autosave_timer.start()
             return
         try:
             self._write_project()
@@ -154,11 +159,23 @@ class ProjectIOMixin:
         was_running = self.engine is not None
         if was_running:
             self.stop_engine()
+        # Reloading must never auto-publish a saved RTMP URL.
+        self.live = False
+        if hasattr(self, "live_button"):
+            self.live_button.setText("Go Live")
+        self.update_stream_status()
         self._close_screen_sessions()
+        for scene in project.scenes:
+            for layer in scene.layers:
+                if layer.kind == "camera" and layer.source:
+                    layer.source = config.camera_identity(layer.source)
         self.project = project
         self._dirty = False
         self._autosave_timer.stop()
         self._clear_history()
+        self._sync_layout_combo()
+        if hasattr(self, "_sync_layout_controls"):
+            self._sync_layout_controls()
         self._refresh_scenes()
         self._refresh_scene_list()
         self._refresh_layers()
@@ -216,6 +233,28 @@ class ProjectIOMixin:
         self.media_gain_slider.setValue(int(self.project.audio.media_gain_db))
         self.media_gain_slider.blockSignals(False)
         self.media_gain_label.setText(f"{self.project.audio.media_gain_db:+.0f} dB")
+        if hasattr(self, "mic_combo"):
+            mic = self.project.audio.mic_device or config.microphone()
+            mic_index = self.mic_combo.findData(mic)
+            if mic_index < 0 and mic:
+                self.mic_combo.addItem(mic, mic)
+                mic_index = self.mic_combo.count() - 1
+            self.mic_combo.blockSignals(True)
+            self.mic_combo.setCurrentIndex(mic_index if mic_index >= 0 else 0)
+            self.mic_combo.blockSignals(False)
+        if hasattr(self, "desktop_combo"):
+            desktop = self.project.audio.desktop_device or ""
+            desk_index = self.desktop_combo.findData(desktop)
+            if desk_index < 0 and desktop:
+                self.desktop_combo.addItem(desktop, desktop)
+                desk_index = self.desktop_combo.count() - 1
+            self.desktop_combo.blockSignals(True)
+            self.desktop_combo.setCurrentIndex(desk_index if desk_index >= 0 else 0)
+            self.desktop_combo.blockSignals(False)
+        if hasattr(self, "backdrop_status"):
+            backdrops = self._active_backdrops()
+            self.backdrop_status.setText(
+                backdrops[-1].name if backdrops else "No stage selected")
         self._load_extended_widgets()
         for combo, value in ((self.denoise_combo, self.project.audio.mic_denoise),
                              (self.effects_device_combo, self.project.output.effects_device),
@@ -304,12 +343,20 @@ class ProjectIOMixin:
                 return False
             path = chosen
         path = Path(path)
+        temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         try:
-            written = save_scene_preset(scene, path.parent)
-            if path.name != written.name:
-                written.replace(path)
-                written = path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(scene.to_dict(), indent=2) + "\n")
+            os.chmod(temp, 0o600)
+            os.replace(temp, path)
+            written = path
         except OSError as exc:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
             self._status(f"Could not export {scene.name}: {exc}")
             return False
         self._status(f"Exported {scene.name} to {written}")
@@ -335,6 +382,9 @@ class ProjectIOMixin:
         for layer in scene.layers:
             renamed[layer.id] = layer.id = new_id("layer")
         scene.playlist.layer_ids = [renamed.get(i, i) for i in scene.playlist.layer_ids]
+        scene.playlist.durations = {
+            renamed.get(k, k): v for k, v in scene.playlist.durations.items()
+        }
         self._append_scene(scene)
         extra = f" ({len(warnings)} repaired)" if warnings else ""
         self._status(f"Imported scene {scene.name}{extra}")
@@ -373,7 +423,9 @@ class ProjectIOMixin:
         quietly(self.media_shuffle_check, lambda w: w.setChecked(audio.media_shuffle))
         self.music_list.clear()
         self.music_list.addItems(audio.media_playlist)
-        self.load_motion_widgets()
-        quietly(self.phone_control_check, lambda w: w.setChecked(out.phone_control))
+        if hasattr(self, "motion_check"):
+            self.load_motion_widgets()
+        if hasattr(self, "phone_control_check"):
+            quietly(self.phone_control_check, lambda w: w.setChecked(out.phone_control))
         if self._phone_service is not None:
             self._phone_service.control_enabled = bool(out.phone_control)

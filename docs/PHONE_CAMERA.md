@@ -7,7 +7,8 @@ no other mobile platform is supported, tested or targeted.
 
 ## 0. Status (built)
 
-The camera half is built (`src/anycam/phone/`, `src/anycam/phone_dialog.py`):
+Both the camera half and the phone remote are built (`src/anycam/phone/`,
+`src/anycam/phone_dialog.py`):
 
 1. **Add → Phone camera (QR code)…** starts the phone link (HTTPS on the LAN
    address, port 8443) and shows a one-time QR code:
@@ -25,13 +26,18 @@ The camera half is built (`src/anycam/phone/`, `src/anycam/phone_dialog.py`):
    connects, and a second after it leaves, the layer shows black; the canvas
    never waits on the network. A paired phone reconnects by opening the page
    again; a scene with a phone layer starts the link on its own.
+5. **Phone remote (`/remote`, `/remote.js`):** authenticated per paired device
+   over HTTPS (`GET /api/control/state`, `POST /api/control`), off by default
+   until switched on in Settings, allowing only `scene`, `mute`, and `record`
+   actions dispatched onto the Qt UI thread (`tests/test_phase8_remote.py`).
 
 Deviations from the plan below, and why:
 
 - **No `aiohttp`/`cryptography`/`segno` requirement.** The server is stdlib
   (`http.server` + `ssl`, TLS handshake on the request thread), the
-  certificate comes from the `openssl` CLI, and the QR from `segno` if
-  installed or else the `qrencode` CLI. No WebSocket is needed for the camera.
+  certificate comes from `cryptography` if installed or else the `openssl` CLI,
+  and the QR from `segno` if installed or else the `qrencode` CLI. No
+  WebSocket is needed for the camera or the REST remote control endpoints.
 - **No pinned fingerprint in the QR.** A web page cannot check its own
   certificate; the trust step is the browser's warning plus the fingerprint
   shown in the dialog.
@@ -42,9 +48,9 @@ Deviations from the plan below, and why:
 - The offer's `urn:3gpp:video-orientation` extension is removed, so Android
   rotates the pixels itself instead of tagging frames the receiver ignores.
 
-Not built yet: the phone remote (M8.2), phone audio, a devices manager to
-forget a paired phone from the UI (`PhoneService.forget` exists), and the
-hardware pass on real Android phones (M8.5).
+Not built yet: phone audio, a devices manager to forget a paired phone from
+the UI (`PhoneService.forget` exists), and the hardware pass on real Android
+phones (M8.5).
 
 ## 1. Without pairing: a camera app's URL
 

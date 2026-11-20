@@ -70,6 +70,12 @@ def set_model(name: str) -> bool:
         return False
     _chosen = name
     reset()
+    try:
+        from . import effect_worker
+
+        effect_worker.notify_runtime_settings(model=_chosen)
+    except Exception:  # noqa: BLE001
+        pass
     return True
 
 
@@ -84,20 +90,28 @@ def reset() -> None:
 inference.on_change(reset)
 
 
-def _session():
-    """The shared MediaPipe session (stateless, so one serves everyone)."""
+def _session_with_input():
+    """Return ``(session, input_name)`` for MediaPipe atomically under ``_lock``."""
     with _lock:
         if "session" not in _state:
             session = None
+            input_name = None
             path = model_path()
             if path.exists():
                 try:
                     session = inference.session(path)
-                    _state["input"] = session.get_inputs()[0].name
+                    input_name = session.get_inputs()[0].name
                 except Exception:  # noqa: BLE001 - optional feature
                     session = None
+                    input_name = None
             _state["session"] = session
-        return _state["session"]
+            _state["input"] = input_name
+        return _state.get("session"), _state.get("input")
+
+
+def _session():
+    """The shared MediaPipe session (stateless, so one serves everyone)."""
+    return _session_with_input()[0]
 
 
 def _rvm_session():
@@ -128,13 +142,14 @@ def person_alpha(rgb: np.ndarray) -> np.ndarray | None:
     ``rgb`` is an ``H x W x 3`` uint8 picture of any size; the result is
     ``144 x 256`` float32, or ``None`` without a usable model.
     """
-    session = _session()
-    if session is None:
+    session, input_name = _session_with_input()
+    if session is None or not input_name:
         return None
-    picture = Image.fromarray(rgb).resize(INPUT_SIZE, Image.BILINEAR)
-    batch = (np.asarray(picture, dtype=np.float32) / 255.0).transpose(2, 0, 1)[None]
+    if rgb.shape[1] != INPUT_SIZE[0] or rgb.shape[0] != INPUT_SIZE[1]:
+        rgb = np.asarray(Image.fromarray(rgb).resize(INPUT_SIZE, Image.BILINEAR))
+    batch = (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
     try:
-        alpha = session.run(None, {_state["input"]: batch})[0]
+        alpha = session.run(None, {input_name: batch})[0]
     except Exception:  # noqa: BLE001 - a bad frame must not stop the stream
         return None
     return np.clip(alpha[0, 0], 0.0, 1.0)

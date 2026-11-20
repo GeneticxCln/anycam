@@ -26,6 +26,27 @@ def _raise_window(window) -> None:
 _INSTANCE_LOCKS: dict[str, int] = {}
 
 
+def _private_runtime_dir() -> str:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime and os.path.isdir(runtime) and os.access(runtime, os.W_OK | os.X_OK):
+        return runtime
+    return str(config.state_dir())
+
+
+def _socket_target(name: str) -> str:
+    """Resolve the default server name into a user-private directory.
+
+    Explicitly supplied names (e.g. from tests connecting with QLocalSocket)
+    are preserved so callers can connect by the same name; the socket still
+    enforces UserAccessOption permissions.
+    """
+    if os.path.isabs(name):
+        return name
+    if name == INSTANCE_SERVER:
+        return os.path.join(_private_runtime_dir(), name)
+    return name
+
+
 def _take_instance_lock(name: str) -> bool | None:
     """Take the per-user launch lock.
 
@@ -33,9 +54,10 @@ def _take_instance_lock(name: str) -> bool | None:
     even on a crash, so it can never be stale).  ``False``: another live
     process owns it.  ``None``: locking is unavailable here.
     """
-    base = os.environ.get("XDG_RUNTIME_DIR") or str(config.state_dir())
+    base = _private_runtime_dir()
+    lock_name = os.path.basename(name) or INSTANCE_SERVER
     try:
-        fd = os.open(os.path.join(base, f"{name}.lock"),
+        fd = os.open(os.path.join(base, f"{lock_name}.lock"),
                      os.O_RDWR | os.O_CREAT, 0o600)
     except OSError:
         return None
@@ -56,9 +78,10 @@ def _take_instance_lock(name: str) -> bool | None:
 
 def _ask_instance_to_show(name: str, attempts: int, wait_ms: int) -> bool:
     """Ask the running GUI to raise its window; True once it was told."""
+    target = _socket_target(name)
     for _ in range(max(1, attempts)):
         probe = QLocalSocket()
-        probe.connectToServer(name)
+        probe.connectToServer(target)
         if probe.waitForConnected(wait_ms):
             probe.write(b"show")
             probe.flush()
@@ -93,11 +116,12 @@ def claim_gui_instance(name: str = INSTANCE_SERVER
         return False, None
     # We own the launch (or locking is unavailable and nobody answered): any
     # socket file left behind belongs to a crashed instance.
-    QLocalServer.removeServer(name)
+    target = _socket_target(name)
+    QLocalServer.removeServer(target)
     server = QLocalServer()
     # Only this user may connect: the socket carries commands.
     server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
-    if not server.listen(name):
+    if not server.listen(target):
         print(f"[guard] single-instance socket failed: {server.errorString()}",
               file=sys.stderr, flush=True)
         server.deleteLater()

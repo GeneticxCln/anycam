@@ -9,7 +9,7 @@ SECONDS_TO_RUN="${SECONDS_TO_RUN:-10}"
 OUT="${OUT:-evidence/demo}"
 mkdir -p "$OUT"
 
-PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 if [ -x .venv/bin/python ]; then
   PY="$ROOT/.venv/bin/python"
 else

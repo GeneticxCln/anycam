@@ -7,6 +7,7 @@ the preview, the drag handles and the GStreamer pad properties agree.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import numpy as np
 
@@ -100,9 +101,12 @@ def fit_mode(value) -> str:
 def rotation_degrees(value) -> int:
     """``value`` snapped to 0, 90, 180 or 270 clockwise degrees."""
     try:
-        degrees = int(round(float(value)))
+        raw = float(value)
     except (TypeError, ValueError):
         return 0
+    if not math.isfinite(raw):
+        return 0
+    degrees = int(round(raw))
     return (round(degrees / 90) * 90) % 360
 
 

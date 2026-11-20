@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
 
 from .. import config, crashguard, safemode
 from ..pipeline import AnyCamEngine
-from ..pool import SCREEN_IDLE_GRACE_S
+from ..pool import RETAIN_GRACE_S, SCREEN_IDLE_GRACE_S
 from .theme import STYLE  # noqa: F401
 from .layout_history import LayoutHistory  # noqa: F401
 from .preview import PreviewWidget, _PreviewOverlay  # noqa: F401
@@ -231,9 +231,10 @@ class EngineMixin:
                 self._status(f"Saved {report['record_path']}")
         # The pool keeps a screen capture alive briefly so an immediate
         # rebuild reuses it (a fresh damage-driven portal stream can be black
-        # until the window repaints).  A real stop must release it afterwards.
-        QTimer.singleShot(int(SCREEN_IDLE_GRACE_S * 1000) + 200,
-                          self._source_pool.sweep)
+        # until the window repaints).  A real stop must release it afterwards,
+        # and also sweep retained cameras once RETAIN_GRACE_S expires.
+        if not getattr(self, "_closing", False) and not getattr(self, "_torn_down", False):
+            self._schedule_pool_sweeps()
         self.status_chip.setText("STOPPED")
         self.start_button.setText("Start preview")
         if clear_preview:
@@ -241,6 +242,21 @@ class EngineMixin:
             self.preview.image = None
             self.preview.layer_sizes = {}
             self.preview.update()
+
+    def _schedule_pool_sweeps(self) -> None:
+        """Schedule parented pool sweeps so idle screens and retained cameras close."""
+        sweep = getattr(self, "_pool_sweep_timer", None)
+        if sweep is None:
+            sweep = self._pool_sweep_timer = QTimer(self)
+            sweep.setSingleShot(True)
+            sweep.timeout.connect(self._source_pool.sweep)
+        sweep.start(int(SCREEN_IDLE_GRACE_S * 1000) + 200)
+        retain = getattr(self, "_pool_retain_timer", None)
+        if retain is None:
+            retain = self._pool_retain_timer = QTimer(self)
+            retain.setSingleShot(True)
+            retain.timeout.connect(self._source_pool.sweep)
+        retain.start(int(RETAIN_GRACE_S * 1000) + 500)
 
     def restart_engine(self) -> None:
         was_running = self.engine is not None
@@ -259,6 +275,33 @@ class EngineMixin:
             self._forget_lost_cameras()
             self.stop_engine()
 
+    def _stop_all_timers(self) -> None:
+        """Stop every QTimer owned by the window during shutdown."""
+        for attr in (
+            "timer", "_camera_watch", "_transform_timer", "_autosave_timer",
+            "_vcam_udev_timer", "_canvas_apply_timer", "_model_download_timer",
+            "_camera_mode_timer", "_preview_resize_timer", "_diag_timer",
+            "_fix_timer", "_pool_sweep_timer", "_pool_retain_timer",
+            "_first_run_timer",
+        ):
+            timer = getattr(self, attr, None)
+            if timer is not None:
+                timer.stop()
+
+    def _close_auxiliary_windows(self) -> None:
+        """Close the floating overlay panel and multi-view dialog cleanly."""
+        close_panel = getattr(self, "_close_overlay_panel", None)
+        if callable(close_panel):
+            close_panel()
+        mv = getattr(self, "_multiview", None)
+        if mv is not None:
+            self._multiview = None
+            try:
+                mv.close()
+                mv.deleteLater()
+            except Exception:  # noqa: BLE001
+                pass
+
     def _teardown(self) -> None:
         """Stop everything and save, whatever fails on the way.
 
@@ -266,13 +309,14 @@ class EngineMixin:
         not stop, a phone link that raises) used to skip the rest, including
         the project save and the recording's finalisation.
         """
+        if getattr(self, "_torn_down", False):
+            return
+        self._torn_down = True
         steps = (
             ("thumbnails", self._stop_thumbnails),
-            ("preview timer", self.timer.stop),
-            ("camera watch", self._camera_watch.stop),
-            ("transform timer", self._transform_timer.stop),
-            ("autosave timer", self._autosave_timer.stop),
+            ("timers", self._stop_all_timers),
             ("pending edits", self.preview.cancel_pending_edits),
+            ("auxiliary windows", self._close_auxiliary_windows),
             ("engine", lambda: self.stop_engine() if self.engine is not None else None),
             ("recorder", self._finish_recorder),
             ("virtual camera", self._finish_vcam_output),
@@ -403,6 +447,8 @@ class EngineMixin:
         self.frame_ready.emit()
 
     def _resume_gpu_preview(self) -> None:
+        if getattr(self, "_ui_blocked", 0) or getattr(self, "_closing", False):
+            return
         from .. import gl_preview
 
         view = self.preview.video_view
@@ -460,7 +506,8 @@ class EngineMixin:
 
     def _apply_preview_size(self) -> None:
         """Have the engine scale the preview to the widget's shown size."""
-        if self.engine is None:
+        if (self.engine is None or getattr(self, "_ui_blocked", 0)
+                or getattr(self, "_closing", False)):
             return
         setter = getattr(self.engine, "set_preview_target", None)
         if callable(setter):
@@ -483,7 +530,9 @@ class EngineMixin:
         panel = self._overlay_panel
         if panel is not None and panel.isVisible():
             panel.set_frame(image)
-        if self._motion_monitor is not None:
+        if (self._motion_monitor is not None
+                and not getattr(self, "_ui_blocked", 0)
+                and not getattr(self, "_closing", False)):
             self._motion_frames = getattr(self, "_motion_frames", 0) + 1
             if self._motion_frames % 3 == 0:       # a third of the frames is plenty
                 import numpy as np
@@ -561,8 +610,11 @@ class EngineMixin:
             return False
         self._gpu_stalled_since = 0.0
         self.log_event("preview: GPU canvas produced no frames; using the image preview")
+        # Stop the running engine first so qml6glsink finishes tearing down
+        # before disable_gpu() destroys the QQuickWidget / GstGLQt6VideoItem.
+        self.stop_engine(clear_preview=False)
         self.preview.disable_gpu()
-        self.restart_engine()
+        self.start_engine()
         return True
 
     def _handle_rtmp_report(self) -> None:
@@ -583,7 +635,8 @@ class EngineMixin:
                 self._status(f"Stream stopped: {rtmp_error}")
 
     def _tick(self) -> None:
-        if self.engine is None:
+        if (self.engine is None or getattr(self, "_ui_blocked", 0)
+                or getattr(self, "_closing", False)):
             return
         # pump() also delivers the newest appsink frame to _on_frame, on this
         # (the main) thread.
@@ -594,12 +647,6 @@ class EngineMixin:
         if mv is not None:
             try:
                 mv.pump()
-            except Exception:
-                pass
-        grid = getattr(self, "grid", None)
-        if grid is not None:
-            try:
-                grid.pump()
             except Exception:
                 pass
         rec = self.engine.sample()

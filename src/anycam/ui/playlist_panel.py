@@ -215,7 +215,11 @@ class PlaylistMixin:
         """Put each page of a PDF in the playlist, paused so the pages are stepped by hand."""
         from .. import content
 
-        pages, error = self._run_with_ui(lambda: content.pdf_pages(path))
+        res = self._run_with_ui(lambda: content.pdf_pages(path))
+        if res is None:
+            self._status("PDF conversion timed out")
+            return 0
+        pages, error = res
         if error:
             self._status(error)
             return 0
@@ -228,10 +232,12 @@ class PlaylistMixin:
             self.playlist_list.addItem(f"{layer.name}  \u00b7  slide")
         self.playlist_pause.setChecked(True)
         self._store_playlist_state()
+        self._clear_history()
+        self._refresh_layers()
         self._mark_dirty()
         if self.engine is not None:
             self.restart_engine()
-        self._status(f"{len(pages)} slides added; step them with the playlist next/previous keys")
+        self._status(f"{len(pages)} slides added; step them with the playlist Previous/Next buttons")
         return len(pages)
 
     def _pick_pdf(self) -> None:

@@ -7,7 +7,7 @@ item stay, and which one comes next.
 from __future__ import annotations
 
 import random
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 
 from .model import PlaylistConfig
 
@@ -23,14 +23,33 @@ def item_seconds(state: PlaylistConfig, layer_id: str) -> float:
 
 
 def next_index(ids: Sequence[str], index: int, *, loop: bool = True, shuffle: bool = False,
-               rng: random.Random | None = None) -> int | None:
+               rng: random.Random | None = None,
+               visited: Collection[int] | None = None) -> int | None:
     """The item to show after ``index`` (None: the end of a playlist that does not loop)."""
     count = len(ids)
     if count == 0:
         return None
-    if shuffle and count > 1:
-        choices = [i for i in range(count) if i != index]
-        return (rng or random).choice(choices)
+    if shuffle:
+        if visited is not None:
+            seen = set(visited)
+            if 0 <= index < count:
+                seen.add(index)
+            choices = [i for i in range(count) if i not in seen]
+            if choices:
+                return (rng or random).choice(choices)
+            if not loop:
+                return None
+            fallback = [i for i in range(count) if i != index]
+            return (rng or random).choice(fallback) if fallback else 0
+        if not loop:
+            # Without a visited tracker, advance randomly among later indices
+            # so a non-looping shuffled playlist still terminates.
+            remaining = [i for i in range(max(0, index + 1), count)]
+            return (rng or random).choice(remaining) if remaining else None
+        if count > 1:
+            choices = [i for i in range(count) if i != index]
+            return (rng or random).choice(choices)
+        return 0
     following = index + 1
     if following < count:
         return following
@@ -39,8 +58,9 @@ def next_index(ids: Sequence[str], index: int, *, loop: bool = True, shuffle: bo
 
 def previous_index(ids: Sequence[str], index: int, *, loop: bool = True) -> int | None:
     """The item before ``index`` (wrapping when the playlist loops)."""
-    if not ids:
+    count = len(ids)
+    if count == 0:
         return None
     if index <= 0:
-        return len(ids) - 1 if loop else 0
-    return index - 1
+        return count - 1 if loop else 0
+    return min(count - 1, index - 1)

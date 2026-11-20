@@ -39,8 +39,18 @@ ACTIONS: tuple[tuple[str, str, str], ...] = _BASE + tuple(
 DEFAULTS: dict[str, str] = {action: key for action, _label, key in ACTIONS}
 LABELS: dict[str, str] = {action: label for action, label, _key in ACTIONS}
 
-_KEY = re.compile(r"^(?:(?:Ctrl|Shift|Alt|Meta)\+)*[^+\s]+$|^(?:(?:Ctrl|Shift|Alt|Meta)\+)+\+$",
-                  re.IGNORECASE)
+_MULTIWORD_KEYS = (
+    r"Media\s+(?:Play|Pause|Stop|Next|Previous|Record|Last|Rewind|Fast\s+Forward|Toggle\s+Play/Pause)"
+    r"|Volume\s+(?:Up|Down|Mute)"
+    r"|Page\s+(?:Up|Down)"
+    r"|(?:Caps|Num|Scroll)\s+Lock"
+    r"|Print\s+Screen|Sys\s+Req"
+)
+_KEY = re.compile(
+    r"^(?:(?:Ctrl|Shift|Alt|Meta)\+)*(?:" + _MULTIWORD_KEYS + r"|[^+\s]+)$"
+    r"|^(?:(?:Ctrl|Shift|Alt|Meta)\+)+\+$",
+    re.IGNORECASE,
+)
 
 
 def path() -> Path:

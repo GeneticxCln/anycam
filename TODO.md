@@ -2,8 +2,8 @@
 
 Backlog from the 2026-10-31 full audit (55 bugs, M0–M9), the 2026-11-11 audit
 (25 findings) and the 2026-11-12 audit (11 items). Snapshot: 2026-11-12, after
-the 11-item fixes; suite **1231 collected, the full run passing** (four
-hardware/packaging tests skip without their hardware).
+the 11-item fixes; suite **~1,250+ collected, the full run passing** (hardware/packaging
+tests skip without their hardware/tools).
 
 `plans/archive/2026-10-30-remediation.md` is the older 2026-10-30 plan; open plans are in `plans/pending/`; this file tracks the newer audits' open
 side. Closed items live in `docs/REGRESSIONS.md` and are not repeated here.
@@ -61,7 +61,7 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done. Bug IDs (`B12`) are the
   through the worker against 0–5 ms in-process at 1080p, so
   `OutputConfig.effects_isolated` now defaults to `False`. Effect packs still
   always isolate (third-party code never runs in the main process) and
-  **Settings → AI effects** can isolate all AI effects. Covered by
+  **Settings → Output → AI effects** can isolate all AI effects. Covered by
   `tests/test_phase6_worker.py::test_the_isolation_setting_reaches_the_worker_switch`.
 - [x] **8. Effects flashed off while the worker started or backed off.** The raw
   frame passed through during startup (~0.2 s) and restart backoff (1–10 s).
@@ -83,7 +83,7 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done. Bug IDs (`B12`) are the
 
 ## 0. M1 acceptance gates — do these first
 
-- [x] **10-minute A/V drift gate.** `PYTHONPATH=src python3 scripts/verify-av-drift.py --seconds 600 --warmup 20 --record /tmp/drift.mp4 --json /tmp/drift.json`. Passed 2026-10-31: `drift_s: 0.0`, 36,008 video / 24,405 audio buffers, zero duplicate/gap timestamps, finalised 600.12 s MP4.
+- [x] **10-minute A/V drift gate.** `PYTHONPATH=src python3 scripts/verify-av-drift.py --seconds 600 --warmup 20 --record /tmp/drift.mp4 --json /tmp/drift.json`. Passed 2026-10-31: `drift_s: 0.0`, 36,008 video / 24,405 audio buffers at the live canvas timestamp taps, zero duplicate/gap timestamps, finalised 600.12 s video-only MP4.
 - [~] **60-minute soak** tracking RSS, tmpfs usage, disk and file descriptors; fail the run on a frame stall. Instrumentation landed 2026-10-31 (tmpfs, recording filesystem, FDs, `--stall-seconds`); the 10-minute synthetic re-run passed at 0.043 MiB/min with no stalls. Run 60 minutes with vcam.
 - [~] **Continuous MP4** across five scene switches and record toggles, plus an unbroken `v4l2src` consumer on the virtual camera (B12). A persistent `Recorder` and a session-owned vcam output span canvas rebuilds; Record start/stop and vcam toggles are now live valve changes rather than rebuilds (2026-10-31). The five-scene-switch gate passes with synthetic sources; the 60-minute soak and a real loopback consumer remain.
 - [x] **Unresponsive RTSP/network source**: canvas keeps ≥99% of its frames and `stop()` returns in under 1 s (B10/B11). Passed 2026-10-31 with a local RTSP server that accepts and never answers: ≥99% of 30 fps over a 2 s window, `stop()` 0.32 s.
@@ -94,7 +94,7 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done. Bug IDs (`B12`) are the
 ## 1. M1 engine split and source/output correctness
 
 - [x] Split `pipeline.py` into `src/anycam/engine/`: `source_pool.py`, `canvas.py`, `outputs/{vcam,recorder,stream}.py`, `health.py`, `controller.py`; `AnyCamEngine` is a thin facade. Passed: full suite on the split tree.
-- [~] Canvas is never rebuilt. Record/stop and vcam toggles attach/detach live through valves (B12, 2026-10-31); scene switches reposition pads without a restart (`tests/test_housekeeping_2026_11_12.py`); structural changes (add layer, effect chain) still rebuild.
+- [~] Canvas is never rebuilt. Record/stop and vcam toggles attach/detach live through valves (B12, 2026-10-31); scene switches swap layers on the running canvas without a restart except for scenes containing a screen share (`tests/test_housekeeping_2026_11_12.py`); structural layer/effect-chain changes still rebuild.
 - [x] Video layers loop with a segment seek and never end on a silent black frame (B14); a video-only scene must not leave the chip saying LIVE. Passed 2026-10-31: a 1 s red clip seeked after EOS, `loops >= 1`, and the centre was still red after 2.6 s.
 - [x] Hidden playlist layers release their sources; hidden cameras stop holding devices and CPU (B15). Passed 2026-10-31: hidden capture layers acquire no pool entry; showing acquires on the stable channel, hiding releases it again.
 - [ ] Stable camera IDs through `/dev/v4l/by-id`, not `/dev/videoN` (B46). **App side implemented 2026-10-31; needs a physical replug run.**
@@ -151,7 +151,7 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done. Bug IDs (`B12`) are the
 
 ## 5. M5 — AI and effects
 
-- [x] AI effects run in-process by default; effect packs always run in a worker process, and **Settings → AI effects** can isolate every AI effect. Measured 21–27 ms/frame in the worker against 0–5 ms in-process at 1080p (item 7). A crashed or hung worker is replaced, and the last processed frame is held so an effect never flashes off (item 8). Passed: `tests/test_phase6_worker.py`. [ ] Face detection for the preview thumbnails is still in-process (B43).
+- [x] AI effects run in-process by default; effect packs always run in a worker process, and **Settings → Output → AI effects** can isolate every AI effect. Measured 21–27 ms/frame in the worker against 0–5 ms in-process at 1080p (item 7). A crashed or hung worker is replaced, and the last processed frame is held so an effect never flashes off (item 8). Passed: `tests/test_phase6_worker.py`. [ ] Face detection for the preview thumbnails is still in-process (B43).
 - [x] Person segmentation on ONNX Runtime (MediaPipe selfie segmentation, bundled): blur, remove, replace with image/video/any source. Passed: `tests/test_processors.py`.
 - [x] Face landmarks: 2D props that follow the face (sunglasses, hat, crown, mustache, cat, halo, frame, pixelate). Passed 2026-11-06: `tests/test_processors.py`. [x] Full-face 2D masks (cyber, web hero, robot, skull, zombie, tiger and 16 more) warped from five landmarks; passed 2026-11-06: `tests/test_themed_content.py`. [ ] True 3D (depth) masks.
 - [x] Stickers on the face, animated GIFs, filters. Passed 2026-11-06: `tests/test_processors.py`, `tests/test_overlays_and_stacking.py`. [x] Emoji pack, emoji eyes, orbiting emoji, emoji rain, 32 themed frames and 42 particle animations; passed 2026-11-06: `tests/test_themed_content.py`. [ ] Drag and drop, `.cube` LUT import.
@@ -164,7 +164,7 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done. Bug IDs (`B12`) are the
 - [ ] Web source with custom CSS through QtWebEngine (offscreen).
 - [x] PDF slides through poppler's `pdftoppm` (one playlist slide per page). Passed: `tests/test_phase7_content.py`, including that a timed-out render leaves no cached pages (item 11). [ ] PowerPoint through LibreOffice.
 - [x] Video-site links through optional `yt-dlp` (only http(s) streams are accepted). Passed with a stand-in `yt-dlp`: `tests/test_phase7_content.py`. [ ] Not run against a real site.
-- [ ] Whiteboard; live draw, text, shapes and region blur.
+- [ ] Whiteboard, shapes and region blur (stroke-based drawing layer and text overlays already exist: `tests/test_drawing.py`, `tests/test_phase2_foundations.py`).
 - [x] Motion detection: switch scene and desktop notification (`notify-send`). Passed: `tests/test_phase7_content.py`; it also receives frames under the GPU preview again (item 4). [ ] Email.
 - [x] Floating always-on-top panel with a round preview; Wayland limits are stated in the settings text. Passed: `tests/test_phase7_content.py`; fed by the CPU preview tap (item 4).
 - [x] MJPEG IP camera test against a local multipart server (`tests/test_phase7_content.py`); network sources of that kind now use `souphttpsrc ! multipartdemux`. [ ] Game capture through window capture.
@@ -218,7 +218,7 @@ Design and build order: `docs/PHONE_CAMERA.md`.
 - [x] `PARITY.md` carries a measured-results section for this round (2026-11-12) and states its gaps; older rows keep their original evidence notes.
 - [x] `scripts/capture-screencast.py` reports `ok: false` for a flat or wrong-shaped frame (B55). Passed: `tests/test_housekeeping_2026_11_12.py`.
 - [ ] Evidence gaps: live portal screen capture, physical unplug, 10-minute soak with the virtual camera; the 2026-11-12 GPU-preview smoke (section 11).
-- [ ] `AnyCamEngine.stop()` (up to ~4 s) and `Recorder.stop()` (up to 5 s) block the UI thread while finalising; move them off-thread with the M1 controller split (2026-11-11 audit).
+- [~] Off-thread teardown: `stop_engine()` now runs off the Qt UI thread via `_run_with_ui` (`tests/test_housekeeping_2026_11_12.py::test_stopping_the_engine_keeps_the_window_responsive`), while `Recorder.stop()` finalisation (up to 5 s) still needs to move off-thread (2026-11-11 audit).
 
 ## 11. Needs the user / hardware
 
@@ -262,5 +262,5 @@ Design and build order: `docs/PHONE_CAMERA.md`.
 - Persistent recorder: one MP4 across canvas rebuilds, with PTS remap and AAC audio (`tests/test_recorder.py`).
 - Session-owned virtual camera: one `v4l2sink` across canvas rebuilds (`tests/test_vcam_output.py`).
 - Five-scene-switch recording gate: one MP4 across five canvas rebuilds (`tests/test_gui.py::test_five_scene_switches_keep_one_recording`).
-- A/V drift harness: 20 s synthetic run with 0.0 s drift and a finalised MP4 (`scripts/verify-av-drift.py`).
+- A/V drift harness: 20 s smoke followed by the 600 s synthetic run in §0 with 0.0 s live A/V drift and a finalised video-only MP4 (`scripts/verify-av-drift.py`).
 - Repo hygiene B54: git history, evidence moved out, launcher/desktop fixed, 123-test suite.

@@ -48,6 +48,25 @@ def distro_family() -> str:
     return "debian"
 
 
+def _is_loopback_device(path: str, vcam: str) -> bool:
+    if path == vcam:
+        return True
+    sysname = Path(path).name
+    try:
+        driver = (Path("/sys/class/video4linux") / sysname / "device" / "driver").resolve().name
+        if driver == "v4l2loopback":
+            return True
+    except OSError:
+        pass
+    try:
+        name = (Path("/sys/class/video4linux") / sysname / "name").read_text(errors="replace").lower()
+        if "anycam" in name or "v4l2loopback" in name or "dummy video" in name:
+            return True
+    except OSError:
+        pass
+    return False
+
+
 def checks(elements: dict | None = None, cameras: list[str] | None = None,
            environ: dict | None = None) -> list[Check]:
     """Every check, in the order a person would fix them."""
@@ -62,15 +81,18 @@ def checks(elements: dict | None = None, cameras: list[str] | None = None,
         else "missing: " + ", ".join(missing[:8]) + (" …" if len(missing) > 8 else ""),
         "" if not missing else install_hint({
             "debian": "gstreamer1.0-plugins-base gstreamer1.0-plugins-good "
-                      "gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav",
+                      "gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav "
+                      "gstreamer1.0-x",
             "arch": "gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav",
             "fedora": "gstreamer1-plugins-base gstreamer1-plugins-good gstreamer1-plugins-bad-free "
                       "gstreamer1-plugins-ugly gstreamer1-libav",
             "suse": "gstreamer-plugins-base gstreamer-plugins-good gstreamer-plugins-bad "
                     "gstreamer-plugins-ugly gstreamer-plugins-libav"})))
 
-    devices = cameras if cameras is not None else sorted(
-        str(path) for path in Path("/dev").glob("video*"))
+    vcam = config.loopback_device()
+    devices = (cameras if cameras is not None else sorted(
+        str(path) for path in Path("/dev").glob("video*")
+        if not _is_loopback_device(str(path), vcam)))
     usable = [path for path in devices if os.access(path, os.R_OK | os.W_OK)]
     found.append(Check(
         "camera", "Camera", bool(usable),
@@ -80,12 +102,13 @@ def checks(elements: dict | None = None, cameras: list[str] | None = None,
                            else "plug a camera in, or add a screen, image or video instead"),
         required=False))
 
-    vcam = config.loopback_device()
     vcam_ok = bool(config.vcam_available(vcam)) if hasattr(config, "vcam_available") else False
     found.append(Check(
         "vcam", "Virtual camera", vcam_ok,
         f"{vcam} is ready" if vcam_ok else "no v4l2loopback device for browsers and meeting apps",
-        "" if vcam_ok else "scripts/enable-v4l2loopback.sh   (or use the PipeWire camera backend)",
+        "" if vcam_ok else (
+            "sudo modprobe v4l2loopback exclusive_caps=1 card_label=AnyCam   "
+            "(or enable-v4l2loopback / PipeWire camera backend)"),
         required=False))
 
     pipewire = bool(env.get("XDG_RUNTIME_DIR")) and (Path(env["XDG_RUNTIME_DIR"]) / "pipewire-0").exists()
@@ -156,7 +179,17 @@ def already_shown() -> bool:
 
 
 def mark_shown() -> None:
+    target = _state_path()
+    temp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
     try:
-        _state_path().write_text(json.dumps({"shown": True, "version": config.VERSION}))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"shown": True, "version": config.VERSION}))
+        os.chmod(temp, 0o600)
+        os.replace(temp, target)
     except OSError:
-        pass
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass

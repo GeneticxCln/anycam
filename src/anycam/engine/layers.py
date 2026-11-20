@@ -120,16 +120,30 @@ class LayerMixin:
     def _add_layer(self, layer: Layer, zorder: int) -> None:
         """Build one layer into the canvas; leave no pool reference on failure."""
         chains_before = len(self.chains)
+        prior_pad = self._layer_pads.get(layer.id)
+        prior_chain = self._layer_chains.get(layer.id)
+        prior_source = self.layer_sources.get(layer.id)
         self._partial_pad = None
         try:
             self._add_layer_impl(layer, zorder)
         except Exception:
             self._rollback_layer_capture(layer.id)
-            self._discard_partial_layer(layer.id, chains_before)
+            self._discard_partial_layer(
+                layer.id, chains_before,
+                prior_pad=prior_pad, prior_chain=prior_chain, prior_source=prior_source,
+            )
             raise
         self._partial_pad = None
 
-    def _discard_partial_layer(self, layer_id: str, chains_before: int) -> None:
+    def _discard_partial_layer(
+        self,
+        layer_id: str,
+        chains_before: int,
+        *,
+        prior_pad=None,
+        prior_chain=None,
+        prior_source=None,
+    ) -> None:
         """Take out what a layer that failed to build left in the canvas.
 
         A requested compositor pad that never got a feed makes the mixer wait
@@ -137,9 +151,18 @@ class LayerMixin:
         elements, probes and generator threads until the next rebuild.
         """
         pad, self._partial_pad = getattr(self, "_partial_pad", None), None
-        self._layer_pads.pop(layer_id, None)
-        self._layer_chains.pop(layer_id, None)
-        self.layer_sources.pop(layer_id, None)
+        if prior_pad is not None:
+            self._layer_pads[layer_id] = prior_pad
+        else:
+            self._layer_pads.pop(layer_id, None)
+        if prior_chain is not None:
+            self._layer_chains[layer_id] = prior_chain
+        else:
+            self._layer_chains.pop(layer_id, None)
+        if prior_source is not None:
+            self.layer_sources[layer_id] = prior_source
+        else:
+            self.layer_sources.pop(layer_id, None)
         orphans = self.chains[chains_before:]
         for chain in orphans:
             for hook in getattr(chain, "cleanup", ()):
@@ -258,11 +281,13 @@ class LayerMixin:
                 png = overlay.render_layer(layer, self.canvas_w, self.canvas_h,
                                            crop=crop)
             # render_layer already applied the layer's crop while rendering,
-            # so the chain must not crop the box-sized PNG again.  Effects are
-            # carried over: they used to be dropped on image/logo/text layers.
+            # so the chain must not crop the box-sized PNG again.  Face layers
+            # use their raw PNG path directly, so keep their crop intact.
             source_layer = Layer(
                 id=layer.id, kind="image", name=layer.name, source=str(png),
-                box=layer.box, crop=(0.0, 0.0, 0.0, 0.0), alpha=layer.alpha,
+                box=layer.box,
+                crop=(crop if layer.kind == "face" else (0.0, 0.0, 0.0, 0.0)),
+                alpha=layer.alpha,
                 z=layer.z, visible=layer.visible, effects=layer.effects,
                 role=layer.role,
             )
@@ -302,14 +327,17 @@ class LayerMixin:
         self._link_dynamic(chain)
 
         screen_identity = [None]
+        health_target: list[str | None] = [layer.id]
+        chain._health_target = health_target  # type: ignore[attr-defined]
 
         retime = self.canvas_backend == "gpu" and layer.kind in LIVE_KINDS
 
-        def on_source_buffer(_pad, _info, layer_id=layer.id):
+        def on_source_buffer(_pad, _info, target=health_target):
             # PipeWire's SPA header sequence is carried in buffer.offset.
             # Some producers send PTS=0 for every frame, so timestamps alone
             # incorrectly label a changing stream as stale. Prefer sequence
             # numbers, falling back to PTS when the source has no sequence.
+            layer_id = target[0]
             if layer.kind == "screen":
                 buffer = _info.get_buffer()
                 if buffer is not None:
@@ -318,39 +346,29 @@ class LayerMixin:
                         identity = ("sequence", buffer.offset)
                     elif buffer.pts != Gst.CLOCK_TIME_NONE:
                         identity = ("pts", buffer.pts)
-                    # A portal stream is live, but its producer's PTS need
-                    # not advance (niri supplies zero). do-timestamp on
-                    # pipewiresrc does not replace an existing PTS. With two
-                    # such streams the compositor can keep presenting the
-                    # first frame even as their sequence numbers advance.
-                    # Put each arrival on the canvas timeline, before any
-                    # queue/GL processing. Preserve the original identity
-                    # above so retiming a cached frame cannot fake freshness.
                     pipeline = self.pipeline   # None once the engine stopped
                     clock = pipeline.get_clock() if pipeline is not None else None
                     if clock is not None:
-                        buffer.pts = max(0, clock.get_time() - pipeline.get_base_time())
-                        buffer.dts = Gst.CLOCK_TIME_NONE
+                        writable = buffer.copy()
+                        writable.pts = max(0, clock.get_time() - pipeline.get_base_time())
+                        writable.dts = Gst.CLOCK_TIME_NONE
+                        _info.set_buffer(writable)
                     if identity is not None:
                         if identity == screen_identity[0]:
                             return Gst.PadProbeReturn.OK
                         screen_identity[0] = identity
             elif retime:
-                # GPU canvas: the frame leaves the CPU chain now.  Its capture
-                # timestamp is older by however long the effects took, and
-                # glvideomixer drops a frame it considers late and repeats its
-                # last one: a Distort filter (tens of ms per 1080p frame) froze
-                # the camera completely.  Stamped with the time it is ready, it
-                # is never late.  The compositor shows late frames, so the CPU
-                # canvas keeps the capture time.
                 buffer = _info.get_buffer()
                 pipeline = self.pipeline
                 clock = pipeline.get_clock() if pipeline is not None else None
                 if buffer is not None and clock is not None:
-                    buffer.pts = max(0, clock.get_time() - pipeline.get_base_time())
-                    buffer.dts = Gst.CLOCK_TIME_NONE
-            self._layer_frames[layer_id] = self._layer_frames.get(layer_id, 0) + 1
-            self._layer_last[layer_id] = time.monotonic()
+                    writable = buffer.copy()
+                    writable.pts = max(0, clock.get_time() - pipeline.get_base_time())
+                    writable.dts = Gst.CLOCK_TIME_NONE
+                    _info.set_buffer(writable)
+            if layer_id is not None:
+                self._layer_frames[layer_id] = self._layer_frames.get(layer_id, 0) + 1
+                self._layer_last[layer_id] = time.monotonic()
             return Gst.PadProbeReturn.OK
 
         # Screen health follows PipeWire arrivals, not a downstream element
@@ -415,7 +433,7 @@ class LayerMixin:
 
         def on_buffer(probe_pad, _info):
             if seen:
-                return Gst.PadProbeReturn.OK
+                return Gst.PadProbeReturn.REMOVE
             caps = probe_pad.get_current_caps()
             if caps is None or caps.get_size() == 0:
                 return Gst.PadProbeReturn.OK
@@ -433,9 +451,10 @@ class LayerMixin:
                     f"screen layer '{layer.name}' captured {got[0]}x{got[1]} "
                     f"but the portal stream is {expected[0]}x{expected[1]}"
                 )
-            return Gst.PadProbeReturn.OK
+            return Gst.PadProbeReturn.REMOVE
 
-        self._probe(pad, Gst.PadProbeType.BUFFER, on_buffer)
+        # Self-removing once caps arrive; do not register in _pad_probes.
+        pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
 
     @staticmethod
     def _sizing_policy(layer: Layer) -> str:
@@ -521,15 +540,23 @@ class LayerMixin:
             except Exception as exc:  # noqa: BLE001 - keep the canvas running
                 layer.visible = False
                 pad.set_property("alpha", 0.0)
+                safe_exc = config.redact_text(str(exc), layer.source)
                 self.report.media_errors.append(
-                    f"{layer.name}: could not open source ({exc})")
-                print(f"[capture] could not show layer={layer_id}: {exc}",
+                    f"{layer.name}: could not open source ({safe_exc})")
+                print(f"[capture] could not show layer={layer_id}: {safe_exc}",
                       file=sys.stderr, flush=True)
                 return False
             self._record_camera_mode(layer_id, entry)
             self._specs.append(spec)
             self._layer_acquired.add(layer_id)
+            old_size = self.layer_sources.get(layer_id)
             self.layer_sources[layer_id] = entry.source_size
+            if old_size and entry.source_size and tuple(old_size) != tuple(entry.source_size):
+                chain = self._layer_chains.get(layer_id)
+                framing = getattr(chain, "effects", {}).get("framing") if chain else None
+                if framing is not None and hasattr(framing, "source_size"):
+                    framing.source_size = tuple(entry.source_size)
+                    self.set_layer_framing(layer_id)
         layer.visible = visible
         pad.set_property("alpha", float(clamp(layer.alpha)) if visible else 0.0)
         self.apply_layer_audio(layer)
@@ -586,7 +613,7 @@ class LayerMixin:
             return True                 # already showing its card
         visible = layer.visible
         self.drop_capture(layer_id)
-        self.detach_layer(layer_id)     # hides the model's layer on the way out
+        self.detach_layer(layer_id, pin=False)     # hides the model's layer on the way out
         layer.visible = visible
         self.skip_layers.add(layer_id)
         if not self.add_layer(layer):
@@ -626,8 +653,9 @@ class LayerMixin:
             except Exception as exc:  # noqa: BLE001 - keep the live screen
                 if was_skipped:
                     self.skip_layers.add(layer_id)
+                safe_exc = config.redact_text(str(exc), layer.source)
                 print(
-                    f"[capture] could not build layer={layer_id}: {exc}",
+                    f"[capture] could not build layer={layer_id}: {safe_exc}",
                     file=sys.stderr, flush=True)
                 return False
             if placeholder is not None and placeholder is not self._layer_pads.get(layer_id):
@@ -647,8 +675,9 @@ class LayerMixin:
         try:
             entry = self.pool.acquire(spec)
         except Exception as exc:  # noqa: BLE001 - keep the live screen alive
+            safe_exc = config.redact_text(str(exc), layer.source)
             print(
-                f"[capture] could not reattach layer={layer_id}: {exc}",
+                f"[capture] could not reattach layer={layer_id}: {safe_exc}",
                 file=sys.stderr, flush=True)
             return False
         self._specs.append(spec)
@@ -664,7 +693,7 @@ class LayerMixin:
             file=sys.stderr, flush=True)
         return True
 
-    def detach_layer(self, layer_id: str) -> None:
+    def detach_layer(self, layer_id: str, *, pin: bool = True) -> None:
         """Remove one layer's contribution without rebuilding the canvas.
 
         Removal must not destroy the source.  A screen layer's pipewiresrc
@@ -681,7 +710,7 @@ class LayerMixin:
             self.resume_vcam()
             return
         spec = self._layer_specs.get(layer_id)
-        if spec is not None:
+        if spec is not None and pin:
             # Pin before set_layer_visible releases this layer's reference:
             # the capture pipeline keeps running for the app lifetime.
             self.pool.pin(spec)
@@ -709,6 +738,7 @@ class LayerMixin:
             self._dispose_chain(removed, pad)
         self._layer_frames.pop(layer_id, None)
         self._layer_last.pop(layer_id, None)
+        getattr(self, "_layer_added_at", {}).pop(layer_id, None)
         self._pads_with_data.discard(layer_id)
         self.layer_sources.pop(layer_id, None)
         self._camera_modes.pop(layer_id, None)
@@ -773,6 +803,9 @@ class LayerMixin:
         if pad is not None:
             pad.set_property("alpha", 0.0)
         if pad is not None and chain is not None:
+            health_target = getattr(chain, "_health_target", None)
+            if isinstance(health_target, list) and health_target:
+                health_target[0] = None
             self._detached_screens.setdefault(str(layer.source), []).append({
                 "chain": chain,
                 "pad": pad,
@@ -782,6 +815,7 @@ class LayerMixin:
                 "source_size": self.layer_sources.get(layer_id, (0, 0)),
                 "frames": self._layer_frames.get(layer_id, 0),
                 "last": self._layer_last.get(layer_id, 0.0),
+                "health_target": health_target,
             })
             print(
                 f"[screen-session] detached layer={layer_id} "
@@ -792,6 +826,7 @@ class LayerMixin:
         self._layer_chains.pop(layer_id, None)
         self._layer_frames.pop(layer_id, None)
         self._layer_last.pop(layer_id, None)
+        getattr(self, "_layer_added_at", {}).pop(layer_id, None)
         self._pads_with_data.discard(layer_id)
         self.layer_sources.pop(layer_id, None)
         self._layer_specs.pop(layer_id, None)
@@ -851,17 +886,28 @@ class LayerMixin:
                 self.set_layer_box(layer.id, layer.box)
                 self.refresh_layer_order()
                 self._sync_standby_label()
-                check = getattr(chain, "check_element", None)
-                health_pad = (check.get_static_pad("src")
-                              if check is not None else None)
-                if health_pad is not None:
-                    def on_buffer(_pad, _info, layer_id=layer.id):
-                        self._layer_frames[layer_id] = (
-                            self._layer_frames.get(layer_id, 0) + 1)
-                        self._layer_last[layer_id] = time.monotonic()
-                        return Gst.PadProbeReturn.OK
+                health_target = entry.get("health_target")
+                if isinstance(health_target, list) and health_target:
+                    # Reuse the original screen probe (preserving sequence
+                    # deduplication and avoiding stacked per-frame probes).
+                    health_target[0] = layer.id
+                else:
+                    check = getattr(chain, "check_element", None)
+                    health_pad = (check.get_static_pad("src")
+                                  if check is not None else None)
+                    if health_pad is not None:
+                        target: list[str | None] = [layer.id]
+                        chain._health_target = target  # type: ignore[attr-defined]
 
-                    self._probe(health_pad, Gst.PadProbeType.BUFFER, on_buffer)
+                        def on_buffer(_pad, _info, target=target):
+                            lid = target[0]
+                            if lid is not None:
+                                self._layer_frames[lid] = (
+                                    self._layer_frames.get(lid, 0) + 1)
+                                self._layer_last[lid] = time.monotonic()
+                            return Gst.PadProbeReturn.OK
+
+                        self._probe(health_pad, Gst.PadProbeType.BUFFER, on_buffer)
                 print(
                     f"[screen-session] reattached layer={layer.id} "
                     f"node={layer.source} without a portal request",
@@ -869,7 +915,14 @@ class LayerMixin:
                 self.resume_vcam()
                 return True
         if layer.kind == "screen":
-            self.screen_fds[layer.id] = int(screen_fd)
+            old_fd = self.screen_fds.get(layer.id, -1)
+            new_fd = int(screen_fd)
+            if old_fd >= 0 and old_fd != new_fd:
+                try:
+                    os.close(old_fd)
+                except OSError:
+                    pass
+            self.screen_fds[layer.id] = new_fd
             if screen_size is not None:
                 self.screen_sizes[layer.id] = screen_size
         ordered = sorted(self.scene.layers, key=lambda item: item.z)
@@ -880,12 +933,17 @@ class LayerMixin:
         try:
             self._add_layer(layer, zorder)
         except Exception as exc:  # noqa: BLE001 - the caller rebuilds on failure
+            safe_exc = config.redact_text(str(exc), layer.source)
             print(
-                f"[engine] could not attach {layer.name} live: {exc}",
+                f"[engine] could not attach {layer.name} live: {safe_exc}",
                 file=sys.stderr, flush=True)
             return False
         self.refresh_layer_order()
         self._sync_standby_label()
+        if self._start_time:
+            if not hasattr(self, "_layer_added_at"):
+                self._layer_added_at = {}
+            self._layer_added_at[layer.id] = time.monotonic()
         self.resume_vcam()
         return True
 
@@ -949,7 +1007,15 @@ class LayerMixin:
             if _empty_drawing(layer):
                 continue
             if not self.add_layer(layer):
+                for added in reversed(incoming):
+                    self.detach_layer(added.id, pin=False)
+                self.scene = old
                 self._ghosts = []
+                if animate:
+                    for layer_old in old.layers:
+                        layer_old.visible = visible.get(layer_old.id, layer_old.visible)
+                    self.refresh_layer_order()
+                    self._sync_standby_label()
                 return False
             incoming.append(layer)
         self.refresh_layer_order()

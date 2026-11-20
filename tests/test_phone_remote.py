@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import http.client
+import importlib.util
 import json
 import os
 import shutil
@@ -14,11 +15,15 @@ import pytest
 from anycam.model import Layer, Project, Scene
 
 
+def _has_tls_tooling() -> bool:
+    return (shutil.which("openssl") is not None
+            or importlib.util.find_spec("cryptography") is not None)
+
 
 @pytest.fixture
 def service(tmp_path):
-    if shutil.which("openssl") is None:
-        pytest.skip("openssl is not installed")
+    if not _has_tls_tooling():
+        pytest.skip("neither openssl nor cryptography is installed")
     from anycam.phone.server import PhoneService
 
     svc = PhoneService(state_dir=tmp_path / "state", cert_dir=tmp_path / "cert",
@@ -170,7 +175,8 @@ def test_the_setting_switches_the_service_and_is_saved(window):
     window.phone_control_check.setChecked(True)
     assert window.project.output.phone_control is True
     service = window._phone_service
-    if service is not None:                         # started only where TLS tooling exists
+    if _has_tls_tooling():
+        assert service is not None, "phone service should start when TLS tooling is installed"
         assert service.control_enabled is True
         window.phone_control_check.setChecked(False)
         assert service.control_enabled is False

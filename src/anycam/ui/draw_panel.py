@@ -75,7 +75,15 @@ class DrawMixin:
         """Enter or leave draw mode (the pointer then draws instead of moving layers)."""
         if on is None:
             on = self.preview.edit_mode != "draw"
+        if on and getattr(self, "_crop_preview_layer_id", ""):
+            self._crop_preview_layer_id = ""
+            if self.engine is not None:
+                self.restart_engine()
         self.preview.set_edit_mode("draw" if on else "move")
+        if not on and hasattr(self, "move_button"):
+            self.move_button.setChecked(True)
+            if hasattr(self, "crop_button"):
+                self.crop_button.setChecked(False)
         self.draw_bar.setVisible(bool(on))
         button = getattr(self, "draw_button", None)
         if button is not None:

@@ -8,10 +8,13 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+import re
 
 from PIL import Image
 
 from . import config
+
+_CODE_RE = re.compile(r"^[0-9a-fA-F_-]+$")
 
 # (codepoint(s), name, category, extra search words)
 CATALOGUE: tuple[tuple[str, str, str, str], ...] = (
@@ -141,7 +144,12 @@ def search(text: str, category: str = "") -> list[tuple[str, str, str, str]]:
 @lru_cache(maxsize=512)
 def load(code: str) -> Image.Image | None:
     """The 128 px RGBA picture for ``code`` (e.g. ``"1f384"``), or None."""
-    path = emoji_dir() / f"{code}.png"
+    if not isinstance(code, str) or not _CODE_RE.fullmatch(code):
+        return None
+    root = emoji_dir().resolve()
+    path = (root / f"{code}.png").resolve()
+    if path.parent != root:
+        return None
     try:
         with Image.open(path) as opened:
             return opened.convert("RGBA")

@@ -1,6 +1,10 @@
 # Build: flatpak-builder --user --install --force-clean build packaging/unsupported/flatpak/io.github.geneticxcln.AnyCam.yml
 # The sandbox cannot load kernel modules, so a v4l2loopback virtual camera must already exist on the host;
 # the PipeWire camera backend works without it.
+#
+# Runtime note: org.kde.Platform ships GStreamer base/good/bad/libav; PyGObject (python3-gi) and any extra
+# GStreamer plugins not in the runtime (such as gst-plugins-ugly / x264enc) must be supplied as modules or
+# Freedesktop/KDE SDK extensions for a standalone Flathub submission.
 app-id: io.github.geneticxcln.AnyCam
 runtime: org.kde.Platform
 runtime-version: '6.8'
@@ -16,24 +20,27 @@ finish-args:
   - --socket=pulseaudio
   - --device=all               # cameras and /dev/video* loopback devices
   - --filesystem=xdg-videos
-  - --talk-name=org.freedesktop.portal.Desktop
   - --filesystem=xdg-run/pipewire-0
 modules:
+  # Local builds fetch Python wheels from PyPI during the python-deps build step.
+  # For offline / Flathub builds, replace this module with pinned wheel sources generated via
+  # `flatpak-pip-generator numpy Pillow psutil cryptography segno` and drop `--share=network`.
   - name: python-deps
     buildsystem: simple
+    build-options:
+      build-args:
+        - --share=network
     build-commands:
-      - pip3 install --no-index --find-links="file://${PWD}" --prefix=${FLATPAK_DEST} numpy Pillow psutil cryptography segno
-    sources:
-      - type: file
-        url: https://files.pythonhosted.org/packages/source/p/psutil/psutil-6.1.0.tar.gz
-        sha256: 353815f59a7f64cdaca1c0307ee13558a0512f6db064e92fe833784f08539c7a
+      - pip3 install --prefix=${FLATPAK_DEST} --no-cache-dir numpy Pillow psutil cryptography segno
   - name: anycam
     buildsystem: simple
     build-commands:
       - pip3 install --no-deps --no-build-isolation --prefix=${FLATPAK_DEST} .
       - install -Dm644 anycam.desktop ${FLATPAK_DEST}/share/applications/io.github.geneticxcln.AnyCam.desktop
+      - sed -i -e 's/^Icon=anycam$/Icon=io.github.geneticxcln.AnyCam/' -e 's/^Exec=anycam gui$/Exec=anycam/' ${FLATPAK_DEST}/share/applications/io.github.geneticxcln.AnyCam.desktop
       - install -Dm644 packaging/metainfo/io.github.geneticxcln.AnyCam.metainfo.xml ${FLATPAK_DEST}/share/metainfo/io.github.geneticxcln.AnyCam.metainfo.xml
-      - install -Dm644 src/anycam/assets/anycam-logo.png ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/io.github.geneticxcln.AnyCam.png
+      - sed -i 's|<launchable type="desktop-id">anycam.desktop</launchable>|<launchable type="desktop-id">io.github.geneticxcln.AnyCam.desktop</launchable>|' ${FLATPAK_DEST}/share/metainfo/io.github.geneticxcln.AnyCam.metainfo.xml
+      - install -Dm644 src/anycam/assets/anycam-logo.png ${FLATPAK_DEST}/share/icons/hicolor/512x512/apps/io.github.geneticxcln.AnyCam.png
     sources:
       - type: dir
         path: ../../..

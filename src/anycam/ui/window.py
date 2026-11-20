@@ -52,9 +52,11 @@ class AnyCamWindow(CtlMixin, GeneralPanelMixin, EffectsPanelMixin, DrawMixin, Ba
     """The standalone studio window."""
 
     frame_ready = Signal()
+    log_event_received = Signal(str)
 
     def __init__(self, project: Project | None = None):
         super().__init__()
+        self.log_event_received.connect(self._append_log_line)
         self._load_warning = ""
         # Windows created with an explicit project are demo/screenshot/test
         # sessions and must not overwrite the user's saved project.
@@ -414,6 +416,9 @@ class AnyCamWindow(CtlMixin, GeneralPanelMixin, EffectsPanelMixin, DrawMixin, Ba
 
     _CAPTURE_KINDS = ("camera", "screen", "video", "network", "phone", "test")
 
+    def _append_log_line(self, _line: str) -> None:
+        """GUI-thread sink for log_event(); overridden by windows with a log view."""
+
     def edit_overlay(self, layer_id: str, values: tuple[str, str, str] | None = None) -> bool:
         """Edit a ticker or lower third; ``values`` skips the dialog (tests, scripts)."""
         layer = self.scene.layer(layer_id)
@@ -421,9 +426,14 @@ class AnyCamWindow(CtlMixin, GeneralPanelMixin, EffectsPanelMixin, DrawMixin, Ba
             return False
         if values is None:
             dialog = OverlayDialog(layer, self)
-            if dialog.exec() != QDialog.DialogCode.Accepted:
-                return False
-            values = dialog.values()
+            try:
+                if dialog.exec() != QDialog.DialogCode.Accepted:
+                    return False
+                values = dialog.values()
+            finally:
+                delete = getattr(dialog, "deleteLater", None)
+                if callable(delete):
+                    delete()
         source, colour, background = values
         if not source.strip("| "):
             self._status("Text cannot be empty")

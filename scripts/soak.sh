@@ -9,7 +9,7 @@ DURATION="${DURATION:-600}"
 WARMUP="${WARMUP:-120}"
 OUT="${OUT:-evidence/soak}"
 mkdir -p "$OUT"
-PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
 PY=python3
 [ -x .venv/bin/python ] && PY="$ROOT/.venv/bin/python"
 VCAM_ARGS=()

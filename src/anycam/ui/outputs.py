@@ -39,6 +39,10 @@ class OutputsMixin:
         self.live_button.setText("Stop stream" if self.live else "Go Live")
         if self.engine is not None:
             self.restart_engine()
+            if self.live and self.engine is None:
+                self.live = False
+                self.live_button.setText("Go Live")
+                return
             if self.live:
                 self._status(f"Publishing to {config.redact_url(url)}")
             else:
@@ -99,6 +103,10 @@ class OutputsMixin:
         self._recorder = None
         report = self._run_with_ui(recorder.stop)
         self._recording_path = ""
+        if not isinstance(report, dict):
+            self.log_event("recording: finalisation timed out")
+            self._status("Recording finalisation timed out")
+            return
         path = str(report.get("path") or "")
         if report.get("ok") and path:
             if path not in self.recording_segments:
@@ -351,24 +359,8 @@ class OutputsMixin:
         return True
 
     def enable_held_vcam(self) -> bool:
-        """Feed the canvas through the loopback node held at launch.
-
-        The idle card says "Start the preview", but a held node whose feed is
-        never switched stays on that near-black card forever, which a consumer
-        cannot tell apart from a dead camera.  Once AnyCam owns the device, the
-        canvas is the virtual camera's picture; turning the button off still
-        returns it to the card.
-        """
-        output = self._vcam_output
-        if output is None or not output.active:
-            return False
-        self.vcam_on = True
-        button = getattr(self, "vcam_button", None)
-        if button is not None:
-            button.setText("Virtual camera: on")
-        if self.engine is not None:
-            self.engine.attach_vcam(output)
-        return True
+        """Alias for :meth:`feed_held_vcam` kept for callers and tests."""
+        return self.feed_held_vcam()
 
     def note_vcam_consumers(self) -> None:
         """Warn about apps that opened the node before AnyCam fed it.

@@ -122,7 +122,6 @@ def test_screen_capture_uploads_pipewire_dmabuf_frames():
     ([1, 1, 1, 1], 1),
 ])
 def test_screen_health_uses_sequence_then_timestamp(monkeypatch, sequences, expected_frames):
-    from anycam import pipeline as pipeline_module
     from anycam.sources import SourceChain, make, caps_filter
 
     src = make("appsrc", is_live=True, format=Gst.Format.TIME)
@@ -157,7 +156,6 @@ def test_screen_health_uses_sequence_then_timestamp(monkeypatch, sequences, expe
 @pytest.mark.parametrize("has_sequence", [False, True])
 def test_two_screens_with_repeated_pts_keep_changing_pixels(monkeypatch, has_sequence):
     """Fresh source counters must not hide a frozen compositor picture."""
-    from anycam import pipeline as pipeline_module
     from anycam.sources import SourceChain, make, caps_filter
     from helpers.frames import Frame
 
@@ -381,7 +379,6 @@ def test_engine_composites_and_records(tmp_path):
 def test_encoder_auto_prefers_nvenc_and_cuda_input(monkeypatch):
     if Gst.ElementFactory.find("nvh264enc") is None:
         pytest.skip("nvh264enc unavailable")
-    from anycam import pipeline as pipeline_module
 
     monkeypatch.setattr("anycam.engine.encoders.nvenc_available",
                         lambda *_args, **_kwargs: True)
@@ -396,8 +393,6 @@ def test_encoder_auto_prefers_nvenc_and_cuda_input(monkeypatch):
 
 
 def test_cpu_encoder_keeps_i420_conversion(monkeypatch):
-    from anycam import pipeline as pipeline_module
-
     monkeypatch.setattr("anycam.engine.encoders.nvenc_available",
                         lambda *_args, **_kwargs: True)
     project = make_project(320, 180, 30)
@@ -417,7 +412,6 @@ def test_hardware_recording_uses_cuda_upload(monkeypatch, tmp_path):
         pytest.skip("nvh264enc unavailable")
     if Gst.ElementFactory.find("cudaupload") is None:
         pytest.skip("cudaupload unavailable")
-    from anycam import pipeline as pipeline_module
 
     monkeypatch.setattr("anycam.engine.encoders.nvenc_available",
                         lambda *_args, **_kwargs: True)

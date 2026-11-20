@@ -113,6 +113,13 @@ class CameraMixin:
         self._status(f"Camera capture: {mode} @ {fps or 'auto'} fps")
 
     def _apply_camera_mode(self) -> None:
+        if getattr(self, "_closing", False):
+            return
+        if getattr(self, "_ui_blocked", 0):
+            timer = getattr(self, "_camera_mode_timer", None)
+            if timer is not None:
+                timer.start()
+            return
         if self.engine is not None:
             self.restart_engine()
 
@@ -182,7 +189,12 @@ class CameraMixin:
 
         dialog = CameraControlsDialog(layer, found, apply, self)
         if show:
-            dialog.exec()
+            try:
+                dialog.exec()
+            finally:
+                delete = getattr(dialog, "deleteLater", None)
+                if callable(delete):
+                    delete()
         return dialog
 
     def _apply_saved_camera_controls(self, layer_ids=None) -> None:
@@ -276,6 +288,8 @@ class CameraMixin:
 
     def _reconnect_cameras(self) -> None:
         """Rebuild the preview when a lost camera device reappears."""
+        if getattr(self, "_ui_blocked", 0) or getattr(self, "_closing", False):
+            return
         if not self._lost_cameras:
             self._camera_watch.stop()
             return

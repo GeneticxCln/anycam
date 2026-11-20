@@ -8,13 +8,14 @@ elements hand buffers over through a shared queue, so a slow consumer can drop
 or duplicate frames and the canvas can drift away from the source clock.
 
 This script builds the real shape (producer pipelines -> inter -> canvas
-compositor -> H.264/AAC MP4) from synthetic sources only, so it never opens a
-camera or a microphone, and reports:
+compositor -> video-only H.264 MP4) from synthetic sources only, so it never
+opens a camera or a microphone, and reports:
 
 * live drift at the canvas: the video/audio timestamp offset at the start of the
   window against the offset at the end (the gate is under one frame),
-* duplicated, missing and out-of-order video timestamps,
-* the same drift re-measured from the recorded file's packet timestamps.
+* duplicated, missing and out-of-order video and audio timestamps,
+* video packet counts and first/last timestamps in the recorded video-only MP4
+  (A/V drift is gated on the live canvas timestamp taps rather than muxed AAC).
 
 Usage:
     python3 scripts/verify-av-drift.py --seconds 600 --json /tmp/drift.json
@@ -138,7 +139,7 @@ class Canvas:
         if not mux.link(sink):
             raise RuntimeError("could not link mp4mux into filesink")
 
-        # Audio: inter -> tap + AAC into the same mux.
+        # Audio: inter -> timestamp tap (not muxed into the video-only MP4).
         self.asrc = make("interaudiosrc", "from_source_audio", channel=audio_channel)
         aconv = make("audioconvert")
         ares = make("audioresample")

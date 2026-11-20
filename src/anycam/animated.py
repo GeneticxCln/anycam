@@ -158,7 +158,8 @@ class LowerThird:
 
     def restart(self) -> None:
         """Slide in again (called when the layer is shown)."""
-        self._start = None
+        with self._lock:
+            self._start = None
 
     def reconfigure(self, name: str, title: str, color: str, background: str,
                     accent: str | None = None) -> None:
@@ -257,12 +258,12 @@ def parse_timer(source: str) -> tuple[str, float]:
             seconds = float(text)
     except ValueError:
         seconds = 0.0
-    return "countdown", max(0.0, seconds if seconds == seconds else 0.0)
+    return "countdown", max(0.0, seconds if math.isfinite(seconds) else 0.0)
 
 
 def format_timer(seconds: float) -> str:
     """``MM:SS``, or ``H:MM:SS`` from an hour on."""
-    whole = max(0, int(seconds))
+    whole = max(0, int(seconds)) if math.isfinite(seconds) else 0
     hours, rest = divmod(whole, 3600)
     minutes, secs = divmod(rest, 60)
     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
@@ -325,8 +326,9 @@ class GifPlayer:
     label = "Animated image"
 
     def __init__(self, path: str) -> None:
-        self.frames: list[Image.Image] = []
+        arrays: list[np.ndarray] = []
         durations: list[float] = []
+        first_size: tuple[int, int] | None = None
         with Image.open(path) as image:
             for index, frame in enumerate(ImageSequence.Iterator(image)):
                 if index >= MAX_GIF_FRAMES:
@@ -337,14 +339,18 @@ class GifPlayer:
                     picture = picture.resize(
                         (max(1, int(picture.width * scale)), max(1, int(picture.height * scale))),
                         Image.LANCZOS)
-                self.frames.append(picture)
+                if first_size is None:
+                    first_size = picture.size
+                elif picture.size != first_size:
+                    picture = picture.resize(first_size, Image.LANCZOS)
+                arrays.append(np.asarray(picture, dtype=np.uint8))
                 durations.append(max(0.02, float(frame.info.get("duration", 100)) / 1000.0))
-        if not self.frames:
+        if not arrays or first_size is None:
             raise ValueError(f"no frames in {path}")
-        self.size = self.frames[0].size
+        self.size = first_size
         self._ends = list(np.cumsum(durations))
         self._total = float(self._ends[-1])
-        self._arrays = [np.asarray(f, dtype=np.uint8) for f in self.frames]
+        self._arrays = arrays
 
     def frame(self, t: float) -> np.ndarray:
         if len(self._arrays) == 1:
@@ -423,25 +429,41 @@ class DrawingCanvas:
     def _render(self, strokes: list[dict]) -> np.ndarray:
         k = self.SUPERSAMPLE
         canvas = Image.new("RGBA", (self.width * k, self.height * k), (0, 0, 0, 0))
+        canvas_draw = ImageDraw.Draw(canvas)
+        temp_layer: Image.Image | None = None
+        temp_draw: ImageDraw.ImageDraw | None = None
         for stroke in strokes:
             colour = overlay.parse_color(stroke["color"])
             width = max(2, int(stroke["width"] * self.width * k))
             points = [(x * self.width * k, y * self.height * k) for x, y in stroke["points"]]
-            layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-            draw = ImageDraw.Draw(layer)
             tool = stroke["tool"]
+            stroke_alpha = colour[3] * 110 // 255 if tool == "marker" else colour[3]
+            if stroke_alpha <= 0:
+                continue
+            opaque_ink = (*colour[:3], 255)
+            if stroke_alpha == 255:
+                target_draw = canvas_draw
+            else:
+                if temp_layer is None:
+                    temp_layer = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+                    temp_draw = ImageDraw.Draw(temp_layer)
+                else:
+                    temp_layer.paste((0, 0, 0, 0), (0, 0, temp_layer.width, temp_layer.height))
+                target_draw = temp_draw
             if tool == "marker":
-                self._line(draw, points, (*colour[:3], 255), width * 4)
-                layer.putalpha(layer.getchannel("A").point(lambda v: v * 110 // 255))
+                self._line(target_draw, points, opaque_ink, width * 4)
             elif tool == "arrow" and len(points) >= 2:
-                self._arrow(draw, points[0], points[-1], (*colour[:3], 255), width)
+                self._arrow(target_draw, points[0], points[-1], opaque_ink, width)
             elif tool == "box" and len(points) >= 2:
                 (x0, y0), (x1, y1) = points[0], points[-1]
-                draw.rectangle([min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)],
-                               outline=(*colour[:3], 255), width=width)
+                target_draw.rectangle([min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)],
+                                      outline=opaque_ink, width=width)
             else:
-                self._line(draw, points, (*colour[:3], 255), width)
-            canvas = Image.alpha_composite(canvas, layer)
+                self._line(target_draw, points, opaque_ink, width)
+            if stroke_alpha < 255 and temp_layer is not None:
+                lut = [v * stroke_alpha // 255 for v in range(256)]
+                temp_layer.putalpha(temp_layer.getchannel("A").point(lut))
+                canvas.alpha_composite(temp_layer)
         out = canvas.resize((self.width, self.height), Image.LANCZOS)
         return np.asarray(out, dtype=np.uint8)
 

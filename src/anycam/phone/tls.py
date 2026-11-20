@@ -30,11 +30,11 @@ def ensure_certificate(directory: Path, host: str = "") -> tuple[Path, Path]:
     cert, key = directory / "phone-cert.pem", directory / "phone-key.pem"
     marker = directory / "phone-cert.host"
     if cert.is_file() and key.is_file():
-        if _covers(cert, marker, host):
+        if _covers(cert, marker, host, key=key):
             return cert, key
         for stale in (cert, key, marker):
             stale.unlink(missing_ok=True)
-    directory.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     made = _create_with_cryptography(cert, key, host)
     if not made:
         _create_with_openssl(cert, key, host)
@@ -45,21 +45,58 @@ def ensure_certificate(directory: Path, host: str = "") -> tuple[Path, Path]:
     return cert, key
 
 
-def _covers(cert: Path, marker: Path, host: str) -> bool:
-    """Whether ``cert`` was made for ``host`` (True when that cannot be told)."""
-    if not host:
-        return True
+def _covers(cert: Path, marker: Path, host: str,
+            key: Path | None = None) -> bool:
+    """Whether ``cert`` is valid, matches its key, is unexpired, and covers ``host``."""
+    key_path = key if key is not None else cert.with_name("phone-key.pem")
     try:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key_path)
+    except (OSError, ssl.SSLError):
+        return False
+
+    try:
+        import datetime
+
         from cryptography import x509
 
-        san = x509.load_pem_x509_certificate(cert.read_bytes()).extensions \
-            .get_extension_for_class(x509.SubjectAlternativeName).value
-        names = {str(item.value) for item in san}
-        return host in names
+        parsed = x509.load_pem_x509_certificate(cert.read_bytes())
+        now = datetime.datetime.now(datetime.timezone.utc)
+        not_after = getattr(parsed, "not_valid_after_utc", None)
+        if not_after is None:
+            not_after = parsed.not_valid_after.replace(tzinfo=datetime.timezone.utc)
+        not_before = getattr(parsed, "not_valid_before_utc", None)
+        if not_before is None:
+            not_before = parsed.not_valid_before.replace(tzinfo=datetime.timezone.utc)
+        if not_after <= now or not_before > now + datetime.timedelta(minutes=5):
+            return False
+        if not host:
+            return True
+        try:
+            san = parsed.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName).value
+            names = {str(item.value) for item in san}
+            return host in names
+        except x509.ExtensionNotFound:
+            pass
     except ImportError:
-        pass
-    except Exception:  # noqa: BLE001 - no SAN at all (openssl fallback) etc.
-        pass
+        openssl = shutil.which("openssl")
+        if openssl is not None:
+            try:
+                check = subprocess.run(
+                    [openssl, "x509", "-in", str(cert), "-checkend", "0", "-noout"],
+                    capture_output=True, timeout=10, check=False)
+                if check.returncode != 0:
+                    return False
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if not host:
+            return True
+    except Exception:  # noqa: BLE001 - corrupt PEM / unreadable certificate
+        return False
+
+    if not host:
+        return True
     try:
         return marker.read_text(encoding="utf-8").strip() == host
     except OSError:
@@ -71,29 +108,50 @@ def _create_with_openssl(cert: Path, key: Path, host: str) -> None:
     if openssl is None:
         raise RuntimeError("the phone link certificate needs the 'cryptography' "
                            "Python package or the openssl command")
-    base = [openssl, "req", "-x509", "-newkey", "ec",
-            "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
-            "-days", "3650", "-subj", "/CN=AnyCam phone link",
-            "-keyout", str(key), "-out", str(cert)]
-    # Browsers ignore the common name; the address must be a subjectAltName.
-    names = ["DNS:localhost"]
-    if host:
+    cert_tmp = cert.with_name(cert.name + ".tmp")
+    key_tmp = key.with_name(key.name + ".tmp")
+    # Pre-create the temporary private key file owner-only and run openssl
+    # with umask 0077 so the private key is never world-readable.
+    try:
+        fd = os.open(key_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            ipaddress.ip_address(host)
-            names.append(f"IP:{host}")
-        except ValueError:
-            names.append(f"DNS:{host}")
-    result = subprocess.run(base + ["-addext", "subjectAltName=" + ",".join(names)],
-                            capture_output=True, text=True, timeout=30, check=False)
-    if result.returncode != 0:
-        # OpenSSL older than 1.1.1 has no -addext: the page still works once
-        # the phone accepts the warning, as before.
-        result = subprocess.run(base, capture_output=True, text=True,
-                                timeout=30, check=False)
-    if result.returncode != 0 or not cert.is_file():
-        raise RuntimeError("could not create the phone link certificate: "
-                           + (result.stderr.strip() or "openssl failed"))
-    key.chmod(0o600)
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+        base = [openssl, "req", "-x509", "-newkey", "ec",
+                "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes",
+                "-days", "3650", "-subj", "/CN=AnyCam phone link",
+                "-keyout", str(key_tmp), "-out", str(cert_tmp)]
+        # Browsers ignore the common name; the address must be a subjectAltName.
+        names = ["DNS:localhost"]
+        if host:
+            try:
+                ipaddress.ip_address(host)
+                names.append(f"IP:{host}")
+            except ValueError:
+                names.append(f"DNS:{host}")
+        result = subprocess.run(
+            base + ["-addext", "subjectAltName=" + ",".join(names)],
+            capture_output=True, text=True, timeout=30, check=False, umask=0o077)
+        if result.returncode != 0:
+            # OpenSSL older than 1.1.1 has no -addext: the page still works once
+            # the phone accepts the warning, as before.
+            result = subprocess.run(
+                base, capture_output=True, text=True,
+                timeout=30, check=False, umask=0o077)
+        if result.returncode != 0 or not cert_tmp.is_file() or not key_tmp.is_file():
+            raise RuntimeError("could not create the phone link certificate: "
+                               + (result.stderr.strip() or "openssl failed"))
+        os.chmod(key_tmp, 0o600)
+        os.replace(key_tmp, key)
+        os.replace(cert_tmp, cert)
+    except BaseException:
+        for stale in (key_tmp, cert_tmp):
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
 
 
 def _create_with_cryptography(cert: Path, key: Path, host: str = "") -> bool:
@@ -130,11 +188,41 @@ def _create_with_cryptography(cert: Path, key: Path, host: str = "") -> bool:
     pem_key = private.private_bytes(serialization.Encoding.PEM,
                                     serialization.PrivateFormat.PKCS8,
                                     serialization.NoEncryption())
-    # The key is written owner-only from the start, never world-readable.
-    fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(pem_key)
-    cert.write_bytes(certificate.public_bytes(serialization.Encoding.PEM))
+    pem_cert = certificate.public_bytes(serialization.Encoding.PEM)
+    key_tmp = key.with_name(key.name + ".tmp")
+    cert_tmp = cert.with_name(cert.name + ".tmp")
+    # The key is written owner-only from the start and moved into place atomically.
+    try:
+        fd = os.open(key_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(pem_key)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        fd = os.open(cert_tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(pem_cert)
+                handle.flush()
+                os.fsync(handle.fileno())
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        os.replace(key_tmp, key)
+        os.replace(cert_tmp, cert)
+    except BaseException:
+        for stale in (key_tmp, cert_tmp):
+            try:
+                stale.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
     return True
 
 
@@ -172,7 +260,8 @@ def qr_png(text: str, scale: int = 8) -> bytes | None:
     if exe is None:
         return None
     result = subprocess.run([exe, "-t", "PNG", "-l", "M", "-s", str(scale),
-                             "-m", "4", "-o", "-", text],
+                             "-m", "4", "-o", "-"],
+                            input=text.encode("utf-8"),
                             capture_output=True, timeout=10, check=False)
     if result.returncode != 0 or not result.stdout.startswith(b"\x89PNG"):
         return None

@@ -11,6 +11,7 @@ timeline, so ``mp4mux`` still sees one monotonic stream.
 """
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 
@@ -78,6 +79,10 @@ class Recorder:
         self._skipping = False
         # Timeline of the canvas that is feeding us now (see begin_epoch).
         self._epoch_base: int | None = None
+        # Guards all shared mutable state across video/audio appsink threads
+        # and caller stop()/begin_epoch().
+        self._lock = threading.Lock()
+        self._push_count = 0
 
     @property
     def active(self) -> bool:
@@ -178,6 +183,27 @@ class Recorder:
             return False
         return True
 
+    def poll_bus(self) -> None:
+        """Drain recorder bus errors/warnings without blocking.
+
+        Surfaces ENOSPC and other filesink I/O failures promptly instead of
+        waiting for stop(), and keeps warnings from piling up on the bus.
+        """
+        bus = self._bus
+        if bus is None:
+            return
+        while True:
+            msg = bus.pop_filtered(
+                Gst.MessageType.ERROR | Gst.MessageType.WARNING)
+            if msg is None:
+                break
+            if msg.type == Gst.MessageType.ERROR:
+                err, debug = msg.parse_error()
+                text = f"{err.message} ({debug})"
+                with self._lock:
+                    if not self.error:
+                        self.error = text
+
     # ------------------------------------------------------------------- push
     def begin_epoch(self) -> None:
         """A new canvas is about to feed this file (its timestamps restart).
@@ -188,15 +214,16 @@ class Recorder:
         back played early for the rest of the file.  Both streams now share
         one offset, taken from the end of whichever stream ran longest.
         """
-        ends = [self._last_out[stream] + step
-                for stream, step in (("video", self._video_step),
-                                     ("audio", self._audio_step))
-                if self._last_out[stream] is not None]
-        # The first canvas starts the file at 0 as well.  Attaching to a canvas
-        # that had been running for seconds kept its running time, so the two
-        # streams entered the muxer at different points: it waited on video,
-        # the leaky audio input dropped frames, and the file lost ~2 s of sound.
-        self._epoch_base = max(ends) if ends else 0
+        with self._lock:
+            ends = [self._last_out[stream] + step
+                    for stream, step in (("video", self._video_step),
+                                         ("audio", self._audio_step))
+                    if self._last_out[stream] is not None]
+            # The first canvas starts the file at 0 as well.  Attaching to a canvas
+            # that had been running for seconds kept its running time, so the two
+            # streams entered the muxer at different points: it waited on video,
+            # the leaky audio input dropped frames, and the file lost ~2 s of sound.
+            self._epoch_base = max(ends) if ends else 0
 
     def push_video(self, sample) -> None:
         self._push("video", sample, self._video_step)
@@ -206,101 +233,122 @@ class Recorder:
             self._push("audio", sample, self._audio_step)
 
     def _push(self, stream: str, sample, default_step: int) -> None:
-        if self._pipeline is None or self.error or self._closing:
-            return
-        source = self._video_src if stream == "video" else self._audio_src
-        if source is None:
-            return
+        self._push_count += 1
+        if self._push_count % 16 == 1:
+            self.poll_bus()
         buf = sample.get_buffer()
         if buf is None or buf.pts == Gst.CLOCK_TIME_NONE:
             return
-        if stream == "video" and not self._accept_size(sample):
+        caps = sample.get_caps()
+        request_kf = None
+        with self._lock:
+            if self._pipeline is None or self.error or self._closing:
+                return
+            source = self._video_src if stream == "video" else self._audio_src
+            if source is None:
+                return
+            if stream == "video" and not self._accept_size(sample):
+                return
+            if stream == "video":
+                admitted, need_kf = self._admit_video(source, buf)
+                if not admitted:
+                    if need_kf:
+                        request_kf = self.request_keyframe
+                    # Call request_keyframe outside the lock below.
+                    source = None
+            if source is not None:
+                if caps is None:
+                    self.error = f"{stream} sample has no caps"
+                    return
+                bias = int(buf.pts) // ENCODER_PTS_BIAS * ENCODER_PTS_BIAS
+                pts = int(buf.pts) - bias
+                if self._epoch_base is not None:
+                    # First sample of a new canvas: one offset for both streams.
+                    shared = self._epoch_base - pts
+                    self._offset = {"video": shared, "audio": shared}
+                    self._last_in = {"video": None, "audio": None}
+                    self._epoch_base = None
+                dts = (int(buf.dts) - bias
+                       if buf.dts != Gst.CLOCK_TIME_NONE and int(buf.dts) >= bias
+                       else None)
+                duration = (int(buf.duration) if buf.duration not in (0, Gst.CLOCK_TIME_NONE)
+                            else default_step)
+                last_in = self._last_in[stream]
+                if last_in is not None and pts < last_in:
+                    # A rebuilt canvas restarts its encoder at PTS 0.  Continue from the
+                    # last written sample instead of letting mp4mux reject the stream.
+                    base = (self._last_out[stream] or 0) + duration
+                    self._offset[stream] = base - pts
+                out_pts = pts + self._offset[stream]
+                if out_pts < 0:
+                    # This stream's first frame is a little older than the one that
+                    # set the shared offset; never hand the muxer a negative time.
+                    self._offset[stream] -= out_pts
+                    out_pts = 0
+                last_out = self._last_out[stream]
+                if last_out is not None and out_pts <= last_out:
+                    self._offset[stream] += last_out + duration - out_pts
+                    out_pts = pts + self._offset[stream]
+                new = buf.copy()
+                new.pts = out_pts
+                if dts is not None:
+                    new.dts = max(0, dts + self._offset[stream])
+                else:
+                    new.dts = Gst.CLOCK_TIME_NONE
+                new.duration = duration
+                self._last_in[stream] = pts
+                self._last_out[stream] = out_pts
+        if request_kf is not None:
+            try:
+                request_kf()
+            except Exception:  # noqa: BLE001 - best effort
+                pass
             return
-        if stream == "video" and not self._admit_video(source, buf):
+        if source is None:
             return
-        bias = int(buf.pts) // ENCODER_PTS_BIAS * ENCODER_PTS_BIAS
-        pts = int(buf.pts) - bias
-        if self._epoch_base is not None:
-            # First sample of a new canvas: one offset for both streams.
-            shared = self._epoch_base - pts
-            self._offset = {"video": shared, "audio": shared}
-            self._last_in = {"video": None, "audio": None}
-            self._epoch_base = None
-        dts = (int(buf.dts) - bias
-               if buf.dts != Gst.CLOCK_TIME_NONE and int(buf.dts) >= bias
-               else None)
-        duration = (int(buf.duration) if buf.duration not in (0, Gst.CLOCK_TIME_NONE)
-                    else default_step)
-        last_in = self._last_in[stream]
-        if last_in is not None and pts < last_in:
-            # A rebuilt canvas restarts its encoder at PTS 0.  Continue from the
-            # last written sample instead of letting mp4mux reject the stream.
-            base = (self._last_out[stream] or 0) + duration
-            self._offset[stream] = base - pts
-        out_pts = pts + self._offset[stream]
-        if out_pts < 0:
-            # This stream's first frame is a little older than the one that
-            # set the shared offset; never hand the muxer a negative time.
-            self._offset[stream] -= out_pts
-            out_pts = 0
-        last_out = self._last_out[stream]
-        if last_out is not None and out_pts <= last_out:
-            self._offset[stream] += last_out + duration - out_pts
-            out_pts = pts + self._offset[stream]
-        new = buf.copy_deep()
-        new.pts = out_pts
-        if dts is not None:
-            new.dts = dts + self._offset[stream]
-        new.duration = duration
-        self._last_in[stream] = pts
-        self._last_out[stream] = out_pts
         try:
             # Push the sample, including the encoder's exact caps.  A hardcoded
             # appsrc caps string missed fields (parsed/profile) and made
             # h264parse reject the stream with not-negotiated.
-            caps = sample.get_caps()
-            if caps is None:
-                self.error = f"{stream} sample has no caps"
-                return
             # A plain time segment: the encoder's own one describes the biased
             # timeline this buffer no longer has.
             segment = Gst.Segment()
             segment.init(Gst.Format.TIME)
             new_sample = Gst.Sample.new(new, caps, segment, None)
             result = source.emit("push-sample", new_sample)
-            if self._closing and result == Gst.FlowReturn.EOS:
-                return      # lost the race with stop(): the file is complete
-            if result not in (Gst.FlowReturn.OK, Gst.FlowReturn.FLUSHING, None):
-                self.error = f"{stream} push failed: {result}"
+            with self._lock:
+                if self._closing and result == Gst.FlowReturn.EOS:
+                    return      # lost the race with stop(): the file is complete
+                if result not in (Gst.FlowReturn.OK, Gst.FlowReturn.FLUSHING, None):
+                    if not self.error:
+                        self.error = f"{stream} push failed: {result}"
         except Exception as exc:  # noqa: BLE001
-            self.error = f"{stream} push failed: {exc}"
+            with self._lock:
+                if not self.error:
+                    self.error = f"{stream} push failed: {exc}"
 
-    def _admit_video(self, source, buf) -> bool:
+    def _admit_video(self, source, buf) -> tuple[bool, bool]:
         """Never let the appsrc leak an encoded frame by itself.
 
         Leaking a delta frame leaves later ones referring to a picture that is
         not in the file.  When the queue is full, drop on a keyframe boundary
-        instead and ask the encoder for a fresh keyframe.
+        instead and ask the encoder for a fresh keyframe.  Returns
+        ``(admitted, request_keyframe)``.
         """
         is_key = not buf.has_flags(Gst.BufferFlags.DELTA_UNIT)
         if self._skipping:
             if not is_key:
-                return False
+                return False, False
             self._skipping = False
         try:
             level = int(source.get_property("current-level-buffers"))
             limit = int(source.get_property("max-buffers"))
         except (AttributeError, TypeError, ValueError):
-            return True     # a source without a readable queue level
+            return True, False     # a source without a readable queue level
         if limit and level >= limit:
             self._skipping = True
-            if self.request_keyframe is not None:
-                try:
-                    self.request_keyframe()
-                except Exception:  # noqa: BLE001 - best effort
-                    pass
-            return False
-        return True
+            return False, True
+        return True, False
 
     def _accept_size(self, sample) -> bool:
         """Whether this frame has the size the file was started with."""
@@ -320,12 +368,15 @@ class Recorder:
 
     # ------------------------------------------------------------------- stop
     def stop(self) -> dict:
-        pipeline = self._pipeline
-        if pipeline is None:
-            return {"path": self.path, "bytes": 0, "ok": False,
-                    "error": self.error or "recorder is not running"}
-        self._closing = True
-        for source in (self._video_src, self._audio_src):
+        with self._lock:
+            pipeline = self._pipeline
+            if pipeline is None:
+                return {"path": self.path, "bytes": 0, "ok": False,
+                        "error": self.error or "recorder is not running"}
+            self._closing = True
+            sources = (self._video_src, self._audio_src)
+            bus = self._bus
+        for source in sources:
             if source is None:
                 continue
             try:
@@ -334,15 +385,16 @@ class Recorder:
                 pass
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline and not self._eos:
-            if self._bus is None:
+            if bus is None:
                 break
-            msg = self._bus.timed_pop_filtered(
+            msg = bus.timed_pop_filtered(
                 100 * Gst.MSECOND, Gst.MessageType.EOS | Gst.MessageType.ERROR)
             if msg is None:
                 continue
             if msg.type == Gst.MessageType.ERROR:
                 err, debug = msg.parse_error()
-                self.error = f"{err.message} ({debug})"
+                with self._lock:
+                    self.error = f"{err.message} ({debug})"
                 break   # an errored pipeline never reaches EOS
             if msg.type == Gst.MessageType.EOS:
                 self._eos = True
@@ -350,18 +402,19 @@ class Recorder:
         pipeline.set_state(Gst.State.NULL)
         file = Path(self.path)
         size = file.stat().st_size if file.exists() else 0
-        ok = bool(size > 0 and not self.error
-                  and self._last_in.get("video") is not None)
-        # The file is fragmented MP4, playable up to its last fragment even
-        # when the muxer never saw end-of-stream (a stuck audio pad), so that
-        # is still a usable recording; but say it was not closed cleanly.
-        result = {"path": self.path, "bytes": size, "ok": ok,
-                  "finalised": bool(finalised),
-                  "warning": ("" if finalised or not ok else
-                              "the file was not closed cleanly; the last "
-                              "moments may be missing"),
-                  "error": self.error, "rejected_frames": self.rejected_frames}
-        self._clear_runtime()
+        with self._lock:
+            ok = bool(size > 0 and not self.error
+                      and self._last_in.get("video") is not None)
+            # The file is fragmented MP4, playable up to its last fragment even
+            # when the muxer never saw end-of-stream (a stuck audio pad), so that
+            # is still a usable recording; but say it was not closed cleanly.
+            result = {"path": self.path, "bytes": size, "ok": ok,
+                      "finalised": bool(finalised),
+                      "warning": ("" if finalised or not ok else
+                                  "the file was not closed cleanly; the last "
+                                  "moments may be missing"),
+                      "error": self.error, "rejected_frames": self.rejected_frames}
+            self._clear_runtime()
         return result
 
     def _clear_runtime(self) -> None:

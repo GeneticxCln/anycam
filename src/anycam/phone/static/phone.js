@@ -17,6 +17,7 @@ let stream = null;
 let pc = null;
 let session = null;
 let wanted = false;
+let gen = 0;
 let retries = 0;
 let retryTimer = null;
 let dropTimer = null;
@@ -87,14 +88,15 @@ function unpaired() {
 function stopCamera() {
   if (stream) stream.getTracks().forEach((track) => track.stop());
   stream = null;
+  ui.video.srcObject = null;
 }
 
-async function openCamera() {
+async function openCamera(myGen) {
   stopCamera();
   const height = Number(ui.quality.value);
   const width = height === 1080 ? 1920 : 1280;
   setStatus("Opening the camera…");
-  stream = await navigator.mediaDevices.getUserMedia({
+  const opened = await navigator.mediaDevices.getUserMedia({
     audio: false,
     video: {
       facingMode: { ideal: facing },
@@ -102,6 +104,11 @@ async function openCamera() {
       frameRate: { ideal: 30, max: 30 },
     },
   });
+  if (myGen !== gen || !wanted) {
+    opened.getTracks().forEach((track) => track.stop());
+    return false;
+  }
+  stream = opened;
   ui.video.srcObject = stream;
   const track = stream.getVideoTracks()[0];
   track.contentHint = "motion";
@@ -109,6 +116,7 @@ async function openCamera() {
   track.addEventListener("ended", () => {
     if (wanted && stream === owner) retryLater("The camera stopped");
   });
+  return true;
 }
 
 function cameraLive() {
@@ -116,6 +124,12 @@ function cameraLive() {
 }
 
 // ----------------------------------------------------------------- network
+function deleteSession(location) {
+  if (location && creds) {
+    fetch(location, { method: "DELETE", headers: auth(), keepalive: true }).catch(() => {});
+  }
+}
+
 function closePeer() {
   clearTimeout(dropTimer);
   if (pc) pc.close();
@@ -159,8 +173,9 @@ async function limitBitrate(sender) {
   } catch { /* older WebView: browser default bitrate */ }
 }
 
-async function connect() {
+async function connect(myGen) {
   closePeer();
+  if (myGen !== gen || !wanted || !cameraLive()) return;
   setStatus("Connecting to AnyCam…");
   const peer = new RTCPeerConnection({ iceServers: [] });
   pc = peer;
@@ -170,21 +185,30 @@ async function connect() {
   peer.addEventListener("connectionstatechange", () => onPeerState(peer));
   await peer.setLocalDescription(await peer.createOffer());
   await iceGathered(peer);
-  if (peer !== pc) return;
+  if (peer !== pc || myGen !== gen || !wanted) return;
   const response = await fetch("/api/whip", {
     method: "POST",
     headers: { ...auth(), "Content-Type": "application/sdp" },
     body: peer.localDescription.sdp,
   });
+  const loc = response.headers.get("Location");
+  if (peer !== pc || myGen !== gen || !wanted) {
+    if (response.ok && loc) deleteSession(loc);
+    return;
+  }
   if (response.status === 401) { unpaired(); return; }
   if (!response.ok) {
     const data = await response.json().catch(() => ({}));
     throw new Error(data.error || "AnyCam refused the stream (" + response.status + ")");
   }
   const answer = await response.text();
-  if (peer !== pc) return;
-  session = response.headers.get("Location");
+  if (peer !== pc || myGen !== gen || !wanted) {
+    if (loc) deleteSession(loc);
+    return;
+  }
+  session = loc;
   await peer.setRemoteDescription({ type: "answer", sdp: answer });
+  if (peer !== pc || myGen !== gen || !wanted) return;
   await limitBitrate(transceiver.sender);
 }
 
@@ -233,18 +257,23 @@ function failed(error) {
 }
 
 async function start() {
+  const myGen = ++gen;
   wanted = true;
   clearTimeout(retryTimer);
   updateButtons();
   try {
-    if (!cameraLive()) await openCamera();
-    await connect();
+    if (!cameraLive()) {
+      if (!(await openCamera(myGen))) return;
+    }
+    if (myGen !== gen || !wanted) return;
+    await connect(myGen);
   } catch (error) {
-    failed(error);
+    if (myGen === gen && wanted) failed(error);
   }
 }
 
 function stop(notify = true) {
+  gen += 1;
   wanted = false;
   clearTimeout(retryTimer);
   const ended = session;
@@ -253,24 +282,24 @@ function stop(notify = true) {
   releaseWake();
   updateButtons();
   setStatus("Stopped. Tap Start to send the camera again.");
-  if (notify && ended && creds) {
-    fetch(ended, { method: "DELETE", headers: auth(), keepalive: true }).catch(() => {});
-  }
+  if (notify && ended && creds) deleteSession(ended);
 }
 
 async function reopenCamera() {
   if (!wanted) return;
+  const myGen = ++gen;
   try {
-    await openCamera();
+    if (!(await openCamera(myGen))) return;
+    if (myGen !== gen || !wanted) return;
     const sender = pc && pc.getSenders()[0];
     if (sender && pc.connectionState === "connected") {
       await sender.replaceTrack(stream.getVideoTracks()[0]);
-      await limitBitrate(sender);
+      if (myGen === gen && wanted) await limitBitrate(sender);
     } else {
-      await connect();
+      await connect(myGen);
     }
   } catch (error) {
-    failed(error);
+    if (myGen === gen && wanted) failed(error);
   }
 }
 
@@ -313,13 +342,16 @@ window.addEventListener("pagehide", () => {
 
 async function main() {
   updateButtons();
+  const token = new URLSearchParams(location.hash.slice(1)).get("pair");
+  if (token) {
+    try { history.replaceState(null, "", location.pathname + location.search); }
+    catch { location.hash = ""; }
+  }
   if (!window.isSecureContext || !navigator.mediaDevices || !window.RTCPeerConnection) {
     showIntro("Open this page from the QR code in AnyCam (it must be the https:// address).");
     return;
   }
-  const token = new URLSearchParams(location.hash.slice(1)).get("pair");
   if (token) {
-    history.replaceState(null, "", location.pathname);
     try {
       await pair(token);
     } catch (error) {

@@ -70,12 +70,8 @@ def requested() -> str:
 
 
 @lru_cache(maxsize=1)
-def unavailable_reason() -> str:
-    """Why the GPU preview cannot run here; empty when it can.
-
-    Creating one ``qml6glsink`` also registers the QML item type, which must
-    happen before any QML that imports it is loaded.
-    """
+def _probe_unavailable_reason() -> str:
+    """Cached probe once a QApplication exists."""
     if requested() == "image":
         return "ANYCAM_PREVIEW=image"
     try:
@@ -96,6 +92,29 @@ def unavailable_reason() -> str:
         return ("qml6glsink did not load; PySide6 and gst-plugin-qml6 must use "
                 "the same Qt (use the distribution's pyside6, not pip's)")
     return ""
+
+
+def unavailable_reason() -> str:
+    """Why the GPU preview cannot run here; empty when it can.
+
+    Creating one ``qml6glsink`` also registers the QML item type, which must
+    happen before any QML that imports it is loaded.  Never caches the
+    pre-QApplication state so an early check before QApplication creation does
+    not permanently disable GPU preview.
+    """
+    if requested() == "image":
+        return "ANYCAM_PREVIEW=image"
+    try:
+        from PySide6.QtGui import QGuiApplication
+    except ImportError as exc:
+        return f"QtQuickWidgets is missing ({exc})"
+    if QGuiApplication.instance() is None:
+        return "no window system (no QApplication)"
+    return _probe_unavailable_reason()
+
+
+unavailable_reason.cache_clear = _probe_unavailable_reason.cache_clear  # type: ignore[attr-defined]
+unavailable_reason.cache_info = _probe_unavailable_reason.cache_info  # type: ignore[attr-defined]
 
 
 def available() -> bool:
@@ -142,13 +161,39 @@ def _pointer_of(obj) -> int:
     return int(get(obj.__gpointer__, None))
 
 
+class _GValue(ctypes.Structure):
+    _fields_ = [("g_type", ctypes.c_size_t), ("data", ctypes.c_uint64 * 2)]
+
+
 @lru_cache(maxsize=1)
-def _g_object_set():
+def _gobject_api():
     gobject = ctypes.CDLL("libgobject-2.0.so.0")
-    function = gobject.g_object_set
-    function.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p]
-    function.restype = None
-    return function
+    gobject.g_type_from_name.argtypes = [ctypes.c_char_p]
+    gobject.g_type_from_name.restype = ctypes.c_size_t
+    gobject.g_value_init.argtypes = [ctypes.POINTER(_GValue), ctypes.c_size_t]
+    gobject.g_value_init.restype = ctypes.POINTER(_GValue)
+    gobject.g_value_set_pointer.argtypes = [ctypes.POINTER(_GValue), ctypes.c_void_p]
+    gobject.g_value_set_pointer.restype = None
+    gobject.g_value_unset.argtypes = [ctypes.POINTER(_GValue)]
+    gobject.g_value_unset.restype = None
+    gobject.g_object_set_property.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(_GValue),
+    ]
+    gobject.g_object_set_property.restype = None
+    g_type_pointer = gobject.g_type_from_name(b"gpointer") or (17 << 2)
+    return gobject, g_type_pointer
+
+
+def _set_pointer_property(obj, name: bytes, ptr: int | None) -> None:
+    """Set a ``gpointer`` GObject property via non-variadic ``g_object_set_property``."""
+    gobject, g_type_pointer = _gobject_api()
+    value = _GValue()
+    gobject.g_value_init(ctypes.byref(value), g_type_pointer)
+    try:
+        gobject.g_value_set_pointer(ctypes.byref(value), ptr)
+        gobject.g_object_set_property(_pointer_of(obj), name, ctypes.byref(value))
+    finally:
+        gobject.g_value_unset(ctypes.byref(value))
 
 
 def make_video_view(parent):
@@ -208,7 +253,7 @@ def attach_sink(sink: Gst.Element, view) -> bool:
     """Point ``qml6glsink``'s ``widget`` property at the view's video item.
 
     PyGObject cannot pass a C++ object to a ``gpointer`` property, so the
-    pointer goes through ``g_object_set`` directly.
+    pointer goes through ``g_object_set_property`` with a typed ``GValue``.
     """
     try:
         import shiboken6
@@ -221,9 +266,20 @@ def attach_sink(sink: Gst.Element, view) -> bool:
         # pipeline fails to start ("failed to retrieve wrapped context").
         if not view.isVisible() or not view_ready(view):
             return False
-        _g_object_set()(_pointer_of(sink), b"widget",
-                        int(shiboken6.getCppPointer(item)[0]), None)
+        _set_pointer_property(sink, b"widget", int(shiboken6.getCppPointer(item)[0]))
     except Exception as exc:  # noqa: BLE001 - the image preview takes over
         _log(f"could not attach the sink: {exc}")
         return False
     return sink.get_property("widget") is not None
+
+
+def detach_sink(sink: Gst.Element | None) -> None:
+    """Clear ``qml6glsink``'s ``widget`` pointer cleanly."""
+    if sink is None:
+        return
+    try:
+        if sink.find_property("widget") is None:
+            return
+        _set_pointer_property(sink, b"widget", None)
+    except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+        _log(f"could not detach the sink: {exc}")

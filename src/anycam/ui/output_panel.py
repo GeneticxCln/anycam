@@ -285,22 +285,11 @@ class OutputPanelMixin:
         self.effects_device_combo.setCurrentIndex(chosen if chosen >= 0 else 0)
         self.effects_device_combo.currentIndexChanged.connect(self._effects_device_changed)
         effects_grid.addWidget(QLabel("Run models on"), 0, 0)
-        effects_grid.addWidget(self.effects_device_combo, 0, 1)
-        self.effects_isolated_check = QCheckBox("Run AI effects in a separate process")
-        self.effects_isolated_check.setChecked(self.project.output.effects_isolated)
-        self.effects_isolated_check.setToolTip(
-            "A crash or hang in a model then costs the effect, never the stream. "
-            "Effect packs always run this way.")
-        self.effects_isolated_check.toggled.connect(self._effects_isolated_changed)
-        effects_grid.addWidget(self.effects_isolated_check, 2, 0, 1, 2)
-        self.packs_note = QLabel(self._packs_summary())
-        self.packs_note.setObjectName("muted")
-        self.packs_note.setWordWrap(True)
-        effects_grid.addWidget(self.packs_note, 3, 0, 1, 2)
+        effects_grid.addWidget(self.effects_device_combo, 0, 1, 1, 2)
         self.effects_device_note = QLabel()
         self.effects_device_note.setObjectName("muted")
         self.effects_device_note.setWordWrap(True)
-        effects_grid.addWidget(self.effects_device_note, 1, 0, 1, 2)
+        effects_grid.addWidget(self.effects_device_note, 1, 0, 1, 3)
         self._update_effects_device_note()
 
         from .. import models as model_catalog
@@ -324,6 +313,17 @@ class OutputPanelMixin:
         self.segmentation_note.setTextFormat(Qt.TextFormat.RichText)
         self.segmentation_note.setOpenExternalLinks(True)
         effects_grid.addWidget(self.segmentation_note, 3, 0, 1, 3)
+        self.effects_isolated_check = QCheckBox("Run AI effects in a separate process")
+        self.effects_isolated_check.setChecked(self.project.output.effects_isolated)
+        self.effects_isolated_check.setToolTip(
+            "A crash or hang in a model then costs the effect, never the stream. "
+            "Effect packs always run this way.")
+        self.effects_isolated_check.toggled.connect(self._effects_isolated_changed)
+        effects_grid.addWidget(self.effects_isolated_check, 4, 0, 1, 3)
+        self.packs_note = QLabel(self._packs_summary())
+        self.packs_note.setObjectName("muted")
+        self.packs_note.setWordWrap(True)
+        effects_grid.addWidget(self.packs_note, 5, 0, 1, 3)
         self._model_download: dict | None = None
         self._model_download_timer = QTimer(self)
         self._model_download_timer.setInterval(150)
@@ -548,6 +548,11 @@ class OutputPanelMixin:
 
     def _apply_canvas_edit(self) -> None:
         """Apply the Width/Height/FPS boxes to the project (and the running canvas)."""
+        if getattr(self, "_closing", False):
+            return
+        if getattr(self, "_ui_blocked", 0):
+            self._canvas_apply_timer.start()
+            return
         self.set_output_format(self.width_spin.value(), self.height_spin.value(),
                                self.fps_spin.value())
 

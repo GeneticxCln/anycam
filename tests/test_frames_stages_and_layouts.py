@@ -25,7 +25,7 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from anycam import config, overlay, procedural, sources  # noqa: E402
 from anycam.model import (  # noqa: E402
-    Effects, Layer, Project, Scene, empty_project, new_id, save_scene_preset,
+    Effects, Layer, Scene, empty_project, new_id, save_scene_preset,
 )
 from anycam.pool import SourcePool, CaptureSpec  # noqa: E402
 

@@ -49,8 +49,8 @@ def validate_stream_url(url: str) -> str:
         return "the stream address is empty"
     if credentials.has_reference(text):
         return "the stream key is not in your keyring on this computer: enter it again"
-    forbidden = " \t\r\n\"'`;|<>\\" + ("" if is_srt(text) else "&")
-    if any(ch in text for ch in forbidden):
+    forbidden = " \t\r\n\"'`;|<>\\"
+    if any(ch in forbidden or ord(ch) < 32 or ord(ch) == 127 for ch in text):
         return "the stream address contains spaces or shell characters"
     try:
         parts = urlsplit(text)
@@ -65,6 +65,8 @@ def validate_stream_url(url: str) -> str:
         return "the stream address has an invalid port"
     if parts.scheme.lower() == "srt":
         return "" if port else "an srt:// address needs a port, like srt://host:9000"
+    if "&" in parts.netloc or "&" in parts.path or "&" in parts.fragment:
+        return "the stream address contains spaces or shell characters"
     if parts.path.strip("/") == "":
         return "the stream address has no application or stream key"
     return ""

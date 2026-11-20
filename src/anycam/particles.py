@@ -8,7 +8,9 @@ bundled emoji pack plus a few drawn sprites (soft dots, bubbles, confetti).
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 import colorsys
+from functools import lru_cache
 import math
 import random
 
@@ -111,6 +113,19 @@ def _make_sprite(kind: str, px: int, variant: int) -> Image.Image | None:
 
 # --- the general field ----------------------------------------------------------
 
+_SPRITE_CACHE_LIMIT = 900
+
+
+@lru_cache(maxsize=64)
+def _alpha_lut_for_byte(scale: int) -> list[int]:
+    return [v * scale // 255 for v in range(256)]
+
+
+def _alpha_lut(alpha: float) -> list[int]:
+    scale = max(0, min(255, int(round(float(alpha) * 255))))
+    return _alpha_lut_for_byte(scale)
+
+
 class ParticleField:
     """Many sprites drifting through the frame, each a function of time."""
 
@@ -127,6 +142,7 @@ class ParticleField:
         self.twinkle = twinkle
         self.span = span
         self.alpha = alpha
+        self._alpha_lut = _alpha_lut(alpha) if alpha < 1.0 else None
         self.lean = lean
         margin = height * size[1] * SIZE_BOOST * 1.6
         self.margin = margin
@@ -143,7 +159,7 @@ class ParticleField:
         self.kind = [rnd.randrange(len(sprites)) for _ in range(n)]
         self.spin = np.array([rnd.uniform(*spin) for _ in range(n)])
         self.tw_rate = np.array([rnd.uniform(1.2, 3.0) for _ in range(n)])
-        self._cache: dict[tuple[int, int, int], Image.Image] = {}
+        self._cache: OrderedDict[tuple[int, int, int], Image.Image] = OrderedDict()
 
     def _sprite(self, index: int, angle: float, scale: float) -> Image.Image | None:
         px = max(4, int(self.px[index] * scale))
@@ -151,16 +167,22 @@ class ParticleField:
         key = (index if self.sprite_names[self.kind[index]].startswith("confetti") else
                self.kind[index], px, step)
         pic = self._cache.get(key)
+        if pic is not None:
+            self._cache.move_to_end(key)
+            return pic
+        name = self.sprite_names[self.kind[index]]
+        pic = _make_sprite(name, px, index)
         if pic is None:
-            name = self.sprite_names[self.kind[index]]
-            pic = _make_sprite(name, px, index)
-            if pic is None:
-                return None
-            if step and not name.startswith("confetti"):
-                pic = pic.rotate(step * 12.0, resample=Image.BICUBIC, expand=True)
-            if len(self._cache) > 900:
-                self._cache.clear()
-            self._cache[key] = pic
+            return None
+        if step and not name.startswith("confetti"):
+            pic = pic.rotate(step * 12.0, resample=Image.BICUBIC, expand=True)
+        if self._alpha_lut is not None:
+            pic = pic.copy()
+            pic.putalpha(pic.getchannel("A").point(self._alpha_lut))
+        self._cache[key] = pic
+        self._cache.move_to_end(key)
+        while len(self._cache) > _SPRITE_CACHE_LIMIT:
+            self._cache.popitem(last=False)
         return pic
 
     def frame(self, t: float) -> np.ndarray:
@@ -181,7 +203,7 @@ class ParticleField:
                 continue
             x = int(xs[i] - pic.width / 2)
             y = int(ys[i] - pic.height / 2)
-            _blend(canvas, pic, x, y, self.alpha)
+            _blend(canvas, pic, x, y)
         return np.asarray(canvas)
 
 
@@ -191,13 +213,12 @@ def _blend(canvas: Image.Image, pic: Image.Image, x: int, y: int, alpha: float =
     x1, y1 = min(w, x + pic.width), min(h, y + pic.height)
     if x1 <= x0 or y1 <= y0:
         return
-    part = pic.crop((x0 - x, y0 - y, x1 - x, y1 - y))
     if alpha < 1.0:
-        part = part.copy()
-        part.putalpha(part.getchannel("A").point(lambda v: int(v * alpha)))
-    region = canvas.crop((x0, y0, x1, y1))
-    region.alpha_composite(part)
-    canvas.paste(region, (x0, y0))
+        part = pic.crop((x0 - x, y0 - y, x1 - x, y1 - y))
+        part.putalpha(part.getchannel("A").point(_alpha_lut(alpha)))
+        canvas.alpha_composite(part, dest=(x0, y0))
+        return
+    canvas.alpha_composite(pic, dest=(x0, y0), source=(x0 - x, y0 - y))
 
 
 # --- bespoke effects --------------------------------------------------------------

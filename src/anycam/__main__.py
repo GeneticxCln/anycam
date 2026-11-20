@@ -68,12 +68,6 @@ def cmd_elements(_args) -> int:
     return 1 if report["missing"] else 0
 
 
-def cmd_demo(args) -> int:
-    from .demo import main as demo_main
-
-    return demo_main(args.demo_args)
-
-
 def cmd_encoders(args) -> int:
     from .engine import encoders
 
@@ -107,7 +101,7 @@ def cmd_repair(args) -> int:
 
 def cmd_gui(args) -> int:
     if args.screenshot:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        os.environ["QT_QPA_PLATFORM"] = "offscreen"
     try:
         if getattr(args, "ui", "manycam") == "classic":
             from .gui import run_gui, run_screenshot
@@ -129,10 +123,12 @@ def cmd_gui(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
-    if argv and argv[0] == "demo":
+    if not argv:
+        argv = ["gui"]
+    if argv[0] == "demo":
         from .demo import main as demo_main
         return demo_main(argv[1:])
-    if argv and argv[0] == "soak":
+    if argv[0] == "soak":
         from .soak import main as soak_main
         return soak_main(argv[1:])
     parser = argparse.ArgumentParser(prog="anycam", description="AnyCam virtual camera studio")
@@ -148,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
                    ).set_defaults(func=cmd_firstrun)
 
     # Listed for `anycam --help`; the early dispatch above forwards the real
-    # soak arguments to its own parser.
+    # soak/demo arguments to their own parsers (including --help).
     encoders_cmd = sub.add_parser("encoders", help="test-encode with every encoder (what Auto may choose from)")
     encoders_cmd.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
     encoders_cmd.add_argument("--again", action="store_true", help="ignore the cached answer")
@@ -159,11 +155,13 @@ def main(argv: list[str] | None = None) -> int:
     ctl_cmd.set_defaults(func=cmd_ctl)
     sub.add_parser("repair", help="set aside project/hotkeys/phones files that no longer read"
                    ).set_defaults(func=cmd_repair)
-    sub.add_parser("soak", help="long-run acceptance test (drops + memory)")
+    soak = sub.add_parser("soak", help="long-run acceptance test (drops + memory)")
+    soak.add_argument("soak_args", nargs=argparse.REMAINDER)
+    soak.set_defaults(func=lambda a: __import__("anycam.soak", fromlist=["main"]).main(a.soak_args))
 
     demo = sub.add_parser("demo", help="headless camera -> composition -> MP4 / vcam")
     demo.add_argument("demo_args", nargs=argparse.REMAINDER)
-    demo.set_defaults(func=cmd_demo)
+    demo.set_defaults(func=lambda a: __import__("anycam.demo", fromlist=["main"]).main(a.demo_args))
 
     gui = sub.add_parser("gui", help="launch the standalone GUI")
     gui.add_argument("--screenshot", default="", help="render headless (Qt offscreen) and save a PNG")

@@ -25,11 +25,17 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from anycam import config  # noqa: E402
 from anycam.gui import AnyCamWindow  # noqa: E402
+from anycam.gui_many import ManyCamWindow  # noqa: E402
 from anycam.model import Layer, Project, Scene  # noqa: E402
+
 
 def _save(window: AnyCamWindow, path: Path) -> bool:
     pixmap = window.grab()
@@ -54,6 +60,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="how long to wait for the device to return")
     parser.add_argument("--settle", type=float, default=20.0,
                         help="max wait for the preview after each transition")
+    parser.add_argument("--ui", choices=("manycam", "classic"), default="manycam",
+                        help="which window to test (default: manycam)")
     args = parser.parse_args(argv)
 
     # Resolve the serial-based path before the pull.  If the device returns as
@@ -82,7 +90,8 @@ def main(argv: list[str] | None = None) -> int:
     project.active_scene = scene.id
 
     app = QApplication(sys.argv[:1])
-    window = AnyCamWindow(project)
+    window_cls = ManyCamWindow if args.ui == "manycam" else AnyCamWindow
+    window = window_cls(project)
     window.headless = True
     window.resize(1440, 900)
     window.show()

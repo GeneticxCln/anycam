@@ -71,18 +71,23 @@ class GlobalShortcuts:
         self.state = "idle"
         self.bound: list[str] = []
         self._subscriptions: list[int] = []
+        self._pending_subs: set[int] = set()
+        self._closed = False
 
     # ------------------------------------------------------------ lifecycle
     def start(self) -> bool:
         if self.state in ("binding", "bound"):
             return True
+        self._closed = False
         try:
             self.connection = self.connection or Gio.bus_get_sync(Gio.BusType.SESSION, None)
         except GLib.Error as exc:
             self.state = f"failed: {exc.message}"
+            self.on_state()
             return False
         if not available(self.connection):
             self.state = "failed: the desktop portal has no GlobalShortcuts"
+            self.on_state()
             return False
         self._subscriptions.append(self.connection.signal_subscribe(
             BUS_NAME, IFACE, "Activated", OBJECT_PATH, None,
@@ -96,15 +101,17 @@ class GlobalShortcuts:
                 "session_handle_token": GLib.Variant("s", self._token()),
             },)),
             token, self._on_session)
-        return True
+        return self.state in ("binding", "bound")
 
     def close(self) -> None:
-        for subscription in self._subscriptions:
+        self._closed = True
+        for subscription in (*self._subscriptions, *self._pending_subs):
             try:
                 self.connection.signal_unsubscribe(subscription)
             except Exception:  # noqa: BLE001
                 pass
         self._subscriptions.clear()
+        self._pending_subs.clear()
         if self.session_handle and self.connection is not None:
             try:
                 self.connection.call_sync(
@@ -131,7 +138,15 @@ class GlobalShortcuts:
         holder: dict = {}
 
         def response(_conn, _sender, _path, _iface, _signal, params):
-            self.connection.signal_unsubscribe(holder["id"])
+            sub_id = holder.get("id")
+            if sub_id is not None:
+                self._pending_subs.discard(sub_id)
+                try:
+                    self.connection.signal_unsubscribe(sub_id)
+                except Exception:  # noqa: BLE001
+                    pass
+            if self._closed:
+                return
             code, results = params.unpack()
             on_response(int(code), results or {})
 
@@ -139,16 +154,26 @@ class GlobalShortcuts:
         holder["id"] = self.connection.signal_subscribe(
             BUS_NAME, REQUEST_IFACE, "Response", path, None,
             Gio.DBusSignalFlags.NONE, response)
+        self._pending_subs.add(holder["id"])
         try:
             self.connection.call_sync(BUS_NAME, OBJECT_PATH, IFACE, method, parameters,
                                       GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE,
                                       5000, None)
         except GLib.Error as exc:
-            self.connection.signal_unsubscribe(holder["id"])
+            sub_id = holder.get("id")
+            if sub_id is not None:
+                self._pending_subs.discard(sub_id)
+                try:
+                    self.connection.signal_unsubscribe(sub_id)
+                except Exception:  # noqa: BLE001
+                    pass
             self.state = f"failed: {exc.message}"
             self.log(f"global shortcuts: {method} failed: {exc.message}")
+            self.on_state()
 
     def _on_session(self, code: int, results: dict) -> None:
+        if self._closed:
+            return
         handle = results.get("session_handle", "")
         if isinstance(handle, GLib.Variant):
             handle = handle.unpack()
@@ -173,6 +198,8 @@ class GlobalShortcuts:
             token, self._on_bound)
 
     def _on_bound(self, code: int, results: dict) -> None:
+        if self._closed:
+            return
         if code != 0:
             # 1 = the user declined in the compositor's dialog.
             self.state = ("failed: declined" if code == 1
@@ -189,6 +216,8 @@ class GlobalShortcuts:
         self.on_state()
 
     def _on_activated(self, _conn, _sender, _path, _iface, _signal, params) -> None:
+        if self._closed:
+            return
         session, shortcut, *_rest = params.unpack()
         if session != self.session_handle:
             return

@@ -74,7 +74,6 @@ def test_rtmp_uses_nvenc_and_cuda_when_available(monkeypatch):
         pytest.skip("nvh264enc unavailable")
     if Gst.ElementFactory.find("cudaupload") is None:
         pytest.skip("cudaupload unavailable")
-    from anycam import pipeline as pipeline_module
 
     monkeypatch.setattr("anycam.engine.encoders.nvenc_available",
                         lambda codec="h264": codec == "h264")

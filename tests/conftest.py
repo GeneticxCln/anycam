@@ -53,17 +53,60 @@ def hardware_free_environment(request):
     if not hardware_free(request.config):
         yield False
         return
+    import subprocess
+
     from anycam import config as anycam_config
-    from anycam import portal
+    from anycam import portal, privileged
 
     def no_portal(*_args, **_kwargs):
         raise portal.PortalError(
             "hardware-free test environment: no desktop portal")
 
+    orig_run = anycam_config.run
+    orig_subprocess_run = subprocess.run
+    orig_list_audio_sinks = anycam_config.list_audio_sinks
+    orig_vcam_exclusive_caps = anycam_config.vcam_exclusive_caps
+    orig_vcam_udev_capabilities = anycam_config.vcam_udev_capabilities
+    orig_refresh_vcam_udev = anycam_config.refresh_vcam_udev
+    orig_run_as_root = privileged.run_as_root
+
+    def fake_list_audio_sinks(*args, **kwargs):
+        if anycam_config.run is not orig_run:
+            return orig_list_audio_sinks(*args, **kwargs)
+        return []
+
+    def fake_vcam_exclusive_caps(
+        path="/sys/module/v4l2loopback/parameters/exclusive_caps",
+        device=None,
+    ):
+        if path and not str(path).startswith("/sys/"):
+            return orig_vcam_exclusive_caps(path, device)
+        return None
+
+    def fake_vcam_udev_capabilities(*args, **kwargs):
+        if anycam_config.run is not orig_run:
+            return orig_vcam_udev_capabilities(*args, **kwargs)
+        return None
+
+    def fake_refresh_vcam_udev(*args, **kwargs):
+        if anycam_config.subprocess.run is not orig_subprocess_run:
+            return orig_refresh_vcam_udev(*args, **kwargs)
+        return ""
+
+    def fake_run_as_root(args, *, timeout: float = 180):
+        if privileged.subprocess.run is not orig_subprocess_run:
+            return orig_run_as_root(args, timeout=timeout)
+        raise RuntimeError("hardware-free test environment: pkexec disabled")
+
     patch = pytest.MonkeyPatch()
     patch.setattr(anycam_config, "list_video_devices", lambda *a, **k: [])
     patch.setattr(anycam_config, "list_audio_sources", lambda *a, **k: [])
+    patch.setattr(anycam_config, "list_audio_sinks", fake_list_audio_sinks)
     patch.setattr(anycam_config, "vcam_available", lambda device=None: False)
+    patch.setattr(anycam_config, "vcam_exclusive_caps", fake_vcam_exclusive_caps)
+    patch.setattr(anycam_config, "vcam_udev_capabilities", fake_vcam_udev_capabilities)
+    patch.setattr(anycam_config, "refresh_vcam_udev", fake_refresh_vcam_udev)
+    patch.setattr(privileged, "run_as_root", fake_run_as_root)
     patch.setattr(portal, "_connection", no_portal)
     try:
         yield True

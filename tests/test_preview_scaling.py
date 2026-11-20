@@ -105,7 +105,7 @@ def app():
 def test_the_widget_paints_without_a_per_frame_rescale_or_copy(app, monkeypatch):
     import gc
 
-    from PySide6.QtGui import QColor, QImage
+    from PySide6.QtGui import QImage
 
     from anycam.gui import PreviewWidget
 

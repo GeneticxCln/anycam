@@ -93,7 +93,8 @@ def set_control(device: str, name: str, value: int) -> str:
         return f"{name!r} is not a control name"
     code, out = config.run(["v4l2-ctl", "-d", device, f"--set-ctrl={name}={int(value)}"], timeout=5.0)
     if code != 0:
-        return (out or "v4l2-ctl failed").strip().splitlines()[-1]
+        lines = (out or "").strip().splitlines()
+        return lines[-1] if lines else "v4l2-ctl failed"
     return ""
 
 

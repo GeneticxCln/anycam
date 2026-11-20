@@ -55,10 +55,13 @@ class HealthMixin:
         """Snapshot visible sources and flag one that stopped delivering."""
         health: dict[str, dict] = {}
         stalled: list[str] = []
+        active_ids: set[str] = set()
         for layer in self.scene.layers:
             if not layer.visible or layer.id not in self._layer_pads:
                 self._health_since.pop(layer.id, None)
+                self._source_rate_history.pop(layer.id, None)
                 continue
+            active_ids.add(layer.id)
             since = self._health_since.setdefault(layer.id, now)
             spec = self._layer_specs.get(layer.id)
             entry = self.pool.entry(spec) if spec is not None else None
@@ -71,8 +74,9 @@ class HealthMixin:
             # Measure the input, not the compositor's repeated output. Keep
             # a bounded three-second window so bursty ~1 Hz screen updates
             # cannot alternate between LIVE and SLOW on every short burst.
+            added = getattr(self, "_layer_added_at", {}).get(layer.id, self._start_time)
             history = self._source_rate_history.setdefault(
-                layer.id, deque([(self._start_time, 0)], maxlen=16))
+                layer.id, deque([(added, 0)], maxlen=16))
             if now < history[-1][0] or frames < history[-1][1]:
                 history.clear()
                 history.append((now, frames))
@@ -97,6 +101,12 @@ class HealthMixin:
                     stalled.append(layer.id)
             elif age is not None and age > self._stall_seconds:
                 stalled.append(layer.id)
+        for stale_id in list(self._source_rate_history):
+            if stale_id not in active_ids:
+                self._source_rate_history.pop(stale_id, None)
+        for stale_id in list(self._health_since):
+            if stale_id not in active_ids:
+                self._health_since.pop(stale_id, None)
         self.report.instant_fps = (
             (self._frame_count - self._last_sample_frames)
             / max(1e-6, now - self._last_sample_time)

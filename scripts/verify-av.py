@@ -56,7 +56,8 @@ def main() -> int:
 
     if video:
         num, den = (video.get("r_frame_rate") or "0/1").split("/")
-        rate = float(num) / float(den or 1)
+        den_f = float(den) if den else 0.0
+        rate = float(num) / (den_f if den_f != 0.0 else 1.0)
         detail["video"] = {
             "codec": video.get("codec_name"),
             "width": video.get("width"),

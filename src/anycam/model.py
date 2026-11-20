@@ -8,11 +8,11 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import uuid
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import credentials, geometry
 
@@ -137,7 +137,23 @@ class Effects:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "Effects":
-        return _coerce_fields(cls, data)
+        fx = _coerce_fields(cls, data)
+        fx.brightness = geometry.clamp(fx.brightness, -1.0, 1.0)
+        fx.contrast = geometry.clamp(fx.contrast, 0.0, 2.0)
+        fx.saturation = geometry.clamp(fx.saturation, 0.0, 2.0)
+        fx.hue = geometry.clamp(fx.hue, -1.0, 1.0)
+        fx.chroma_similarity = geometry.clamp(fx.chroma_similarity, 0.0, 1.0)
+        fx.chroma_smoothness = geometry.clamp(fx.chroma_smoothness, 0.0, 1.0)
+        fx.red_gain = geometry.clamp(fx.red_gain, 0.0, 4.0)
+        fx.green_gain = geometry.clamp(fx.green_gain, 0.0, 4.0)
+        fx.blue_gain = geometry.clamp(fx.blue_gain, 0.0, 4.0)
+        fx.filter_amount = geometry.clamp(fx.filter_amount, 0.0, 1.0)
+        fx.filter2_amount = geometry.clamp(fx.filter2_amount, 0.0, 1.0)
+        fx.frame_width = max(0, min(100, int(fx.frame_width)))
+        effect = fx.color_effect.strip().lower()
+        fx.color_effect = effect if effect in (
+            "none", "sepia", "heat", "xray", "xpro", "yellowblue") else "none"
+        return fx
 
 
 @dataclass
@@ -174,10 +190,10 @@ class PlaylistConfig:
         interval = _coerce(data.get("interval"), 3.0)
         raw_durations = data.get("durations")
         return cls(
-            layer_ids=[str(value) for value in ids if value],
-            interval=interval if interval > 0 else 3.0,
+            layer_ids=[value for value in ids if isinstance(value, str) and value],
+            interval=geometry.clamp(interval, 0.1, 3600.0) if interval > 0 else 3.0,
             loop=_coerce(data.get("loop"), True),
-            index=_coerce(data.get("index"), -1),
+            index=max(-1, _coerce(data.get("index"), -1)),
             durations={str(key): float(value)
                        for key, value in (raw_durations if isinstance(raw_durations, dict)
                                           else {}).items()
@@ -295,7 +311,15 @@ class Layer:
         if layer.kind == "network" and isinstance(layer.source, str):
             layer.source = credentials.reveal(layer.source)
         layer.box = _quad(data.get("box"), layer.box)
-        layer.crop = _quad(data.get("crop"), layer.crop)
+        crop = _quad(data.get("crop"), layer.crop)
+        layer.crop = tuple(geometry.clamp(v, 0.0, 0.99) for v in crop)  # type: ignore[assignment]
+        layer.alpha = geometry.clamp(layer.alpha, 0.0, 1.0)
+        layer.volume = geometry.clamp(layer.volume, 0.0, 4.0)
+        layer.font_size = geometry.clamp(layer.font_size, 0.005, 1.0)
+        layer.style = layer.style if layer.style in ("badge", "plain") else "badge"
+        layer.camera_width = max(0, min(16384, int(layer.camera_width)))
+        layer.camera_height = max(0, min(16384, int(layer.camera_height)))
+        layer.camera_fps = max(0, min(MAX_FPS, int(layer.camera_fps)))
         layer.effects = Effects.from_dict(data.get("effects"))
         layer.fit = geometry.fit_mode(layer.fit)
         layer.rotation = geometry.rotation_degrees(layer.rotation)
@@ -317,14 +341,30 @@ class Layer:
         items = data.get("playlist")
         for entry in items if isinstance(items, list) else []:
             if isinstance(entry, dict) and isinstance(entry.get("source"), str):
+                dur = _coerce(entry.get("duration"), 4.0)
+                item_kind = _coerce(entry.get("kind"), "image")
                 layer.playlist.append(PlaylistItem(
                     source=entry["source"],
-                    duration=_coerce(entry.get("duration"), 4.0),
-                    kind=_coerce(entry.get("kind"), "image")))
+                    duration=geometry.clamp(dur, 0.1, 3600.0) if dur > 0 else 4.0,
+                    kind=item_kind if item_kind in ("image", "video") else "image"))
         if layer.kind == "network" and "@" in layer.name:
-            # Older builds named a network layer after the URL's host part,
-            # camera password included.
-            layer.name = layer.name.rpartition("@")[2]
+            # Older builds named a network layer after the URL or its netloc
+            # (camera password included). Only strip credentials when the name
+            # looks like a URL or matches the source URL/netloc, not human names
+            # such as "Cam @ Studio".
+            source_netloc = ""
+            if layer.source:
+                try:
+                    source_netloc = urlsplit(layer.source).netloc
+                except ValueError:
+                    source_netloc = ""
+            if ("://" in layer.name
+                    or layer.name == layer.source
+                    or (source_netloc and layer.name == source_netloc)
+                    or re.fullmatch(r"[^\s@:/]+:[^\s@]*@[^\s@]+", layer.name)):
+                stripped = layer.name.rpartition("@")[2]
+                if stripped:
+                    layer.name = stripped
         return layer
 
     def to_dict(self) -> dict[str, Any]:
@@ -453,15 +493,32 @@ class AudioConfig:
         raw = data.get("media_playlist") if isinstance(data, dict) else None
         audio.media_playlist = [item for item in raw if isinstance(item, str) and item] \
             if isinstance(raw, list) else []
+        denoise = audio.mic_denoise.strip().lower()
+        audio.mic_denoise = denoise if denoise in (
+            "off", "low", "moderate", "high", "very-high") else "moderate"
         audio.mic_dynamics = audio.mic_dynamics.strip().lower() \
             if audio.mic_dynamics.strip().lower() in ("off", "gate", "compressor", "broadcast") \
             else "off"
         audio.mic_eq = audio.mic_eq.strip().lower() \
             if audio.mic_eq.strip().lower() in ("flat", "voice", "warm", "bright", "bass-cut") \
             else "flat"
+        for gain in ("mic_gain_db", "media_gain_db", "desktop_gain_db"):
+            setattr(audio, gain, geometry.clamp(getattr(audio, gain), -60.0, 24.0))
         for name in ("mic_delay_ms", "desktop_delay_ms", "media_delay_ms"):
             setattr(audio, name, max(0, min(2000, int(getattr(audio, name)))))
         return audio
+
+
+_VALID_ENCODERS = frozenset({
+    "auto", "nvenc", "nvenc_h264", "nvenc_h265", "nvenc_hevc", "nvenc_av1",
+    "h264", "h265", "hevc", "av1", "nvh265", "nvav1", "hevc_nvenc", "av1_nvenc",
+    "vaapi", "va", "vaapi_h264", "va_h264", "vaapi_h265", "va_h265",
+    "vaapi_hevc", "vaapi_av1", "va_av1", "cpu", "x264", "software",
+})
+_VALID_SCREEN_FLIPS = frozenset({
+    "automatic", "none", "clockwise", "rotate-180", "counterclockwise",
+    "horizontal-flip", "vertical-flip", "upper-left-diagonal", "upper-right-diagonal",
+})
 
 
 @dataclass
@@ -517,7 +574,8 @@ class OutputConfig:
     canvas_backend: str = "auto"
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any] | None) -> "OutputConfig":
+    def from_dict(cls, data: dict[str, Any] | None,
+                  warnings: list[str] | None = None) -> "OutputConfig":
         output = _coerce_fields(cls, data, skip=("rtmp_extra_urls",))
         raw = data.get("rtmp_extra_urls") if isinstance(data, dict) else None
         output.rtmp_extra_urls = ([credentials.reveal(url.strip()) for url in raw
@@ -531,13 +589,27 @@ class OutputConfig:
         output.record_min_free_mb = max(0, min(1_000_000, output.record_min_free_mb))
         # A canvas or rate the encoder cannot use would only fail later.
         if output.canvas_w < 2 or output.canvas_h < 2:
+            if warnings is not None:
+                warnings.append(
+                    f"canvas {output.canvas_w}x{output.canvas_h} reset to "
+                    f"{defaults.canvas_w}x{defaults.canvas_h}")
             output.canvas_w, output.canvas_h = defaults.canvas_w, defaults.canvas_h
         if output.fps < 1:
+            if warnings is not None:
+                warnings.append(f"frame rate {output.fps} reset to {defaults.fps}")
             output.fps = defaults.fps
         if output.vcam_backend not in ("v4l2", "pipewire", "both"):
             output.vcam_backend = defaults.vcam_backend
         if output.canvas_backend not in ("auto", "cpu"):
             output.canvas_backend = defaults.canvas_backend
+        enc = output.encoder.strip().lower()
+        output.encoder = enc if enc in _VALID_ENCODERS else defaults.encoder
+        dev = output.effects_device.strip().lower()
+        output.effects_device = dev if dev in ("cpu", "gpu") else defaults.effects_device
+        seg = output.segmentation_model.strip().lower()
+        output.segmentation_model = seg if seg in ("mediapipe", "rvm") else defaults.segmentation_model
+        flip = output.screen_flip.strip().lower()
+        output.screen_flip = flip if flip in _VALID_SCREEN_FLIPS else defaults.screen_flip
         return output
 
 
@@ -618,14 +690,21 @@ class Project:
                     f"scene \"{scene.name}\" repeated an id; it was given a new one")
             seen.add(scene.id)
             scenes.append(scene)
+        raw_active = data.get("active_scene")
+        if isinstance(raw_active, int) and not isinstance(raw_active, bool):
+            active_scene = str(raw_active)
+        elif isinstance(raw_active, str):
+            active_scene = raw_active
+        else:
+            active_scene = ""
         p = cls(
             name=_coerce(data.get("name"), "AnyCam project"),
-            output=OutputConfig.from_dict(data.get("output")),
+            output=OutputConfig.from_dict(data.get("output"), warnings),
             audio=AudioConfig.from_dict(data.get("audio")),
             editor=EditorConfig.from_dict(data.get("editor")),
             motion=MotionConfig.from_dict(data.get("motion")),
             scenes=scenes,
-            active_scene=_coerce(data.get("active_scene"), ""),
+            active_scene=active_scene,
         )
         normalize_output(p.output, warnings)
         if not p.scenes:
@@ -645,43 +724,76 @@ class Project:
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        data = json.dumps(protected_project(self.to_dict()), indent=2) + "\n"
+        payload = (json.dumps(protected_project(self.to_dict()), indent=2) + "\n").encode("utf-8")
         temp = path.with_name(path.name + ".tmp")
-        payload = data.encode("utf-8")
         fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
+            os.fchmod(fd, 0o600)
             view = memoryview(payload)
             while view:  # os.write may write less than asked
                 view = view[os.write(fd, view):]
             os.fsync(fd)
-        finally:
             os.close(fd)
-        if path.exists() and _is_readable_project(path):
-            # Only a file that still parses is worth keeping as the backup.
-            # Copying a truncated one replaced the last good .bak with it, so
-            # the second save after a crash destroyed the recovery copy.
+            fd = -1
+            if path.exists() and _is_readable_project(path):
+                # Only a file that still parses is worth keeping as the backup.
+                # Write .bak atomically with mode 0600 so secrets are never world-readable.
+                try:
+                    _write_private_atomic(
+                        path.with_name(path.name + ".bak"), path.read_bytes())
+                except OSError:
+                    pass
+            os.replace(temp, path)
+        except BaseException:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             try:
-                shutil.copy2(path, path.with_name(path.name + ".bak"))
+                temp.unlink(missing_ok=True)
             except OSError:
                 pass
-        os.replace(temp, path)
-        try:
-            # The file contains the stream key; keep it private to the user.
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+            raise
         return path
 
     @classmethod
     def load(cls, path: str | Path) -> "Project":
         migrate_secrets(path)
-        return cls.from_dict(json.loads(Path(path).read_text()))
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def _write_private_atomic(path: Path, payload: bytes) -> None:
+    """Write ``payload`` to ``path`` atomically with mode 0600 and fsync."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        view = memoryview(payload)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(temp, path)
+    except BaseException:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _is_readable_project(path: Path) -> bool:
     """Whether ``path`` holds a JSON object, i.e. is a usable backup."""
     try:
-        return isinstance(json.loads(path.read_text()), dict)
+        return isinstance(json.loads(path.read_text(encoding="utf-8")), dict)
     except (OSError, ValueError):
         return False
 
@@ -847,17 +959,22 @@ def save_scene_preset(scene: Scene, directory: str | Path) -> Path:
     # or produce an unusable filename.
     safe = re.sub(r"[^a-z0-9._-]+", "-", scene.name.strip().lower()).strip("-.") or "scene"
     path = directory / f"{safe}.anycam-scene.json"
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            existing_id = existing.get("id") if isinstance(existing, dict) else None
+        except (OSError, ValueError):
+            existing_id = None
+        if existing_id is not None and existing_id != scene.id:
+            suffix = re.sub(r"[^a-z0-9_-]+", "", scene.id.lower())[:12] or "2"
+            path = directory / f"{safe}-{suffix}.anycam-scene.json"
     # Layer sources can carry credentials (rtsp://user:pass@...): owner-only
     # and atomic, exactly like Project.save, never world-readable or torn.
-    temp = path.with_name(path.name + ".tmp")
-    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps(protected_scene(scene.to_dict()), indent=2) + "\n")
-    os.chmod(temp, 0o600)
-    os.replace(temp, path)
+    payload = (json.dumps(protected_scene(scene.to_dict()), indent=2) + "\n").encode("utf-8")
+    _write_private_atomic(path, payload)
     return path
 
 
 def load_scene_preset(path: str | Path,
                       warnings: list[str] | None = None) -> Scene:
-    return Scene.from_dict(json.loads(Path(path).read_text()), warnings)
+    return Scene.from_dict(json.loads(Path(path).read_text(encoding="utf-8")), warnings)

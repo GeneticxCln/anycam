@@ -12,7 +12,9 @@ Two backends, picked by :func:`backend`:
 
 from __future__ import annotations
 
+import ipaddress
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -22,6 +24,15 @@ UFW_DEFAULTS = Path("/etc/default/ufw")
 COMMENT = "AnyCam phone camera"
 
 
+def _validate_port(port: int) -> int:
+    if isinstance(port, bool):
+        raise ValueError(f"invalid port: {port!r}")
+    value = int(port)
+    if not (1 <= value <= 65535):
+        raise ValueError(f"port out of range: {value}")
+    return value
+
+
 def _read(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="replace")
@@ -29,7 +40,7 @@ def _read(path: Path) -> str:
         return ""
 
 
-def ufw_rules_readable(*, ufw_dir: Path = UFW_DIR) -> bool:
+def ufw_rules_readable(*, ufw_dir: Path = UFW_DIR, rules_file: str = "user.rules") -> bool:
     """Whether this user may read ufw's rules.
 
     Debian and Ubuntu install ``user.rules`` as mode 640, owner root: a normal
@@ -37,7 +48,7 @@ def ufw_rules_readable(*, ufw_dir: Path = UFW_DIR) -> bool:
     are world-readable, so "enabled, default deny" is still known.)
     """
     try:
-        (ufw_dir / "user.rules").read_text(encoding="utf-8")
+        (ufw_dir / rules_file).read_text(encoding="utf-8")
     except PermissionError:
         return False
     except OSError:
@@ -53,14 +64,33 @@ def _allowed_path() -> Path:
 
 def remember_allowed(port: int, *, state_file: Path | None = None) -> None:
     """Note that this app opened ``port`` in ufw (rules unreadable afterwards)."""
+    port_num = _validate_port(port)
     path = state_file or _allowed_path()
     ports = _allowed_ports(path)
-    if port not in ports:
-        ports.append(int(port))
+    if port_num not in ports:
+        ports.append(port_num)
+        tmp = path.with_suffix(".tmp")
+        fd = -1
         try:
-            path.write_text(json.dumps({"ufw": ports}), encoding="utf-8")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                fd = -1
+                json.dump({"ufw": ports}, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
         except OSError:
-            pass
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _allowed_ports(path: Path) -> list[int]:
@@ -71,9 +101,82 @@ def _allowed_ports(path: Path) -> list[int]:
         return []
 
 
+def _port_matches(spec: str, port: int) -> bool:
+    if spec == "any":
+        return True
+    for part in spec.split(","):
+        low, _, high = part.partition(":")
+        try:
+            if int(low) <= port <= int(high or low):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _dest_allows(daddr: str, host: str = "") -> bool:
+    if daddr in ("0.0.0.0/0", "::/0", "any"):
+        return True
+    if not host:
+        return False
+    try:
+        net = ipaddress.ip_network(daddr, strict=False)
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return net.version == addr.version and addr in net
+
+
+def _source_allows(saddr: str, host: str = "") -> bool:
+    if saddr in ("0.0.0.0/0", "::/0", "any"):
+        return True
+    if not host:
+        return False
+    try:
+        net = ipaddress.ip_network(saddr, strict=False)
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return net.version == addr.version and net.prefixlen < net.max_prefixlen and addr in net
+
+
+def _rules_allow(rules: str, port: int, host: str = "") -> bool:
+    # ufw records each rule as:
+    # "### tuple ### allow <proto> <dport> <daddr> <sport> <saddr> <direction> ..."
+    # ("any" instead of "tcp" for a protocol-less rule; ranges as a:b).
+    pattern = re.compile(
+        r"^### tuple ### allow (tcp|any) (\S+) (\S+) (\S+) (\S+) (\S+)",
+        re.M,
+    )
+    for match in pattern.finditer(rules):
+        _proto, dport, daddr, sport, saddr, direction = match.groups()
+        if direction != "in" and not direction.startswith("in_"):
+            continue
+        if sport != "any":
+            continue
+        if not _port_matches(dport, port):
+            continue
+        if not _dest_allows(daddr, host):
+            continue
+        if not _source_allows(saddr, host):
+            continue
+        return True
+    return False
+
+
+def _is_ipv6(host: str) -> bool:
+    if not host:
+        return False
+    try:
+        return ipaddress.ip_address(host).version == 6
+    except ValueError:
+        return False
+
+
 def ufw_blocks(port: int, *, ufw_dir: Path = UFW_DIR,
                defaults: Path = UFW_DEFAULTS,
-               state_file: Path | None = None) -> bool:
+               state_file: Path | None = None,
+               host: str = "") -> bool:
     """True when ufw is on, drops incoming traffic and may have no rule for ``port``.
 
     When the rules cannot be read (the normal case on Debian/Ubuntu) there is no
@@ -83,37 +186,38 @@ def ufw_blocks(port: int, *, ufw_dir: Path = UFW_DIR,
     is reported as not blocked: the dialog then shows no button rather than a
     wrong one.
     """
+    port_num = _validate_port(port)
     if shutil.which("ufw") is None and not (ufw_dir / "ufw.conf").exists():
         return False
     if not re.search(r"^ENABLED=yes", _read(ufw_dir / "ufw.conf"), re.M):
         return False
-    policy = re.search(r'^DEFAULT_INPUT_POLICY="?(\w+)', _read(defaults), re.M)
+    defaults_text = _read(defaults)
+    policy = re.search(r'^DEFAULT_INPUT_POLICY="?(\w+)', defaults_text, re.M)
     if policy is None or policy.group(1).upper() == "ACCEPT":
         return False
-    if not ufw_rules_readable(ufw_dir=ufw_dir):
-        return port not in _allowed_ports(state_file or _allowed_path())
-    rules = _read(ufw_dir / "user.rules")
+    rules_file = "user6.rules" if _is_ipv6(host) else "user.rules"
+    if rules_file == "user.rules":
+        readable = ufw_rules_readable(ufw_dir=ufw_dir)
+    else:
+        readable = ufw_rules_readable(ufw_dir=ufw_dir, rules_file=rules_file)
+    if not readable:
+        return port_num not in _allowed_ports(state_file or _allowed_path())
+    rules = _read(ufw_dir / rules_file)
     if not rules:
-        return False
-    # ufw records each rule as "### tuple ### allow tcp 8443 0.0.0.0/0 any ..."
-    # ("any" instead of "tcp" for a protocol-less rule; ranges as a:b).
-    for match in re.finditer(r"^### tuple ### allow (tcp|any) (\S+) ", rules, re.M):
-        for part in match.group(2).split(","):
-            low, _, high = part.partition(":")
-            try:
-                if int(low) <= port <= int(high or low):
-                    return False
-            except ValueError:
-                continue
-    return True
+        if rules_file == "user.rules" and (ufw_dir / "user6.rules").exists():
+            rules = _read(ufw_dir / "user6.rules")
+        if not rules:
+            return False
+    return not _rules_allow(rules, port_num, host)
 
 
 def allow_command(port: int) -> list[str] | None:
     """The command that opens ``port`` (asks for the password), or None."""
+    port_num = _validate_port(port)
     pkexec, ufw = shutil.which("pkexec"), shutil.which("ufw")
     if pkexec is None or ufw is None:
         return None
-    return [pkexec, ufw, "allow", f"{port}/tcp", "comment", COMMENT]
+    return [pkexec, ufw, "allow", f"{port_num}/tcp", "comment", COMMENT]
 
 
 # ------------------------------------------------------------- firewalld
@@ -175,8 +279,12 @@ def firewalld_zone(host: str = "") -> str:
     interface = _interface_of(host) if host else ""
     zone = ""
     if interface:
-        zone = _call(FIREWALLD_PATH, FIREWALLD + ".zone", "getZoneOfInterface",
-                     "(s)", (interface,), "(s)")[0]
+        try:
+            zone = _call(FIREWALLD_PATH, FIREWALLD + ".zone", "getZoneOfInterface",
+                         "(s)", (interface,), "(s)")[0]
+        except Exception as exc:  # noqa: BLE001 - interface may not be bound to any zone
+            if "UNKNOWN_INTERFACE" not in str(exc):
+                raise
     if not zone:
         zone = _call(FIREWALLD_PATH, FIREWALLD, "getDefaultZone", reply="(s)")[0]
     return zone
@@ -185,9 +293,10 @@ def firewalld_zone(host: str = "") -> str:
 def firewalld_blocks(port: int, host: str = "") -> bool:
     """True when firewalld's zone for the phone link does not open ``port``."""
     try:
+        port_num = _validate_port(port)
         zone = firewalld_zone(host)
         opened = _call(FIREWALLD_PATH, FIREWALLD + ".zone", "queryPort",
-                       "(sss)", (zone, str(port), "tcp"), "(b)")[0]
+                       "(sss)", (zone, str(port_num), "tcp"), "(b)")[0]
     except Exception:  # noqa: BLE001 - unknown is not "blocked" (no wrong button)
         return False
     return not opened
@@ -196,17 +305,18 @@ def firewalld_blocks(port: int, host: str = "") -> bool:
 def firewalld_allow(port: int, host: str = "") -> str:
     """Open ``port``/tcp now and permanently; "" on success, else the reason."""
     try:
+        port_num = _validate_port(port)
         zone = firewalld_zone(host)
         for step in ("runtime", "permanent"):
             try:
                 if step == "runtime":
                     _call(FIREWALLD_PATH, FIREWALLD + ".zone", "addPort", "(sssi)",
-                          (zone, str(port), "tcp", 0), "(s)", interactive=True)
+                          (zone, str(port_num), "tcp", 0), "(s)", interactive=True)
                 else:
                     config_zone = _call(FIREWALLD_CONFIG, FIREWALLD + ".config",
                                         "getZoneByName", "(s)", (zone,), "(o)")[0]
                     _call(config_zone, FIREWALLD + ".config.zone", "addPort",
-                          "(ss)", (str(port), "tcp"), interactive=True)
+                          "(ss)", (str(port_num), "tcp"), interactive=True)
             except Exception as exc:  # noqa: BLE001
                 if "ALREADY_ENABLED" not in str(exc):
                     raise
@@ -238,7 +348,7 @@ def blocks(port: int, host: str = "") -> bool:
     if kind == "firewalld":
         return firewalld_blocks(port, host)
     if kind == "ufw":
-        return ufw_blocks(port) and allow_command(port) is not None
+        return ufw_blocks(port, host=host) and allow_command(port) is not None
     return False
 
 

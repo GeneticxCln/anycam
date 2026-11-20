@@ -166,6 +166,8 @@ class ScreenMixin:
 
     def _close_screen_sessions(self) -> None:
         sessions = list(self._screen_sessions.values())
+        if self._last_screen_session is not None:
+            sessions.append(self._last_screen_session)
         self._screen_sessions.clear()
         self._last_screen_session = None
         closed: set[int] = set()

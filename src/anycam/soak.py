@@ -35,6 +35,10 @@ def _disk_usage(path: str | Path) -> dict:
     while not target.exists() and target != target.parent:
         target = target.parent
     try:
+        target = target.resolve()
+    except OSError:
+        pass
+    try:
         usage = psutil.disk_usage(str(target))
     except OSError:
         return {}
@@ -113,22 +117,24 @@ def _stall_assessment(samples: list[dict], *, warmup: float = 5.0,
     if len(points) >= 2:
         last_frames = points[0][1]
         stall_start = points[0][0]
+        stall_end = points[0][0]
         for t, frames in points[1:]:
             if frames == last_frames:
+                stall_end = t
                 continue
-            if t - stall_start >= stall_seconds:
+            if stall_end - stall_start >= stall_seconds:
                 stalls.append({"from_s": round(stall_start, 1),
-                               "to_s": round(t, 1),
-                               "seconds": round(t - stall_start, 1),
+                               "to_s": round(stall_end, 1),
+                               "seconds": round(stall_end - stall_start, 1),
                                "frames": last_frames})
             last_frames = frames
             stall_start = t
-        end_t, end_frames = points[-1]
-        if end_t - stall_start >= stall_seconds:
+            stall_end = t
+        if stall_end - stall_start >= stall_seconds:
             stalls.append({"from_s": round(stall_start, 1),
-                           "to_s": round(end_t, 1),
-                           "seconds": round(end_t - stall_start, 1),
-                           "frames": end_frames})
+                           "to_s": round(stall_end, 1),
+                           "seconds": round(stall_end - stall_start, 1),
+                           "frames": last_frames})
     longest = max((s["seconds"] for s in stalls), default=0.0)
     return {"ok": len(points) >= 2 and not stalls,
             "stalls": stalls, "longest_s": longest}
@@ -161,7 +167,16 @@ def _memory_assessment(samples: list[dict], warmup: float) -> dict:
     settled = points[len(points) // 2:]
     tail = points[int(len(points) * 0.75):]
     settled_slope = _slope_per_min(settled)
-    tail_growth = max(r for _, r in tail) - min(r for _, r in tail)
+    # Measure upward RSS growth (maximum rise after a minimum) so a GC memory
+    # decrease in the tail is never flagged as a leak.
+    tail_values = [r for _, r in tail]
+    min_so_far = tail_values[0]
+    tail_growth = 0.0
+    for value in tail_values[1:]:
+        if value < min_so_far:
+            min_so_far = value
+        elif value - min_so_far > tail_growth:
+            tail_growth = value - min_so_far
     # 0.5 MiB/min for the settled half plus a still tail: a real per-frame leak
     # grows by at least a frame per minute and cannot hide in the noise.
     ok = (settled_slope is not None and settled_slope < 0.5 and tail_growth < 1.0)
@@ -203,7 +218,32 @@ def main(argv: list[str] | None = None) -> int:
         preview=True,
         audio=False,
     )
-    engine.build()
+    try:
+        engine.build()
+    except Exception as exc:  # noqa: BLE001 - report structured failure JSON
+        error_result = {
+            "soak": {
+                "requested_seconds": args.seconds,
+                "elapsed_seconds": 0.0,
+                "resolution": [args.width, args.height],
+                "fps": args.fps,
+                "stall_seconds": args.stall_seconds,
+            },
+            "acceptance": {
+                "overall": "fail",
+                "drops_ok": False,
+                "memory_ok": False,
+                "mp4_ok": False,
+                "stalls_ok": False,
+                "vcam_ok": not args.vcam,
+                "error": f"engine build failed: {exc}",
+            },
+        }
+        print(json.dumps(error_result, indent=2))
+        if args.json:
+            Path(args.json).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.json).write_text(json.dumps(error_result, indent=2) + "\n", encoding="utf-8")
+        return 1
     started = time.monotonic()
     print(f"soak: {args.seconds:.0f}s at {args.width}x{args.height}@{args.fps} "
           f"(warm-up {args.warmup:.0f}s)", flush=True)
@@ -245,7 +285,7 @@ def main(argv: list[str] | None = None) -> int:
     drops_ok = preview_drops_ok and (recorded_drops is None or recorded_drops < 1.0)
     memory_ok = bool(memory["ok"])
     stalls_ok = bool(stalls["ok"])
-    vcam_ok = bool(report["vcam_active"])
+    vcam_ok = (not args.vcam) or bool(report["vcam_active"])
     overall = "pass" if (drops_ok and memory_ok and mp4_ok and stalls_ok
                          and vcam_ok and not report["error"]) else (
         "blocked" if (drops_ok and memory_ok and mp4_ok and stalls_ok
@@ -283,7 +323,7 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps({k: v for k, v in result.items() if k != "report"}, indent=2))
     if args.json:
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.json).write_text(json.dumps(result, indent=2) + "\n")
+        Path(args.json).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     return 0 if overall == "pass" else (3 if overall == "blocked" else 1)
 
 

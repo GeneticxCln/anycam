@@ -138,6 +138,21 @@ class PreviewWidget(QWidget):
 
     def disable_gpu(self) -> None:
         """Back to the image preview for good (the engine could not use it)."""
+        if self.video_view is not None:
+            from .. import gl_preview
+
+            detach = getattr(gl_preview, "detach_sink", None)
+            if callable(detach):
+                try:
+                    detach(self.video_view)
+                except Exception:  # noqa: BLE001
+                    pass
+            root = (self.video_view.rootObject()
+                    if hasattr(self.video_view, "rootObject") else None)
+            if root is not None:
+                root.setProperty("live", False)
+            if hasattr(self.video_view, "video_item"):
+                self.video_view.video_item = None
         for child in (self.video_view, self._overlay):
             if child is not None:
                 child.hide()

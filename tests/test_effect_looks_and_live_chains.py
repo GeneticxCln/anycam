@@ -127,7 +127,7 @@ def test_drawing_tiles_never_blocks_the_window(window):
     and froze the camera through the GIL; ticks now only hand work over."""
     import time
 
-    from tests.test_effects_browser import open_effects, pump, show_category
+    from tests.test_effects_browser import open_effects, show_category
 
     win, app = window
     open_effects(win, app)

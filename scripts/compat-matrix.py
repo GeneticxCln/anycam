@@ -33,7 +33,8 @@ def main() -> int:
         Path(args.json).write_text(compat.to_json(rows))
     if args.markdown:
         Path(args.markdown).write_text(table + "\n")
-    return 0 if all(row.state == "ok" for row in rows if row.state != "not found") else 1
+    tested = [row for row in rows if row.state != "not found"]
+    return 0 if tested and all(row.state == "ok" for row in tested) else 1
 
 
 if __name__ == "__main__":

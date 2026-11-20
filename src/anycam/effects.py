@@ -221,8 +221,11 @@ _PACK_SPECS: dict[str, FilterSpec] = {}
 
 def reload_packs(root=None) -> list[str]:
     """(Re)read the effect packs folder; returns what could not be loaded."""
+    from pathlib import Path
+
     from . import packs
 
+    packs.set_custom_root(Path(root) if root is not None and Path(root).is_dir() else None)
     for key in list(_PACK_SPECS):
         FILTERS.pop(key, None)
     _PACK_SPECS.clear()
@@ -449,7 +452,10 @@ class FilterSlot:
         self.runner = None
         self._lock = threading.RLock()
         self._busy = False
+        self._closed = False
         self._wanted: tuple[str, float] | None = None
+        self._pending_timer: threading.Timer | None = None
+        self._cancel_swap = None
         self.idle = threading.Event()
         self.idle.set()
         self.element, self.runner = self._new_bin(self.key, self.amount)
@@ -461,18 +467,34 @@ class FilterSlot:
 
     def close(self) -> None:
         """Stop a processor's worker thread (the canvas is going away)."""
-        if self.runner is not None:
-            self.runner.stop()
-            self.runner = None
+        with self._lock:
+            self._closed = True
+            self._wanted = None
+            timer, self._pending_timer = self._pending_timer, None
+            cancel, self._cancel_swap = self._cancel_swap, None
+            runner, self.runner = self.runner, None
+            self._busy = False
+        if timer is not None:
+            timer.cancel()
+        if cancel is not None:
+            cancel()
+        self.idle.set()
+        if self._gate is not None:
+            self._gate.release(self)
+        if runner is not None:
+            runner.stop()
 
     # ------------------------------------------------------------------ amount
     def set_amount(self, amount: float) -> None:
-        self.amount = float(amount)
-        spec = FILTERS.get(self.key)
-        if self.runner is not None:
-            self.runner.processor.set_amount(amount)
+        with self._lock:
+            self.amount = float(amount)
+            spec = FILTERS.get(self.key)
+            runner = self.runner
+            element = self.element
+        if runner is not None:
+            runner.processor.set_amount(amount)
             return
-        effect = self.element.get_by_name("fx")
+        effect = element.get_by_name("fx")
         if spec is not None and spec.prop and effect is not None:
             value = amount_value(spec, amount)
             shrink = int(dict(spec.fixed).get("downscale", 1)) if self.size else 1
@@ -487,6 +509,8 @@ class FilterSlot:
         """
         key = normalize_filter(key)
         with self._lock:
+            if self._closed:
+                return False
             if self._busy:
                 self._wanted = (key, float(amount))
                 return True
@@ -507,6 +531,11 @@ class FilterSlot:
     def _resume(self) -> None:
         """Run the request that was waiting for a neighbour's swap."""
         with self._lock:
+            if self._closed:
+                self._wanted = None
+                self._busy = False
+                self.idle.set()
+                return
             wanted, self._wanted = self._wanted, None
             self._busy = False
         if wanted is not None:
@@ -518,6 +547,8 @@ class FilterSlot:
     def _start_swap(self, key: str, amount: float) -> str:
         """Begin the swap; ``"scheduled"`` (it will finish by itself),
         ``"done"`` (finished at once) or ``"failed"`` (nothing changed)."""
+        if self._closed:
+            return "failed"
         old, old_runner = self.element, self.runner
         parent = old.get_parent()
         try:
@@ -540,10 +571,14 @@ class FilterSlot:
         self._busy = True
         self.idle.clear()
 
-        def relink() -> None:
+        def relink(finish: bool = True) -> bool:
             ok = False
             upstream = downstream = None
+            closed_during = False
             try:
+                if self._closed:
+                    closed_during = True
+                    return False
                 # The neighbours *now*: they are re-read here rather than
                 # captured earlier, so a topology change cannot leave this
                 # relinking against pads that are no longer connected.
@@ -564,25 +599,44 @@ class FilterSlot:
             except Exception as exc:  # noqa: BLE001 - restore below
                 print(f"[filter] swap to {key} failed: {exc!r}", file=sys.stderr, flush=True)
             finally:
-                if ok:
-                    self._replace_in_list(old, new)
-                    self.element, self.runner = new, new_runner
-                    self.key, self.amount = key, amount
+                with self._lock:
+                    timer, self._pending_timer = self._pending_timer, None
+                    self._cancel_swap = None
+                    closed_during = closed_during or self._closed
+                    if ok and not closed_during:
+                        self._replace_in_list(old, new)
+                        self.element, self.runner = new, new_runner
+                        self.key, self.amount = key, amount
+                if timer is not None:
+                    timer.cancel()
+                if closed_during:
+                    if new_runner is not None:
+                        new_runner.stop()
+                    if old_runner is not None:
+                        old_runner.stop()
+                    with self._lock:
+                        self._busy = False
+                    self.idle.set()
+                elif ok:
                     if old_runner is not None:
                         old_runner.stop()
                 else:
                     if new_runner is not None:
                         new_runner.stop()
                     self._restore(old, new, upstream, downstream, parent)
-                self._finish()
+                if finish and not closed_during:
+                    self._finish()
+            return ok and not closed_during
 
         if parent.get_state(0)[1] != Gst.State.PLAYING:
-            relink()
-            return "scheduled"
+            ok = relink(finish=False)
+            self._busy = False
+            self.idle.set()
+            return "done" if ok else "failed"
 
         claim = threading.Lock()
         done = [False]
-        probe = {"pad": sink.get_peer(), "id": 0}
+        probe = {"pad": sink.get_peer(), "id": 0, "idle_id": 0}
 
         def once() -> bool:
             with claim:
@@ -591,14 +645,46 @@ class FilterSlot:
                 done[0] = True
                 return True
 
+        def clear_probes() -> None:
+            pad = probe["pad"]
+            if pad is None:
+                return
+            for field in ("id", "idle_id"):
+                pid = probe[field]
+                if pid:
+                    probe[field] = 0
+                    try:
+                        pad.remove_probe(pid)
+                    except Exception:  # noqa: BLE001 - the old pad may be gone
+                        pass
+
+        def cancel_swap() -> None:
+            if once():
+                clear_probes()
+                if new_runner is not None:
+                    new_runner.stop()
+
+        self._cancel_swap = cancel_swap
+
         def on_block(_pad, _info):
             if once():
-                relink()
+                clear_probes()
+                relink(finish=True)
             return Gst.PadProbeReturn.REMOVE
 
         def arm(pad) -> None:
             probe["pad"] = pad
-            probe["id"] = pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, on_block)
+            probe["idle_id"] = 0
+            probe["id"] = pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, on_block) or 0
+
+        def schedule_watchdog() -> None:
+            with self._lock:
+                if self._closed or done[0]:
+                    return
+                timer = threading.Timer(0.5, watchdog)
+                timer.daemon = True
+                self._pending_timer = timer
+                timer.start()
 
         started = time.monotonic()
 
@@ -606,39 +692,36 @@ class FilterSlot:
             """Re-arm if the probed pad stopped being this slot's real upstream."""
             if done[0]:
                 return
+            if self._closed:
+                cancel_swap()
+                return
             current = sink.get_peer()
             if current is not None and current is not probe["pad"]:
-                try:
-                    probe["pad"].remove_probe(probe["id"])
-                except Exception:  # noqa: BLE001 - the old pad may be gone
-                    pass
+                clear_probes()
                 arm(current)
+                if done[0]:
+                    return
             age = time.monotonic() - started
             if age >= SWAP_GIVE_UP_S:
                 if once():
-                    try:
-                        probe["pad"].remove_probe(probe["id"])
-                    except Exception:  # noqa: BLE001
-                        pass
+                    clear_probes()
                     if new_runner is not None:
                         new_runner.stop()
                     self._finish()      # unblock later requests; nothing changed
                 return
-            if age >= SWAP_IDLE_AFTER_S and not probe.get("idle"):
+            if age >= SWAP_IDLE_AFTER_S and not probe["idle_id"] and probe["pad"] is not None:
                 # No buffer came through: relink when the pad is idle instead.
-                probe["idle"] = True
                 try:
-                    probe["pad"].add_probe(Gst.PadProbeType.IDLE, on_block)
+                    probe["idle_id"] = probe["pad"].add_probe(
+                        Gst.PadProbeType.IDLE, on_block) or 0
                 except Exception:  # noqa: BLE001 - keep waiting for a buffer
-                    probe["idle"] = False
-            timer = threading.Timer(0.5, watchdog)
-            timer.daemon = True
-            timer.start()
+                    probe["idle_id"] = 0
+                if done[0]:
+                    return
+            schedule_watchdog()
 
         arm(probe["pad"])
-        timer = threading.Timer(0.5, watchdog)
-        timer.daemon = True
-        timer.start()
+        schedule_watchdog()
         return "scheduled"
 
     @staticmethod
@@ -677,7 +760,14 @@ class FilterSlot:
         wanted = None
         with self._lock:
             self._busy = False
-            wanted, self._wanted = self._wanted, None
+            self._cancel_swap = None
+            timer, self._pending_timer = self._pending_timer, None
+            if not self._closed:
+                wanted, self._wanted = self._wanted, None
+            else:
+                self._wanted = None
+        if timer is not None:
+            timer.cancel()
         self.idle.set()
         if self._gate is not None:
             self._gate.release(self)       # a waiting neighbour may go now

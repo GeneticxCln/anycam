@@ -513,7 +513,7 @@ class EffectsPanelMixin:
         self.effect_grid.clear()
         self._thumb_queue.clear()
         self._thumb_renderer.forget()
-        sample_id = id(self._thumb_sample_image)
+        sample_id = id(self._thumb_sample())
         for index, entry in enumerate(self._effect_entries):
             item = QListWidgetItem(entry["label"])
             item.setData(Qt.ItemDataRole.UserRole, index)
@@ -957,7 +957,11 @@ class EffectsPanelMixin:
             queue.clear()
         renderer = getattr(self, "_thumb_renderer", None)
         if renderer is not None:
-            renderer.forget()
+            stop = getattr(renderer, "stop", None)
+            if callable(stop):
+                stop()
+            else:
+                renderer.forget()
 
     def _update_effects_device_note(self) -> None:
         from .. import inference

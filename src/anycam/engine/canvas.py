@@ -10,6 +10,7 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GstVideo", "1.0")
 from gi.repository import Gst  # noqa: E402
 
+from .. import geometry  # noqa: E402
 from ..model import Effects, Layer  # noqa: E402
 from ..sources import (SourceChain, apply_effects, background_chain,  # noqa: E402
                          caps_filter, caps_string, gl_rack_elements,
@@ -43,20 +44,24 @@ class CanvasMixin:
         if self.canvas_backend == "gpu":
             no_pool = make("identity", None, drop_allocation=True)
             upload = make("glupload")
-            self._add(no_pool, upload)
+            self._add(no_pool, upload, sync=False)
             chain.add(no_pool, upload)
             if not (chain.tail.link(no_pool) and no_pool.link(upload)):
                 raise RuntimeError("could not upload a layer to the GPU canvas")
             chain.tail = upload
             crop = tuple(getattr(layer, "crop", None) or (0.0, 0.0, 0.0, 0.0))
             symmetric = len(crop) < 4 or abs(float(crop[0]) - float(crop[2])) < 1e-6
+            if symmetric and layer is not None:
+                _fit, _fh, _fv, rotation, _zoom, pan = geometry.layer_transform(layer)
+                if rotation != 0 or abs(pan[0] - 0.5) > 1e-6 or abs(pan[1] - 0.5) > 1e-6:
+                    symmetric = False
             gl_rack = (gl_rack_elements(mirror_on_gpu=symmetric)
                        if chain.effects.get("balance") is not None else None)
             if gl_rack:
                 # The colour step (and mirror) as shaders (see apply_effects).
                 gl_elements = [gl_rack["gl_balance"]] + (
                     [gl_rack["gl_flip"]] if "gl_flip" in gl_rack else [])
-                self._add(*gl_elements)
+                self._add(*gl_elements, sync=False)
                 chain.add(*gl_elements)
                 previous = upload
                 for element in gl_elements:
@@ -148,15 +153,66 @@ class CanvasMixin:
         self._frame_zero = self._rendered(getattr(self, "_frame_counter", None))
         self._frame_base = int(value)
 
+    def _attach_tee_branch(self, tee: Gst.Element, elements: list[Gst.Element],
+                           *, count_branch: bool = False) -> Gst.Pad:
+        """Add, link, sync and attach a complete branch to ``tee`` safely.
+
+        On a running (PLAYING) pipeline, downstream elements are added with
+        ``sync=False``, linked end-to-end, and synced downstream-to-upstream
+        BEFORE linking and activating the new tee src pad so no buffer can hit
+        an unlinked pad and post a fatal ``not-linked`` error.
+        """
+        assert self.pipeline is not None
+        assert elements
+        self._add(*elements, sync=False)
+        try:
+            self._link(elements)
+        except Exception:
+            for element in reversed(elements):
+                element.set_state(Gst.State.NULL)
+                if element.get_parent() is self.pipeline:
+                    self.pipeline.remove(element)
+            raise
+        for element in reversed(elements):
+            self._sync_state(element)
+        tee_pad = tee.request_pad_simple("src_%u")
+        if (tee_pad is None
+                or tee_pad.link(elements[0].get_static_pad("sink")) != Gst.PadLinkReturn.OK):
+            if tee_pad is not None:
+                try:
+                    tee.release_request_pad(tee_pad)
+                except Exception:  # noqa: BLE001
+                    pass
+            for element in reversed(elements):
+                element.set_state(Gst.State.NULL)
+                if element.get_parent() is self.pipeline:
+                    self.pipeline.remove(element)
+            raise RuntimeError(f"could not attach {elements[0].get_name()} to {tee.get_name()}")
+        try:
+            tee_pad.set_active(True)
+        except Exception:  # noqa: BLE001
+            pass
+        if count_branch:
+            self._branch_count += 1
+        return tee_pad
+
     def _branch(self, name: str, max_buffers: int = 4,
                 max_time_ns: int = 200_000_000) -> Gst.Element:
         assert self.tee is not None
         queue = make("queue", f"queue_{name}", max_size_buffers=max_buffers,
                      max_size_time=max_time_ns)
-        self._add(queue)
+        self._add(queue, sync=False)
         tee_pad = self.tee.request_pad_simple("src_%u")
         if tee_pad is None or tee_pad.link(queue.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+            if tee_pad is not None:
+                try:
+                    self.tee.release_request_pad(tee_pad)
+                except Exception:  # noqa: BLE001
+                    pass
+            if self.pipeline is not None and queue.get_parent() is self.pipeline:
+                self.pipeline.remove(queue)
             raise RuntimeError(f"could not create {name} branch")
+        self._sync_state(queue)
         try:
             tee_pad.set_active(True)
         except Exception:  # noqa: BLE001
@@ -332,6 +388,7 @@ class CanvasMixin:
         self._preview_caps = caps
         sink = make("appsink", "preview_sink", emit_signals=True,
                     max_buffers=2, drop=True, sync=False)
+        sink.set_property("async", False)
         self._add(convert, format_caps, scale, caps, sink)
         self._link([queue, convert, format_caps, scale, caps, sink])
         # The streaming thread only stores the newest sample.  Delivery to
@@ -395,11 +452,15 @@ class CanvasMixin:
             return False
         self._pending_sample = None
         if not self._preview_gate_open:
-            if (len(self._pads_with_data) < len(self._layer_pads)
+            expected = {
+                layer_id for layer_id, pad in self._layer_pads.items()
+                if float(pad.get_property("alpha")) > 0.0
+            }
+            if (not expected.issubset(self._pads_with_data)
                     and time.monotonic() < self._preview_gate_deadline):
-                # The compositor can emit background frames before every layer
-                # has produced its first buffer; showing one flashes the
-                # preview black.  Hold delivery until all pads are live
+                # The compositor can emit background frames before every visible
+                # layer has produced its first buffer; showing one flashes the
+                # preview black.  Hold delivery until all visible pads are live
                 # (bounded by the deadline so a stalled source cannot freeze
                 # the preview).
                 return False

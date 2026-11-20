@@ -35,11 +35,15 @@ def _ring(w: int, h: int, band: int, radius: int = 0, inset: int = 0) -> Image.I
     """An 'L' mask of a border of ``band`` pixels, optionally rounded."""
     outer = Image.new("L", (w * 2, h * 2), 0)
     d = ImageDraw.Draw(outer)
+    max_inset = max(0, min(w, h) // 2 - 2)
+    inset = min(max(0, inset), max_inset)
+    band = min(max(1, band), max(1, min(w, h) // 2 - inset - 1))
     box = [inset * 2, inset * 2, w * 2 - 1 - inset * 2, h * 2 - 1 - inset * 2]
     d.rounded_rectangle(box, radius=radius * 2, fill=255)
     inner = [(inset + band) * 2, (inset + band) * 2,
              w * 2 - 1 - (inset + band) * 2, h * 2 - 1 - (inset + band) * 2]
-    d.rounded_rectangle(inner, radius=max(0, radius - band // 3) * 2, fill=0)
+    if inner[2] > inner[0] and inner[3] > inner[1]:
+        d.rounded_rectangle(inner, radius=max(0, radius - band // 3) * 2, fill=0)
     return outer.resize((w, h), Image.LANCZOS)
 
 
@@ -124,7 +128,9 @@ def _emoji_border(canvas: Image.Image, codes: list[str], band: int, size: float 
     for i, (x, y, _edge) in enumerate(pts):
         _place(canvas, codes[i % len(codes)], x, y, px, rnd.uniform(-14, 14))
     if corner:
-        big = int(px * corner_scale)
+        # Cap corner emoji so high thickness never covers the transparent centre.
+        max_big = max(10, int(min(w, h) - 2 * band - 8))
+        big = min(max(10, int(px * corner_scale)), max_big)
         for cx, cy in ((band, band), (w - band, band), (band, h - band), (w - band, h - band)):
             _place(canvas, corner, cx, cy, big)
 
@@ -489,28 +495,35 @@ def vhs(w, h, thickness, _color):
     """Camcorder look: black bars with PLAY / REC text and a chromatic ghost."""
     from . import overlay
     band = _band_size(w, h, thickness)
-    bar = int(band * 1.7)
+    bar = min(int(band * 1.7), max(8, h // 4))
+    side = min(band // 3, max(2, w // 12))
     img = _canvas(w, h)
     d = ImageDraw.Draw(img)
     d.rectangle([0, 0, w, bar], fill=(8, 8, 12, 235))
     d.rectangle([0, h - bar, w, h], fill=(8, 8, 12, 235))
-    d.rectangle([0, 0, band // 3, h], fill=(8, 8, 12, 235))
-    d.rectangle([w - band // 3, 0, w, h], fill=(8, 8, 12, 235))
+    d.rectangle([0, 0, side, h], fill=(8, 8, 12, 235))
+    d.rectangle([w - side, 0, w, h], fill=(8, 8, 12, 235))
     for y in range(0, bar, 3):                           # scanlines in the bars only
         d.line([0, y, w, y], fill=(255, 255, 255, 18))
         d.line([0, h - bar + y, w, h - bar + y], fill=(255, 255, 255, 18))
+    # Draw OSD text/REC on a separate layer so chromatic ghosting never bleeds
+    # a seam from the black side bars into the transparent video centre.
+    osd = _canvas(w, h)
+    od = ImageDraw.Draw(osd)
     font = overlay._load_font(max(10, int(bar * 0.55)))
-    d.text((band, bar // 2), "\u25b6 PLAY", font=font, fill=(235, 235, 235, 255), anchor="lm")
-    d.text((w - band, bar // 2), "SP  0:03:27", font=font, fill=(235, 235, 235, 255), anchor="rm")
-    d.text((band, h - bar // 2), "AUTO TRACKING", font=font, fill=(235, 235, 235, 255),
-           anchor="lm")
-    d.ellipse([w - band - bar * 0.5, h - bar * 0.75, w - band, h - bar * 0.25],
-              fill=(235, 40, 40, 255))
-    for sx, color in ((-2, (255, 0, 60)), (2, (0, 220, 255))):   # chromatic ghosting
-        shifted = ImageChops.offset(img.copy(), sx, 0)
+    inset_x = min(band, w // 4)
+    od.text((inset_x, bar // 2), "\u25b6 PLAY", font=font, fill=(235, 235, 235, 255), anchor="lm")
+    od.text((w - inset_x, bar // 2), "SP  0:03:27", font=font, fill=(235, 235, 235, 255), anchor="rm")
+    od.text((inset_x, h - bar // 2), "AUTO TRACKING", font=font, fill=(235, 235, 235, 255),
+            anchor="lm")
+    od.ellipse([w - inset_x - bar * 0.5, h - bar * 0.75, w - inset_x, h - bar * 0.25],
+               fill=(235, 40, 40, 255))
+    for sx, color in ((-2, (255, 0, 60)), (2, (0, 220, 255))):   # chromatic ghosting on OSD only
+        shifted = ImageChops.offset(osd, sx, 0)
         tint = Image.new("RGBA", (w, h), color + (110,))
         tint.putalpha(ImageChops.multiply(shifted.getchannel("A"), Image.new("L", (w, h), 100)))
         img.alpha_composite(tint)
+    img.alpha_composite(osd)
     return img
 
 

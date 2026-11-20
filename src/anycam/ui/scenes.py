@@ -149,10 +149,11 @@ class SceneMixin:
         scene = self.scene
         self.transition_combo.blockSignals(True)
         self.transition_ms.blockSignals(True)
-        index = self.transition_combo.findData(transitions.transition_kind(scene.transition))
+        kind = transitions.transition_kind(scene.transition)
+        index = self.transition_combo.findData(kind)
         self.transition_combo.setCurrentIndex(max(0, index))
         self.transition_ms.setValue(int(scene.transition_ms))
-        self.transition_ms.setEnabled(scene.transition != "cut")
+        self.transition_ms.setEnabled(kind != "cut")
         self.transition_combo.blockSignals(False)
         self.transition_ms.blockSignals(False)
 
@@ -166,6 +167,8 @@ class SceneMixin:
     def _refresh_scenes(self) -> None:
         self._sync_transition_controls()
         self._refresh_next_scene()
+        if hasattr(self, "refresh_motion_scenes"):
+            self.refresh_motion_scenes()
         self.scene_combo.blockSignals(True)
         self.scene_combo.clear()
         for scene in self.project.scenes:
@@ -207,6 +210,10 @@ class SceneMixin:
         self._forget_lost_cameras()
         self.project.active_scene = scene_id
         self._sync_layout_combo()
+        if hasattr(self, "_sync_layout_controls"):
+            self._sync_layout_controls()
+        self._sync_transition_controls()
+        self._refresh_next_scene()
         self._clear_history()
         self._refresh_scene_list()
         self._refresh_layers()
@@ -227,6 +234,8 @@ class SceneMixin:
         self._forget_lost_cameras()
         self.project.active_scene = scene_id
         self._sync_layout_combo()
+        if hasattr(self, "_sync_layout_controls"):
+            self._sync_layout_controls()
         self._clear_history()
         self._refresh_scenes()
         self._refresh_layers()
@@ -260,9 +269,14 @@ class SceneMixin:
                          f"(found {len(choices)})")
             return
         dialog = CameraGridDialog(choices, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        slots = dialog.slots()
+        try:
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            slots = dialog.slots()
+        finally:
+            delete = getattr(dialog, "deleteLater", None)
+            if callable(delete):
+                delete()
         count = len([device for device in slots if device])
         names = {3: "Three cameras", 4: "Four cameras"}
         scene = camera_grid_scene(slots, name=names.get(count, "Camera grid"))
@@ -309,6 +323,9 @@ class SceneMixin:
         self._forget_lost_cameras()
         self.project.scenes.append(scene)
         self.project.active_scene = scene.id
+        self._sync_layout_combo()
+        if hasattr(self, "_sync_layout_controls"):
+            self._sync_layout_controls()
         self._clear_history()
         self._refresh_scenes()
         self._refresh_scene_list()
@@ -330,6 +347,9 @@ class SceneMixin:
         for layer in copy_.layers:
             renamed[layer.id] = layer.id = new_id("layer")
         copy_.playlist.layer_ids = [renamed.get(i, i) for i in copy_.playlist.layer_ids]
+        copy_.playlist.durations = {
+            renamed.get(k, k): v for k, v in copy_.playlist.durations.items()
+        }
         self._append_scene(copy_)
         # Next to the original rather than at the end.
         index = next(i for i, item in enumerate(self.project.scenes) if item.id == scene.id)
@@ -376,6 +396,9 @@ class SceneMixin:
         if self.project.active_scene not in [s.id for s in self.project.scenes]:
             self.project.active_scene = self.project.scenes[0].id
         self._forget_lost_cameras()
+        self._sync_layout_combo()
+        if hasattr(self, "_sync_layout_controls"):
+            self._sync_layout_controls()
         self._clear_history()
         self._refresh_scenes()
         self._refresh_scene_list()

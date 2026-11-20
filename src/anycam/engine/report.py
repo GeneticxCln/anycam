@@ -41,6 +41,7 @@ class EngineReport:
     record_bytes: int = 0
     record_ok: bool = False
     rtmp_url: str = ""
+    _rtmp_extra_urls: list[str] = field(default_factory=list, repr=False)
     # One row per destination: url (redacted), state, error, restarts, retry_in_s.
     rtmp_targets: list[dict] = field(default_factory=list)
     audio_inputs: list[str] = field(default_factory=list)
@@ -62,7 +63,7 @@ class EngineReport:
             "expected_frames": round(self.expected_frames, 1),
             "dropped_frames": round(self.dropped_frames, 1),
             "dropped_pct": round(self.dropped_pct, 3),
-            "error": self.error,
+            "error": config.redact_text(self.error, self.rtmp_url, *self._rtmp_extra_urls),
             "vcam_error": self.vcam_error,
             "media_error": self.media_error,
             "media_errors": self.media_errors,
@@ -81,7 +82,7 @@ class EngineReport:
             "vcam": self.vcam,
             "vcam_active": self.vcam_active,
             "screen_error": self.screen_error,
-            "rtmp_error": config.redact_text(self.rtmp_error, self.rtmp_url),
+            "rtmp_error": config.redact_text(self.rtmp_error, self.rtmp_url, *self._rtmp_extra_urls),
             "rtmp_encoder": self.rtmp_encoder,
             "rtmp_encoder_note": self.rtmp_encoder_note,
             "record_path": self.record_path,

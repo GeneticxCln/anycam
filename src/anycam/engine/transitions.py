@@ -97,6 +97,13 @@ class TransitionMixin:
 
     _transition: Running | None = None
 
+    def _get_transition_lock(self) -> threading.Lock:
+        lock = getattr(self, "_transition_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._transition_lock = lock
+        return lock
+
     @property
     def transitioning(self) -> bool:
         return self._transition is not None
@@ -123,16 +130,21 @@ class TransitionMixin:
 
     def _apply_transition_step(self, run: Running, progress: float) -> None:
         step = step_at(run.kind, progress, self.canvas_w, self.canvas_h)
-        for layers, dx, dy, scale in ((run.ghosts, step.out_dx, step.out_dy, step.out_alpha),
-                                      (run.incoming, step.in_dx, step.in_dy, step.in_alpha)):
-            for layer in layers:
-                pad = self._layer_pads.get(layer.id)
-                if pad is None or not layer.visible:
-                    continue
-                rect = self._box_pixels(layer)
-                pad.set_property("xpos", int(rect[0] + dx))
-                pad.set_property("ypos", int(rect[1] + dy))
-                pad.set_property("alpha", float(max(0.0, min(1.0, layer.alpha * scale))))
+        with self._get_transition_lock():
+            if (run.stop.is_set()
+                    or getattr(self, "_stopping", False)
+                    or getattr(self, "_stopped", False)):
+                return
+            for layers, dx, dy, scale in ((run.ghosts, step.out_dx, step.out_dy, step.out_alpha),
+                                          (run.incoming, step.in_dx, step.in_dy, step.in_alpha)):
+                for layer in layers:
+                    pad = self._layer_pads.get(layer.id)
+                    if pad is None or not layer.visible:
+                        continue
+                    rect = self._box_pixels(layer)
+                    pad.set_property("xpos", int(rect[0] + dx))
+                    pad.set_property("ypos", int(rect[1] + dy))
+                    pad.set_property("alpha", float(max(0.0, min(1.0, layer.alpha * scale))))
 
     def finish_transition(self) -> None:
         """Drop the old scene's layers and put the new ones exactly in place."""
@@ -140,16 +152,17 @@ class TransitionMixin:
         if run is None:
             return
         run.stop.set()
-        if run.thread is not None:
+        if run.thread is not None and run.thread is not threading.current_thread():
             run.thread.join(timeout=1.0)
-        for layer in run.incoming:
-            pad = self._layer_pads.get(layer.id)
-            if pad is None:
-                continue
-            rect = self._box_pixels(layer)
-            pad.set_property("xpos", int(rect[0]))
-            pad.set_property("ypos", int(rect[1]))
-            pad.set_property("alpha", float(max(0.0, min(1.0, layer.alpha))) if layer.visible else 0.0)
+        with self._get_transition_lock():
+            for layer in run.incoming:
+                pad = self._layer_pads.get(layer.id)
+                if pad is None:
+                    continue
+                rect = self._box_pixels(layer)
+                pad.set_property("xpos", int(rect[0]))
+                pad.set_property("ypos", int(rect[1]))
+                pad.set_property("alpha", float(max(0.0, min(1.0, layer.alpha))) if layer.visible else 0.0)
         for layer in run.ghosts:
             visible = layer.visible
             self.detach_layer(layer.id)

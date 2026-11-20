@@ -7,13 +7,19 @@ def ffprobe(path: str) -> dict:
     import json
     import subprocess
 
-    proc = subprocess.run(
-        ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
-        capture_output=True, text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"error": str(exc)}
     if proc.returncode != 0:
         return {"error": proc.stderr.strip()}
-    data = json.loads(proc.stdout or "{}")
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        return {"error": f"invalid ffprobe output: {exc}"}
     streams = []
     for stream in data.get("streams", []):
         streams.append({

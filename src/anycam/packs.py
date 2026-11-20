@@ -15,6 +15,7 @@ the effect.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import re
 import sys
@@ -24,8 +25,20 @@ from pathlib import Path
 from . import config
 
 MAX_FILE_BYTES = 1_000_000
+MAX_MANIFEST_BYTES = 256 * 1024
 _SAFE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,47}$")
 CATEGORY = "Packs"
+_custom_root: Path | None = None
+
+
+def set_custom_root(root: Path | None) -> None:
+    """Record a custom packs root (or None to use the default data dir)."""
+    global _custom_root
+    _custom_root = Path(root) if root is not None else None
+
+
+def custom_root() -> Path | None:
+    return _custom_root
 
 
 @dataclass(frozen=True)
@@ -59,15 +72,26 @@ def discover(root: Path | None = None) -> tuple[list[PackEffect], list[str]]:
     root = Path(root) if root is not None else packs_dir()
     effects: list[PackEffect] = []
     problems: list[str] = []
+    seen_keys: set[str] = set()
     for manifest in sorted(root.glob("*/pack.json")):
         folder = manifest.parent
         try:
-            data = json.loads(manifest.read_text(encoding="utf-8"))
+            with manifest.open("rb") as handle:
+                raw = handle.read(MAX_MANIFEST_BYTES + 1)
+            if len(raw) > MAX_MANIFEST_BYTES:
+                problems.append(f"{folder.name}: pack.json is larger than {MAX_MANIFEST_BYTES} bytes")
+                continue
+            data = json.loads(raw.decode("utf-8"))
         except (OSError, ValueError) as exc:
             problems.append(f"{folder.name}: pack.json unreadable ({exc})")
             continue
         found, issues = _read_manifest(folder, data)
-        effects.extend(found)
+        for effect in found:
+            if effect.filter_key in seen_keys:
+                problems.append(f"{folder.name}: duplicate effect key {effect.filter_key!r} ignored")
+                continue
+            seen_keys.add(effect.filter_key)
+            effects.append(effect)
         problems.extend(f"{folder.name}: {issue}" for issue in issues)
     return effects, problems
 
@@ -112,6 +136,11 @@ def _read_manifest(folder: Path, data) -> tuple[list[PackEffect], list[str]]:
 
 
 def find(pack: str, key: str, root: Path | None = None) -> PackEffect | None:
+    if root is None and _custom_root is not None and _custom_root.is_dir():
+        effects, _problems = discover(_custom_root)
+        match = next((effect for effect in effects if effect.pack == pack and effect.key == key), None)
+        if match is not None:
+            return match
     effects, _problems = discover(root)
     return next((effect for effect in effects if effect.pack == pack and effect.key == key), None)
 
@@ -155,7 +184,11 @@ def load_effect(variant: str, amount: float, root: Path | None = None):
     if cls is None:
         raise ImportError(f"{found.path.name} defines no class Effect")
     try:
-        effect = cls(amount)
+        inspect.signature(cls).bind(amount)
+        accepts_amount = True
     except TypeError:
-        effect = cls()
+        accepts_amount = False
+    except ValueError:
+        accepts_amount = True
+    effect = cls(amount) if accepts_amount else cls()
     return _Adapter(effect, float(amount))

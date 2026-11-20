@@ -9,7 +9,9 @@ line, blinking LED eyes) drawn on top of the cached base a dozen times a second.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 import math
+import threading
 from typing import Callable
 
 import numpy as np
@@ -619,16 +621,23 @@ MASKS: dict[str, tuple[str, str, Callable, Callable | None]] = {
 
 GROUPS: tuple[str, ...] = tuple(dict.fromkeys(item[1] for item in MASKS.values()))
 
+_ANIM_CACHE_MAX = 48
+_ANIM_LOOP_STEPS = 48          # 4 s loop at 12 FPS so animated masks hit the cache
+_cache_lock = threading.Lock()
 _base_cache: dict[str, Image.Image] = {}
-_anim_cache: dict[tuple[str, int], Image.Image] = {}
+_anim_cache: OrderedDict[tuple[str, int], Image.Image] = OrderedDict()
 
 
 def base(key: str) -> Image.Image:
-    if key not in _base_cache:
+    with _cache_lock:
+        cached = _base_cache.get(key)
+    if cached is None:
         art = Art(2)
         MASKS[key][2](art)
-        _base_cache[key] = art.finish()
-    return _base_cache[key]
+        built = art.finish()
+        with _cache_lock:
+            cached = _base_cache.setdefault(key, built)
+    return cached
 
 
 def template(key: str, t: float) -> Image.Image:
@@ -636,20 +645,25 @@ def template(key: str, t: float) -> Image.Image:
     animator = MASKS[key][3]
     if animator is None:
         return base(key)
-    step = int(t * ANIM_FPS)
-    cached = _anim_cache.get((key, step % 4096))
-    if cached is None:
-        picture = base(key).copy()
-        overlay = animator(step / ANIM_FPS)
-        # the overlay is painted unsupersampled at the same pixel size as the base
-        if overlay.size != picture.size:
-            overlay = overlay.resize(picture.size, Image.BILINEAR)
-        picture.alpha_composite(overlay)
-        if len(_anim_cache) > 600:
-            _anim_cache.clear()
-        _anim_cache[(key, step % 4096)] = picture
-        cached = picture
-    return cached
+    phase = int(t * ANIM_FPS) % _ANIM_LOOP_STEPS
+    cache_key = (key, phase)
+    with _cache_lock:
+        cached = _anim_cache.get(cache_key)
+        if cached is not None:
+            _anim_cache.move_to_end(cache_key)
+            return cached
+    picture = base(key).copy()
+    overlay = animator(phase / ANIM_FPS)
+    # the overlay is painted unsupersampled at the same pixel size as the base
+    if overlay.size != picture.size:
+        overlay = overlay.resize(picture.size, Image.BILINEAR)
+    picture.alpha_composite(overlay)
+    with _cache_lock:
+        _anim_cache[cache_key] = picture
+        _anim_cache.move_to_end(cache_key)
+        while len(_anim_cache) > _ANIM_CACHE_MAX:
+            _anim_cache.popitem(last=False)
+    return picture
 
 
 def next_template_time(key: str, t: float) -> float | None:
@@ -660,10 +674,11 @@ def next_template_time(key: str, t: float) -> float | None:
     """
     if MASKS[key][3] is None:
         return None
-    step = int(t * ANIM_FPS) + 1
-    if (key, step % 4096) in _anim_cache:
-        return None
-    return step / ANIM_FPS
+    next_phase = (int(t * ANIM_FPS) + 1) % _ANIM_LOOP_STEPS
+    with _cache_lock:
+        if (key, next_phase) in _anim_cache:
+            return None
+    return next_phase / ANIM_FPS
 
 
 # --- placing it on a face -------------------------------------------------------------

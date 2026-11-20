@@ -54,8 +54,15 @@ class RecordTapMixin:
                         pass
             return encoder
         if plan.hardware:
-            return make(plan.factory, name, bitrate=bitrate,
-                        zerolatency=True, preset="p4")
+            encoder = make(plan.factory, name, bitrate=bitrate,
+                           zerolatency=True, preset="p4")
+            if encoder.find_property("gop-size") is not None:
+                gop = max(1, min(60, int(self.fps) * 2))
+                try:
+                    encoder.set_property("gop-size", gop)
+                except (TypeError, ValueError):
+                    pass
+            return encoder
         return make(plan.factory, name, speed_preset="veryfast",
                     tune="zerolatency", bitrate=bitrate, key_int_max=60)
 
@@ -68,7 +75,8 @@ class RecordTapMixin:
 
     def _make_record_encoder(self) -> tuple[Gst.Element, bool]:
         """Return the recording encoder and whether its input is GPU memory."""
-        plan = encoder_plan(self._encoder_preference())
+        plan = encoder_plan(self._encoder_preference(),
+                            width=self.canvas_w, height=self.canvas_h)
         self._record_plan = plan
         self.report.encoder = plan.factory
         self.report.video_codec = plan.codec
@@ -106,27 +114,32 @@ class RecordTapMixin:
         branch can be destroyed and recreated with the canvas without
         finalising the MP4.
         """
-        if self.recorder is None:
+        if self.recorder is None or self.pipeline is None or self.tee is None:
             return
         if self._recorder_valve is not None:
             self._recorder_valve.set_property("drop", False)
             return
-        queue = self._branch("record")
+        queue = make("queue", "queue_record", max_size_buffers=4,
+                     max_size_time=200_000_000)
         queue.set_property("leaky", 2)
         valve = make("valve", "record_valve", drop=False)
-        self._recorder_valve = valve
         enc, hardware = self._make_record_encoder()
-        self._record_encoder = enc
-        plan = self._record_plan or encoder_plan(self._encoder_preference())
+        plan = self._record_plan or encoder_plan(
+            self._encoder_preference(),
+            width=self.canvas_w, height=self.canvas_h)
         pixel_path = self._encoder_input(hardware, "record", plan.factory)
         parse = self._make_parser(plan, "record_parse_tap")
         # Encoded frames are never dropped here (the leaky queue in front of
         # the encoder is where this graph sheds load).
         sink = make("appsink", "record_tap_sink", emit_signals=True,
                     max_buffers=16, drop=False, sync=False)
-        self._add(valve, *pixel_path, enc, parse, sink)
-        self._link([queue, valve, *pixel_path, enc, parse, sink])
+        sink.set_property("async", False)
         self._on(sink, "new-sample", self._on_record_sample)
+        self._attach_tee_branch(
+            self.tee, [queue, valve, *pixel_path, enc, parse, sink],
+            count_branch=True)
+        self._recorder_valve = valve
+        self._record_encoder = enc
 
         tee = self._audio_tee()
         if tee is not None:
@@ -136,22 +149,22 @@ class RecordTapMixin:
             audio_sink = make("appsink", "record_audio_sink", emit_signals=True,
                               max_buffers=4, drop=True, sync=False)
             audio_sink.set_property("async", False)
-            self._add(audio_queue, audio_sink)
-            self._link([audio_queue, audio_sink])
-            tpad = tee.request_pad_simple("src_%u")
-            if (tpad is None or
-                    tpad.link(audio_queue.get_static_pad("sink")) != Gst.PadLinkReturn.OK):
-                raise RuntimeError("could not tap shared audio for recording")
-            try:
-                tpad.set_active(True)
-            except Exception:  # noqa: BLE001
-                pass
-            audio_queue.set_state(Gst.State.PLAYING)
-            audio_sink.set_state(Gst.State.PLAYING)
             self._on(audio_sink, "new-sample", self._on_record_audio_sample)
+            self._attach_tee_branch(tee, [audio_queue, audio_sink])
 
     def attach_recorder(self, recorder: Recorder) -> bool:
         """Start feeding the existing canvas into ``recorder`` without a rebuild."""
+        if self.pipeline is None or self._stopped:
+            return False
+        if self._recorder_valve is not None:
+            if (self._record_plan is not None
+                    and getattr(recorder, "codec", None)
+                    and recorder.codec != self._record_plan.codec):
+                return False
+            if (getattr(recorder, "has_audio", False)
+                    and self.pipeline.get_by_name("record_audio_sink") is None
+                    and self._audio_tee() is None):
+                return False
         self.recorder = recorder
         self.record_path = str(recorder.path)
         self._bind_recorder()
@@ -219,7 +232,9 @@ class RecordTapMixin:
     def _build_recording(self) -> None:
         queue = self._branch("record")
         enc, hardware = self._make_record_encoder()
-        plan = self._record_plan or encoder_plan(self._encoder_preference())
+        plan = self._record_plan or encoder_plan(
+            self._encoder_preference(),
+            width=self.canvas_w, height=self.canvas_h)
         pixel_path = self._encoder_input(hardware, "record", plan.factory)
         parse = self._make_parser(plan, "record_parse")
         # Buffer encoded video while mux waits for the first audio buffer, so a
@@ -235,8 +250,11 @@ class RecordTapMixin:
         self._add(*pixel_path, enc, parse, buffer, mux, sink)
         self._link([queue, *pixel_path, enc, parse, buffer])
         video_pad = mux.request_pad_simple("video_%u")
-        buffer.get_static_pad("src").link(video_pad)
-        mux.link(sink)
+        if (video_pad is None
+                or buffer.get_static_pad("src").link(video_pad) != Gst.PadLinkReturn.OK):
+            raise RuntimeError("could not link encoded video into mp4mux")
+        if not mux.link(sink):
+            raise RuntimeError("could not link mp4mux into filesink")
         self._record_sink = sink
         tee = self._audio_tee()
         if tee is not None:
@@ -245,7 +263,7 @@ class RecordTapMixin:
             # RTMP muxer (and the recording) during simultaneous output.
             audio_queue = make("queue", "record_audio_queue",
                                max_size_buffers=8, max_size_time=1 * Gst.SECOND)
-            self._add(audio_queue)
+            self._add(audio_queue, sync=False)
             tpad = tee.request_pad_simple("src_%u")
             apad = mux.request_pad_simple("audio_%u")
             if (tpad is None or apad is None
@@ -253,4 +271,18 @@ class RecordTapMixin:
                     != Gst.PadLinkReturn.OK
                     or audio_queue.get_static_pad("src").link(apad)
                     != Gst.PadLinkReturn.OK):
+                if tpad is not None:
+                    try:
+                        tee.release_request_pad(tpad)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if apad is not None:
+                    try:
+                        mux.release_request_pad(apad)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if self.pipeline is not None and audio_queue.get_parent() is self.pipeline:
+                    audio_queue.set_state(Gst.State.NULL)
+                    self.pipeline.remove(audio_queue)
                 raise RuntimeError("could not link shared audio into mp4mux")
+            self._sync_state(audio_queue)

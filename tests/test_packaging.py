@@ -136,10 +136,10 @@ def test_missing_pieces_come_with_the_command_that_fixes_them(tmp_path, monkeypa
     assert results["gpu"].ok is False and results["gpu"].fix == ""
 
 
-def test_a_camera_the_user_cannot_open_points_at_the_video_group():
+def test_a_camera_the_user_cannot_open_points_at_the_video_group(monkeypatch):
+    monkeypatch.setattr(os, "access", lambda _path, _mode: False)
     results = by_key(firstrun.checks(elements={"missing": []}, cameras=["/dev/video0"]))
-    if not os.access("/dev/video0", os.R_OK | os.W_OK):
-        assert "usermod -aG video" in results["camera"].fix
+    assert "usermod -aG video" in results["camera"].fix
 
 
 def test_install_hints_follow_the_distribution():

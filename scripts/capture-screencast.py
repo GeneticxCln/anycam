@@ -245,10 +245,13 @@ def capture(out_path: Path, timeout: float, types: int = 3,
             buffer.unmap(info)
         from PIL import Image
 
-        expected = width * height * 3
+        # GStreamer aligns RGB rows to 4-byte boundaries; account for padding
+        # when widths are not multiples of 4.
+        stride = (width * 3 + 3) & ~3
+        expected = stride * height
         if len(data) < expected:
             raise RuntimeError(f"short ScreenCast frame: {len(data)} < {expected}")
-        image = Image.frombytes("RGB", (width, height), data[:expected])
+        image = Image.frombytes("RGB", (width, height), data[:expected], "raw", "RGB", stride, 1)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         image.save(out_path)
         problems = frame_problems(image, (stream.width, stream.height))

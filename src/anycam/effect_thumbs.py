@@ -53,6 +53,8 @@ def default_sample(size: tuple[int, int] = THUMB_SIZE) -> Image.Image:
 def render_thumbnail(effects: Effects, sample: Image.Image,
                      size: tuple[int, int] = THUMB_SIZE) -> Image.Image | None:
     """``sample`` with ``effects`` applied, or ``None`` if the chain failed."""
+    import time
+
     width, height = size
     picture = sample.convert("RGBA").resize((width, height), Image.BILINEAR)
     if str(effects.filter).startswith("pack-") or str(effects.filter2).startswith("pack-"):
@@ -63,40 +65,42 @@ def render_thumbnail(effects: Effects, sample: Image.Image,
             effects, filter="none" if str(effects.filter).startswith("pack-") else effects.filter,
             filter2="none" if str(effects.filter2).startswith("pack-") else effects.filter2)
     layer = Layer("thumb", "test", "thumb", effects=effects)
-    try:
-        chain = SourceChain()
-        chain.add(make("videoconvert"))
-        _add_effects(chain, layer)
-        with effect_worker.in_process():
-            _finish_chain(chain, width, height, 30, layer=layer)
-        pipeline = Gst.Pipeline.new("anycam-thumb")
-        source = make("appsrc", format=Gst.Format.TIME, is_live=False,
-                      block=True)
-        source.set_property("caps", Gst.Caps.from_string(
-            f"video/x-raw,format=RGBA,width={width},height={height},"
-            "framerate=30/1"))
-        sink = make("appsink", sync=False, max_buffers=MOTION_FRAMES + 2,
-                    drop=False)
-        elements = [source, *chain.elements, sink]
-        for element in elements:
-            pipeline.add(element)
-        for first, second in zip(elements, elements[1:], strict=False):
-            if not first.link(second):
-                return None
-    except Exception:  # noqa: BLE001 - a missing element means "no preview"
-        return None
-    from PIL import ImageChops
-
-    moving = any(
-        getattr(effect_library.FILTERS.get(key), "element", "") in MOTION_ELEMENTS
-        for key in (effects.filter, effects.filter2))
-    count = MOTION_FRAMES if moving else THUMB_FRAMES
-    # Shift sideways and return, so the last frame sits where the sample does.
-    offsets = ([0, 6, 12, 6, 0, -6, -12, -6, 0][:count] if moving else [0] * count)
-    frames_data = [(picture if dx == 0 else ImageChops.offset(picture, dx, 0)).tobytes()
-                   for dx in offsets]
+    chain = None
+    pipeline = None
     result = None
     try:
+        try:
+            chain = SourceChain()
+            chain.add(make("videoconvert"))
+            _add_effects(chain, layer)
+            with effect_worker.in_process():
+                _finish_chain(chain, width, height, 30, layer=layer)
+            pipeline = Gst.Pipeline.new("anycam-thumb")
+            source = make("appsrc", format=Gst.Format.TIME, is_live=False,
+                          block=True)
+            source.set_property("caps", Gst.Caps.from_string(
+                f"video/x-raw,format=RGBA,width={width},height={height},"
+                "framerate=30/1"))
+            sink = make("appsink", sync=False, max_buffers=MOTION_FRAMES + 2,
+                        drop=False)
+            elements = [source, *chain.elements, sink]
+            for element in elements:
+                pipeline.add(element)
+            for first, second in zip(elements, elements[1:], strict=False):
+                if not first.link(second):
+                    return None
+        except Exception:  # noqa: BLE001 - a missing element means "no preview"
+            return None
+        from PIL import ImageChops
+
+        moving = any(
+            getattr(effect_library.FILTERS.get(key), "element", "") in MOTION_ELEMENTS
+            for key in (effects.filter, effects.filter2))
+        count = MOTION_FRAMES if moving else THUMB_FRAMES
+        # Shift sideways and return, so the last frame sits where the sample does.
+        offsets = ([0, 6, 12, 6, 0, -6, -12, -6, 0][:count] if moving else [0] * count)
+        frames_data = [(picture if dx == 0 else ImageChops.offset(picture, dx, 0)).tobytes()
+                       for dx in offsets]
         if pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             return None
         step = Gst.SECOND // 30
@@ -104,14 +108,22 @@ def render_thumbnail(effects: Effects, sample: Image.Image,
             buffer = Gst.Buffer.new_wrapped(frames_data[index])
             buffer.pts = index * step
             buffer.duration = step
-            source.emit("push-buffer", buffer)
-        source.emit("end-of-stream")
-        last = None
-        while True:
-            sample_out = sink.emit("pull-sample")
-            if sample_out is None:
+            if source.emit("push-buffer", buffer) != Gst.FlowReturn.OK:
                 break
-            last = sample_out
+        source.emit("end-of-stream")
+        bus = pipeline.get_bus()
+        deadline = time.monotonic() + 5.0
+        last = None
+        while time.monotonic() < deadline:
+            if bus is not None and bus.pop_filtered(Gst.MessageType.ERROR) is not None:
+                return None
+            remaining_ns = max(1, int((deadline - time.monotonic()) * Gst.SECOND))
+            sample_out = sink.emit("try-pull-sample", min(remaining_ns, Gst.SECOND // 2))
+            if sample_out is not None:
+                last = sample_out
+                continue
+            if sink.get_property("eos"):
+                break
         if last is not None:
             buffer = last.get_buffer()
             ok, info = buffer.map(Gst.MapFlags.READ)
@@ -122,14 +134,16 @@ def render_thumbnail(effects: Effects, sample: Image.Image,
                 finally:
                     buffer.unmap(info)
     finally:
-        pipeline.set_state(Gst.State.NULL)
+        if pipeline is not None:
+            pipeline.set_state(Gst.State.NULL)
         # A processor filter owns a worker thread; without this every tile
         # drawn for one leaked a thread for the life of the program.
-        for hook in chain.cleanup:
-            try:
-                hook()
-            except Exception:  # noqa: BLE001 - cleanup must not hide the result
-                pass
+        if chain is not None:
+            for hook in chain.cleanup:
+                try:
+                    hook()
+                except Exception:  # noqa: BLE001 - cleanup must not hide the result
+                    pass
     return result.convert("RGB") if result is not None else None
 
 

@@ -25,6 +25,7 @@ GPU_MEMORY_LIMIT = 512 * 1024 * 1024
 
 _lock = threading.Lock()
 _preference = "cpu"
+_actual_device: str | None = None
 _listeners: list = []
 
 
@@ -36,7 +37,7 @@ def preference() -> str:
 
 def set_preference(device: str) -> bool:
     """Choose ``cpu`` or ``gpu``; True when it changed (sessions are rebuilt)."""
-    global _preference
+    global _preference, _actual_device
     device = str(device or "cpu").strip().lower()
     if device not in DEVICES:
         device = "cpu"
@@ -44,12 +45,19 @@ def set_preference(device: str) -> bool:
         if device == _preference:
             return False
         _preference = device
+        _actual_device = None
         listeners = list(_listeners)
     for reset in listeners:
         try:
             reset()
         except Exception:  # noqa: BLE001 - a cache reset must not break the switch
             pass
+    try:
+        from . import effect_worker
+
+        effect_worker.notify_runtime_settings(device=preference())
+    except Exception:  # noqa: BLE001
+        pass
     return True
 
 
@@ -109,18 +117,27 @@ def session_options():
 
 def session(path: str | Path):
     """An onnxruntime session on the chosen device (CPU on any failure)."""
+    global _actual_device
     import onnxruntime as ort
 
     wanted = providers()
     if wanted != ["CPUExecutionProvider"]:
         try:
-            return ort.InferenceSession(str(path), sess_options=session_options(),
+            sess = ort.InferenceSession(str(path), sess_options=session_options(),
                                         providers=wanted)
+            with _lock:
+                _actual_device = device_of(sess)
+            return sess
         except Exception as exc:  # noqa: BLE001 - CUDA libraries missing or broken
             print(f"[effects] CUDA session for {Path(path).name} failed, using the "
                   f"CPU: {exc}", file=sys.stderr, flush=True)
-    return ort.InferenceSession(str(path), sess_options=session_options(),
+            with _lock:
+                _actual_device = "cpu"
+    sess = ort.InferenceSession(str(path), sess_options=session_options(),
                                 providers=["CPUExecutionProvider"])
+    with _lock:
+        _actual_device = device_of(sess)
+    return sess
 
 
 def device_of(session) -> str:
@@ -137,4 +154,8 @@ def describe() -> str:
     if asked == "gpu" and not gpu_available():
         return ("CPU (GPU chosen, but onnxruntime has no CUDA provider: install "
                 "onnxruntime-gpu with CUDA and cuDNN)")
+    with _lock:
+        actual = _actual_device
+    if asked == "gpu" and actual == "cpu":
+        return "CPU (GPU chosen, fell back to CPU after CUDA session error)"
     return "NVIDIA GPU (CUDA)" if asked == "gpu" else "CPU"

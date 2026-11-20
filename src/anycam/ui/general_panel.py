@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import threading
 
 import numpy as np
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QGroupBox,
                                QHBoxLayout, QHeaderView, QKeySequenceEdit, QLabel, QPushButton,
                                QSlider, QTableWidget, QVBoxLayout, QWidget)
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
 from .. import a11y, hotkeys, i18n
 from ..motion import MotionMonitor
@@ -142,7 +143,9 @@ class GeneralPanelMixin:
         language = i18n.saved_language()
         catalog = i18n.load(language)
         targets = [root] if root is not None else [self] + [
-            child for child in (getattr(self, "_settings", None),) if child is not None]
+            child for child in (getattr(self, "_settings", None),
+                                getattr(self, "_overlay_panel", None))
+            if child is not None]
         changed = 0
         for target in targets:
             changed += i18n.apply(target, catalog)
@@ -152,16 +155,60 @@ class GeneralPanelMixin:
 
     # ---------------------------------------------------------- first run
     def show_first_run_check(self, force: bool = False) -> bool:
-        """The welcome checklist, once (or on demand); True when it was shown."""
+        """The welcome checklist, once (or on demand); True when it was started."""
         from .. import firstrun
-        from .dialogs import FirstRunDialog
 
         if self.headless or (firstrun.already_shown() and not force):
             return False
-        dialog = FirstRunDialog(firstrun.checks(), self)
-        firstrun.mark_shown()
-        dialog.exec()
+        running = getattr(self, "_first_run_thread", None)
+        if running is not None and running.is_alive():
+            return False
+        result: dict = {}
+
+        def work() -> None:
+            try:
+                result["checks"] = firstrun.checks()
+            except Exception as exc:  # noqa: BLE001
+                result["error"] = exc
+            result["done"] = True
+
+        self._first_run_result = result
+        self._first_run_thread = threading.Thread(
+            target=work, name="anycam-first-run-check", daemon=True)
+        self._first_run_thread.start()
+        timer = getattr(self, "_first_run_timer", None)
+        if timer is None:
+            timer = self._first_run_timer = QTimer(self)
+            timer.setInterval(100)
+            timer.timeout.connect(self._poll_first_run_check)
+        timer.start()
         return True
+
+    def _poll_first_run_check(self) -> None:
+        result = getattr(self, "_first_run_result", None)
+        if not result or not result.get("done"):
+            return
+        if getattr(self, "_ui_blocked", 0):
+            return
+        timer = getattr(self, "_first_run_timer", None)
+        if timer is not None:
+            timer.stop()
+        if getattr(self, "_closing", False) or getattr(self, "_torn_down", False) or self.headless:
+            return
+        if "error" in result:
+            self.log_event(f"first-run check failed: {result['error']}")
+            return
+        from .. import firstrun
+        from .dialogs import FirstRunDialog
+
+        dialog = FirstRunDialog(result.get("checks") or [], self)
+        firstrun.mark_shown()
+        try:
+            dialog.exec()
+        finally:
+            delete = getattr(dialog, "deleteLater", None)
+            if callable(delete):
+                delete()
 
     # ------------------------------------------------------ floating panel
     _overlay_panel = None
@@ -170,7 +217,10 @@ class GeneralPanelMixin:
         from .overlay_panel import OverlayPanel
 
         if shown and self._overlay_panel is None:
-            self._overlay_panel = OverlayPanel(self)
+            panel = OverlayPanel(self)
+            panel.closed.connect(self._overlay_panel_closed)
+            self._overlay_panel = panel
+            self.apply_interface_polish(panel)
         if self._overlay_panel is not None:
             if shown:
                 self._overlay_panel.refresh()
@@ -181,6 +231,22 @@ class GeneralPanelMixin:
             self.panel_check.blockSignals(True)
             self.panel_check.setChecked(bool(shown))
             self.panel_check.blockSignals(False)
+
+    def _overlay_panel_closed(self) -> None:
+        if hasattr(self, "panel_check") and self.panel_check.isChecked():
+            self.panel_check.blockSignals(True)
+            self.panel_check.setChecked(False)
+            self.panel_check.blockSignals(False)
+
+    def _close_overlay_panel(self) -> None:
+        panel, self._overlay_panel = self._overlay_panel, None
+        if panel is not None:
+            try:
+                panel.closed.disconnect(self._overlay_panel_closed)
+            except (RuntimeError, TypeError):
+                pass
+            panel.close()
+            panel.deleteLater()
 
     # ------------------------------------------------------ motion detection
     def _motion_group(self) -> QGroupBox:
@@ -222,11 +288,13 @@ class GeneralPanelMixin:
         grid.addWidget(self.motion_notify, 5, 0, 1, 2)
         grid.addWidget(self.motion_level_label, 6, 0, 1, 2)
         self._motion_monitor = None
-        self._motion_settings_changed()
+        self._sync_motion_monitor()
         return box
 
     def load_motion_widgets(self) -> None:
         """Show the (just loaded) project's motion settings."""
+        if not hasattr(self, "motion_check"):
+            return
         motion = self.project.motion
         widgets = (self.motion_check, self.motion_sensitivity, self.motion_hold,
                    self.motion_cooldown, self.motion_scene, self.motion_notify)
@@ -240,7 +308,7 @@ class GeneralPanelMixin:
         self.refresh_motion_scenes()
         for widget in widgets:
             widget.blockSignals(False)
-        self._motion_settings_changed()
+        self._sync_motion_monitor()
 
     def refresh_motion_scenes(self) -> None:
         combo = getattr(self, "motion_scene", None)
@@ -254,15 +322,14 @@ class GeneralPanelMixin:
         combo.setCurrentIndex(max(0, combo.findData(self.project.motion.scene_id)))
         combo.blockSignals(False)
 
-    def _motion_settings_changed(self, *_args) -> None:
+    def _sync_motion_monitor(self) -> None:
+        """Sync the MotionMonitor and child widget states without dirtying the project."""
         motion = self.project.motion
-        motion.enabled = self.motion_check.isChecked()
-        motion.sensitivity = self.motion_sensitivity.value() / 100.0
-        motion.hold_s = float(self.motion_hold.value())
-        motion.cooldown_s = float(self.motion_cooldown.value())
-        motion.scene_id = str(self.motion_scene.currentData() or "")
-        motion.notify = self.motion_notify.isChecked()
-        if motion.enabled:
+        enabled = bool(motion.enabled)
+        for widget in (self.motion_sensitivity, self.motion_hold,
+                       self.motion_cooldown, self.motion_scene, self.motion_notify):
+            widget.setEnabled(enabled)
+        if enabled:
             monitor = self._motion_monitor
             if monitor is None:
                 monitor = self._motion_monitor = MotionMonitor()
@@ -271,6 +338,16 @@ class GeneralPanelMixin:
         else:
             self._motion_monitor = None
             self.motion_level_label.setText("")
+
+    def _motion_settings_changed(self, *_args) -> None:
+        motion = self.project.motion
+        motion.enabled = self.motion_check.isChecked()
+        motion.sensitivity = self.motion_sensitivity.value() / 100.0
+        motion.hold_s = float(self.motion_hold.value())
+        motion.cooldown_s = float(self.motion_cooldown.value())
+        motion.scene_id = str(self.motion_scene.currentData() or "")
+        motion.notify = self.motion_notify.isChecked()
+        self._sync_motion_monitor()
         self._mark_dirty()
 
     def feed_motion(self, rgba: np.ndarray, now: float) -> bool:
@@ -285,6 +362,8 @@ class GeneralPanelMixin:
         return fired
 
     def _motion_triggered(self) -> None:
+        if getattr(self, "_ui_blocked", 0) or getattr(self, "_closing", False):
+            return
         motion = self.project.motion
         target = next((i for i, scene in enumerate(self.project.scenes)
                        if scene.id == motion.scene_id), -1)

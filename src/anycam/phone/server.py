@@ -16,11 +16,14 @@ through ``on_event(event, device_id, name)`` only.
 from __future__ import annotations
 
 import http.server
+import io
 import json
 import secrets
+import socket
 import ssl
 import sys
 import threading
+import time
 from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
@@ -32,6 +35,7 @@ from .tls import ensure_certificate, fingerprint, lan_address
 MAX_BODY = 64 * 1024
 MAX_CONNECTIONS = 32
 HANDSHAKE_TIMEOUT_S = 15
+REQUEST_DEADLINE_S = 10.0
 STATIC = {"/": ("index.html", "text/html; charset=utf-8"),
           "/index.html": ("index.html", "text/html; charset=utf-8"),
           "/phone.js": ("phone.js", "text/javascript; charset=utf-8"),
@@ -44,8 +48,36 @@ CONTROL_ACTIONS = ("scene", "mute", "record")
 EventHandler = Callable[[str, str, str], None]
 
 
+def _format_host(host: str) -> str:
+    """Bracket IPv6 literals for URLs."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
 def _static(name: str) -> bytes:
     return resources.files(__package__).joinpath("static", name).read_bytes()
+
+
+class _DeadlineRawIO(io.RawIOBase):
+    """Readable socket stream capped by a wall-clock deadline (anti-Slowloris)."""
+
+    def __init__(self, sock: ssl.SSLSocket, deadline: float) -> None:
+        self._sock = sock
+        self._deadline = deadline
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b) -> int:
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("request deadline exceeded")
+        self._sock.settimeout(remaining)
+        try:
+            return self._sock.recv_into(b)
+        except ssl.SSLWantReadError:
+            raise TimeoutError("request deadline exceeded") from None
 
 
 class _TLSServer(http.server.ThreadingHTTPServer):
@@ -107,6 +139,14 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     sys_version = ""
     server: _TLSServer
 
+    def setup(self) -> None:
+        super().setup()
+        self._deadline = time.monotonic() + REQUEST_DEADLINE_S
+        self.connection.settimeout(REQUEST_DEADLINE_S)
+        # Replace rfile with a wall-clock-deadline reader so trickle clients
+        # cannot reset socket timeouts indefinitely and hold all worker slots.
+        self.rfile = io.BufferedReader(_DeadlineRawIO(self.connection, self._deadline))
+
     def log_message(self, format, *args):  # noqa: A002 - stdlib signature
         return
 
@@ -114,39 +154,61 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _send(self, status: int, body: bytes = b"",
               content_type: str = "application/json",
               headers: dict[str, str] | None = None) -> None:
+        self.connection.settimeout(REQUEST_DEADLINE_S)
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
+        if self.close_connection:
+            self.send_header("Connection", "close")
         if content_type.startswith("text/html"):
-            self.send_header("Content-Security-Policy",
-                             "default-src 'self'; style-src 'self' 'unsafe-inline'; "
-                             "img-src 'self' data:; media-src 'self' blob: mediastream:")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; frame-ancestors 'none'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data:; media-src 'self' blob: mediastream:",
+            )
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
         if body and self.command != "HEAD":
             self.wfile.write(body)
+        if self.close_connection:
+            try:
+                self.wfile.flush()
+                self.connection.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
 
     def _json(self, status: int, payload: dict) -> None:
         self._send(status, json.dumps(payload).encode("utf-8"))
 
-    def _body(self) -> bytes | None:
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            return None
-        if length < 0 or length > MAX_BODY:
-            # Read (and drop) a moderately oversized body before answering
-            # 413; closing with unread data resets the connection and the
-            # client never sees the answer.
-            if 0 < length <= 16 * MAX_BODY:
-                self.rfile.read(length)
+    def _body(self) -> tuple[bytes | None, int, str]:
+        if self.headers.get("Transfer-Encoding"):
             self.close_connection = True
-            return None
-        return self.rfile.read(length) if length else b""
+            return None, 411, "chunked transfer encoding is not supported"
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            return b"", 0, ""
+        text = raw_length.strip()
+        if not text or not text.isascii() or not text.isdigit():
+            self.close_connection = True
+            return None, 400, "invalid Content-Length"
+        length = int(text)
+        if length > MAX_BODY:
+            # Never drain an oversized body into RAM: answer 413 and close.
+            self.close_connection = True
+            return None, 413, "request too large"
+        if length == 0:
+            return b"", 0, ""
+        data = self.rfile.read(length)
+        if len(data) < length:
+            self.close_connection = True
+            return None, 400, "incomplete request body"
+        return data, 0, ""
 
     def _device(self) -> str | None:
         header = self.headers.get("Authorization") or ""
@@ -156,6 +218,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         return self.server.service.pairing.check(credential.strip())
 
     # ----------------------------------------------------------------- routes
+    def do_HEAD(self):  # noqa: N802 - stdlib name
+        self.do_GET()
+
     def do_GET(self):  # noqa: N802 - stdlib name
         path = self.path.split("?", 1)[0]
         if path == "/api/check":
@@ -178,9 +243,18 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         path = self.path.split("?", 1)[0]
-        body = self._body()
+        if path not in ("/api/pair", "/api/control", "/api/whip"):
+            self.close_connection = True
+            return self._json(404, {"error": "not found"})
+        device: str | None = None
+        if path in ("/api/control", "/api/whip"):
+            device = self._device()
+            if device is None:
+                self.close_connection = True
+                return self._json(401, {"error": "not paired"})
+        body, err_status, err_msg = self._body()
         if body is None:
-            return self._json(413, {"error": "request too large"})
+            return self._json(err_status, {"error": err_msg})
         service = self.server.service
         if path == "/api/pair":
             try:
@@ -194,14 +268,12 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(403, {
                     "error": "This QR code has expired or was already used. "
                              "Show a new one in AnyCam."})
-            device, secret = paired
-            name = service.pairing.name(device)
-            service.emit("paired", device)
-            return self._json(200, {"device": device, "secret": secret, "name": name})
+            paired_device, secret = paired
+            name = service.pairing.name(paired_device)
+            service.emit("paired", paired_device)
+            return self._json(200, {"device": paired_device, "secret": secret, "name": name})
         if path == "/api/control":
-            device = self._device()
-            if device is None:
-                return self._json(401, {"error": "not paired"})
+            assert device is not None
             try:
                 data = json.loads(body or b"{}")
             except ValueError:
@@ -211,20 +283,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._json(400, {"error": "unknown action"})
             reply = service.control(action, data, device)
             return self._json(200 if "error" not in reply else 403, reply)
-        if path == "/api/whip":
-            device = self._device()
-            if device is None:
-                return self._json(401, {"error": "not paired"})
-            try:
-                session, answer = service.start_stream(device, body.decode("utf-8"))
-            except (ValueError, UnicodeDecodeError) as exc:
-                return self._json(400, {"error": str(exc)})
-            except Exception as exc:  # noqa: BLE001 - report, keep serving
-                print(f"[phone] {device}: {exc}", file=sys.stderr, flush=True)
-                return self._json(503, {"error": str(exc)})
-            return self._send(201, answer.encode("utf-8"), "application/sdp",
-                              {"Location": f"/api/whip/{session}"})
-        return self._json(404, {"error": "not found"})
+        assert device is not None
+        try:
+            session, answer = service.start_stream(
+                device, body.decode("utf-8"), require_paired=True)
+        except (ValueError, UnicodeDecodeError) as exc:
+            return self._json(400, {"error": str(exc)})
+        except Exception as exc:  # noqa: BLE001 - report, keep serving
+            print(f"[phone] {device}: {exc}", file=sys.stderr, flush=True)
+            return self._json(503, {"error": "could not start the phone stream"})
+        return self._send(201, answer.encode("utf-8"), "application/sdp",
+                          {"Location": f"/api/whip/{session}"})
 
     def do_DELETE(self):  # noqa: N802
         device = self._device()
@@ -254,6 +323,8 @@ class PhoneService:
         self._httpd: _TLSServer | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._stopped = False
+        self._forgotten: set[str] = set()
         self.receivers: dict[str, object] = {}
         self._sessions: dict[str, str] = {}
         # The remote page: off until the user allows it, then ``control_handler``
@@ -280,16 +351,20 @@ class PhoneService:
             raise RuntimeError(
                 f"the phone link cannot listen on {host}:{self.port} ({exc.strerror or exc})"
             ) from exc
-        self.host = host
-        self.port = httpd.server_address[1]
-        self.fingerprint = fingerprint(cert)
-        self._httpd = httpd
+        with self._lock:
+            self._stopped = False
+            self.host = host
+            self.port = httpd.server_address[1]
+            self.fingerprint = fingerprint(cert)
+            self._httpd = httpd
         self._thread = threading.Thread(target=httpd.serve_forever,
                                         name="anycam-phone-link", daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
-        httpd, self._httpd = self._httpd, None
+        with self._lock:
+            self._stopped = True
+            httpd, self._httpd = self._httpd, None
         if httpd is not None:
             httpd.shutdown()
             httpd.server_close()
@@ -311,10 +386,10 @@ class PhoneService:
         token = self.pairing.new_token()
         # The token rides in the fragment: the browser never sends it in a
         # request line, so it cannot end up in any log.
-        return f"https://{self.host}:{self.port}/#pair={token}"
+        return f"https://{_format_host(self.host)}:{self.port}/#pair={token}"
 
     def page_url(self) -> str:
-        return f"https://{self.host}:{self.port}/"
+        return f"https://{_format_host(self.host)}:{self.port}/"
 
     def emit(self, event: str, device: str, detail: str = "") -> None:
         if self.on_event is None:
@@ -339,34 +414,66 @@ class PhoneService:
             return {"error": "AnyCam could not do that."}
 
     def forget(self, device: str) -> None:
+        with self._lock:
+            self._forgotten.add(device)
         self._drop(device)
         self.pairing.forget(device)
 
     # ---------------------------------------------------------------- streams
-    def start_stream(self, device: str, offer: str) -> tuple[str, str]:
+    def _on_receiver_closed(self, device: str, receiver: object) -> None:
+        with self._lock:
+            if self.receivers.get(device) is receiver:
+                del self.receivers[device]
+                for key in [k for k, v in self._sessions.items() if v == device]:
+                    del self._sessions[key]
+        # Stop the GStreamer pipeline off its streaming/callback thread.
+        threading.Thread(target=receiver.stop, name=f"anycam-phone-stop-{device}",
+                         daemon=True).start()
+
+    def start_stream(self, device: str, offer: str, *,
+                     require_paired: bool = False) -> tuple[str, str]:
         from .webrtc import PhoneReceiver
 
         if "m=video" not in offer:
             raise ValueError("the offer has no video")
+        with self._lock:
+            if self._stopped or device in self._forgotten:
+                raise RuntimeError("the phone link stopped or the phone was unpaired")
+            was_running = self._httpd is not None
+        was_paired = device in self.pairing.devices()
+        if require_paired and not was_paired:
+            raise RuntimeError("the phone is no longer paired")
         # One call per phone: a reconnect replaces the old receiver.
         self._drop(device)
         receiver = PhoneReceiver(
             device, on_event=lambda event, detail: self.emit(event, device, detail))
+        receiver.on_closed = lambda r=receiver: self._on_receiver_closed(device, r)
         try:
             answer = receiver.answer(offer)
         except Exception:
             receiver.stop()
             raise
         session = secrets.token_urlsafe(12)
-        # Swap under the lock and stop whatever was replaced: two offers from
-        # one phone at once both passed _drop() above, and the second
-        # assignment overwrote the first receiver, which kept running untracked.
+        # Swap under the lock and re-verify the service and pairing state so a
+        # concurrent stop() or forget() cannot leave an orphaned receiver running.
+        still_paired = device in self.pairing.devices()
+        replaced = None
+        abort = False
         with self._lock:
-            replaced = self.receivers.get(device)
-            self.receivers[device] = receiver
-            for key in [key for key, value in self._sessions.items() if value == device]:
-                del self._sessions[key]
-            self._sessions[session] = device
+            if (self._stopped
+                    or (was_running and self._httpd is None)
+                    or device in self._forgotten
+                    or ((was_paired or require_paired) and not still_paired)):
+                abort = True
+            else:
+                replaced = self.receivers.get(device)
+                self.receivers[device] = receiver
+                for key in [key for key, value in self._sessions.items() if value == device]:
+                    del self._sessions[key]
+                self._sessions[session] = device
+        if abort:
+            receiver.stop()
+            raise RuntimeError("the phone link stopped or the phone was unpaired")
         if replaced is not None and replaced is not receiver:
             replaced.stop()
         self.emit("connecting", device)
@@ -376,7 +483,11 @@ class PhoneService:
         with self._lock:
             if self._sessions.get(session) != device:
                 return
-        self._drop(device)
+            receiver = self.receivers.pop(device, None)
+            for key in [key for key, value in self._sessions.items() if value == device]:
+                del self._sessions[key]
+        if receiver is not None:
+            receiver.stop()
         self.emit("stopped", device)
 
     def _drop(self, device: str) -> None:

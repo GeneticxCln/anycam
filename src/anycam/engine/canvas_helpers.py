@@ -65,7 +65,7 @@ def gl_canvas_problem() -> str:
             centre = bytes(info.data)[(32 * 64 + 32) * 4:(32 * 64 + 32) * 4 + 3]
         finally:
             buf.unmap(info)
-        if not (centre[0] > 200 and centre[1] < 60 and centre[2] < 60):
+        if len(centre) < 3 or not (centre[0] > 200 and centre[1] < 60 and centre[2] < 60):
             return f"GL canvas probe frame came out wrong (centre {tuple(centre)})"
         return ""
     finally:

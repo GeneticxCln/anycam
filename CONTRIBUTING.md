@@ -17,7 +17,7 @@ PyGObject and the GStreamer plugins come from your distribution, not from PyPI
 ```bash
 scripts/test.sh                  # the whole suite, Qt offscreen
 scripts/test.sh --no-hardware    # hides cameras, loopback, audio server and portal, like the CI runner
-ruff check src                   # defect rules only (see pyproject.toml)
+ruff check src tests scripts     # defect rules only (see pyproject.toml)
 ```
 
 The tests use synthetic sources (`videotestsrc`, generated clips) and temporary `XDG_*` directories. They must
@@ -40,5 +40,7 @@ never open your real camera or your saved project.
 
 ## Releasing
 
-Bump `version` in `pyproject.toml` and `VERSION` in `src/anycam/config.py`, update `CHANGELOG.md`, commit, then
+Bump `version` in `pyproject.toml`, `VERSION` in `src/anycam/config.py`, `pkgver` in
+`packaging/arch/PKGBUILD`, and add a `<release>` entry in
+`packaging/metainfo/io.github.geneticxcln.AnyCam.metainfo.xml`, update `CHANGELOG.md`, commit, then
 `git tag vX.Y.Z && git push origin vX.Y.Z` (see the README, "Releases").

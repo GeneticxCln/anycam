@@ -16,8 +16,16 @@ SAMPLE_WIDTH = 96          # the comparison runs on a picture this wide
 def to_grey(rgba: np.ndarray, width: int = SAMPLE_WIDTH) -> np.ndarray:
     """A small float grey copy of an (h, w, 3|4) uint8 picture (box-averaged)."""
     height, full = rgba.shape[:2]
-    step = max(1, full // width)
-    small = rgba[: height - height % step : step, : full - full % step : step, :3].astype(np.float32)
+    if height == 0 or full == 0:
+        return np.empty((0, 0), dtype=np.float32)
+    step = max(1, min(full // max(1, int(width)), height, full))
+    if step == 1:
+        small = rgba[:, :, :3].astype(np.float32)
+    else:
+        rows = (height // step) * step
+        cols = (full // step) * step
+        blocks = rgba[:rows, :cols, :3].reshape(rows // step, step, cols // step, step, 3)
+        small = blocks.mean(axis=(1, 3), dtype=np.float32)
     return small @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
 
@@ -27,7 +35,7 @@ def detect(previous: np.ndarray, current: np.ndarray, threshold: float = 18.0
 
     ``threshold`` is the grey-level difference (0..255) that counts as change.
     """
-    if previous.shape != current.shape:
+    if previous.shape != current.shape or previous.size == 0:
         return 0.0, None
     changed = np.abs(current - previous) >= threshold
     share = float(changed.mean())

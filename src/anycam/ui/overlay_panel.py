@@ -5,7 +5,7 @@ panel asks for it but cannot insist; on X11 it is placed and kept on top.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QRectF, Qt
+from PySide6.QtCore import QPoint, QRectF, Qt, Signal
 from PySide6.QtGui import QImage, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
@@ -14,6 +14,8 @@ CIRCLE = 150
 
 class OverlayPanel(QWidget):
     """Round canvas preview plus Record / Mute / previous and next scene."""
+
+    closed = Signal()
 
     def __init__(self, window) -> None:
         super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
@@ -94,3 +96,7 @@ class OverlayPanel(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         self._drag = None
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.closed.emit()
+        super().closeEvent(event)

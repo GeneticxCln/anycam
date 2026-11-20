@@ -43,13 +43,29 @@ class Pairing:
         return {str(key): value for key, value in data.items()
                 if isinstance(value, dict) and isinstance(value.get("secret"), str)}
 
-    def _save(self) -> None:
+    def _save(self, devices: dict[str, dict]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(self._devices, handle, indent=2)
-        os.replace(tmp, self.path)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                fd = -1
+                json.dump(devices, handle, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, self.path)
+        except BaseException:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     def new_token(self) -> str:
         """A token for one QR code: single use, valid for five minutes."""
@@ -64,17 +80,22 @@ class Pairing:
     def pair(self, token: str, name: object) -> tuple[str, str] | None:
         """Consume ``token``; return ``(device_id, secret)`` or None."""
         with self._lock:
-            expiry = self._tokens.pop(str(token or ""), None)
+            key = str(token or "")
+            expiry = self._tokens.get(key)
             if expiry is None or expiry < time.monotonic():
+                self._tokens.pop(key, None)
                 return None
             device = "phone-" + secrets.token_hex(4)
             while device in self._devices:
                 device = "phone-" + secrets.token_hex(4)
             secret = secrets.token_urlsafe(32)
-            self._devices[device] = {"name": clean_name(name),
-                                     "secret": _hash(secret),
-                                     "paired": int(time.time())}
-            self._save()
+            updated = dict(self._devices)
+            updated[device] = {"name": clean_name(name),
+                               "secret": _hash(secret),
+                               "paired": int(time.time())}
+            self._save(updated)
+            self._tokens.pop(key, None)
+            self._devices = updated
         return device, secret
 
     def check(self, bearer: str) -> str | None:
@@ -100,7 +121,10 @@ class Pairing:
 
     def forget(self, device: str) -> bool:
         with self._lock:
-            if self._devices.pop(device, None) is None:
+            if device not in self._devices:
                 return False
-            self._save()
+            updated = dict(self._devices)
+            del updated[device]
+            self._save(updated)
+            self._devices = updated
         return True

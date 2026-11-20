@@ -124,6 +124,8 @@ class Tee:
         self.partial = ""
 
     def write(self, text: str) -> int:
+        if self.real is not None:
+            self.real.write(text)
         self.file.write(text)
         self.partial += text
         while "\n" in self.partial:
@@ -133,6 +135,8 @@ class Tee:
         return len(text)
 
     def flush(self) -> None:
+        if self.real is not None:
+            self.real.flush()
         self.file.flush()
 
     def isatty(self) -> bool:
@@ -230,9 +234,8 @@ def region_stats(image, box) -> tuple[float, float]:
     x, y, w, h = box
     part = image.copy(int(x * image.width()), int(y * image.height()),
                       max(2, int(w * image.width())), max(2, int(h * image.height())))
-    small = part.scaled(48, 27).convertToFormat(QImage.Format.Format_RGBA8888) \
-        if False else part.scaled(48, 27)
-    total, count, values = 0.0, 0, []
+    small = part.scaled(48, 27)
+    values = []
     for yy in range(27):
         for xx in range(48):
             c = small.pixelColor(xx, yy)
@@ -939,7 +942,7 @@ import socket  # noqa: E402
 
 import numpy as np  # noqa: E402
 from PySide6.QtCore import QEvent, QPoint, QPointF, Qt  # noqa: E402
-from PySide6.QtGui import QImage, QKeySequence, QMouseEvent  # noqa: E402
+from PySide6.QtGui import QKeySequence, QMouseEvent  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QFileDialog, QInputDialog, QMenu, QTabWidget  # noqa: E402
 
@@ -1774,7 +1777,6 @@ def step_shortcuts() -> None:
     pump(0.5)
     go_scene(0)
     R.info("window focused", str(W.isActiveWindow()))
-    cam = CTX.get("cam")
     W.record_button  # noqa: B018  (the controls exist)
     # mic mute
     muted = W.project.audio.mic_muted
@@ -1797,7 +1799,6 @@ def step_shortcuts() -> None:
     pump(2.0)
     # snapshot
     folder = config.recordings_dir(W.project.output.record_dir)
-    count = len(list(folder.glob("anycam-snapshot-*.png")))
     R.check("F5 saves a snapshot",
             _fire("F5", lambda: len(list(folder.glob("anycam-snapshot-*.png"))), "F5"))
     # record
@@ -2207,7 +2208,6 @@ def step_network() -> None:
     # an unreachable camera and credentials in the URL
     secret = "hunter2pass"
     layer = W.add_layer("network", source=f"rtsp://user:{secret}@127.0.0.1:1/none")
-    started = time.monotonic()
     pump(6.0)
     R.check("an unreachable network source does not freeze the window",
             R.gaps.get(R.step, 0) < 2.0, f"longest freeze {R.gaps.get(R.step, 0):.1f}s")

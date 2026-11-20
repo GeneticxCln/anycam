@@ -236,6 +236,8 @@ class VcamOutput:
         # What is actually published: "v4l2", "pipewire" or "both".  It can
         # be narrower than what was asked for when one side is unavailable.
         self.backend = "v4l2"
+        # What the caller explicitly requested in start() ("" before start).
+        self.requested_backend = ""
         # Why a requested PipeWire node is not published (empty when it is
         # or was not asked for).
         self.pipewire_error = ""
@@ -280,6 +282,9 @@ class VcamOutput:
         # When the canvas detached.  The card waits CARD_GRACE_S after this,
         # so a rebuild does not flash the ready card at a consumer.
         self._detached_at = 0.0
+        # Guards _appsrc, _last_buffer, _last_push, _canvas_live, _frozen,
+        # _idle_bytes across push_sample(), _idle_loop() and stop().
+        self._lock = threading.Lock()
 
     @property
     def active(self) -> bool:
@@ -297,9 +302,13 @@ class VcamOutput:
         """Whether this running output already serves ``device``/``backend``.
 
         A "both" request that fell back to one side counts as served:
-        restarting would only fail the same way again.
+        restarting would only fail the same way again.  An explicit upgrade
+        from a single-backend start ("v4l2" or "pipewire") to "both" does not
+        match so the second backend is started.
         """
         if backend == "both":
+            if self.requested_backend in ("v4l2", "pipewire"):
+                return False
             if self.backend == "pipewire":
                 return True
             return self.device == device
@@ -313,6 +322,7 @@ class VcamOutput:
             self.stop()
         if backend not in BACKENDS:
             backend = "v4l2"
+        self.requested_backend = backend
         # One fixed camera mode, like OBS's v4l2sink output.  The canvas may
         # resize or switch layouts while this node is open; the tap scales
         # into this mode rather than reopening (and killing) the device.
@@ -342,6 +352,13 @@ class VcamOutput:
             # modprobe in a terminal.
             problem = config.ensure_vcam_device(device)
             if problem:
+                if backend == "both":
+                    print(f"[vcam] {problem}; publishing the PipeWire camera only",
+                          file=sys.stderr, flush=True)
+                    self.device = ""
+                    self.backend = "pipewire"
+                    self.pixel_format = "YUY2"
+                    return self._start_chain(width, height, fps)
                 self.error = problem
                 return False
         if not config.vcam_available(device):
@@ -489,6 +506,10 @@ class VcamOutput:
             self._teardown_pipeline()
             return False
         if not use_gl:
+            if self.backend in ("pipewire", "both") and not self._first_frame_flows():
+                self.error = self.error or "PipeWire camera failed to start"
+                self._teardown_pipeline()
+                return False
             self.conversion = "cpu"
             return True
         if self._first_frame_flows():
@@ -548,15 +569,22 @@ class VcamOutput:
             if reached.wait(0.02):
                 flowed = True
                 break
-            if (self._bus is not None
-                    and self._bus.pop_filtered(Gst.MessageType.ERROR) is not None):
-                break
+            if self._bus is not None:
+                msg = self._bus.pop_filtered(Gst.MessageType.ERROR)
+                if msg is not None:
+                    err, debug = msg.parse_error()
+                    self.error = f"{err.message} ({debug})"
+                    break
         if flowed:
             # A sink pad accepts a buffer before the driver write happens; give
             # the sink a moment to reject the frame, then confirm it did not.
             time.sleep(0.15)
-            flowed = (self._bus is None
-                      or self._bus.pop_filtered(Gst.MessageType.ERROR) is None)
+            if self._bus is not None:
+                msg = self._bus.pop_filtered(Gst.MessageType.ERROR)
+                if msg is not None:
+                    err, debug = msg.parse_error()
+                    self.error = f"{err.message} ({debug})"
+                    flowed = False
         pad.remove_probe(probe)
         return flowed
 
@@ -566,17 +594,18 @@ class VcamOutput:
             pipeline.set_state(Gst.State.NULL)
         self._clear()
 
-    def _card_allowed(self) -> bool:
-        """Whether the ready card may push right now."""
+    def _card_allowed_locked(self) -> bool:
         if self._canvas_live:
             return False
-        # A rebuild releases the tap, probes the camera and rebuilds the
-        # canvas.  Hold the last canvas frame through that gap: the card is
-        # near-black, and a consumer shows it as a black camera.
         if (self._detached_at
                 and time.monotonic() - self._detached_at < CARD_GRACE_S):
             return False
         return time.monotonic() - self._last_push >= LIVE_GRACE_S
+
+    def _card_allowed(self) -> bool:
+        """Whether the ready card may push right now."""
+        with self._lock:
+            return self._card_allowed_locked()
 
     def set_canvas_attached(self, attached: bool) -> None:
         """Give the feed to the canvas, or take it back for the ready card.
@@ -588,13 +617,14 @@ class VcamOutput:
         rebuild does not flash the card while sources are probed.
         """
         attached = bool(attached)
-        if attached:
-            self._detached_at = 0.0
-            # A new canvas (or a re-attached one) owns the feed again.
-            self._frozen = False
-        elif self._canvas_live:
-            self._detached_at = time.monotonic()
-        self._canvas_live = attached
+        with self._lock:
+            if attached:
+                self._detached_at = 0.0
+                # A new canvas (or a re-attached one) owns the feed again.
+                self._frozen = False
+            elif self._canvas_live:
+                self._detached_at = time.monotonic()
+            self._canvas_live = attached
 
     def freeze_last_frame(self) -> None:
         """Hold the last canvas frame while the scene has no sources.
@@ -605,18 +635,27 @@ class VcamOutput:
         consumer.  Freeze on the last real frame instead; the idle loop already
         repeats that buffer at the idle rate.
         """
-        if self._last_buffer is None or self._frozen:
-            return
-        self._frozen = True
-        # The idle loop only repeats a quiet canvas after LIVE_GRACE_S.  Make
-        # the hold take effect on its next tick instead of a silent gap.
-        self._last_push = 0.0
+        with self._lock:
+            if self._last_buffer is None or self._frozen:
+                return
+            self._frozen = True
+            # The idle loop only repeats a quiet canvas after LIVE_GRACE_S.  Make
+            # the hold take effect on its next tick instead of a silent gap.
+            self._last_push = 0.0
         print("[vcam] canvas empty; holding the last canvas frame",
               file=sys.stderr, flush=True)
 
     def resume_canvas(self) -> None:
         """Accept live canvas samples again after a source is shown."""
-        self._frozen = False
+        with self._lock:
+            self._frozen = False
+
+    def _held_canvas_buffer_locked(self) -> Gst.Buffer | None:
+        if self._last_buffer is None or not self._detached_at:
+            return None
+        if time.monotonic() - self._detached_at >= CARD_GRACE_S:
+            return None
+        return self._copy_last_buffer_locked()
 
     def _held_canvas_buffer(self) -> Gst.Buffer | None:
         """The last canvas frame, repeated while a rebuild is underway.
@@ -627,20 +666,23 @@ class VcamOutput:
         back.  Repeat the last real frame instead of going quiet or showing
         the ready card during that window.
         """
-        if self._last_buffer is None or not self._detached_at:
-            return None
-        if time.monotonic() - self._detached_at >= CARD_GRACE_S:
-            return None
-        return self._copy_last_buffer()
+        with self._lock:
+            return self._held_canvas_buffer_locked()
 
-    def _copy_last_buffer(self) -> Gst.Buffer | None:
-        """A fresh-timestamped copy of the last real canvas frame."""
+    def _copy_last_buffer_locked(self) -> Gst.Buffer | None:
         if self._last_buffer is None:
             return None
         buffer = self._last_buffer.copy()
         buffer.pts = int((time.monotonic() - self._epoch) * Gst.SECOND)
         buffer.duration = int(Gst.SECOND / max(1, self.fps))
         return buffer
+
+    def _quiet_canvas_buffer_locked(self) -> Gst.Buffer | None:
+        if not self._canvas_live or self._last_buffer is None:
+            return None
+        if time.monotonic() - self._last_push < LIVE_GRACE_S:
+            return None
+        return self._copy_last_buffer_locked()
 
     def _quiet_canvas_buffer(self) -> Gst.Buffer | None:
         """Keep a consumer fed when the attached canvas has gone quiet.
@@ -650,15 +692,13 @@ class VcamOutput:
         on v4l2loopback is shown as a black camera, so repeat the last real
         frame at the idle rate until the canvas produces a new one.
         """
-        if not self._canvas_live or self._last_buffer is None:
-            return None
-        if time.monotonic() - self._last_push < LIVE_GRACE_S:
-            return None
-        return self._copy_last_buffer()
+        with self._lock:
+            return self._quiet_canvas_buffer_locked()
 
     def _start_idle_feed(self) -> None:
-        self._epoch = time.monotonic()
-        self._last_push = 0.0
+        with self._lock:
+            self._epoch = time.monotonic()
+            self._last_push = 0.0
         self._idle_stop.clear()
         self._idle_thread = threading.Thread(
             target=self._idle_loop, name="anycam-vcam-idle", daemon=True)
@@ -669,33 +709,38 @@ class VcamOutput:
         thread, self._idle_thread = self._idle_thread, None
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=0.5)
-        self._idle_bytes = b""
+        with self._lock:
+            self._idle_bytes = b""
 
     def _idle_loop(self) -> None:
         interval = 1.0 / IDLE_FPS
         while not self._idle_stop.wait(interval):
-            appsrc = self._appsrc
-            if appsrc is None:
-                return
-            if self._canvas_live:
-                # The canvas owns the device.  If it is temporarily quiet (a
-                # static/damage-driven screencast after a pad change), repeat
-                # its last real frame instead of leaving Discord on black.
-                buffer = self._quiet_canvas_buffer()
-                if buffer is None:
-                    continue
-                if not self._quiet_logged:
-                    self._quiet_logged = True
-                    print("[vcam] canvas quiet; repeating last canvas frame",
-                          file=sys.stderr, flush=True)
-            else:
-                buffer = self._held_canvas_buffer()
-                if buffer is None:
-                    if not self._idle_bytes:
-                        return
-                    buffer = Gst.Buffer.new_wrapped(self._idle_bytes)
-                    buffer.pts = int((time.monotonic() - self._epoch) * Gst.SECOND)
-                    buffer.duration = int(Gst.SECOND / max(1, self.fps))
+            log_quiet = False
+            with self._lock:
+                appsrc = self._appsrc
+                if appsrc is None:
+                    return
+                if self._canvas_live:
+                    # The canvas owns the device.  If it is temporarily quiet (a
+                    # static/damage-driven screencast after a pad change), repeat
+                    # its last real frame instead of leaving Discord on black.
+                    buffer = self._quiet_canvas_buffer_locked()
+                    if buffer is None:
+                        continue
+                    if not self._quiet_logged:
+                        self._quiet_logged = True
+                        log_quiet = True
+                else:
+                    buffer = self._held_canvas_buffer_locked()
+                    if buffer is None:
+                        if not self._card_allowed_locked() or not self._idle_bytes:
+                            continue
+                        buffer = Gst.Buffer.new_wrapped(self._idle_bytes)
+                        buffer.pts = int((time.monotonic() - self._epoch) * Gst.SECOND)
+                        buffer.duration = int(Gst.SECOND / max(1, self.fps))
+            if log_quiet:
+                print("[vcam] canvas quiet; repeating last canvas frame",
+                      file=sys.stderr, flush=True)
             try:
                 appsrc.emit("push-buffer", buffer)
             except Exception:  # noqa: BLE001 - the pipeline is going away
@@ -709,41 +754,47 @@ class VcamOutput:
         self._error_from_push = True
 
     def push_sample(self, sample) -> None:
-        if self._appsrc is None:
-            return
-        if self.error and not self._error_from_push:
-            # A dead sink cannot accept frames; the owner rebuilds the output.
-            return
-        if self._frozen:
-            # The canvas is empty; a black compositor frame must not replace
-            # the last real picture being repeated to consumers.
-            return
-        source_buffer = sample.get_buffer()
-        out_buffer = None
-        if source_buffer is not None:
-            previous = self._last_canvas_pts
-            if (previous is not None
-                    and source_buffer.pts != Gst.CLOCK_TIME_NONE
-                    and source_buffer.pts < previous):
-                print(
-                    "[vcam] canvas timestamps reset; retimestamping on the "
-                    "vcam clock", file=sys.stderr, flush=True)
-            self._last_canvas_pts = source_buffer.pts
-            # The vcam pipeline outlives canvas rebuilds, which restart the
-            # canvas PTS at zero.  A live appsrc treats those as late buffers
-            # and can leave the device on the last black frame.  Copy only the
-            # metadata and stamp on the vcam's own continuous timeline.
-            out_buffer = source_buffer.copy()
-            out_buffer.pts = int((time.monotonic() - self._epoch) * Gst.SECOND)
-            out_buffer.dts = Gst.CLOCK_TIME_NONE
-            out_buffer.duration = int(Gst.SECOND / max(1, self.fps))
-            method, payload = "push-buffer", out_buffer
-        else:
-            method, payload = "push-sample", sample
+        with self._lock:
+            appsrc = self._appsrc
+            if appsrc is None:
+                return
+            if self.error and not self._error_from_push:
+                # A dead sink cannot accept frames; the owner rebuilds the output.
+                return
+            if self._frozen:
+                # The canvas is empty; a black compositor frame must not replace
+                # the last real picture being repeated to consumers.
+                return
+            source_buffer = sample.get_buffer()
+            out_buffer = None
+            reset_pts = False
+            if source_buffer is not None:
+                previous = self._last_canvas_pts
+                if (previous is not None
+                        and source_buffer.pts != Gst.CLOCK_TIME_NONE
+                        and source_buffer.pts < previous):
+                    reset_pts = True
+                self._last_canvas_pts = source_buffer.pts
+                # The vcam pipeline outlives canvas rebuilds, which restart the
+                # canvas PTS at zero.  A live appsrc treats those as late buffers
+                # and can leave the device on the last black frame.  Copy only the
+                # metadata and stamp on the vcam's own continuous timeline.
+                out_buffer = source_buffer.copy()
+                out_buffer.pts = int((time.monotonic() - self._epoch) * Gst.SECOND)
+                out_buffer.dts = Gst.CLOCK_TIME_NONE
+                out_buffer.duration = int(Gst.SECOND / max(1, self.fps))
+                method, payload = "push-buffer", out_buffer
+            else:
+                method, payload = "push-sample", sample
+        if reset_pts:
+            print(
+                "[vcam] canvas timestamps reset; retimestamping on the "
+                "vcam clock", file=sys.stderr, flush=True)
         try:
-            result = self._appsrc.emit(method, payload)
+            result = appsrc.emit(method, payload)
         except Exception as exc:  # noqa: BLE001
-            self._push_failed(f"virtual camera push failed: {exc}")
+            with self._lock:
+                self._push_failed(f"virtual camera push failed: {exc}")
             return
         if result == Gst.FlowReturn.FLUSHING:
             # The pipeline is shutting down or restarting; not a fault.
@@ -755,29 +806,31 @@ class VcamOutput:
             caps = sample.get_caps()
             message = ("virtual camera rejected the canvas frame ("
                        f"{result.value_nick})")
-            if message != self.error:
-                print(
-                    f"[vcam] {message}; frame="
-                    f"{caps.to_string() if caps else 'no caps'}; appsrc="
-                    f"{self._appsrc.get_property('caps').to_string()}",
-                    file=sys.stderr, flush=True)
-            self._push_failed(message)
+            with self._lock:
+                if message != self.error:
+                    print(
+                        f"[vcam] {message}; frame="
+                        f"{caps.to_string() if caps else 'no caps'}; appsrc="
+                        f"{appsrc.get_property('caps').to_string()}",
+                        file=sys.stderr, flush=True)
+                self._push_failed(message)
             return
-        if self._error_from_push:
-            # A good frame after a failed push: the output works again.
-            print("[vcam] canvas frames accepted again", file=sys.stderr,
-                  flush=True)
-            self.error = ""
-            self._error_from_push = False
-        if not self._live_logged:
-            self._live_logged = True
-            caps = sample.get_caps()
-            print(f"[vcam] first live canvas frame "
-                  f"{caps.to_string() if caps else ''}",
-                  file=sys.stderr, flush=True)
-        self._last_buffer = out_buffer or self._last_buffer
-        self._last_push = time.monotonic()
-        self._quiet_logged = False
+        with self._lock:
+            if self._error_from_push:
+                # A good frame after a failed push: the output works again.
+                print("[vcam] canvas frames accepted again", file=sys.stderr,
+                      flush=True)
+                self.error = ""
+                self._error_from_push = False
+            if not self._live_logged:
+                self._live_logged = True
+                caps = sample.get_caps()
+                print(f"[vcam] first live canvas frame "
+                      f"{caps.to_string() if caps else ''}",
+                      file=sys.stderr, flush=True)
+            self._last_buffer = out_buffer or self._last_buffer
+            self._last_push = time.monotonic()
+            self._quiet_logged = False
 
     def poll(self) -> None:
         if self._bus is None:
@@ -797,31 +850,36 @@ class VcamOutput:
             self._error_from_push = False
 
     def stop(self) -> dict:
-        pipeline = self._pipeline
-        if pipeline is None:
-            return {"device": self.device, "ok": False,
-                    "error": self.error or "virtual camera is not running"}
+        with self._lock:
+            pipeline = self._pipeline
+            if pipeline is None:
+                return {"device": self.device, "ok": False,
+                        "error": self.error or "virtual camera is not running"}
         self._stop_idle_feed()
+        with self._lock:
+            appsrc = self._appsrc
         try:
-            if self._appsrc is not None:
-                self._appsrc.emit("end-of-stream")
+            if appsrc is not None:
+                appsrc.emit("end-of-stream")
         except Exception:
             pass
         pipeline.set_state(Gst.State.NULL)
         result = {"device": self.device, "backend": self.backend,
                   "ok": not self.error, "error": self.error}
+        self.requested_backend = ""
         self._clear()
         return result
 
     def _clear(self) -> None:
-        self._canvas_live = False
-        self._frozen = False
-        self._last_canvas_pts = None
-        self._detached_at = 0.0
-        self._last_buffer = None
-        self.conversion = ""
-        self._pipeline = None
-        self._appsrc = None
-        self._bus = None
-        self._sink = None
-        self._pipewire_sink = None
+        with self._lock:
+            self._canvas_live = False
+            self._frozen = False
+            self._last_canvas_pts = None
+            self._detached_at = 0.0
+            self._last_buffer = None
+            self.conversion = ""
+            self._pipeline = None
+            self._appsrc = None
+            self._bus = None
+            self._sink = None
+            self._pipewire_sink = None

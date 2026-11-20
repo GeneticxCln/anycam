@@ -46,28 +46,36 @@ class SlowJob:
 
     def __init__(self, name: str) -> None:
         self.name = name
+        self._lock = threading.Lock()
+        self._closed = False
         self._pool: concurrent.futures.ThreadPoolExecutor | None = None
         self._future: concurrent.futures.Future | None = None
 
     @property
     def busy(self) -> bool:
-        return self._future is not None and not self._future.done()
+        with self._lock:
+            return self._future is not None and not self._future.done()
 
     def submit(self, function, *args) -> bool:
-        if self._future is not None:
-            return False
-        if self._pool is None:
-            self._pool = concurrent.futures.ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix=f"anycam-{self.name}")
-        self._future = self._pool.submit(function, *args)
-        return True
+        with self._lock:
+            if self._closed or self._future is not None:
+                return False
+            if self._pool is None:
+                self._pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix=f"anycam-{self.name}")
+            try:
+                self._future = self._pool.submit(function, *args)
+            except RuntimeError:
+                return False
+            return True
 
     def poll(self):
         """The finished job's result, or None (still running, none, failed)."""
-        future = self._future
-        if future is None or not future.done():
-            return None
-        self._future = None
+        with self._lock:
+            future = self._future
+            if future is None or not future.done():
+                return None
+            self._future = None
         try:
             return future.result()
         except Exception:  # noqa: BLE001 - a failed refresh keeps the old result
@@ -75,14 +83,17 @@ class SlowJob:
 
     def wait(self, timeout: float = 2.0):
         """Block for the running job (tests and shutdown)."""
-        future = self._future
+        with self._lock:
+            future = self._future
         if future is None:
             return None
         concurrent.futures.wait([future], timeout=timeout)
         return self.poll()
 
     def close(self) -> None:
-        pool, self._pool, self._future = self._pool, None, None
+        with self._lock:
+            self._closed = True
+            pool, self._pool, self._future = self._pool, None, None
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
 
@@ -212,7 +223,7 @@ class PersonMask:
 
     def __init__(self, interval: float = 0.07, asynchronous: bool = True) -> None:
         self.interval = interval
-        self.faces = FaceTrack()
+        self.faces = FaceTrack(asynchronous=asynchronous)
         self._last = -1e9
         self._small: np.ndarray | None = None
         self._full: Image.Image | None = None
@@ -365,9 +376,13 @@ class Background(Processor):
         super().__init__(amount)
         self.mode, self.backdrop = mode, backdrop
         self.mask = PersonMask(asynchronous=asynchronous)
+        self._state_lock = threading.Lock()
+        self._gen_lock = threading.Lock()
         self._generator = None
+        self._generator_size: tuple[int, int] | None = None
         self._cache: tuple | None = None      # (size, RGBA picture, time) of the backdrop
-        self._shaded: tuple | None = None     # (size, RGBA picture, time) of the shaded copy
+        self._shaded: tuple | None = None     # (size, RGBA picture, time, version) of the shaded copy
+        self._shade_version = 0
         self._shade_job = SlowJob("shade") if asynchronous else None
         self._backdrop_job = SlowJob("backdrop") if asynchronous else None
 
@@ -375,32 +390,40 @@ class Background(Processor):
     SHADE_FPS = 12.0      # a blurred background changes too slowly to need more
     STALE_S = 0.7         # older than this (a paused source): redo it now
 
-    def _render_backdrop(self, size, now):
-        frame = Image.fromarray(self._generator.frame(now), "RGBA")
+    def _render_backdrop(self, generator, size, now):
+        with self._gen_lock:
+            frame = Image.fromarray(generator.frame(now), "RGBA")
         return size, frame.resize(size, Image.BILINEAR), now
 
     def _backdrop_picture(self, size, now) -> Image.Image:
         """The replacement backdrop as an RGBA picture of ``size``."""
         width, height = size
         if self.backdrop in procedural.GENERATORS:
-            if self._generator is None:
-                inner = procedural.internal_size(width, height)
-                self._generator = procedural.GENERATORS[self.backdrop](*inner)
+            inner = procedural.internal_size(width, height)
+            if self._generator is None or self._generator_size != inner:
+                with self._gen_lock:
+                    self._generator = procedural.GENERATORS[self.backdrop](*inner)
+                    self._generator_size = inner
+                self._cache = None
+            generator = self._generator
             job = self._backdrop_job
             if job is not None:
                 done = job.poll()
                 if done is not None and done[0] == size:
                     self._cache = done
-            due = (self._cache is None or self._cache[0] != size
-                   or now - self._cache[2] >= 1.0 / self.BACKDROP_FPS)
+            cache = self._cache
+            due = (cache is None or cache[0] != size
+                   or now - cache[2] >= 1.0 / self.BACKDROP_FPS)
             if due:
-                if (job is None or self._cache is None or self._cache[0] != size
-                        or now - self._cache[2] > self.STALE_S):
-                    self._cache = self._render_backdrop(size, now)
+                if (job is None or cache is None or cache[0] != size
+                        or now - cache[2] > self.STALE_S):
+                    cache = self._render_backdrop(generator, size, now)
+                    self._cache = cache
                 elif not job.busy:
-                    job.submit(self._render_backdrop, size, now)
-            return self._cache[1]
-        if self._cache is None or self._cache[0] != size:
+                    job.submit(self._render_backdrop, generator, size, now)
+            return cache[1]
+        cache = self._cache
+        if cache is None or cache[0] != size:
             from . import overlay
 
             path = overlay.render_background(self.backdrop or "Studio", width, height)
@@ -410,8 +433,9 @@ class Background(Processor):
             # composite must still come out at the frame's size.
             if picture.size != size:
                 picture = picture.resize(size, Image.BILINEAR)
-            self._cache = (size, picture, now)
-        return self._cache[1]
+            cache = (size, picture, now)
+            self._cache = cache
+        return cache[1]
 
     def process(self, image: Image.Image, now: float) -> Image.Image:
         rgba = image if image.mode == "RGBA" else image.convert("RGBA")
@@ -421,32 +445,48 @@ class Background(Processor):
         else:
             background = self._shaded_picture(rgba, now)
         # Straight in RGBA: converting to RGB and back cost ~4 ms a frame.
-        return Image.composite(rgba, background, mask)
+        out = Image.composite(rgba, background, mask)
+        alpha = rgba.getchannel("A")
+        if alpha.getextrema()[0] < 255:
+            out.putalpha(ImageChops.darker(out.getchannel("A"), alpha))
+        return out
 
     def _shaded_picture(self, image: Image.Image, now: float) -> Image.Image:
         size = image.size
         job = self._shade_job
+        with self._state_lock:
+            version = self._shade_version
+            amount = self.amount
+            shaded = self._shaded
         if job is not None:
             done = job.poll()
-            if done is not None and done[0] == size:
-                self._shaded = done
-        stale = (self._shaded is None or self._shaded[0] != size
-                 or now - self._shaded[2] >= 1.0 / self.SHADE_FPS)
+            if done is not None and done[0] == size and done[3] == version:
+                shaded = done
+                with self._state_lock:
+                    if self._shade_version == version:
+                        self._shaded = done
+        stale = (shaded is None or shaded[0] != size
+                 or now - shaded[2] >= 1.0 / self.SHADE_FPS)
         if stale:
-            if (job is None or self._shaded is None or self._shaded[0] != size
-                    or now - self._shaded[2] > self.STALE_S):
-                self._shaded = self._shade(self._shade_sample(image), size, now)
+            if (job is None or shaded is None or shaded[0] != size
+                    or now - shaded[2] > self.STALE_S):
+                shaded = self._shade(self._shade_sample(image), size, now, amount, version)
+                with self._state_lock:
+                    if self._shade_version == version:
+                        self._shaded = shaded
             elif not job.busy:
-                job.submit(self._shade, self._shade_sample(image), size, now)
-        return self._shaded[1]
+                job.submit(self._shade, self._shade_sample(image), size, now, amount, version)
+        return shaded[1]
 
     @staticmethod
     def _shade_sample(image: Image.Image) -> Image.Image:
         factor = max(1, int(image.width // 360))
         return image.reduce(factor) if factor > 1 else image.copy()
 
-    def _shade(self, small: Image.Image, size, stamp):
+    def _shade(self, small: Image.Image, size, stamp, amount: float | None = None,
+               version: int = 0):
         """Blur/dim/grey the reduced picture, then enlarge it once."""
+        strength = self.amount if amount is None else amount
         factor = max(1.0, size[0] / max(1, small.width))
         rgb = small.convert("RGB")
 
@@ -454,17 +494,19 @@ class Background(Processor):
             return rgb.filter(ImageFilter.GaussianBlur(max(0.5, radius / factor)))
 
         if self.mode == "blur":
-            out = blur(3.0 + 28.0 * self.amount)
+            out = blur(3.0 + 28.0 * strength)
         elif self.mode == "dim":
-            out = ImageEnhance.Brightness(blur(2.0)).enhance(max(0.05, 1.0 - 0.9 * self.amount))
+            out = ImageEnhance.Brightness(blur(2.0)).enhance(max(0.05, 1.0 - 0.9 * strength))
         else:
             gray = ImageOps.grayscale(blur(3.0)).convert("RGB")
-            out = ImageEnhance.Brightness(gray).enhance(1.0 - 0.45 * self.amount)
-        return size, out.resize(size, Image.BILINEAR).convert("RGBA"), stamp
+            out = ImageEnhance.Brightness(gray).enhance(1.0 - 0.45 * strength)
+        return size, out.resize(size, Image.BILINEAR).convert("RGBA"), stamp, version
 
     def set_amount(self, amount: float) -> None:
-        super().set_amount(amount)
-        self._shaded = None      # the strength changed: shade again next frame
+        with self._state_lock:
+            super().set_amount(amount)
+            self._shade_version += 1
+            self._shaded = None      # the strength changed: shade again next frame
 
     def close(self) -> None:
         super().close()
@@ -841,7 +883,10 @@ class TouchUp(Processor):
                 table = [int(255 * ((i / 255.0) ** (1.0 / gamma))) for i in range(256)]
                 self._lut, self._lut_amount = table * 3, self.amount
             out = rgb.point(self._lut)
-        return out.convert("RGBA")
+        rgba = out.convert("RGBA")
+        if image.mode == "RGBA":
+            rgba.putalpha(image.getchannel("A"))
+        return rgba
 
     def _bloom(self, rgb: Image.Image, now: float) -> Image.Image:
         """Add a blurred, dimmed copy with ``screen``; the copy is reused ~80 ms."""
@@ -867,19 +912,22 @@ class TouchUp(Processor):
         faces = self.faces.update(image, now)
         if not faces:
             return image
-        out = image.copy()
+        out = image.convert("RGBA") if image.mode != "RGBA" else image.copy()
         for tracked in faces:
             x, y, w, h = tracked.box
             box = (max(0, int(x - w * 0.12)), max(0, int(y - h * 0.22)),
                    min(image.width, int(x + w * 1.12)), min(image.height, int(y + h * 1.12)))
             if box[2] - box[0] < 16 or box[3] - box[1] < 16:
                 continue
-            crop = image.crop(box).convert("RGB")
+            cropped = out.crop(box)
+            crop = cropped.convert("RGB")
             soft = _blurred(crop, 2.5 + 5.0 * self.amount) if crop.width > 360 else \
                 crop.filter(ImageFilter.GaussianBlur(2.5 + 5.0 * self.amount))
             soft = Image.blend(crop, soft, 0.4 + 0.5 * self.amount)
             mask = self._feather_mask(crop.size)
-            out.paste(Image.composite(soft, crop, mask).convert("RGBA"), box[:2])
+            blended = Image.composite(soft, crop, mask).convert("RGBA")
+            blended.putalpha(cropped.getchannel("A"))
+            out.paste(blended, box[:2])
         return out
 
 
@@ -892,9 +940,10 @@ class Zoom(Processor):
         width, height = image.size
         crop_w, crop_h = width / factor, height / factor
         left, top = (width - crop_w) / 2, (height - crop_h) / 2
-        return image.convert("RGB").resize(
-            image.size, Image.BILINEAR,
-            box=(left, top, left + crop_w, top + crop_h)).convert("RGBA")
+        rgba = image if image.mode == "RGBA" else image.convert("RGBA")
+        return rgba.resize(
+            rgba.size, Image.BILINEAR,
+            box=(left, top, left + crop_w, top + crop_h))
 
 
 class AutoFrame(Processor):
@@ -924,9 +973,10 @@ class AutoFrame(Processor):
         crop_w, crop_h = width / self._zoom, height / self._zoom
         left = min(max(self._centre[0] - crop_w / 2, 0), width - crop_w)
         top = min(max(self._centre[1] - crop_h / 2, 0), height - crop_h)
-        return image.convert("RGB").resize(
-            image.size, Image.BILINEAR,
-            box=(left, top, left + crop_w, top + crop_h)).convert("RGBA")
+        rgba = image if image.mode == "RGBA" else image.convert("RGBA")
+        return rgba.resize(
+            rgba.size, Image.BILINEAR,
+            box=(left, top, left + crop_w, top + crop_h))
 
 
 class SelfTest(Processor):
@@ -971,10 +1021,11 @@ class RoundCorners(Processor):
             return None
         key = (width, height, radius)
         if key != self._key:
-            # 4x supersampled for smooth edges.
-            big = Image.new("L", (width * 4, height * 4), 0)
+            # 4x supersampled up to 1080p, 2x above 1080p to bound RAM/CPU.
+            ss = 2 if width > 1920 or height > 1080 else 4
+            big = Image.new("L", (width * ss, height * ss), 0)
             ImageDraw.Draw(big).rounded_rectangle(
-                (0, 0, width * 4 - 1, height * 4 - 1), radius=radius * 4, fill=255)
+                (0, 0, width * ss - 1, height * ss - 1), radius=radius * ss, fill=255)
             self._mask = np.asarray(big.resize((width, height), Image.LANCZOS))
             self._key = key
         return self._mask
@@ -1100,6 +1151,8 @@ class ProcessorRunner:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=1.5)
         self.processor.close()
 
 
@@ -1237,16 +1290,21 @@ class NativeAutoFrame:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=1.5)
         self.faces.close()
 
 
 def build_framing_bin(name: str, amount: float, bin_name: str, width: int,
                       height: int, fps: int):
     """``(bin, runner)`` for a live Zoom or Auto-frame slot (GStreamer scaling)."""
+    from .sources import no_qos
+
     def make(factory, element_name=None, **props):
         element = Gst.ElementFactory.make(factory, element_name)
         if element is None:
             raise RuntimeError(f"GStreamer element '{factory}' is not installed")
+        no_qos(element)
         for key, value in props.items():
             element.set_property(key.replace("_", "-"), value)
         return element
@@ -1284,12 +1342,13 @@ def build_framing_bin(name: str, amount: float, bin_name: str, width: int,
         elements = [tee, main_queue, *chain, *tap]
         for element in elements:
             bin_.add(element)
-        tee.link(main_queue)
-        tee.link(tap[0])
+        if not tee.link(main_queue) or not tee.link(tap[0]):
+            raise RuntimeError("could not link the auto-frame tee")
         for first, second in zip(tap, tap[1:]):
             if not first.link(second):
                 raise RuntimeError("could not link the auto-frame tap")
-        main_queue.link(crop)
+        if not main_queue.link(crop):
+            raise RuntimeError("could not link the auto-frame crop")
         head = tee
     for first, second in zip(chain, chain[1:]):
         if not first.link(second):
@@ -1310,15 +1369,17 @@ NATIVE_FRAMING = ("zoom", "autoframe")
 def build_processor_bin(name: str, amount: float, bin_name: str, width: int,
                         height: int, fps: int, live: bool = False):
     """A bin that runs processor ``name``; returns ``(bin, runner)``."""
-    if name.partition(":")[0] in NATIVE_FRAMING:
-        return build_framing_bin(name, amount, bin_name, width, height, fps)
     from . import effect_worker, safemode
 
-    if safemode.active() and name.partition(":")[0] in effect_worker.ISOLATED_KINDS:
+    kind = name.partition(":")[0]
+    if safemode.active() and kind in effect_worker.ISOLATED_KINDS:
         processor = Processor(amount)    # safe mode: AI effects pass the picture through
     else:
+        isolated = effect_worker.wants_isolation(name)
+        if kind in NATIVE_FRAMING and not isolated:
+            return build_framing_bin(name, amount, bin_name, width, height, fps)
         processor = (effect_worker.RemoteProcessor(name, amount)
-                     if effect_worker.wants_isolation(name) else make_processor(name, amount))
+                     if isolated else make_processor(name, amount))
 
     def make(factory, element_name=None):
         element = Gst.ElementFactory.make(factory, element_name)

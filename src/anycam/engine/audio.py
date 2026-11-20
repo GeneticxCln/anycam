@@ -28,7 +28,7 @@ class AudioMixin:
     """The audio mixer, microphone and shared AAC tee."""
 
     def _mixer_input(self, name: str, gain_db: float, muted: bool, meter: bool = False,
-                     delay_ms: int = 0):
+                     delay_ms: int = 0, *, sync: bool = True):
         """Convert/resample one audio source and attach it to the mixer.
 
         ``delay_ms`` holds the source back (a sync offset).  Every input but the
@@ -40,23 +40,40 @@ class AudioMixin:
         caps = caps_filter("audio/x-raw,format=F32LE,rate=48000,channels=2", f"{name}_caps")
         vol = make("volume", f"{name}_volume", volume=10 ** (gain_db / 20.0))
         vol.set_property("mute", bool(muted))
-        self._add(conv, res, caps, vol)
-        self._link([conv, res, caps, vol])
+        elements: list[Gst.Element] = [conv, res, caps, vol]
         delay = delay_element(delay_ms, f"{name}_delay")
         if delay is not None:
-            self._add(delay)
-            self._link([vol, delay])
-            tail = delay
-        else:
-            tail = vol
+            elements.append(delay)
         level = None
         if meter:
             level = make("level", f"{name}_level", interval=100_000_000, post_messages=True)
-            self._add(level)
-            self._link([tail, level])
-            tail = level
-        pad = self.audio_mixer.request_pad_simple("sink_%u")
-        tail.get_static_pad("src").link(pad)
+            elements.append(level)
+        tail = elements[-1]
+        self._add(*elements, sync=False)
+        pad = None
+        try:
+            self._link(elements)
+            pad = self.audio_mixer.request_pad_simple("sink_%u")
+            if pad is None or tail.get_static_pad("src").link(pad) != Gst.PadLinkReturn.OK:
+                raise RuntimeError(f"could not link {name} into the audio mixer")
+        except Exception:
+            for element in reversed(elements):
+                element.set_state(Gst.State.NULL)
+            if pad is not None:
+                try:
+                    self.audio_mixer.release_request_pad(pad)
+                except Exception:  # noqa: BLE001
+                    pass
+            if self.pipeline is not None:
+                for element in reversed(elements):
+                    if element.get_parent() is self.pipeline:
+                        self.pipeline.remove(element)
+            raise
+        conv._mixer_elements = elements  # type: ignore[attr-defined]
+        conv._mixer_pad = pad  # type: ignore[attr-defined]
+        if sync:
+            for element in reversed(elements):
+                self._sync_state(element)
         return conv, vol, level
 
     def _build_audio(self) -> None:
@@ -168,14 +185,35 @@ class AudioMixin:
         name = f"layeraudio_{layer.id}"
         src = make("interaudiosrc", f"{name}_src", channel=channel)
         conv, vol, _level = self._mixer_input(
-            name, 0.0, False, meter=True)
-        self._add(src)
-        self._link([src, conv])
+            name, 0.0, False, meter=True, sync=False)
+        mixer_elements = list(getattr(conv, "_mixer_elements", (conv,)))
+        mixer_pad = getattr(conv, "_mixer_pad", None)
+        try:
+            self._add(src, sync=False)
+            self._link([src, conv])
+        except Exception:
+            for element in (*reversed(mixer_elements), src):
+                element.set_state(Gst.State.NULL)
+            if mixer_pad is not None and self.audio_mixer is not None:
+                try:
+                    self.audio_mixer.release_request_pad(mixer_pad)
+                except Exception:  # noqa: BLE001
+                    pass
+            if self.pipeline is not None:
+                for element in (*reversed(mixer_elements), src):
+                    if element.get_parent() is self.pipeline:
+                        self.pipeline.remove(element)
+            raise
         self._layer_audio[layer.id] = (src, conv, vol)
+        src_pad = src.get_static_pad("src")
+        if src_pad is not None and src_pad not in self._audio_eos_pads:
+            self._audio_eos_pads.append(src_pad)
         self.report.audio_inputs.append(f"layer:{layer.name}")
         self.apply_layer_audio(layer)
-        for element in (src, conv):
-            element.sync_state_with_parent()
+        # Sync downstream-to-upstream so every downstream element is ready
+        # before interaudiosrc begins pushing buffers on a running canvas.
+        for element in (*reversed(mixer_elements), src):
+            self._sync_state(element)
         return True
 
     def apply_layer_audio(self, layer) -> None:
@@ -201,14 +239,17 @@ class AudioMixin:
         entry = self._layer_audio.pop(layer_id, None)
         if entry is None or self.pipeline is None:
             return
+        src = entry[0]
+        src_pad = src.get_static_pad("src") if src is not None else None
+        if src_pad is not None:
+            self._audio_eos_pads = [p for p in self._audio_eos_pads if p is not src_pad]
         prefix = f"layeraudio_{layer_id}_"
         members = [element for element in self.pipeline.children
                    if element.get_name().startswith(prefix)]
-        # Unlink the last element from the mixer before stopping.  (Video
-        # layer chains are stopped first, see _dispose_chain; this path was
-        # checked with a clip that has sound: no pipeline error on removal.)
-        # The mixer pad is released only after the stop (releasing first broke
-        # re-add).
+        # Stop elements BEFORE unlinking pads so no streaming thread pushes
+        # into an unlinked pad and posts a fatal not-linked error.
+        for element in members:
+            element.set_state(Gst.State.NULL)
         mixer_pads = []
         for element in members:
             pad = element.get_static_pad("src")
@@ -218,20 +259,25 @@ class AudioMixin:
             pad.unlink(peer)
             if peer.get_parent_element() is self.audio_mixer:
                 mixer_pads.append(peer)
-        for element in members:
-            element.set_state(Gst.State.NULL)
         for peer in mixer_pads:
-            self.audio_mixer.release_request_pad(peer)
+            if self.audio_mixer is not None:
+                try:
+                    self.audio_mixer.release_request_pad(peer)
+                except Exception:  # noqa: BLE001
+                    pass
         for element in members:
-            self.pipeline.remove(element)
+            if element.get_parent() is self.pipeline:
+                self.pipeline.remove(element)
 
     # ------------------------------------------------------------- media bed
     def _media_paths(self) -> list[str]:
         audio = self.project.audio
         wanted = [audio.media_file, *audio.media_playlist] if audio.media_file else \
             list(audio.media_playlist)
-        found = [path for path in wanted if path and Path(path).exists()]
-        missing = [path for path in wanted if path and not Path(path).exists()]
+        found = [str(Path(path).expanduser()) for path in wanted
+                 if path and Path(path).expanduser().exists()]
+        missing = [path for path in wanted
+                   if path and not Path(path).expanduser().exists()]
         if missing:
             self.report.media_error = f"media audio file not found: {missing[0]}"
         if audio.media_shuffle and len(found) > 1:
@@ -244,10 +290,12 @@ class AudioMixin:
         self._media_items = paths
         self._media_index = 0
         self._media_eos = False
+        self._media_eos_pad = None
         if not paths:
             return
         audio = self.project.audio
-        decode = make("uridecodebin", "media_audio", uri=Path(paths[0]).resolve().as_uri())
+        decode = make("uridecodebin", "media_audio",
+                      uri=Path(paths[0]).expanduser().resolve().as_uri())
         conv, vol, _level = self._mixer_input("media", audio.media_gain_db, audio.media_muted,
                                               meter=True, delay_ms=audio.media_delay_ms)
         self._add(decode)
@@ -264,14 +312,21 @@ class AudioMixin:
                 return
             sink = target.get_static_pad("sink")
             if sink is not None and not sink.is_linked():
-                pad.link(sink)
-                self._audio_eos_pads.append(pad)
+                if pad.link(sink) == Gst.PadLinkReturn.OK:
+                    prev = getattr(self, "_media_eos_pad", None)
+                    if prev is not None:
+                        self._audio_eos_pads = [
+                            p for p in self._audio_eos_pads if p is not prev]
+                    self._media_eos_pad = pad
+                    self._audio_eos_pads.append(pad)
 
         self._on(decode, "pad-added", on_pad, conv)
 
         def on_event(_pad, info):
             event = info.get_event()
             if event is not None and event.type == Gst.EventType.EOS:
+                if getattr(self, "_stopping", False) or self._stopped:
+                    return Gst.PadProbeReturn.OK
                 # The bed ended: the mixer must not see EOS (it would end the
                 # whole mix); pump() starts the next item or the same one again.
                 self._media_eos = True
@@ -285,7 +340,10 @@ class AudioMixin:
 
         Returns True when something was restarted.  Called from ``pump``.
         """
-        if not getattr(self, "_media_eos", False) or self._stopped or self.pipeline is None:
+        if (not getattr(self, "_media_eos", False)
+                or getattr(self, "_stopping", False)
+                or self._stopped
+                or self.pipeline is None):
             return False
         self._media_eos = False
         items = self._media_items
@@ -305,7 +363,7 @@ class AudioMixin:
             # mixer does not treat the whole file as late.
             self._media_sink.set_offset(max(0, clock.get_time() - self.pipeline.get_base_time()))
         decode.set_state(Gst.State.NULL)
-        decode.set_property("uri", Path(items[index]).resolve().as_uri())
+        decode.set_property("uri", Path(items[index]).expanduser().resolve().as_uri())
         decode.sync_state_with_parent()
         return True
 
@@ -345,13 +403,24 @@ class AudioMixin:
         aconv = make("audioconvert", "audio_shared_conv")
         aenc = make("avenc_aac", "audio_shared_enc", bitrate=128000)
         aparse = make("aacparse", "audio_shared_parse")
-        tee = make("tee", "audio_shared_tee")
+        tee = make("tee", "audio_shared_tee", allow_not_linked=True)
         self._add(mixer_caps, master, raw, queue, aconv, aenc, aparse, tee)
         self._link([self.audio_mixer, mixer_caps, master, raw, queue, aconv, aenc, aparse, tee])
         self.audio_tee = tee
         self._audio_raw_tee = raw
         self._build_audio_outputs(raw)
         return tee
+
+    @staticmethod
+    def _default_audio_sink() -> str:
+        """Name of the PulseAudio/PipeWire-Pulse default playback sink, or ""."""
+        code, out = config.run(["pactl", "get-default-sink"], timeout=2.0)
+        if code == 0 and out.strip():
+            return out.strip().splitlines()[0].strip()
+        sinks = config.list_audio_sinks()
+        if len(sinks) == 1:
+            return sinks[0].name
+        return ""
 
     def _audio_branch(self, raw: Gst.Element, name: str, sink: Gst.Element) -> bool:
         """raw tee -> queue -> convert -> resample -> ``sink``; False when it cannot link."""
@@ -360,10 +429,34 @@ class AudioMixin:
         conv = make("audioconvert", f"{name}_conv")
         res = make("audioresample", f"{name}_resample")
         caps = caps_filter("audio/x-raw,format=F32LE,rate=48000,channels=2", f"{name}_caps")
-        self._add(queue, conv, res, caps, sink)
-        self._link([queue, conv, res, caps, sink])
-        pad = raw.request_pad_simple("src_%u")
-        return pad is not None and pad.link(queue.get_static_pad("sink")) == Gst.PadLinkReturn.OK
+        elements = [queue, conv, res, caps, sink]
+        self._add(*elements, sync=False)
+        pad = None
+        try:
+            self._link(elements)
+            for element in reversed(elements):
+                self._sync_state(element)
+            pad = raw.request_pad_simple("src_%u")
+            if pad is None or pad.link(queue.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+                raise RuntimeError(f"could not link {name} to audio tee")
+            try:
+                pad.set_active(True)
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        except Exception:  # noqa: BLE001
+            for element in reversed(elements):
+                element.set_state(Gst.State.NULL)
+            if pad is not None:
+                try:
+                    raw.release_request_pad(pad)
+                except Exception:  # noqa: BLE001
+                    pass
+            if self.pipeline is not None:
+                for element in reversed(elements):
+                    if element.get_parent() is self.pipeline:
+                        self.pipeline.remove(element)
+            return False
 
     def _build_audio_outputs(self, raw: Gst.Element) -> None:
         """The monitor (hear the mix) and the virtual microphone (other apps record it)."""
@@ -377,8 +470,11 @@ class AudioMixin:
             desktop = (audio.desktop_device or "").strip()
             monitor = (audio.monitor_device or "").strip()
             desktop_sink = desktop[:-8] if desktop.endswith(".monitor") else desktop
-            if desktop and monitor and monitor != "default" and (
-                    monitor == desktop_sink or desktop == f"{monitor}.monitor"):
+            resolved_monitor = monitor
+            if desktop and monitor == "default":
+                resolved_monitor = self._default_audio_sink()
+            if desktop and resolved_monitor and (
+                    resolved_monitor == desktop_sink or desktop == f"{resolved_monitor}.monitor"):
                 report.audio_monitor_error = (
                     "monitor output would play into the desktop-audio capture "
                     "(feedback loop); monitor disabled")
@@ -388,6 +484,7 @@ class AudioMixin:
                 report.audio_monitor_error = "GStreamer pulsesink is not installed"
             else:
                 sink = make("pulsesink", "audio_monitor_sink", sync=False)
+                sink.set_property("async", False)
                 if device:
                     sink.set_property("device", device)
                 if self._audio_branch(raw, "audio_monitor", sink):
@@ -401,6 +498,7 @@ class AudioMixin:
                 report.virtual_mic_error = "GStreamer pipewiresink is not installed"
             else:
                 sink = make("pipewiresink", "audio_vmic_sink", sync=False, mode="provide")
+                sink.set_property("async", False)
                 props = Gst.Structure.from_string(virtual_mic_properties())[0]
                 if props is not None:
                     sink.set_property("stream-properties", props)

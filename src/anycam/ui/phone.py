@@ -65,6 +65,8 @@ class PhoneMixin:
 
     def phone_control(self, action: str, data: dict, device: str = "") -> dict:
         """What the remote page can do; returns the state to show afterwards."""
+        if getattr(self, "_ui_blocked", 0) or getattr(self, "_closing", False):
+            return {"ok": False, "error": "busy"}
         if action == "scene":
             if self.ctl_scene_index(str(data.get("scene_id") or ""), ids_only=True) < 0:
                 return {"error": "No such scene."}
@@ -115,11 +117,16 @@ class PhoneMixin:
         self._phone_dialog = dialog
         try:
             accepted = dialog.exec() == QDialog.DialogCode.Accepted
+            device = dialog.device
+            device_name = dialog.device_name or dialog.device
         finally:
             self._phone_dialog = None
-        if not accepted or not dialog.device:
+            delete = getattr(dialog, "deleteLater", None)
+            if callable(delete):
+                delete()
+        if not accepted or not device:
             return None
-        return dialog.device, dialog.device_name or dialog.device
+        return device, device_name
 
     def _on_phone_event(self, event: str, device: str, detail: str) -> None:
         """Phone-link events, delivered on the UI thread."""

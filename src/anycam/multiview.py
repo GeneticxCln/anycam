@@ -3,13 +3,25 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap
-from PySide6.QtWidgets import QDialog, QGridLayout, QLabel, QVBoxLayout
+from PySide6.QtWidgets import QDialog, QGridLayout, QLabel, QSizePolicy, QVBoxLayout
 
 import gi
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstVideo", "1.0")
 from gi.repository import Gst, GstVideo  # noqa: E402
+
+Gst.init(None)
+
+PREVIEW_MAX_W = 320
+PREVIEW_MAX_H = 180
+
+
+def _make(factory: str, name: str) -> Gst.Element:
+    element = Gst.ElementFactory.make(factory, name)
+    if element is None:
+        raise RuntimeError(f"GStreamer element '{factory}' is not installed")
+    return element
 
 
 class SourcePreview:
@@ -18,18 +30,21 @@ class SourcePreview:
     def __init__(self, channel: str, label: QLabel) -> None:
         self.channel = channel
         self.label = label
+        self.label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.pipeline = Gst.Pipeline.new(f"preview-{channel}")
-        src = Gst.ElementFactory.make("intervideosrc", f"mv-src-{channel}")
+        src = _make("intervideosrc", f"mv-src-{channel}")
         src.set_property("channel", channel)
-        conv = Gst.ElementFactory.make("videoconvert", f"mv-conv-{channel}")
-        sink = Gst.ElementFactory.make("appsink", f"mv-sink-{channel}")
+        conv = _make("videoconvert", f"mv-conv-{channel}")
+        scale = _make("videoscale", f"mv-scale-{channel}")
+        caps = _make("capsfilter", f"mv-caps-{channel}")
+        caps.set_property("caps", Gst.Caps.from_string(
+            f"video/x-raw,format=RGBA,width=[1,{PREVIEW_MAX_W}],height=[1,{PREVIEW_MAX_H}]"))
+        sink = _make("appsink", f"mv-sink-{channel}")
         sink.set_property("emit-signals", True)
         sink.set_property("max-buffers", 2)
         sink.set_property("drop", True)
         sink.set_property("sync", False)
-        caps = Gst.ElementFactory.make("capsfilter", f"mv-caps-{channel}")
-        caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=RGBA"))
-        elements = (src, conv, caps, sink)
+        elements = (src, conv, scale, caps, sink)
         for element in elements:
             self.pipeline.add(element)
         for first, second in zip(elements, elements[1:]):
@@ -60,9 +75,11 @@ class SourcePreview:
         image = self._last
         self._last = None
         if image is not None:
-            self.label.setPixmap(QPixmap.fromImage(image).scaled(
-                self.label.size(), Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation))
+            target = self.label.contentsRect().size()
+            if target.width() > 0 and target.height() > 0:
+                self.label.setPixmap(QPixmap.fromImage(image).scaled(
+                    target, Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation))
 
     def start(self) -> None:
         self.pipeline.set_state(Gst.State.PLAYING)
@@ -104,15 +121,19 @@ class MultiViewDialog(QDialog):
         # does not send a close event; ``finished`` covers every way out.
         self.finished.connect(self._stop_previews)
         cols = 2 if len(entries) <= 4 else 3
-        for i, entry in enumerate(entries):
-            label = QLabel(source_label(entry.spec))
-            label.setMinimumSize(320, 180)
-            label.setStyleSheet("background:#0e1216; border:1px solid #1e2830;")
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            grid.addWidget(label, i // cols, i % cols)
-            sp = SourcePreview(entry.channel, label)
-            sp.start()
-            self.previews.append(sp)
+        try:
+            for i, entry in enumerate(entries):
+                label = QLabel(source_label(entry.spec))
+                label.setMinimumSize(320, 180)
+                label.setStyleSheet("background:#0e1216; border:1px solid #1e2830;")
+                label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                grid.addWidget(label, i // cols, i % cols)
+                sp = SourcePreview(entry.channel, label)
+                sp.start()
+                self.previews.append(sp)
+        except Exception:
+            self._stop_previews()
+            raise
 
     def pump(self) -> None:
         for sp in self.previews:

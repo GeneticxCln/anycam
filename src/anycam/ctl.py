@@ -20,8 +20,18 @@ MAX_REPLY = 1 << 20
 
 
 def socket_path(name: str | None = None) -> str:
-    """Where the window's ``QLocalServer`` listens (Qt puts it in the temp directory)."""
-    return os.path.join(os.environ.get("TMPDIR") or "/tmp", name or f"anycam-gui-{os.getuid()}")
+    """Where the window's ``QLocalServer`` listens."""
+    if name:
+        if os.path.isabs(name):
+            return name
+        return os.path.join(os.environ.get("TMPDIR") or "/tmp", name)
+    default_name = f"anycam-gui-{os.getuid()}"
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if runtime and os.path.isdir(runtime) and os.access(runtime, os.W_OK | os.X_OK):
+        return os.path.join(runtime, default_name)
+    from . import config
+
+    return os.path.join(str(config.state_dir()), default_name)
 
 
 def request(action: str, argument: str = "", path: str | None = None) -> dict:

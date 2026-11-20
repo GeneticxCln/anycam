@@ -16,6 +16,7 @@ canvas rate for exactly this reason.
 from __future__ import annotations
 
 import itertools
+import os
 import sys
 import threading
 import time
@@ -109,16 +110,25 @@ class Entry:
     restarting: bool = False
     frames_at_restart: int = 0
     closed: bool = False
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    _fd_closed: bool = False
 
     def teardown(self) -> None:
-        self.closed = True
-        self.pipeline.set_state(Gst.State.NULL)
-        for pad, probe in self.probes:
-            try:
-                pad.remove_probe(probe)
-            except Exception:  # noqa: BLE001
-                pass
-        self.probes.clear()
+        with self.lock:
+            self.closed = True
+            self.pipeline.set_state(Gst.State.NULL)
+            for pad, probe in self.probes:
+                try:
+                    pad.remove_probe(probe)
+                except Exception:  # noqa: BLE001
+                    pass
+            self.probes.clear()
+            if self.spec.kind == "screen" and self.spec.fd >= 0 and not self._fd_closed:
+                self._fd_closed = True
+                try:
+                    os.close(self.spec.fd)
+                except OSError:
+                    pass
 
     def as_dict(self) -> dict:
         return {
@@ -162,11 +172,11 @@ def _link_all(elements: list[Gst.Element], dynamic_from: Gst.Element | None) -> 
 
 
 def _on_pad_added(_bin, pad, target) -> None:
-    """Link the first video (or audio) pad a decodebin exposes."""
+    """Link the first video pad a decodebin exposes."""
     caps = pad.get_current_caps() or pad.query_caps(None)
     if caps is None or caps.get_size() == 0:
         return
-    if not caps.get_structure(0).get_name().startswith(("video/", "audio/", "image/")):
+    if not caps.get_structure(0).get_name().startswith(("video/", "image/")):
         return
     sink = target.get_static_pad("sink")
     if sink is not None and not sink.is_linked():
@@ -255,9 +265,47 @@ class SourcePool:
         # channel when it is shown again.
         self._channels: dict[CaptureSpec, str] = {}
         self._started = False
+        self._lock = threading.RLock()
+        self._sweep_timer: threading.Timer | None = None
+        self._sweep_due = 0.0
         # Optional sink for session events (the GUI routes these to the
         # Diagnostics log).  Kept as a callback so the pool stays UI-free.
         self.log_event = None
+
+    def _schedule_sweep(self, delay: float) -> None:
+        """Schedule a background sweep so retained/idle entries expire even when stopped."""
+        delay = max(0.05, float(delay))
+        due = time.monotonic() + delay
+        with self._lock:
+            if self._sweep_timer is not None and self._sweep_due <= due:
+                return
+            if self._sweep_timer is not None:
+                self._sweep_timer.cancel()
+            timer = threading.Timer(delay, self._run_scheduled_sweep)
+            timer.daemon = True
+            self._sweep_timer = timer
+            self._sweep_due = due
+            timer.start()
+
+    def _run_scheduled_sweep(self) -> None:
+        with self._lock:
+            self._sweep_timer = None
+            self._sweep_due = 0.0
+        self.sweep()
+        now = time.monotonic()
+        next_delay: float | None = None
+        with self._lock:
+            for entry in self._entries.values():
+                if entry.refs > 0:
+                    continue
+                if entry.retained and entry.spec.kind != "screen" and entry.retained_since:
+                    remaining = RETAIN_GRACE_S - (now - entry.retained_since)
+                    next_delay = remaining if next_delay is None else min(next_delay, remaining)
+                elif entry.idle_since:
+                    remaining = SCREEN_IDLE_GRACE_S - (now - entry.idle_since)
+                    next_delay = remaining if next_delay is None else min(next_delay, remaining)
+        if next_delay is not None:
+            self._schedule_sweep(max(0.1, next_delay + 0.05))
 
     # ------------------------------------------------------------------ public
     def _resolve(self, spec: CaptureSpec, *, claim: bool = False) -> CaptureSpec:
@@ -291,28 +339,29 @@ class SourcePool:
             pass
 
     def acquire(self, spec: CaptureSpec) -> Entry:
-        self.sweep()
-        spec = self._resolve(spec, claim=True)
-        entry = self._entries.get(spec)
-        if entry is not None and entry.error and entry.refs == 0:
-            # A capture that failed is never handed out again (a camera that
-            # errored must be reopened, not reused from the rebuild grace).
-            entry.teardown()
-            del self._entries[spec]
-            entry = None
-        if entry is None:
-            entry = self._build(spec)
-            self._entries[spec] = entry
-            if self._started:
-                entry.pipeline.set_state(Gst.State.PLAYING)
-        elif entry.refs == 0 and entry.idle_since:
-            self._note(f"{spec.kind} capture reused after a rebuild ({entry.channel})")
-        elif entry.refs == 0 and entry.retained:
-            self._note(f"capture reused after re-add ({entry.channel})")
-        entry.idle_since = 0.0
-        entry.retained = False
-        entry.refs += 1
-        return entry
+        with self._lock:
+            self.sweep()
+            spec = self._resolve(spec, claim=True)
+            entry = self._entries.get(spec)
+            if entry is not None and entry.error and entry.refs == 0:
+                # A capture that failed is never handed out again (a camera that
+                # errored must be reopened, not reused from the rebuild grace).
+                entry.teardown()
+                del self._entries[spec]
+                entry = None
+            if entry is None:
+                entry = self._build(spec)
+                self._entries[spec] = entry
+                if self._started:
+                    entry.pipeline.set_state(Gst.State.PLAYING)
+            elif entry.refs == 0 and entry.idle_since:
+                self._note(f"{spec.kind} capture reused after a rebuild ({entry.channel})")
+            elif entry.refs == 0 and entry.retained:
+                self._note(f"capture reused after re-add ({entry.channel})")
+            entry.idle_since = 0.0
+            entry.retained = False
+            entry.refs += 1
+            return entry
 
     def pin(self, spec: CaptureSpec) -> None:
         """Keep a capture alive when its last visible layer is removed.
@@ -321,41 +370,46 @@ class SourcePool:
         stream must stay alive so adding the source back only relinks it.
         ``stop()`` still releases every retained capture at app exit.
         """
-        entry = self._entries.get(self._resolve(spec))
-        if entry is None:
-            return
-        entry.retained = True
-        entry.idle_since = 0.0
-        entry.retained_since = time.monotonic()
-        self._note(f"capture retained for re-add ({entry.channel})")
+        with self._lock:
+            entry = self._entries.get(self._resolve(spec))
+            if entry is None:
+                return
+            entry.retained = True
+            entry.idle_since = 0.0
+            entry.retained_since = time.monotonic()
+            self._note(f"capture retained for re-add ({entry.channel})")
 
     def release(self, spec: CaptureSpec, *, linger: bool = False) -> None:
         """Drop one reference.  ``linger`` (a canvas rebuild) keeps an unused
         camera running for a moment so the rebuilt canvas takes it over
         instead of closing and reopening the device."""
-        spec = self._resolve(spec)
-        entry = self._entries.get(spec)
-        if entry is None or entry.refs <= 0:
-            # An unmatched release must not drive the count negative: the next
-            # acquire would then start at zero and be torn down under its user.
-            return
-        entry.refs -= 1
-        if entry.refs > 0:
-            return
-        if entry.retained:
-            # The layer was removed, not hidden.  Keep the pipeline PLAYING
-            # (and the device/portal stream open) for the re-add window.
-            entry.idle_since = 0.0
-            entry.retained_since = time.monotonic()
-            return
-        if entry.spec.kind == "screen" or (
-                linger and entry.spec.kind == "camera" and not entry.error):
-            entry.idle_since = time.monotonic()
-            self._note(f"{entry.spec.kind} capture kept alive for the next rebuild "
-                       f"({entry.channel})")
-            return
-        entry.teardown()
-        del self._entries[spec]
+        with self._lock:
+            spec = self._resolve(spec)
+            entry = self._entries.get(spec)
+            if entry is None or entry.refs <= 0:
+                # An unmatched release must not drive the count negative: the next
+                # acquire would then start at zero and be torn down under its user.
+                return
+            entry.refs -= 1
+            if entry.refs > 0:
+                return
+            if entry.retained and not entry.error:
+                # The layer was removed, not hidden.  Keep the pipeline PLAYING
+                # (and the device/portal stream open) for the re-add window.
+                entry.idle_since = 0.0
+                entry.retained_since = time.monotonic()
+                if entry.spec.kind != "screen":
+                    self._schedule_sweep(RETAIN_GRACE_S + 0.1)
+                return
+            if entry.spec.kind == "screen" or (
+                    linger and entry.spec.kind == "camera" and not entry.error):
+                entry.idle_since = time.monotonic()
+                self._note(f"{entry.spec.kind} capture kept alive for the next rebuild "
+                           f"({entry.channel})")
+                self._schedule_sweep(SCREEN_IDLE_GRACE_S + 0.1)
+                return
+            entry.teardown()
+            del self._entries[spec]
 
     def discard(self, spec: CaptureSpec) -> None:
         """Drop a released capture immediately (a removed layer's source).
@@ -364,36 +418,38 @@ class SourcePool:
         capture around for a layer that no longer exists.  A capture shared
         with another layer stays alive for its remaining references.
         """
-        spec = self._resolve(spec)
-        entry = self._entries.get(spec)
-        if entry is None or entry.refs > 0 or entry.retained:
-            return
-        entry.teardown()
-        del self._entries[spec]
-        self._note(f"capture released on removal ({entry.channel})")
+        with self._lock:
+            spec = self._resolve(spec)
+            entry = self._entries.get(spec)
+            if entry is None or entry.refs > 0 or entry.retained:
+                return
+            entry.teardown()
+            del self._entries[spec]
+            self._note(f"capture released on removal ({entry.channel})")
 
     def sweep(self) -> None:
-        """Tear down screen captures whose rebuild grace has expired."""
+        """Tear down screen/retained captures whose grace window has expired."""
         now = time.monotonic()
-        for spec, entry in list(self._entries.items()):
-            if entry.refs > 0:
-                continue
-            if entry.retained:
-                if (entry.spec.kind == "screen" or not entry.retained_since
-                        or now - entry.retained_since < RETAIN_GRACE_S):
+        with self._lock:
+            for spec, entry in list(self._entries.items()):
+                if entry.refs > 0:
+                    continue
+                if entry.retained:
+                    if (entry.spec.kind == "screen" or not entry.retained_since
+                            or now - entry.retained_since < RETAIN_GRACE_S):
+                        continue
+                    entry.teardown()
+                    del self._entries[spec]
+                    self._note(
+                        f"removed capture released ({entry.channel})")
+                    continue
+                if not entry.idle_since:
+                    continue
+                if now - entry.idle_since < SCREEN_IDLE_GRACE_S:
                     continue
                 entry.teardown()
                 del self._entries[spec]
-                self._note(
-                    f"removed capture released ({entry.channel})")
-                continue
-            if not entry.idle_since:
-                continue
-            if now - entry.idle_since < SCREEN_IDLE_GRACE_S:
-                continue
-            entry.teardown()
-            del self._entries[spec]
-            self._note(f"idle {entry.spec.kind} capture released ({entry.channel})")
+                self._note(f"idle {entry.spec.kind} capture released ({entry.channel})")
 
     def probe_size(self, spec: CaptureSpec) -> tuple[int, int]:
         """The native frame size a capture for ``spec`` will have.
@@ -436,21 +492,31 @@ class SourcePool:
         return channel
 
     def start(self) -> None:
-        self._started = True
-        for entry in self._entries.values():
+        with self._lock:
+            self._started = True
+            entries = list(self._entries.values())
+        for entry in entries:
             entry.pipeline.set_state(Gst.State.PLAYING)
 
     def stop(self) -> None:
-        self._started = False
-        for entry in list(self._entries.values()):
+        with self._lock:
+            self._started = False
+            if self._sweep_timer is not None:
+                self._sweep_timer.cancel()
+                self._sweep_timer = None
+                self._sweep_due = 0.0
+            entries = list(self._entries.values())
+            self._entries.clear()
+        for entry in entries:
             entry.teardown()
-        self._entries.clear()
 
     def entry(self, spec: CaptureSpec) -> Entry | None:
-        return self._entries.get(self._resolve(spec))
+        with self._lock:
+            return self._entries.get(self._resolve(spec))
 
     def entries(self) -> list[Entry]:
-        return list(self._entries.values())
+        with self._lock:
+            return list(self._entries.values())
 
     def poll_errors(self) -> None:
         self.sweep()
@@ -527,15 +593,18 @@ class SourcePool:
         def reconnect() -> None:
             # NULL can block on a hung server: keep it off the caller's thread.
             try:
-                entry.pipeline.set_state(Gst.State.NULL)
-                if entry.closed:
-                    return
-                entry.error = ""
-                entry.restart_at = 0.0
-                entry.restarts += 1
-                entry.frames_at_restart = entry.frames
-                entry.pipeline.set_state(Gst.State.PLAYING)
-                self._note(f"network source {entry.channel} reconnecting")
+                with entry.lock:
+                    if entry.closed:
+                        return
+                    entry.pipeline.set_state(Gst.State.NULL)
+                    if entry.closed:
+                        return
+                    entry.error = ""
+                    entry.restart_at = 0.0
+                    entry.restarts += 1
+                    entry.frames_at_restart = entry.frames
+                    entry.pipeline.set_state(Gst.State.PLAYING)
+                    self._note(f"network source {entry.channel} reconnecting")
             finally:
                 entry.restarting = False
 
@@ -548,11 +617,12 @@ class SourcePool:
 
     # ------------------------------------------------------------------ build
     @staticmethod
-    def _add_audio_branch(pipeline: Gst.Pipeline, channel: str) -> Gst.Element:
+    def _add_audio_branch(pipeline: Gst.Pipeline, channel: str, *,
+                          sync: bool = False) -> Gst.Element:
         """convert -> resample -> 48 kHz stereo -> interaudiosink; returns the head."""
         elements = [make("audioconvert"), make("audioresample"),
                     caps_filter("audio/x-raw,format=F32LE,rate=48000,channels=2"),
-                    make("interaudiosink", channel=channel, sync=False)]
+                    make("interaudiosink", channel=channel, sync=sync)]
         for element in elements:
             pipeline.add(element)
         _link_all(elements, None)
@@ -579,7 +649,10 @@ class SourcePool:
             built.dynamic_from.connect("pad-added", _on_pad_added,
                                        built.elements[index + 1])
             if built.audio and Gst.ElementFactory.find("interaudiosink") is not None:
-                head = self._add_audio_branch(pipeline, audio_channel(channel))
+                # Pace file audio with its video instead of racing ahead to EOS.
+                head = self._add_audio_branch(
+                    pipeline, audio_channel(channel),
+                    sync=spec.kind in ("video", "file"))
                 built.dynamic_from.connect("pad-added", _on_audio_pad_added, head)
         entry = Entry(spec=spec, channel=channel, pipeline=pipeline,
                       source_size=built.size, camera_mode=built.camera_mode,
@@ -598,8 +671,6 @@ class SourcePool:
                 (sink_pad, sink_pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)))
         if built.check is not None and built.check_size is not None:
             self._watch_size(built.check, built.check_size, entry)
-        if self._started:
-            pipeline.set_state(Gst.State.PLAYING)
         return entry
 
     def _watch_size(self, element: Gst.Element, expected: tuple[int, int],
@@ -607,15 +678,12 @@ class SourcePool:
         pad = element.get_static_pad("src")
         if pad is None:
             return
-        seen: list[bool] = []
+        probe_ref: list[int] = [0]
 
         def on_buffer(probe_pad, _info):
-            if seen:
-                return Gst.PadProbeReturn.OK
             caps = probe_pad.get_current_caps()
             if caps is None or caps.get_size() == 0:
                 return Gst.PadProbeReturn.OK
-            seen.append(True)
             struct = caps.get_structure(0)
             got = (int(struct.get_value("width")), int(struct.get_value("height")))
             # Compare the shape, not the exact size: the portal reports logical
@@ -627,9 +695,13 @@ class SourcePool:
                     f"screen layer captured {got[0]}x{got[1]} but the portal "
                     f"stream is {expected[0]}x{expected[1]}"
                 )
-            return Gst.PadProbeReturn.OK
+            entry.probes = [p for p in entry.probes if p != (probe_pad, probe_ref[0])]
+            return Gst.PadProbeReturn.REMOVE
 
-        entry.probes.append((pad, pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)))
+        probe_id = pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
+        probe_ref[0] = probe_id
+        if probe_id:
+            entry.probes.append((pad, probe_id))
 
     def _elements(self, spec: CaptureSpec) -> _Built:
         if spec.kind == "camera":
@@ -658,22 +730,22 @@ class SourcePool:
         ]
         if mode.pixel_format in ("MJPG", "JPEG"):
             elements.append(caps_filter(
-                f"image/jpeg,width={mode.width},height={mode.height},framerate={mode.fps}/1"))
+                f"image/jpeg,width={mode.width},height={mode.height},framerate={mode.framerate}"))
             elements.append(jpeg_decoder())
         elif mode.pixel_format == "H264":
             elements.append(caps_filter(
-                f"video/x-h264,width={mode.width},height={mode.height},framerate={mode.fps}/1"))
+                f"video/x-h264,width={mode.width},height={mode.height},framerate={mode.framerate}"))
             elements.extend([make("h264parse"), make("avdec_h264")])
         else:
             fmt = _gst_raw_format(mode.pixel_format)
             elements.append(caps_filter(
                 f"video/x-raw,format={fmt},width={mode.width},height={mode.height},"
-                f"framerate={mode.fps}/1"))
+                f"framerate={mode.framerate}"))
         elements.append(make("videoconvert"))
         # The capture frame is normalised here; crop/fit belong to the layer.
         elements.append(caps_filter(
             f"video/x-raw,format=RGBA,width={mode.width},height={mode.height},"
-            f"framerate={mode.fps}/1"))
+            f"framerate={mode.framerate}"))
         return _Built(elements, (mode.width, mode.height),
                       camera_mode=f"{mode.pixel_format} {mode.width}x{mode.height}@{mode.fps}",
                       probe_error=camera_probe_error(device))

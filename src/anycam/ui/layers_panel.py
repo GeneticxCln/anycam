@@ -186,7 +186,7 @@ class LayersMixin:
         appearance_layout.addWidget(QLabel("Volume"), 1, 0)
         appearance_layout.addWidget(self.layer_volume_slider, 1, 1)
         appearance_layout.addWidget(self.layer_volume_label, 1, 2)
-        appearance_layout.addWidget(self.layer_mute_check, 2, 1)
+        appearance_layout.addWidget(self.layer_mute_check, 2, 1, 1, 2)
         self.order_buttons = []
         order_row = QHBoxLayout()
         for text, action in (("Raise", "raise"), ("Lower", "lower"),
@@ -196,7 +196,7 @@ class LayersMixin:
                 lambda _=False, act=action: self._move_layer(act))
             self.order_buttons.append(button)
             order_row.addWidget(button)
-        appearance_layout.addLayout(order_row, 1, 0, 1, 3)
+        appearance_layout.addLayout(order_row, 3, 0, 1, 3)
         history_row = QHBoxLayout()
         self.undo_button = QPushButton("Undo")
         self.undo_button.setEnabled(False)
@@ -206,7 +206,7 @@ class LayersMixin:
         self.redo_button.clicked.connect(self.redo)
         history_row.addWidget(self.undo_button)
         history_row.addWidget(self.redo_button)
-        appearance_layout.addLayout(history_row, 2, 0, 1, 3)
+        appearance_layout.addLayout(history_row, 4, 0, 1, 3)
         layout.addWidget(appearance)
 
         grid = QGridLayout()
@@ -451,7 +451,11 @@ class LayersMixin:
             if content.needs_resolving(uri):
                 # A video-site page is not a stream: ask yt-dlp for the real address.
                 self._status("Looking up the stream\u2026")
-                resolved, problem = self._run_with_ui(lambda: content.resolve_stream(uri))
+                res = self._run_with_ui(lambda: content.resolve_stream(uri))
+                if res is None:
+                    self._status("Stream lookup timed out")
+                    return None
+                resolved, problem = res
                 if problem:
                     self._status(problem)
                     return None
@@ -578,6 +582,12 @@ class LayersMixin:
         for layer_id in removed:
             self.scene.remove_layer(layer_id)
             self._lost_cameras.pop(layer_id, None)
+            session = self._screen_sessions.pop(layer_id, None)
+            if (session is not None
+                    and session is not self._last_screen_session
+                    and not any(other is session
+                                for other in self._screen_sessions.values())):
+                session.close()
             self.playlist_ids = [item for item in self.playlist_ids if item != layer_id]
         self.playlist_index = min(self.playlist_index, len(self.playlist_ids) - 1)
         self._refresh_layers()
@@ -650,6 +660,10 @@ class LayersMixin:
             # Toggle the compositor pad alpha; rebuilding the graph here would
             # end the current MP4 segment for a purely cosmetic change.
             self.engine.set_layer_visible(layer.id, layer.visible)
+        if hasattr(self, "_refresh_stage_slots"):
+            self._refresh_stage_slots()
+        if hasattr(self, "_refresh_scene_cards"):
+            self._refresh_scene_cards()
 
     def _move_layer(self, action: str) -> None:
         layer = self.preview.selected_layer()
@@ -691,6 +705,10 @@ class LayersMixin:
                 self._status("Select a layer first")
                 return
             targets = [primary]
+        targets = [layer for layer in targets if not layer.locked]
+        if not targets:
+            self._status("Selected layer(s) are locked: unlock them to align")
+            return
         before = self._layout_snapshot()
         for layer in targets:
             x, y, w, h = layer.box
@@ -888,9 +906,14 @@ class LayersMixin:
         layer = self.preview.selected_layer()
         if layer is None:
             return
+        if layer.locked:
+            self._sync_transform_fields()
+            self._status(f"{layer.name} is locked: unlock it to move or resize")
+            return
         before = self._layout_snapshot()
         x, y, w, h = layer.box
-        targets = self.preview.selected_layers() or [layer]
+        targets = [item for item in (self.preview.selected_layers() or [layer])
+                   if not item.locked]
         low, high = geometry.BOX_POSITION_RANGE
         if key in ("x", "y"):
             delta = (clamp(value, low, high) - (x if key == "x" else y))
@@ -976,6 +999,11 @@ class LayersMixin:
         self._transform_timer.start()
 
     def _commit_transform(self) -> None:
+        if getattr(self, "_closing", False):
+            return
+        if getattr(self, "_ui_blocked", 0):
+            self._transform_timer.start()
+            return
         layer_id = self._transform_pending
         self._transform_pending = ""
         if not layer_id or self.engine is None:
@@ -1004,6 +1032,15 @@ class LayersMixin:
         self.preview.set_edit_mode(mode)
         self.move_button.setChecked(mode == "move")
         self.crop_button.setChecked(mode == "crop")
+        if mode in ("move", "crop"):
+            draw_bar = getattr(self, "draw_bar", None)
+            if draw_bar is not None and draw_bar.isVisible():
+                draw_bar.hide()
+            draw_button = getattr(self, "draw_button", None)
+            if draw_button is not None and draw_button.isChecked():
+                draw_button.blockSignals(True)
+                draw_button.setChecked(False)
+                draw_button.blockSignals(False)
         wanted = self.preview.selected_id if mode == "crop" else ""
         if wanted != self._crop_preview_layer_id:
             self._crop_preview_layer_id = wanted

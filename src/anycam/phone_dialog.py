@@ -93,11 +93,16 @@ class PhonePairDialog(QDialog):
         self.firewall_button.clicked.connect(self.allow_through_firewall)
         bar.addWidget(self.firewall_button)
         layout.addWidget(self.firewall_bar)
+        self._closed = False
         self._firewall_process: QProcess | None = None
         self._firewall_job: dict | None = None
         self._firewall_timer = QTimer(self)
         self._firewall_timer.setInterval(150)
         self._firewall_timer.timeout.connect(self._poll_firewalld)
+        self._firewall_retry_timer = QTimer(self)
+        self._firewall_retry_timer.setSingleShot(True)
+        self._firewall_retry_timer.setInterval(2500)
+        self._firewall_retry_timer.timeout.connect(self._retry_allow_through_firewall)
         self.host = str(getattr(service, "host", "") or "")
         self.firewall_backend = ""
         self.firewall_bar.setVisible(False)
@@ -155,7 +160,30 @@ class PhonePairDialog(QDialog):
         if not result.get("done"):
             self._detect_timer.start()
 
+    def _stop_timers(self) -> None:
+        self._closed = True
+        for attr in ("_renew", "_detect_timer", "_firewall_timer", "_firewall_retry_timer"):
+            timer = getattr(self, attr, None)
+            if timer is not None:
+                timer.stop()
+
+    def done(self, result: int) -> None:
+        self._stop_timers()
+        super().done(result)
+
+    def closeEvent(self, event) -> None:
+        self._stop_timers()
+        super().closeEvent(event)
+
+    def _retry_allow_through_firewall(self) -> None:
+        if self._closed:
+            return
+        self.allow_through_firewall(retried=True)
+
     def _apply_firewall_detection(self) -> None:
+        if self._closed:
+            self._detect_timer.stop()
+            return
         result = self._detect_result
         if not result.get("done"):
             return
@@ -165,6 +193,8 @@ class PhonePairDialog(QDialog):
 
     def allow_through_firewall(self, *, retried: bool = False) -> None:
         """Open the phone port; the desktop asks for the password."""
+        if self._closed:
+            return
         if self.firewall_backend == "firewalld":
             self._allow_with_firewalld(retried)
             return
@@ -176,11 +206,21 @@ class PhonePairDialog(QDialog):
         process = QProcess(self)
         process.finished.connect(
             lambda code, _status: self._firewall_done(code, retried))
-        process.errorOccurred.connect(
-            lambda error: self.log(f"firewall: pkexec did not run ({error})"))
+        process.errorOccurred.connect(self._firewall_error)
         self._firewall_process = process
         self.log("firewall: " + " ".join(command))
         process.start(command[0], command[1:])
+
+    def _firewall_error(self, error) -> None:
+        self.log(f"firewall: pkexec did not run ({error})")
+        if error == QProcess.ProcessError.FailedToStart:
+            process, self._firewall_process = self._firewall_process, None
+            if process is not None:
+                process.deleteLater()
+            if not self._closed:
+                self.firewall_button.setEnabled(True)
+                self.firewall_text.setText(
+                    "Could not start the password prompt (pkexec not found). Try again:")
 
     def _firewall_done(self, code: int, retried: bool = False) -> None:
         process, self._firewall_process = self._firewall_process, None
@@ -189,6 +229,8 @@ class PhonePairDialog(QDialog):
             output = bytes(process.readAllStandardError()).decode(errors="replace").strip()
             process.deleteLater()
         self.log(f"firewall: pkexec exit {code}: {output or 'no output'}")
+        if self._closed:
+            return
         if code == 0 and (not firewall.ufw_blocks(self.port)
                           or not firewall.ufw_rules_readable()):
             # ufw allow succeeded.  Where its rules cannot be read (Debian,
@@ -206,7 +248,7 @@ class PhonePairDialog(QDialog):
             started = QProcess.startDetached(agent, [])
             self.log(f"firewall: no polkit agent running; started {agent}: {started}")
             # The agent needs a moment to register with polkit.
-            QTimer.singleShot(2500, lambda: self.allow_through_firewall(retried=True))
+            self._firewall_retry_timer.start()
             return
         self.firewall_button.setEnabled(True)
         if firewall.no_agent(output):
@@ -223,7 +265,7 @@ class PhonePairDialog(QDialog):
 
     def _allow_with_firewalld(self, retried: bool) -> None:
         """firewalld over D-Bus on a thread; polkit shows the password prompt."""
-        if self._firewall_job is not None:
+        if self._closed or self._firewall_job is not None:
             return
         self.firewall_button.setEnabled(False)
         self.firewall_text.setText("Enter your password in the system prompt…")
@@ -246,6 +288,8 @@ class PhonePairDialog(QDialog):
             return
         self._firewall_timer.stop()
         self._firewall_job = None
+        if self._closed:
+            return
         error = job.get("error", "")
         self.log(f"firewall: firewalld result: {error or 'ok'}")
         if not error and not firewall.firewalld_blocks(self.port, self.host):
@@ -257,7 +301,7 @@ class PhonePairDialog(QDialog):
             # Same as with ufw: no polkit agent in this session; start it.
             self.firewall_text.setText("Starting the system password prompt…")
             QProcess.startDetached(agent, [])
-            QTimer.singleShot(2500, lambda: self.allow_through_firewall(retried=True))
+            self._firewall_retry_timer.start()
             return
         self.firewall_button.setEnabled(True)
         self.firewall_text.setText(f"Could not change the firewall: {error}. Try again:")

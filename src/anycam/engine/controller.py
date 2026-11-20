@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -139,6 +140,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         self.screen_sizes = dict(screen_sizes or {})
         self.on_frame = on_frame
         self.report = EngineReport()
+        self.report._rtmp_extra_urls = list(self.rtmp_extra)
         self.pipeline: Gst.Pipeline | None = None
         self.compositor: Gst.Element | None = None
         self.tee: Gst.Element | None = None
@@ -196,7 +198,10 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         self._rtmp_with_audio = False
         self._rtmp_encoder: Gst.Element | None = None
         self._rtmp_feed: EncodedFeed | None = None
+        self._stopping = False
         self._stopped = False
+        self._transition_lock = threading.Lock()
+        self._layer_health_probes: dict[str, tuple] = {}
         # Every signal handler and pad probe this engine installs.  They point
         # back at the engine, so until they are removed neither the engine nor
         # its pipeline can be freed: each rebuild leaked a whole graph.
@@ -242,17 +247,20 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
     def _abort_build(self) -> None:
         """Undo a failed build without disturbing a pool other engines share."""
         self._run_chain_cleanup()
+        self.chains.clear()
         for spec in list(self._specs):
             self.pool.release(spec)
         self._specs.clear()
         self._layer_acquired.clear()
         self._layer_specs.clear()
         if self._vcam_valve is not None:
+            self._vcam_valve = None
             self._notify_canvas_attached(False)
         if self.pipeline is not None:
             self.pipeline.set_state(Gst.State.NULL)
         if self._vcam_pipeline is not None:
             self._vcam_pipeline.set_state(Gst.State.NULL)
+            self._vcam_pipeline = None
         self._teardown_rtmp(everything=True)
         if self._owns_pool:
             self.pool.stop()
@@ -308,7 +316,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
             self.compositor.set_property("latency", GL_MIXER_LATENCY_NS)
         else:
             self.compositor = make("compositor", "compositor", background="black", ignore_inactive_pads=False)
-        self.tee = make("tee", "output")
+        self.tee = make("tee", "output", allow_not_linked=True)
         # A canvas-wide rate element keeps the composited timestamps monotonic
         # for h264parse/qtmux (two inter sources can start at the same PTS).
         # ``skip-to-first`` stops it emitting black buffers before the first
@@ -362,7 +370,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         if self.preview:
             self._build_preview()
         media = self.project.audio.media_file
-        if media and not Path(media).exists():
+        if media and not Path(media).expanduser().exists():
             self.report.media_error = f"media audio file not found: {media}"
         if self.audio:
             # Build audio whenever it is requested, even in preview-only mode.
@@ -385,7 +393,8 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
                 self._build_rtmp()
             except Exception as exc:  # noqa: BLE001
                 self.report.rtmp_error = config.redact_text(
-                    f"stream output could not start: {exc}", self.rtmp)
+                    f"stream output could not start: {exc}",
+                    self.rtmp, *self.rtmp_extra)
 
         if self._branch_count == 0:
             # Without a tee branch the compositor's output pad stays unlinked
@@ -427,10 +436,11 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         self.report.stalled_sources = []
         # Prefer the system clock: a USB/PipeWire microphone's clock can start
         # late and would delay the first composited frame (and the recording).
-        self.pipeline.use_clock(Gst.SystemClock.obtain())
+        clock = Gst.SystemClock.obtain()
+        self.pipeline.use_clock(clock)
         # The publish legs are separate pipelines fed canvas timestamps; giving
         # them the canvas's base time makes those timestamps their running time.
-        self._canvas_base = Gst.SystemClock.obtain().get_time()
+        self._canvas_base = clock.get_time()
         self.pipeline.set_start_time(Gst.CLOCK_TIME_NONE)
         self.pipeline.set_base_time(self._canvas_base)
         # Captures must be live before the canvas prerolls, or the compositor
@@ -439,8 +449,9 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         if self._vcam_pipeline is not None:
             self._vcam_pipeline.set_state(Gst.State.PLAYING)
         if self._rtmp_pipeline is not None:
+            self._apply_canvas_clock(self._rtmp_pipeline, clock)
             self._rtmp_pipeline.set_state(Gst.State.PLAYING)
-        self.start_extra_targets()
+        self.start_extra_targets(clock)
         result = self.pipeline.set_state(Gst.State.PLAYING)
         if result == Gst.StateChangeReturn.FAILURE:
             self.report.error = "pipeline failed to start"
@@ -468,7 +479,8 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         if self.bus is None:
             return []
         self.poll_transition()
-        self.service_media()
+        if not self._stopping and not self._stopped:
+            self.service_media()
         messages: list[Gst.Message] = []
         deadline = time.monotonic() + timeout_ms / 1000.0
         while True:
@@ -487,7 +499,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
             if msg.type == Gst.MessageType.ERROR:
                 err, debug = msg.parse_error()
                 self.report.error = config.redact_text(
-                    f"{err.message} ({debug})", self.rtmp,
+                    f"{err.message} ({debug})", self.rtmp, *self.rtmp_extra,
                     *(spec.source for spec in self._layer_specs.values()
                       if spec.kind == "network"))
                 self._error_seen = True
@@ -528,46 +540,55 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         # report (0 frames, 100% dropped).  Stopping is final.
         if self.pipeline is None or self._stopped:
             return self.report.as_dict()
+        self._stopping = True
         run = self._transition
         if run is not None:
             run.stop.set()                 # no pad is touched once teardown starts
             self._transition = None
+            if run.thread is not None and run.thread is not threading.current_thread():
+                run.thread.join(timeout=0.5)
         self.report.stopped = time.monotonic()
-        elapsed = self.report.stopped - self._start_time
+        was_started = self._start_time > 0.0
+        elapsed = (self.report.stopped - self._start_time) if was_started else 0.0
         stop_frames = self._frame_count
-        # Stop upstream sources first so no buffer arrives after EOS.
-        for chain in self.chains:
-            for element in chain.pause_elements:
-                element.set_state(Gst.State.PAUSED)
-        time.sleep(0.12)
-        # End the output branch, not the individual source pads.  EOS pushed
-        # into an ``intervideosrc`` tail deadlocks against the compositor's
-        # streaming thread, and EOS never crosses the inter channel from the
-        # capture pipeline.  One event on the compositor's src pad reaches
-        # every branch and finalises mp4mux/flvmux.
-        # A closed valve drops events too, EOS included, so a detached recorder
-        # or vcam tap made the wait below run to its full timeout on every
-        # later rebuild.  Nothing consumes those taps any more; let EOS through.
-        for valve in (self._recorder_valve, self._vcam_valve):
-            if valve is not None:
-                valve.set_property("drop", False)
-        output_pad = self.compositor.get_static_pad("src") if self.compositor else None
-        if output_pad is not None:
-            try:
-                output_pad.push_event(Gst.Event.new_eos())
-            except Exception:
-                pass
-        # mp4mux/flvmux only finalise after every pad sees EOS.  Video alone is
-        # not enough once audio is mixed in, so end the audio inputs too.
-        for pad in self._audio_eos_pads:
-            try:
-                pad.push_event(Gst.Event.new_eos())
-            except Exception:
-                pass
-        deadline = time.monotonic() + 4.0
-        while time.monotonic() < deadline and not self._eos_seen:
-            self.pump(100)
+        if was_started:
+            # Stop upstream sources first so no buffer arrives after EOS.
+            for chain in self.chains:
+                for element in chain.pause_elements:
+                    element.set_state(Gst.State.PAUSED)
+            time.sleep(0.12)
+            # End the output branch, not the individual source pads.  EOS pushed
+            # into an ``intervideosrc`` tail deadlocks against the compositor's
+            # streaming thread, and EOS never crosses the inter channel from the
+            # capture pipeline.  One event on the compositor's src pad reaches
+            # every branch and finalises mp4mux/flvmux.
+            # A closed valve drops events too, EOS included, so a detached recorder
+            # or vcam tap made the wait below run to its full timeout on every
+            # later rebuild.  Nothing consumes those taps any more; let EOS through.
+            for valve in (self._recorder_valve, self._vcam_valve):
+                if valve is not None:
+                    valve.set_property("drop", False)
+            output_pad = self.compositor.get_static_pad("src") if self.compositor else None
+            if output_pad is not None:
+                try:
+                    output_pad.push_event(Gst.Event.new_eos())
+                except Exception:
+                    pass
+            # mp4mux/flvmux only finalise after every pad sees EOS.  Video alone is
+            # not enough once audio is mixed in, so end the audio inputs too.
+            for pad in list(self._audio_eos_pads):
+                try:
+                    pad.push_event(Gst.Event.new_eos())
+                except Exception:
+                    pass
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline and not self._eos_seen:
+                self.pump(100)
         self.pipeline.set_state(Gst.State.NULL)
+        gl_sink = getattr(self, "_preview_gl_sink_element", None)
+        if gl_sink is not None:
+            from .. import gl_preview
+            gl_preview.detach_sink(gl_sink)
         self._run_chain_cleanup()
         # The tap died with this canvas.  Release the held device back to its
         # idle card so the next engine can attach, instead of leaving the
@@ -592,6 +613,7 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         # The graph is gone: a late add_layer()/start() must see that.
         self._stopped = True
         self._release_graph()
+        self._clear_graph_refs()
         self.report.frames = stop_frames
         self.report.fps = stop_frames / elapsed if elapsed > 0 else 0.0
         self.report.expected_frames = elapsed * self.fps
@@ -613,6 +635,41 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
                     else "recording file was not written"
                 )
         return self.report.as_dict()
+
+    def _clear_graph_refs(self) -> None:
+        """Drop references to GStreamer elements/pads after shutdown (keep self.pipeline)."""
+        self.compositor = None
+        self.tee = None
+        self.bus = None
+        self.chains.clear()
+        self._layer_pads.clear()
+        self._layer_chains.clear()
+        self._layer_health_probes.clear()
+        self._ghosts.clear()
+        self._detached_screens.clear()
+        self._background_pad = None
+        self._background_chain = None
+        self._audio_eos_pads.clear()
+        self._layer_audio.clear()
+        self.audio_mixer = None
+        self.audio_tee = None
+        self.mic_source = None
+        self.mic_volume = None
+        self.desktop_volume = None
+        self.media_volume = None
+        self._recorder_valve = None
+        self._record_encoder = None
+        self._record_sink = None
+        self._vcam_valve = None
+        self._vcam_sink = None
+        self._vcam_pipeline = None
+        self._vcam_appsrc = None
+        self._rtmp_encoder = None
+        self._appsink = None
+        self._preview_caps = None
+        self._pending_sample = None
+        self._frame_counter = None
+        self._preview_gl_sink_element = None
 
     def run(self, seconds: float, sample_cb: Callable[[dict], None] | None = None,
             tick_cb: Callable[[float], None] | None = None) -> dict:

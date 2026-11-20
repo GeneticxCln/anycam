@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Enable AnyCam's virtual camera with v4l2loopback.
 #
-# One root-only command. AnyCam writes no files under /etc; boot persistence
-# is the explicit opt-in printed at the end.
+# One root-only command. This terminal script writes no files under /etc
+# (boot persistence is the explicit opt-in printed at the end; AnyCam's GUI
+# one-time setup writes /etc/modprobe.d/anycam.conf,
+# /etc/modules-load.d/anycam.conf and /etc/udev/rules.d/70-anycam-vcam.rules).
 #
 # Reversible:
 #   sudo modprobe -r v4l2loopback
@@ -35,7 +37,18 @@ options='video_nr=10 card_label=AnyCam exclusive_caps=1'
 if lsmod | grep -q '^v4l2loopback'; then
   echo "v4l2loopback is already loaded:"
   lsmod | grep '^v4l2loopback'
-  caps=$(cut -d, -f1 \
+  # Match the slot belonging to video_nr=10 (fall back to slot 1 if unlisted).
+  slot=1
+  if [ -r /sys/module/v4l2loopback/parameters/video_nr ]; then
+    IFS=',' read -r -a vnr_list < /sys/module/v4l2loopback/parameters/video_nr
+    for idx in "${!vnr_list[@]}"; do
+      if [ "${vnr_list[$idx]// /}" = "10" ]; then
+        slot=$((idx + 1))
+        break
+      fi
+    done
+  fi
+  caps=$(cut -d, -f"$slot" \
     /sys/module/v4l2loopback/parameters/exclusive_caps 2>/dev/null || true)
   if [ ! -e /dev/video10 ] || [ "${caps:-N}" != "Y" ]; then
     echo "Reloading with $options ..."

@@ -5,7 +5,11 @@ from __future__ import annotations
 
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
+    QLineEdit,
     QMenu,
+    QPlainTextEdit,
+    QTextEdit,
 )
 
 from .theme import STYLE  # noqa: F401
@@ -140,9 +144,9 @@ class DesktopMixin:
             "vcam": self.toggle_vcam,
             "snapshot": self.snapshot,
             "mute": self.toggle_mic_mute,
-            "undo": self.undo,
-            "redo": self.redo,
-            "redo-alt": self.redo,
+            "undo": self._shortcut_undo,
+            "redo": self._shortcut_redo,
+            "redo-alt": self._shortcut_redo,
             "duplicate": self.duplicate_layer,
             "lock": self._toggle_selected_lock,
             "next-scene": lambda: self._step_scene(1),
@@ -157,6 +161,20 @@ class DesktopMixin:
         for index in range(1, 10):
             actions[f"scene-{index}"] = lambda i=index - 1: self.switch_scene(i)
         return actions
+
+    def _shortcut_undo(self) -> None:
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QLineEdit, QPlainTextEdit, QTextEdit)) and not focus.isReadOnly():
+            focus.undo()
+            return
+        self.undo()
+
+    def _shortcut_redo(self) -> None:
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QLineEdit, QPlainTextEdit, QTextEdit)) and not focus.isReadOnly():
+            focus.redo()
+            return
+        self.redo()
 
     def _toggle_selected_lock(self) -> None:
         layer = self.preview.selected_layer()

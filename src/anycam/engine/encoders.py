@@ -319,7 +319,8 @@ def _wants_va(preference: str) -> bool:
     return preference in _VA_ALIASES | _VA_H265_ALIASES | _VA_AV1_ALIASES
 
 
-def encoder_plan(preference: str, *, purpose: str = "record") -> EncoderPlan:
+def encoder_plan(preference: str, *, purpose: str = "record",
+                 width: int = 0, height: int = 0) -> EncoderPlan:
     """Choose an encoder, falling back only through formats the graph supports.
 
     Recording accepts H.264, H.265 and AV1 in MP4.  RTMP/FLV is H.264-only, so
@@ -330,11 +331,8 @@ def encoder_plan(preference: str, *, purpose: str = "record") -> EncoderPlan:
     requested = _requested_codec(preference)
     effective = "h264" if purpose == "rtmp" else requested
     if preference in _CPU_ENCODERS:
-        note = "CPU x264"
-        if effective != "h264":
-            note += f" · {ENCODER_LABELS[effective]} needs NVENC"
         return EncoderPlan("h264", "x264enc", False, "h264parse",
-                           ENCODER_BITRATES["h264"], note)
+                           ENCODER_BITRATES["h264"], "CPU x264")
 
     candidates = {
         "h264": ["h264"],
@@ -343,6 +341,8 @@ def encoder_plan(preference: str, *, purpose: str = "record") -> EncoderPlan:
     }[effective]
 
     def nvenc(codec: str) -> EncoderPlan | None:
+        if codec == "h264" and (width > 4096 or height > 4096):
+            return None
         if (not nvenc_available(codec)
                 or Gst.ElementFactory.find(ENCODER_PARSERS[codec]) is None):
             return None
@@ -390,14 +390,15 @@ def encoder_plan(preference: str, *, purpose: str = "record") -> EncoderPlan:
                        ENCODER_BITRATES["h264"], note)
 
 
-def recording_codec(preference: str) -> str:
+def recording_codec(preference: str, *, width: int = 0, height: int = 0) -> str:
     """Codec a new persistent recorder must parse for this preference.
 
     ``ANYCAM_ENCODER`` overrides the saved setting in the engine, so it has to
     here too, or the recorder and the encoder disagree about the codec.
     """
     return encoder_plan(
-        os.environ.get("ANYCAM_ENCODER", "").strip().lower() or preference
+        os.environ.get("ANYCAM_ENCODER", "").strip().lower() or preference,
+        width=width, height=height,
     ).codec
 
 

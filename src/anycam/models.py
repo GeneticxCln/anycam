@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import tempfile
+import threading
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -51,6 +53,7 @@ CATALOG: dict[str, ModelInfo] = {
 
 ProgressHandler = Callable[[int, int], None]
 _verified: dict[str, tuple[int, int]] = {}
+_verified_lock = threading.Lock()
 
 
 def models_dir() -> Path:
@@ -72,10 +75,14 @@ def model_path(key: str) -> Path | None:
         # Size alone accepts a replaced file; check the pinned hash once per
         # change of the file, not on every call.
         stamp = (stat.st_mtime_ns, stat.st_size)
-        if _verified.get(str(path)) != stamp:
+        key_str = str(path)
+        with _verified_lock:
+            verified = _verified.get(key_str) == stamp
+        if not verified:
             if _sha256(path) != info.sha256:
                 return None
-            _verified[str(path)] = stamp
+            with _verified_lock:
+                _verified[key_str] = stamp
         return path
     except OSError:
         return None
@@ -99,22 +106,26 @@ def download(key: str, progress: ProgressHandler | None = None,
     """
     info = CATALOG[key]
     final = models_dir() / info.filename
-    partial = final.with_suffix(final.suffix + ".part")
     request = urllib.request.Request(info.url, headers={"User-Agent": "AnyCam"})
     received = 0
+    partial: Path | None = None
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response, \
-                partial.open("wb") as handle:
-            while True:
-                chunk = response.read(1 << 16)
-                if not chunk:
-                    break
-                handle.write(chunk)
-                received += len(chunk)
-                if received > info.size:
-                    raise ValueError("the download is larger than the expected model")
-                if progress is not None:
-                    progress(received, info.size)
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=str(final.parent), prefix=f".{info.filename}.",
+            suffix=".part", delete=False,
+        ) as handle:
+            partial = Path(handle.name)
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                while True:
+                    chunk = response.read(1 << 16)
+                    if not chunk:
+                        break
+                    handle.write(chunk)
+                    received += len(chunk)
+                    if received > info.size:
+                        raise ValueError("the download is larger than the expected model")
+                    if progress is not None:
+                        progress(received, info.size)
         if received != info.size:
             raise ValueError(f"the download stopped at {received} of {info.size} bytes")
         actual = _sha256(partial)
@@ -122,12 +133,18 @@ def download(key: str, progress: ProgressHandler | None = None,
             raise ValueError("the downloaded file does not match the expected "
                              f"SHA-256 ({actual[:12]}…); it was discarded")
         os.replace(partial, final)
+        with _verified_lock:
+            _verified.pop(str(final), None)
     finally:
-        partial.unlink(missing_ok=True)
+        if partial is not None:
+            partial.unlink(missing_ok=True)
     return final
 
 
 def remove(key: str) -> None:
     info = CATALOG.get(key)
     if info is not None:
-        (models_dir() / info.filename).unlink(missing_ok=True)
+        path = models_dir() / info.filename
+        path.unlink(missing_ok=True)
+        with _verified_lock:
+            _verified.pop(str(path), None)

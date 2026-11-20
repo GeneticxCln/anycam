@@ -73,8 +73,8 @@ def apply(root) -> int:
     """Name and focus-enable the interactive widgets below ``root``; returns the count fixed."""
     from PySide6.QtCore import Qt
     from PySide6.QtWidgets import (QAbstractButton, QAbstractSlider, QAbstractSpinBox, QComboBox,
-                                   QLabel, QLineEdit, QListWidget, QPlainTextEdit, QTextEdit,
-                                   QWidget)
+                                   QLabel, QLineEdit, QListWidget, QPlainTextEdit, QScrollBar,
+                                   QTextEdit, QWidget)
 
     interactive = (QAbstractButton, QAbstractSlider, QAbstractSpinBox, QComboBox, QLineEdit,
                    QListWidget, QPlainTextEdit, QTextEdit)
@@ -97,7 +97,9 @@ def apply(root) -> int:
             if name:
                 widget.setAccessibleName(name)
                 changed = True
-        if widget.isEnabled() and widget.focusPolicy() == Qt.FocusPolicy.NoFocus:
+        if (not isinstance(widget, QScrollBar)
+                and widget.isEnabled()
+                and widget.focusPolicy() == Qt.FocusPolicy.NoFocus):
             widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             changed = True
         fixed += 1 if changed else 0
