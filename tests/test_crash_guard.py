@@ -4,7 +4,7 @@ import os
 
 import pytest
 
-from anycam import config, crashguard, repair, safemode
+from anycam import applog, config, crashguard, repair, safemode
 from anycam.ui import startup
 
 
@@ -14,6 +14,7 @@ def state(tmp_path, monkeypatch):
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     yield tmp_path
     crashguard._state.clear()
+    applog.uninstall()
 
 
 def test_a_clean_exit_leaves_no_marker_and_no_crash(state):

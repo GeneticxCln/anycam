@@ -40,7 +40,7 @@ no Wine.
 ## Quick start
 
 ```bash
-pip install anycam-1.5.0.tar.gz     # from the GitHub release, or from a checkout:
+pip install anycam-1.5.1.tar.gz     # from the GitHub release, or from a checkout:
 ./scripts/setup.sh                  # creates .venv with system site-packages
 ./scripts/anycam-gui                # the studio (or: python -m anycam gui)
 ./scripts/install-desktop.sh        # optional: add it to the app menu

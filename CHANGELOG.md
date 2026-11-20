@@ -2,6 +2,35 @@
 
 All notable changes. Versions follow `pyproject.toml`; each `vX.Y.Z` tag publishes a GitHub Release.
 
+## 1.5.1 - 2026-11-20
+
+- **Security hardening:** Replaced pickle IPC across the untrusted effect-pack worker boundary with bounded
+  JSON framing (`effect_worker.py`); hardened `yt-dlp`/`pdftoppm` invocations (`--ignore-config`, `--`, SSRF
+  blocking); blocked path traversal in `emoji.load()`; made project `.bak` backups and OpenSSL TLS keys
+  owner-only (`0600`) atomically; passed QR pairing secrets to `qrencode` via stdin instead of `argv`; added
+  Slowloris request deadlines, pre-body auth checks, `frame-ancestors 'none'` / `X-Frame-Options: DENY`
+  headers, and atomic pairing/session teardown in the phone HTTPS server; moved the default instance/control
+  socket into `XDG_RUNTIME_DIR` (`0700`) with `UserAccessOption`; expanded URL/secret redaction.
+- **Engine, streaming & recording stability:** Fixed dynamic tap attachment onto running `tee` pads and
+  sync-before-link errors; fixed shutdown EOS deadlocks with media audio beds and video-layer audio; added
+  thread locking, negative `dts` clamping, stale 1000-hour `dts` clearing, and bus polling in `Recorder`;
+  fixed RTMP+audio linking (`flvmux` explicit `"video"`/`"audio"` request pads), mixed SRT primary + RTMP
+  extra targets, SRT segment re-basing, canvas clock propagation to initial publishers, and reconnect/teardown
+  races; fixed file A/V sync, `VcamOutput` thread safety and `"both"` fallback/upgrade, fractional V4L2
+  framerates, HTTP Basic Auth MJPEG probing, CPU RGB levels, and `gl_preview` non-variadic `g_object_set_property`.
+- **Effects, ML & GUI fixes:** Propagated GPU (`inference`) and RVM (`segment`) settings to isolated workers;
+  fixed `RemoteProcessor`, `Background`, `SlowJob`, `FilterSlot`/`SwapGate`, and animated mask cache races
+  and memory bloat; fixed GPU preview recovery use-after-free order (`stop_engine` before `disable_gpu`),
+  cross-thread `diag_log` updates, re-entrant `_run_with_ui()` guards, overlapping `QGridLayout` controls in
+  Settings → Output and Layers/Sources, classic UI `reload_project()`, Undo framing/animation restoration,
+  scene/Studio/motion sync, `ManyCamWindow` `last-project` loading and no-autosave-on-launch, `OverlayPanel`
+  and `PhonePairDialog` cleanup, `a11y` scrollbar Tab stops, Wayland `setDesktopFileName`, and `pkexec`
+  `stdin=DEVNULL`.
+- **Packaging, CLI, scripts & CI:** Made bare `anycam` default to launching the GUI; fixed `soak.py`,
+  `compat.py`, `demo.py`, `.deb` runtime dependencies (`gstreamer1.0-x`, `ffmpeg`, GIR typelibs, `.dist-info`,
+  512×512 icons), Arch `PKGBUILD`, `scripts/`, `web/` test pages, CI/release workflows, and `--no-hardware`
+  test isolation.
+
 ## 1.5.0 - 2026-11-14
 
 - **Keyring.** Stream keys (RTMP and extra destinations), SRT passphrases and stream ids, and network
