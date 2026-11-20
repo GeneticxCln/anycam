@@ -8,7 +8,7 @@ url='https://github.com/GeneticxCln/anycam'
 license=('MIT')
 depends=('python' 'python-numpy' 'python-pillow' 'python-psutil' 'python-gobject'
          'pyside6' 'gstreamer' 'gst-plugins-base' 'gst-plugins-good' 'gst-plugins-bad'
-         'gst-plugins-ugly' 'gst-libav' 'gst-plugin-opengl' 'ffmpeg' 'v4l-utils')
+         'gst-plugins-ugly' 'gst-libav' 'ffmpeg' 'v4l-utils')
 optdepends=('v4l2loopback-dkms: virtual camera device for browsers and meeting apps'
             'gst-plugin-qml6: GPU-accelerated preview (qml6glsink)'
             'python-onnxruntime: AI effects (cut-out, face masks)'

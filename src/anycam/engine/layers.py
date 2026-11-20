@@ -28,6 +28,23 @@ from ..engine.canvas_helpers import (GL_MIXER_LATENCY_NS, canvas_requested, gl_c
 Gst.init(None)
 
 
+def _restamp(info, buffer, running_time: int) -> None:
+    """Stamp a probed buffer with the canvas running time, dropping its DTS.
+
+    Swap in a copy when PyGObject can (``PadProbeInfo.set_buffer``), so a
+    buffer shared with other consumers is never mutated.  Older PyGObject
+    (Ubuntu 24.04) has no setter; there the probe's own buffer is stamped in
+    place, which is what the engine did before the setter was used.
+    """
+    setter = getattr(info, "set_buffer", None)
+    if setter is not None:
+        buffer = buffer.copy()
+    buffer.pts = max(0, running_time)
+    buffer.dts = Gst.CLOCK_TIME_NONE
+    if setter is not None:
+        setter(buffer)
+
+
 class LayerMixin:
     """Building, adding, removing and swapping layers on the canvas."""
 
@@ -349,10 +366,7 @@ class LayerMixin:
                     pipeline = self.pipeline   # None once the engine stopped
                     clock = pipeline.get_clock() if pipeline is not None else None
                     if clock is not None:
-                        writable = buffer.copy()
-                        writable.pts = max(0, clock.get_time() - pipeline.get_base_time())
-                        writable.dts = Gst.CLOCK_TIME_NONE
-                        _info.set_buffer(writable)
+                        _restamp(_info, buffer, clock.get_time() - pipeline.get_base_time())
                     if identity is not None:
                         if identity == screen_identity[0]:
                             return Gst.PadProbeReturn.OK
@@ -362,10 +376,7 @@ class LayerMixin:
                 pipeline = self.pipeline
                 clock = pipeline.get_clock() if pipeline is not None else None
                 if buffer is not None and clock is not None:
-                    writable = buffer.copy()
-                    writable.pts = max(0, clock.get_time() - pipeline.get_base_time())
-                    writable.dts = Gst.CLOCK_TIME_NONE
-                    _info.set_buffer(writable)
+                    _restamp(_info, buffer, clock.get_time() - pipeline.get_base_time())
             if layer_id is not None:
                 self._layer_frames[layer_id] = self._layer_frames.get(layer_id, 0) + 1
                 self._layer_last[layer_id] = time.monotonic()
