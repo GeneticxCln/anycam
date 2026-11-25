@@ -161,6 +161,11 @@ def test_nftables_backend_detection_and_command(monkeypatch, tmp_path):
 
     firewall.remember_allowed(8443, backend_name="nftables")
     assert firewall.nftables_blocks(8443, conf=conf) is False
+    assert firewall.blocks(8443) is False
+
+    # Missing config must not report nftables even if host /etc/nftables.conf exists
+    monkeypatch.setattr(firewall, "NFTABLES_CONF", tmp_path / "missing-nftables.conf")
+    assert firewall.backend() == ""
 
 
 # ----------------------------------------------------------------- First-run actionable checklist

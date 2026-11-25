@@ -343,25 +343,26 @@ def auth_missing(reason: str) -> bool:
 NFTABLES_CONF = Path("/etc/nftables.conf")
 
 
-def _nftables_active(*, conf: Path = NFTABLES_CONF) -> bool:
+def _nftables_active(*, conf: Path | None = None) -> bool:
     """True when plain nftables appears configured with a restrictive input policy."""
     if shutil.which("nft") is None:
         return False
-    text = _read(conf)
+    text = _read(conf if conf is not None else NFTABLES_CONF)
     if not text:
         return False
     return bool(re.search(r"hook\s+input\b[^}]*policy\s+(drop|reject)", text, re.S | re.I))
 
 
-def nftables_blocks(port: int, *, conf: Path = NFTABLES_CONF,
+def nftables_blocks(port: int, *, conf: Path | None = None,
                     state_file: Path | None = None) -> bool:
     """True when ``/etc/nftables.conf`` drops input and does not accept ``port``/tcp."""
     port_num = _validate_port(port)
-    if not _nftables_active(conf=conf):
+    target = conf if conf is not None else NFTABLES_CONF
+    if not _nftables_active(conf=target):
         return False
     if port_num in _allowed_ports(state_file or _allowed_path(), "nftables"):
         return False
-    text = _read(conf)
+    text = _read(target)
     if re.search(rf"\btcp\s+dport\s+(?:\{{[^}}]*\b)?{port_num}\b[^;\n]*\baccept\b", text):
         return False
     return True
