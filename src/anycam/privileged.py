@@ -21,7 +21,13 @@ POLKIT_AGENTS = (
     "/usr/libexec/polkit-kde-authentication-agent-1",
     "/usr/lib/x86_64-linux-gnu/libexec/polkit-kde-authentication-agent-1",
     "/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1",
+    "/usr/lib/policykit-1-gnome/polkit-gnome-authentication-agent-1",
     "/usr/libexec/polkit-gnome-authentication-agent-1",
+    "/usr/lib/hyprpolkitagent/hyprpolkitagent",
+    "/usr/libexec/hyprpolkitagent",
+    "/usr/lib/xfce-polkit/xfce-polkit",
+    "/usr/libexec/xfce-polkit",
+    "/usr/bin/lxqt-policykit-agent",
     "/usr/lib/mate-polkit/polkit-mate-authentication-agent-1",
     "/usr/bin/lxpolkit",
 )
@@ -51,8 +57,12 @@ def installed_agent() -> str | None:
 
 def start_agent(agent: str) -> None:
     # No pipes: the agent outlives this call and must not hold our output.
-    subprocess.Popen([agent], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
+    # Reap on a daemon thread so an early exit never leaves a zombie behind.
+    import threading
+
+    proc = subprocess.Popen([agent], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    threading.Thread(target=proc.wait, name="anycam-polkit-reap", daemon=True).start()
 
 
 def run_as_root(args: list[str], *, timeout: float = 180) -> subprocess.CompletedProcess:

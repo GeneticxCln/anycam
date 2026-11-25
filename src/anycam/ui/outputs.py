@@ -38,14 +38,37 @@ class OutputsMixin:
         self.live = not self.live
         self.live_button.setText("Stop stream" if self.live else "Go Live")
         if self.engine is not None:
-            self.restart_engine()
-            if self.live and self.engine is None:
-                self.live = False
-                self.live_button.setText("Go Live")
-                return
             if self.live:
+                needs_audio = self._project_needs_audio()
+                attach = getattr(self.engine, "attach_rtmp", None)
+                can_live_attach = (
+                    callable(attach)
+                    and (not needs_audio or self.engine.audio_mixer is not None)
+                )
+                if can_live_attach and attach(url, list(self.project.output.rtmp_extra)):
+                    self._rtmp_error_shown = ""
+                    self._status(f"Publishing to {config.redact_url(url)}")
+                    return
+                if can_live_attach and getattr(self.engine.report, "rtmp_error", ""):
+                    err = self.engine.report.rtmp_error
+                    self.live = False
+                    self.live_button.setText("Go Live")
+                    self._status(f"Cannot go live: {err}")
+                    return
+                self.restart_engine()
+                if self.live and self.engine is None:
+                    self.live = False
+                    self.live_button.setText("Go Live")
+                    return
                 self._status(f"Publishing to {config.redact_url(url)}")
             else:
+                detach = getattr(self.engine, "detach_rtmp", None)
+                if callable(detach) and detach():
+                    self._rtmp_error_shown = ""
+                    if hasattr(self, "update_stream_status"):
+                        self.update_stream_status()
+                else:
+                    self.restart_engine()
                 self._status("Stream stopped")
         else:
             if self.live:
@@ -67,13 +90,23 @@ class OutputsMixin:
         self._recording_path = str(path)
         return path
 
+    def _project_needs_audio(self, recorder=None) -> bool:
+        """True whenever any configured input, layer, output or recorder needs the audio mixer."""
+        audio = self.project.audio
+        if (self.audio_on or bool(audio.media_file) or bool(audio.media_playlist)
+                or bool(audio.desktop_device) or bool(audio.monitor_device)
+                or bool(audio.virtual_mic)):
+            return True
+        if recorder is not None and getattr(recorder, "has_audio", False):
+            return True
+        return any(layer.kind in ("video", "phone") for layer in self.scene.layers)
+
     def _start_recorder(self) -> bool:
         if self._recorder is not None:
             return True
         path = self._record_path()
         recorder = Recorder()
-        audio = (self.audio_on or bool(self.project.audio.media_file)
-                 or bool(self.project.audio.desktop_device))
+        audio = self._project_needs_audio()
         if not recorder.start(str(path), self.project.output.canvas_w,
                               self.project.output.canvas_h, self.project.output.fps,
                               audio=audio,
@@ -101,7 +134,7 @@ class OutputsMixin:
         if recorder is None:
             return
         self._recorder = None
-        report = self._run_with_ui(recorder.stop)
+        report = self._run_with_ui(recorder.stop, allow_closing=True)
         self._recording_path = ""
         if not isinstance(report, dict):
             self.log_event("recording: finalisation timed out")
@@ -113,7 +146,8 @@ class OutputsMixin:
                 self.recording_segments.append(path)
             warning = str(report.get("warning") or "")
             self._status(f"Saved {path}" + (f" ({warning})" if warning else ""))
-            self._check_recording(path, bool(report.get("finalised", True)))
+            if not getattr(self, "_closing", False) and not getattr(self, "_torn_down", False):
+                self._check_recording(path, bool(report.get("finalised", True)))
         else:
             self._status(
                 f"Recording failed: {report.get('error') or 'no frames'}")
@@ -123,6 +157,8 @@ class OutputsMixin:
         from ..engine import verify
 
         summary = self._run_with_ui(lambda: verify.summarize_recording(path, finalised))
+        if not isinstance(summary, dict):
+            return
         self.last_recording_summary = summary
         self._status(verify.describe_recording(summary))
         self.log_event(verify.describe_recording(summary))
@@ -146,8 +182,14 @@ class OutputsMixin:
         folder = box.addButton("Show in folder", QMessageBox.ButtonRole.ActionRole)
         box.addButton("Close", QMessageBox.ButtonRole.RejectRole)
         box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        box.buttonClicked.connect(lambda button: self._open_recording(summary["path"], button is folder))
-        del play
+
+        def on_clicked(button) -> None:
+            if button is play:
+                self._open_recording(summary["path"], False)
+            elif button is folder:
+                self._open_recording(summary["path"], True)
+
+        box.buttonClicked.connect(on_clicked)
         box.open()
 
     def _open_recording(self, path: str, folder: bool) -> None:
@@ -168,6 +210,13 @@ class OutputsMixin:
         self.vcam_hint.hide()
         self.vcam_dismiss.hide()
 
+    def _vcam_mode(self) -> tuple[int, int, int]:
+        out = self.project.output
+        w = int(getattr(out, "vcam_w", 0) or 0) or int(out.canvas_w)
+        h = int(getattr(out, "vcam_h", 0) or 0) or int(out.canvas_h)
+        fps = int(getattr(out, "vcam_fps", 0) or 0) or int(out.fps)
+        return max(2, w // 2 * 2), max(2, h // 2 * 2), max(1, fps)
+
     def hold_vcam_device(self) -> bool:
         """Open the loopback node at launch so apps can select it early.
 
@@ -179,10 +228,9 @@ class OutputsMixin:
             return True
         crashguard.stage("holding the virtual camera")
         device = self.project.output.vcam_device or config.loopback_device()
+        width, height, fps = self._vcam_mode()
         output = VcamOutput()
-        if not output.start(device, self.project.output.canvas_w,
-                            self.project.output.canvas_h,
-                            self.project.output.fps,
+        if not output.start(device, width, height, fps,
                             backend=self._vcam_backend()):
             return False
         self._vcam_output = output
@@ -273,10 +321,15 @@ class OutputsMixin:
             self._status("Virtual camera not set up: Discord will not list AnyCam")
             return False
         self._status("Setting up the virtual camera…")
+        timed_out = object()
         try:
-            error = self._run_with_ui(lambda: config.setup_vcam_system(dev))
+            error = self._run_with_ui(
+                lambda: config.setup_vcam_system(dev),
+                timeout=185.0, on_timeout=timed_out)
         except Exception as exc:  # noqa: BLE001 - shown to the user
             error = str(exc)
+        if error is timed_out:
+            error = "the virtual camera setup timed out waiting for authorization"
         if error:
             self.log_event(f"virtual camera setup failed: {error}")
             QMessageBox.warning(self, "Virtual camera", f"The setup did not finish:\n{error}")
@@ -382,9 +435,7 @@ class OutputsMixin:
 
     def _start_vcam_output(self, setup: bool = False) -> bool:
         device = self.project.output.vcam_device or config.loopback_device()
-        width = self.project.output.canvas_w
-        height = self.project.output.canvas_h
-        fps = self.project.output.fps
+        width, height, fps = self._vcam_mode()
         output = self._vcam_output
         if output is not None and output.active:
             matches = getattr(output, "matches", None)
@@ -415,7 +466,8 @@ class OutputsMixin:
             # start off the UI thread so the window stays alive meanwhile.
             started = self._run_with_ui(
                 lambda: output.start(device, width, height, fps, setup=True,
-                                     backend=backend))
+                                     backend=backend),
+                timeout=65.0)
         else:
             started = output.start(device, width, height, fps,
                                    setup=setup and backend != "pipewire",
@@ -478,14 +530,72 @@ class OutputsMixin:
         self._status("Virtual camera re-attached to the canvas")
         return True
 
+    def _vcam_extra_changed(self, *_args) -> None:
+        edit = getattr(self, "vcam_extra_edit", None)
+        if edit is not None:
+            self.project.output.vcam_extra_devices = [
+                part.strip() for part in edit.text().split(",") if part.strip()
+            ]
+        spin = getattr(self, "vcam_pw_count", None)
+        if spin is not None:
+            self.project.output.vcam_pipewire_count = max(1, min(4, int(spin.value())))
+        self._mark_dirty()
+        if self.vcam_on and self.engine is not None:
+            self._sync_extra_vcams()
+
+    def _sync_extra_vcams(self) -> None:
+        """Start/stop additional virtual camera outputs alongside the primary one."""
+        self._stop_extra_vcams()
+        if not self.vcam_on:
+            return
+        width = self.project.output.canvas_w
+        height = self.project.output.canvas_h
+        fps = self.project.output.fps
+        backend = self._vcam_backend()
+        primary_dev = self.project.output.vcam_device or config.loopback_device()
+        outputs: list[VcamOutput] = []
+        if backend in ("v4l2", "both"):
+            for dev in getattr(self.project.output, "vcam_extra_devices", ()):
+                if not dev or dev == primary_dev:
+                    continue
+                extra = VcamOutput()
+                if extra.start(dev, width, height, fps, setup=False, backend="v4l2"):
+                    outputs.append(extra)
+                else:
+                    self.log_event(f"extra virtual camera {dev}: {extra.error or 'unavailable'}")
+        if backend in ("pipewire", "both"):
+            count = max(1, min(4, int(getattr(self.project.output, "vcam_pipewire_count", 1))))
+            for idx in range(2, count + 1):
+                extra = VcamOutput()
+                if extra.start("", width, height, fps, setup=False, backend="pipewire",
+                               node_name=f"anycam-{idx}", description=f"AnyCam {idx}"):
+                    outputs.append(extra)
+                else:
+                    self.log_event(f"extra PipeWire camera {idx}: {extra.error or 'unavailable'}")
+        self._extra_vcam_outputs = outputs
+        if self.engine is not None and hasattr(self.engine, "attach_extra_vcams"):
+            self.engine.attach_extra_vcams(outputs)
+
+    def _stop_extra_vcams(self) -> None:
+        extras = list(getattr(self, "_extra_vcam_outputs", ()))
+        self._extra_vcam_outputs = []
+        if self.engine is not None and hasattr(self.engine, "detach_extra_vcams"):
+            self.engine.detach_extra_vcams()
+        for out in extras:
+            try:
+                out.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
     def _finish_vcam_output(self) -> None:
+        self._stop_extra_vcams()
         output = self._vcam_output
         self._vcam_output = None
         self._vcam_canvas_size = None
         if output is None:
             return
-        report = output.stop()
-        if report.get("error"):
+        report = self._run_with_ui(output.stop, allow_closing=True) or {}
+        if isinstance(report, dict) and report.get("error"):
             self._status(str(report["error"]))
 
     def toggle_record(self) -> None:
@@ -563,6 +673,7 @@ class OutputsMixin:
         self.project.output.vcam_device = (self.vcam_edit.text().strip()
                                            or config.loopback_device())
         if not self.vcam_on:
+            self._stop_extra_vcams()
             if self.engine is not None:
                 self.engine.detach_vcam()
             # The node stays open with the idle card so the next application
@@ -591,6 +702,8 @@ class OutputsMixin:
             self.vcam_on = False
             self.vcam_button.setText("Virtual camera")
             self._finish_vcam_output()
+            return
+        self._sync_extra_vcams()
 
     def snapshot(self) -> None:
         image = self.preview.image

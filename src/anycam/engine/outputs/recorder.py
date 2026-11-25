@@ -260,8 +260,9 @@ class Recorder:
                 if caps is None:
                     self.error = f"{stream} sample has no caps"
                     return
-                bias = int(buf.pts) // ENCODER_PTS_BIAS * ENCODER_PTS_BIAS
-                pts = int(buf.pts) - bias
+                raw_pts = int(buf.pts)
+                bias = ((raw_pts + ENCODER_PTS_BIAS // 2) // ENCODER_PTS_BIAS) * ENCODER_PTS_BIAS
+                pts = raw_pts - bias
                 if self._epoch_base is not None:
                     # First sample of a new canvas: one offset for both streams.
                     shared = self._epoch_base - pts
@@ -283,7 +284,11 @@ class Recorder:
                 if out_pts < 0:
                     # This stream's first frame is a little older than the one that
                     # set the shared offset; never hand the muxer a negative time.
-                    self._offset[stream] -= out_pts
+                    shift = -out_pts
+                    self._offset[stream] += shift
+                    other = "audio" if stream == "video" else "video"
+                    if self._last_out[other] is None:
+                        self._offset[other] += shift
                     out_pts = 0
                 last_out = self._last_out[stream]
                 if last_out is not None and out_pts <= last_out:
@@ -292,7 +297,7 @@ class Recorder:
                 new = buf.copy()
                 new.pts = out_pts
                 if dts is not None:
-                    new.dts = max(0, dts + self._offset[stream])
+                    new.dts = min(out_pts, max(0, dts + self._offset[stream]))
                 else:
                     new.dts = Gst.CLOCK_TIME_NONE
                 new.duration = duration

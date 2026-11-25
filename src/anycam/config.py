@@ -15,7 +15,7 @@ from . import privileged
 
 APP_NAME = "AnyCam"
 APP_ID = "anycam"
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 
 CANVAS_W = 1920
 CANVAS_H = 1080
@@ -352,33 +352,41 @@ def list_video_devices() -> list[CameraInfo]:
     return devices
 
 
-def camera_identity(device: str, *, by_id_dir: Path | None = None) -> str:
-    """Return the stable ``/dev/v4l/by-id`` name for a V4L2 node.
+def camera_identity(device: str, *, by_id_dir: Path | None = None,
+                    by_path_dir: Path | None = None) -> str:
+    """Return the stable ``/dev/v4l/by-id`` (or ``by-path``) name for a V4L2 node.
 
     A USB camera usually comes back as a different ``/dev/videoN`` after a
-    replug.  The by-id symlink carries the serial number and udev points it at
-    the new node, so storing that path is what lets a project reconnect without
-    the user picking the camera again (audit B46).
+    replug.  The by-id symlink carries the serial number (and by-path carries
+    the physical USB port for cameras without serials), so storing that path
+    lets a project reconnect without picking the camera again (audit B46).
     """
     if not device:
         return device
-    candidates = Path(by_id_dir) if by_id_dir is not None else Path("/dev/v4l/by-id")
-    if not candidates.is_dir():
-        return device
+    search_dirs = [
+        Path(by_id_dir) if by_id_dir is not None else Path("/dev/v4l/by-id"),
+        Path(by_path_dir) if by_path_dir is not None else Path("/dev/v4l/by-path"),
+    ]
     try:
         target = Path(device).resolve(strict=True)
-        links = sorted(
-            candidates.iterdir(),
-            key=lambda link: ("video-index0" not in link.name, link.name),
-        )
     except OSError:
         return device
-    for link in links:
+    for candidates in search_dirs:
+        if not candidates.is_dir():
+            continue
         try:
-            if link.resolve() == target:
-                return str(link)
+            links = sorted(
+                candidates.iterdir(),
+                key=lambda link: ("video-index0" not in link.name, link.name),
+            )
         except OSError:
             continue
+        for link in links:
+            try:
+                if link.resolve() == target:
+                    return str(link)
+            except OSError:
+                continue
     return device
 
 

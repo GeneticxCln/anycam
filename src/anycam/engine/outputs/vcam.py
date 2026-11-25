@@ -59,15 +59,16 @@ def pipewire_available() -> bool:
     return Gst.ElementFactory.find("pipewiresink") is not None
 
 
-def pipewire_stream_properties(description: str = PIPEWIRE_DESCRIPTION) -> Gst.Structure:
+def pipewire_stream_properties(description: str = PIPEWIRE_DESCRIPTION,
+                               node_name: str = PIPEWIRE_NODE_NAME) -> Gst.Structure:
     """The node properties that make PipeWire (and its camera portal) treat
     the stream as a camera.  WirePlumber grants portal camera access by
     exactly ``media.class=Video/Source`` plus ``media.role=Camera``."""
     props = Gst.Structure.new_empty("props")
     for key, value in (("media.class", "Video/Source"),
                        ("media.role", "Camera"),
-                       ("node.name", PIPEWIRE_NODE_NAME),
-                       ("node.description", description)):
+                       ("node.name", node_name or PIPEWIRE_NODE_NAME),
+                       ("node.description", description or PIPEWIRE_DESCRIPTION)):
         props.set_value(key, value)
     return props
 
@@ -317,12 +318,16 @@ class VcamOutput:
         return self.backend == "v4l2" and self.device == device
 
     def start(self, device: str, width: int, height: int, fps: int,
-              setup: bool = False, backend: str = "v4l2") -> bool:
+              setup: bool = False, backend: str = "v4l2",
+              node_name: str = PIPEWIRE_NODE_NAME,
+              description: str = PIPEWIRE_DESCRIPTION) -> bool:
         if self.active:
             self.stop()
         if backend not in BACKENDS:
             backend = "v4l2"
         self.requested_backend = backend
+        self.node_name = node_name or PIPEWIRE_NODE_NAME
+        self.description = description or PIPEWIRE_DESCRIPTION
         # One fixed camera mode, like OBS's v4l2sink output.  The canvas may
         # resize or switch layouts while this node is open; the tap scales
         # into this mode rather than reopening (and killing) the device.
@@ -531,11 +536,15 @@ class VcamOutput:
             sinks.append([v4l2])
             self._sink_for_probe = v4l2
         if self.backend in ("pipewire", "both"):
+            node_name = getattr(self, "node_name", PIPEWIRE_NODE_NAME)
+            description = getattr(self, "description", PIPEWIRE_DESCRIPTION)
             pipewire = _make("pipewiresink", "vcam_pipewire_sink", sync=False)
             # provide: AnyCam is the producer and consumers connect to it.
             pipewire.set_property("mode", 2)
-            pipewire.set_property("client-name", PIPEWIRE_DESCRIPTION)
-            pipewire.set_property("stream-properties", pipewire_stream_properties())
+            pipewire.set_property("client-name", description)
+            pipewire.set_property(
+                "stream-properties",
+                pipewire_stream_properties(description=description, node_name=node_name))
             sinks.append([pipewire])
             self._pipewire_sink = pipewire
             if self._sink_for_probe is None:
@@ -555,38 +564,40 @@ class VcamOutput:
             return False
         pad = sink.get_static_pad("sink")
         probe = pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
-        data = self._idle_bytes or bytes(self.width * self.height * 4)
-        buffer = Gst.Buffer.new_wrapped(data)
-        buffer.pts = 0
-        buffer.duration = int(Gst.SECOND / max(1, self.fps))
         try:
-            appsrc.emit("push-buffer", buffer)
-        except Exception:  # noqa: BLE001 - treated as a failed probe
-            pass
-        deadline = time.monotonic() + GL_PROBE_S
-        flowed = False
-        while time.monotonic() < deadline:
-            if reached.wait(0.02):
-                flowed = True
-                break
-            if self._bus is not None:
-                msg = self._bus.pop_filtered(Gst.MessageType.ERROR)
-                if msg is not None:
-                    err, debug = msg.parse_error()
-                    self.error = f"{err.message} ({debug})"
+            data = self._idle_bytes or bytes(self.width * self.height * 4)
+            buffer = Gst.Buffer.new_wrapped(data)
+            buffer.pts = 0
+            buffer.duration = int(Gst.SECOND / max(1, self.fps))
+            try:
+                appsrc.emit("push-buffer", buffer)
+            except Exception:  # noqa: BLE001 - treated as a failed probe
+                pass
+            deadline = time.monotonic() + GL_PROBE_S
+            flowed = False
+            while time.monotonic() < deadline:
+                if reached.wait(0.02):
+                    flowed = True
                     break
-        if flowed:
-            # A sink pad accepts a buffer before the driver write happens; give
-            # the sink a moment to reject the frame, then confirm it did not.
-            time.sleep(0.15)
-            if self._bus is not None:
-                msg = self._bus.pop_filtered(Gst.MessageType.ERROR)
-                if msg is not None:
-                    err, debug = msg.parse_error()
-                    self.error = f"{err.message} ({debug})"
-                    flowed = False
-        pad.remove_probe(probe)
-        return flowed
+                if self._bus is not None:
+                    msg = self._bus.pop_filtered(Gst.MessageType.ERROR)
+                    if msg is not None:
+                        err, debug = msg.parse_error()
+                        self.error = f"{err.message} ({debug})"
+                        break
+            if flowed:
+                # A sink pad accepts a buffer before the driver write happens; give
+                # the sink a moment to reject the frame, then confirm it did not.
+                time.sleep(0.15)
+                if self._bus is not None:
+                    msg = self._bus.pop_filtered(Gst.MessageType.ERROR)
+                    if msg is not None:
+                        err, debug = msg.parse_error()
+                        self.error = f"{err.message} ({debug})"
+                        flowed = False
+            return flowed
+        finally:
+            pad.remove_probe(probe)
 
     def _teardown_pipeline(self) -> None:
         pipeline = self._pipeline
@@ -833,21 +844,24 @@ class VcamOutput:
             self._quiet_logged = False
 
     def poll(self) -> None:
-        if self._bus is None:
+        with self._lock:
+            bus = self._bus
+        if bus is None:
             return
         while True:
-            msg = self._bus.pop_filtered(Gst.MessageType.ERROR)
+            msg = bus.pop_filtered(Gst.MessageType.ERROR)
             if msg is None:
                 return
             err, debug = msg.parse_error()
             error = f"{err.message} ({debug})"
-            if error != self.error:
-                # Log it: a latched sink error used to be invisible until the
-                # camera silently stayed on the ready card.
-                print(f"[vcam] sink error: {error}", file=sys.stderr, flush=True)
-            # The sink itself failed: frames cannot recover without a rebuild.
-            self.error = error
-            self._error_from_push = False
+            with self._lock:
+                if error != self.error:
+                    # Log it: a latched sink error used to be invisible until the
+                    # camera silently stayed on the ready card.
+                    print(f"[vcam] sink error: {error}", file=sys.stderr, flush=True)
+                # The sink itself failed: frames cannot recover without a rebuild.
+                self.error = error
+                self._error_from_push = False
 
     def stop(self) -> dict:
         with self._lock:

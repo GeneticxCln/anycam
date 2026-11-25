@@ -110,6 +110,7 @@ class Effects:
     chroma_key: str = "#00ff00"
     chroma_similarity: float = 0.35
     chroma_smoothness: float = 0.10
+    chroma_spill: float = 0.0
     # Fast look-up-table style.  Kept separate from the colour sliders so a
     # preset never has to rebuild the layer graph.
     color_effect: str = "none"     # none|sepia|heat|xray|xpro|yellowblue
@@ -123,10 +124,14 @@ class Effects:
     # its 0..1 strength.  Swapped in while running, so it never rebuilds.
     filter: str = "none"
     filter_amount: float = 0.5
-    # A second, independent slot, so two filters stack (e.g. a portrait effect
-    # and a distortion).  Filter 2 runs after filter 1.
+    # Additional independent filter slots so up to four filters stack cleanly
+    # (e.g. background blur + skin smooth + retro grain + distortion).
     filter2: str = "none"
     filter2_amount: float = 0.5
+    filter3: str = "none"
+    filter3_amount: float = 0.5
+    filter4: str = "none"
+    filter4_amount: float = 0.5
     # Frame drawn over this layer's box.  Rendered to a transparent PNG and
     # overlaid in the source chain, so changing it does not rebuild the canvas.
     frame_style: str = "none"       # see overlay.WINDOW_FRAME_STYLES
@@ -144,11 +149,14 @@ class Effects:
         fx.hue = geometry.clamp(fx.hue, -1.0, 1.0)
         fx.chroma_similarity = geometry.clamp(fx.chroma_similarity, 0.0, 1.0)
         fx.chroma_smoothness = geometry.clamp(fx.chroma_smoothness, 0.0, 1.0)
-        fx.red_gain = geometry.clamp(fx.red_gain, 0.0, 4.0)
-        fx.green_gain = geometry.clamp(fx.green_gain, 0.0, 4.0)
-        fx.blue_gain = geometry.clamp(fx.blue_gain, 0.0, 4.0)
+        fx.chroma_spill = geometry.clamp(fx.chroma_spill, 0.0, 1.0)
+        fx.red_gain = geometry.clamp(fx.red_gain, 0.0, 2.0)
+        fx.green_gain = geometry.clamp(fx.green_gain, 0.0, 2.0)
+        fx.blue_gain = geometry.clamp(fx.blue_gain, 0.0, 2.0)
         fx.filter_amount = geometry.clamp(fx.filter_amount, 0.0, 1.0)
         fx.filter2_amount = geometry.clamp(fx.filter2_amount, 0.0, 1.0)
+        fx.filter3_amount = geometry.clamp(fx.filter3_amount, 0.0, 1.0)
+        fx.filter4_amount = geometry.clamp(fx.filter4_amount, 0.0, 1.0)
         fx.frame_width = max(0, min(100, int(fx.frame_width)))
         effect = fx.color_effect.strip().lower()
         fx.color_effect = effect if effect in (
@@ -284,6 +292,8 @@ class Layer:
     rotation: int = 0
     zoom: float = 1.0
     pan: tuple[float, float] = (0.5, 0.5)
+    # Optional CSS injected into ``web`` (browser) layers.
+    custom_css: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Layer":
@@ -387,6 +397,9 @@ class Scene:
     # Layout template that last arranged this preset; "" means the boxes
     # were placed by hand.  Stored so switching presets restores the picker.
     layout: str = ""
+    # Normalised (x, y, w, h) rectangles blurred over the composited picture
+    # (post-compositor whiteboard privacy blur).
+    blur_regions: list[tuple[float, float, float, float]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any],
@@ -414,6 +427,18 @@ class Scene:
                         "it was given a new one")
             seen.add(layer.id)
             layers.append(layer)
+        raw_blurs = data.get("blur_regions")
+        blur_regions: list[tuple[float, float, float, float]] = []
+        if isinstance(raw_blurs, list):
+            for entry in raw_blurs:
+                quad = _quad(entry, (-1.0, -1.0, 0.0, 0.0))
+                if quad[0] >= 0.0 and quad[2] > 0.0 and quad[3] > 0.0:
+                    x = geometry.clamp(quad[0], 0.0, 1.0)
+                    y = geometry.clamp(quad[1], 0.0, 1.0)
+                    w = geometry.clamp(quad[2], 0.0, 1.0 - x)
+                    h = geometry.clamp(quad[3], 0.0, 1.0 - y)
+                    if w > 0.002 and h > 0.002:
+                        blur_regions.append((x, y, w, h))
         return cls(
             id=_ident(data.get("id"), "scene"),
             name=name,
@@ -422,6 +447,7 @@ class Scene:
             transition_ms=max(100, min(5000, _coerce(data.get("transition_ms"), 500))),
             playlist=PlaylistConfig.from_dict(data.get("playlist")),
             layout=_coerce(data.get("layout"), ""),
+            blur_regions=blur_regions,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -430,7 +456,8 @@ class Scene:
                 "transition": self.transition,
                 "transition_ms": self.transition_ms,
                 "playlist": asdict(self.playlist),
-                "layout": self.layout}
+                "layout": self.layout,
+                "blur_regions": [list(r) for r in self.blur_regions]}
 
     def add_layer(self, layer: Layer) -> Layer:
         # An explicit positive z wins; 0 means "put it on top".
@@ -462,6 +489,8 @@ class AudioConfig:
     # automatic gain.  Measured on pink noise: -6/-12/-18/-21 dB.
     mic_denoise: str = "moderate"
     mic_auto_gain: bool = False
+    mic_echo_cancel: bool = False
+    mic_neural_denoise: bool = False
     media_file: str = ""
     media_loop: bool = True      # a single media file restarts; a playlist wraps round
     media_gain_db: float = 0.0
@@ -527,6 +556,10 @@ class OutputConfig:
     canvas_h: int = 1080
     fps: int = 60
     vcam_device: str = "/dev/video10"
+    # Additional loopback devices fed alongside ``vcam_device`` (multi-vcam).
+    vcam_extra_devices: list[str] = field(default_factory=list)
+    # Number of PipeWire camera nodes to publish when PipeWire backend is active (1..4).
+    vcam_pipewire_count: int = 1
     # Where the virtual camera is published: "v4l2" (the loopback device,
     # which every app can open), "pipewire" (a PipeWire camera node: no
     # driver or root, but only apps with PipeWire camera support list it) or
@@ -543,6 +576,18 @@ class OutputConfig:
     # ignored: recordings always went to ~/Videos/AnyCam regardless.
     record_dir: str = ""
     rtmp_url: str = ""
+    # Optional per-output resolution and FPS overrides (0 = follow canvas).
+    record_w: int = 0
+    record_h: int = 0
+    record_fps: int = 0
+    stream_w: int = 0
+    stream_h: int = 0
+    stream_fps: int = 0
+    vcam_w: int = 0
+    vcam_h: int = 0
+    vcam_fps: int = 0
+    # Optional NDI output name (requires gst-plugin-ndi / ndisink when non-empty).
+    ndi_name: str = ""
     # Video bitrate in kbit/s for recordings and for the stream; 0 follows the
     # codec and canvas size.  The disk guard stops a recording when the folder
     # has less than ``record_min_free_mb`` MiB left (0 turns the guard off).
@@ -576,16 +621,31 @@ class OutputConfig:
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None,
                   warnings: list[str] | None = None) -> "OutputConfig":
-        output = _coerce_fields(cls, data, skip=("rtmp_extra_urls",))
+        output = _coerce_fields(cls, data, skip=("rtmp_extra_urls", "vcam_extra_devices"))
         raw = data.get("rtmp_extra_urls") if isinstance(data, dict) else None
         output.rtmp_extra_urls = ([credentials.reveal(url.strip()) for url in raw
                                    if isinstance(url, str) and url.strip()]
                                   if isinstance(raw, list) else [])
+        raw_vcams = data.get("vcam_extra_devices") if isinstance(data, dict) else None
+        output.vcam_extra_devices = ([dev.strip() for dev in raw_vcams
+                                      if isinstance(dev, str) and dev.strip()]
+                                     if isinstance(raw_vcams, list) else [])
+        output.vcam_pipewire_count = max(1, min(4, int(output.vcam_pipewire_count)))
         output.rtmp_url = credentials.reveal(output.rtmp_url)
         defaults = cls()
         for name in ("record_bitrate_kbps", "stream_bitrate_kbps"):
             value = getattr(output, name)
             setattr(output, name, 0 if value <= 0 else max(500, min(200_000, value)))
+        for name in ("record_w", "stream_w", "vcam_w"):
+            val = int(getattr(output, name, 0) or 0)
+            setattr(output, name, 0 if val < 2 else min(MAX_CANVAS[0], val) // 2 * 2)
+        for name in ("record_h", "stream_h", "vcam_h"):
+            val = int(getattr(output, name, 0) or 0)
+            setattr(output, name, 0 if val < 2 else min(MAX_CANVAS[1], val) // 2 * 2)
+        for name in ("record_fps", "stream_fps", "vcam_fps"):
+            val = int(getattr(output, name, 0) or 0)
+            setattr(output, name, 0 if val < 1 else min(MAX_FPS, val))
+        output.ndi_name = str(output.ndi_name or "").strip()[:80]
         output.record_min_free_mb = max(0, min(1_000_000, output.record_min_free_mb))
         # A canvas or rate the encoder cannot use would only fail later.
         if output.canvas_w < 2 or output.canvas_h < 2:

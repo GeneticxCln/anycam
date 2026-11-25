@@ -107,13 +107,13 @@ class ScreenMixin:
             if layer.kind != "screen" or layer.id in self._screen_sessions:
                 continue
             session = self._last_screen_session
-            if session is None or not session.streams:
+            if session is None or not session.streams or self._screen_session_in_use(session):
                 try:
                     # Saved layers come back without a picker when the portal
-                    # still honours last launch's choice.  Adding a new share
-                    # never passes a token: the user is picking then.
-                    session = self._request_screen_cast(
-                        restore_token=config.load_screen_restore_token())
+                    # still honours last launch's choice.  A second saved screen
+                    # layer needs its own portal share instead of reusing the first.
+                    token = "" if self._screen_sessions else config.load_screen_restore_token()
+                    session = self._request_screen_cast(restore_token=token)
                 except Exception as exc:  # noqa: BLE001
                     self._status(f"Screen capture unavailable: {exc}")
                     return False

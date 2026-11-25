@@ -38,8 +38,8 @@ class PlaylistMixin:
         add.clicked.connect(self._add_playlist_items)
         clear = QPushButton("Clear")
         clear.clicked.connect(self._clear_playlist)
-        pdf = QPushButton("+ PDF slides")
-        pdf.setToolTip("Every page of a PDF becomes a slide, stepped by hand")
+        pdf = QPushButton("+ Slides (PDF/PPTX)")
+        pdf.setToolTip("Every page of a PDF, PPTX or ODP deck becomes a slide, stepped by hand")
         pdf.clicked.connect(self._pick_pdf)
         row.addWidget(add)
         row.addWidget(pdf)
@@ -212,19 +212,21 @@ class PlaylistMixin:
         self._mark_dirty()
 
     def add_pdf_slides(self, path: str) -> int:
-        """Put each page of a PDF in the playlist, paused so the pages are stepped by hand."""
+        """Put each page of a PDF/PPTX/ODP in the playlist, paused so pages are stepped by hand."""
         from .. import content
 
-        res = self._run_with_ui(lambda: content.pdf_pages(path))
+        loader = (content.pdf_pages if Path(path).suffix.lower() == ".pdf"
+                  else content.presentation_pages)
+        res = self._run_with_ui(lambda: loader(path), timeout=185.0)
         if res is None:
-            self._status("PDF conversion timed out")
+            self._status("Slide conversion timed out")
             return 0
         pages, error = res
         if error:
             self._status(error)
             return 0
-        for page in pages:
-            layer = Layer(new_id("layer"), "image", f"{Path(path).stem} p{pages.index(page) + 1}",
+        for page_num, page in enumerate(pages, start=1):
+            layer = Layer(new_id("layer"), "image", f"{Path(path).stem} p{page_num}",
                           source=str(page), box=(0.0, 0.0, 1.0, 1.0), z=2,
                           visible=not self.playlist_ids)
             self.scene.add_layer(layer)
@@ -241,7 +243,9 @@ class PlaylistMixin:
         return len(pages)
 
     def _pick_pdf(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Choose a PDF", "", "PDF (*.pdf)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose slides", "",
+            "Slides (*.pdf *.pptx *.odp);;PDF (*.pdf);;Presentations (*.pptx *.odp)")
         if path:
             self.add_pdf_slides(path)
 

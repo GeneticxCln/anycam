@@ -22,6 +22,86 @@ DEFAULT_MODEL = config.assets_dir() / "models" / "yunet.onnx"
 _STRIDES = (8, 16, 32)
 
 
+@dataclass(frozen=True)
+class HeadPose:
+    """Estimated 3D head orientation in radians from facial landmarks."""
+
+    yaw: float        # -left .. +right
+    pitch: float      # -up .. +down
+    roll: float       # counter-clockwise .. clockwise
+
+
+def estimate_head_pose(
+    landmarks: tuple[tuple[float, float], ...] | list[tuple[float, float]] | None,
+) -> HeadPose:
+    """Estimate (yaw, pitch, roll) in radians from YuNet's 5 landmarks.
+
+    Landmarks order: left eye, right eye, nose tip, left mouth, right mouth.
+    Uses eye-line angle for roll, nose horizontal asymmetry for yaw, and
+    vertical nose-to-mouth proportion for pitch.
+    """
+    import math
+
+    if not landmarks or len(landmarks) < 5:
+        return HeadPose(0.0, 0.0, 0.0)
+    (lx, ly), (rx, ry), (nx, ny), (mlx, mly), (mrx, mry) = landmarks[:5]
+    dx = rx - lx
+    dy = ry - ly
+    eye_dist = math.hypot(dx, dy)
+    if eye_dist < 1e-6:
+        return HeadPose(0.0, 0.0, 0.0)
+    roll = math.atan2(dy, dx)
+    # Rotate nose and mouth centre into the de-rolled face frame centred between eyes.
+    c, s = math.cos(-roll), math.sin(-roll)
+    ex, ey = 0.5 * (lx + rx), 0.5 * (ly + ry)
+    mx, my = 0.5 * (mlx + mrx), 0.5 * (mly + mry)
+    nx_r = ((nx - ex) * c - (ny - ey) * s) / eye_dist
+    ny_r = ((nx - ex) * s + (ny - ey) * c) / eye_dist
+    my_r = ((mx - ex) * s + (my - ey) * c) / eye_dist
+    yaw = max(-0.75, min(0.75, nx_r * 1.45))
+    pitch_ratio = ny_r / max(0.35, my_r) if my_r > 1e-4 else 0.52
+    pitch = max(-0.55, min(0.55, (pitch_ratio - 0.52) * 1.6))
+    return HeadPose(yaw=float(yaw), pitch=float(pitch), roll=float(roll))
+
+
+def estimate_expression(
+    frame_rgb: np.ndarray | None,
+    landmarks: tuple[tuple[float, float], ...] | list[tuple[float, float]] | None,
+) -> tuple[float, float]:
+    """Return ``(mouth_open, smile)`` in 0..1 from face landmarks and optional frame."""
+    import math
+
+    if not landmarks or len(landmarks) < 5:
+        return 0.0, 0.0
+    (lx, ly), (rx, ry), (_nx, _ny), (mlx, mly), (mrx, mry) = landmarks[:5]
+    eye_dist = math.hypot(rx - lx, ry - ly)
+    mouth_w = math.hypot(mrx - mlx, mry - mly)
+    if eye_dist < 1e-6:
+        return 0.0, 0.0
+    # Smile widens the mouth relative to inter-ocular distance (neutral ~0.72, wide ~1.05).
+    smile = max(0.0, min(1.0, (mouth_w / eye_dist - 0.72) / 0.35))
+    mouth_open = 0.0
+    if frame_rgb is not None and frame_rgb.ndim >= 2 and frame_rgb.size > 0:
+        h, w = frame_rgb.shape[:2]
+        # Handle both normalised (0..1) and pixel-space landmarks.
+        norm = max(lx, rx, mlx, mrx) <= 1.5 and max(ly, ry, mly, mry) <= 1.5
+        cx = int(round(0.5 * (mlx + mrx) * (w if norm else 1.0)))
+        cy = int(round(0.5 * (mly + mry) * (h if norm else 1.0)))
+        span = max(3, int(round(mouth_w * (w if norm else 1.0) * 0.28)))
+        x0, x1 = max(0, cx - span), min(w, cx + span)
+        y0, y1 = max(0, cy - span), min(h, cy + span)
+        if x1 > x0 + 2 and y1 > y0 + 2:
+            patch = frame_rgb[y0:y1, x0:x1]
+            luma = patch.mean(axis=2) if patch.ndim == 3 else patch.astype(np.float32)
+            # An open mouth has a dark interior band compared to surrounding skin/lips.
+            edge_luma = float(np.percentile(luma, 80))
+            core_luma = float(np.percentile(luma, 15))
+            if edge_luma > 25.0:
+                contrast = (edge_luma - core_luma) / max(edge_luma, 1.0)
+                mouth_open = max(0.0, min(1.0, (contrast - 0.35) / 0.45))
+    return float(mouth_open), float(smile)
+
+
 @dataclass
 class Face:
     x: float          # normalised 0..1
@@ -36,7 +116,10 @@ class Face:
 
 
 class FaceDetector:
-    def __init__(self, model_path: str | Path | None = None, input_size: tuple[int, int] = (640, 640)):
+    MAX_SIDE = 640
+
+    def __init__(self, model_path: str | Path | None = None,
+                 input_size: tuple[int, int] | None = None):
         self.input_size = input_size
         self._session = None
         self._model_path = Path(model_path or os.environ.get(MODEL_ENV) or DEFAULT_MODEL)
@@ -49,8 +132,14 @@ class FaceDetector:
         from . import inference
 
         self._session = inference.session(self._model_path)
-        self._input_name = self._session.get_inputs()[0].name
+        inp = self._session.get_inputs()[0]
+        self._input_name = inp.name
         self._output_names = [output.name for output in self._session.get_outputs()]
+        if self.input_size is None:
+            shape = getattr(inp, "shape", None) or ()
+            if (len(shape) == 4 and isinstance(shape[2], int) and isinstance(shape[3], int)
+                    and shape[2] > 0 and shape[3] > 0):
+                self.input_size = (int(shape[3]), int(shape[2]))
 
     @property
     def available(self) -> bool:
@@ -70,8 +159,21 @@ class FaceDetector:
         h, w = frame_rgb.shape[:2]
         if h < 2 or w < 2:
             return []
-        iw, ih = self.input_size
-        resized = _resize(frame_rgb, (iw, ih))
+        if self.input_size is not None:
+            iw, ih = self.input_size
+            resized = _resize(frame_rgb, (iw, ih))
+        else:
+            # YuNet is fully convolutional: keep the frame's native aspect
+            # ratio and only shrink frames larger than MAX_SIDE instead of
+            # stretching a 384x216 webcam sample up to 640x640 (4.9x pixels).
+            longest = max(w, h)
+            if longest > self.MAX_SIDE:
+                scale = self.MAX_SIDE / float(longest)
+                iw, ih = max(32, int(round(w * scale))), max(32, int(round(h * scale)))
+                resized = _resize(frame_rgb, (iw, ih))
+            else:
+                iw, ih = w, h
+                resized = frame_rgb
         rgb = _as_rgb(resized)
         bgr = np.ascontiguousarray(rgb[:, :, ::-1], dtype=np.float32)
         padded = _pad_to_divisor(bgr, 32)

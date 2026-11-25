@@ -20,6 +20,15 @@ from . import config
 DEFAULT = "en"
 _SOURCE = "_anycam_source"
 _APPLIED = "_anycam_applied"
+_ACTIVE_CATALOG: dict[str, str] = {}
+
+
+def translate(text: str, catalog: dict[str, str] | None = None) -> str:
+    """Translate ``text`` using ``catalog`` (or the last catalog applied by :func:`apply`)."""
+    if not text:
+        return text
+    active = _ACTIVE_CATALOG if catalog is None else catalog
+    return _lookup(active, text)
 
 
 def catalog_dir() -> Path:
@@ -144,9 +153,13 @@ def _record_applied(obj, attribute: str, value: str) -> None:
 def apply(root, catalog: dict[str, str]) -> int:
     """Translate ``root`` and everything below it; the number of strings changed."""
     from PySide6.QtGui import QAction
-    from PySide6.QtWidgets import (QAbstractButton, QGroupBox, QLabel, QLineEdit, QMenu,
-                                   QTabWidget, QTextEdit, QWidget)
+    from PySide6.QtWidgets import (QAbstractButton, QAbstractSpinBox, QComboBox, QGroupBox,
+                                   QLabel, QLineEdit, QMenu, QTableWidget, QTabWidget,
+                                   QTextEdit, QWidget)
 
+    _ACTIVE_CATALOG.clear()
+    if catalog:
+        _ACTIVE_CATALOG.update(catalog)
     changed = 0
 
     def set_text(obj, attribute: str, getter, setter) -> None:
@@ -172,6 +185,35 @@ def apply(root, catalog: dict[str, str]) -> int:
             set_text(widget, "title", widget.title, widget.setTitle)
         if isinstance(widget, (QLineEdit, QTextEdit)) and hasattr(widget, "placeholderText"):
             set_text(widget, "placeholder", widget.placeholderText, widget.setPlaceholderText)
+        if isinstance(widget, QAbstractSpinBox) and hasattr(widget, "specialValueText"):
+            set_text(widget, "special", widget.specialValueText, widget.setSpecialValueText)
+        if isinstance(widget, QComboBox):
+            for index in range(widget.count()):
+                key = f"item{index}"
+                current = widget.itemText(index)
+                if not current:
+                    continue
+                source = _remember(widget, key, current)
+                wanted = _lookup(catalog, source)
+                if wanted != current:
+                    widget.setItemText(index, wanted)
+                    changed += 1
+                _record_applied(widget, key, wanted)
+        if isinstance(widget, QTableWidget):
+            for col in range(widget.columnCount()):
+                hdr = widget.horizontalHeaderItem(col)
+                if hdr is None:
+                    continue
+                key = f"hdr{col}"
+                current = hdr.text()
+                if not current:
+                    continue
+                source = _remember(widget, key, current)
+                wanted = _lookup(catalog, source)
+                if wanted != current:
+                    hdr.setText(wanted)
+                    changed += 1
+                _record_applied(widget, key, wanted)
         if isinstance(widget, QTabWidget):
             bar = widget.tabBar()
             for index in range(widget.count()):

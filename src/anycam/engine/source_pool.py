@@ -307,8 +307,21 @@ class SourcePool:
         if next_delay is not None:
             self._schedule_sweep(max(0.1, next_delay + 0.05))
 
+    @staticmethod
+    def _canonical_camera(source: str) -> str:
+        """Canonicalize a camera node path so /dev/video0 and /dev/v4l/by-id/... share one entry."""
+        if not source:
+            return source
+        try:
+            if os.path.exists(source):
+                return os.path.realpath(source)
+        except OSError:
+            pass
+        return source
+
     # ------------------------------------------------------------------ public
-    def _resolve(self, spec: CaptureSpec, *, claim: bool = False) -> CaptureSpec:
+    def _resolve(self, spec: CaptureSpec, *, claim: bool = False,
+                 teardown_out: list[Entry] | None = None) -> CaptureSpec:
         """The spec whose entry serves ``spec``.
 
         A camera device can only be opened once.  Two layers on the same node
@@ -320,13 +333,17 @@ class SourcePool:
         """
         if spec.kind != "camera" or spec in self._entries:
             return spec
+        target = self._canonical_camera(spec.source)
         for other, entry in list(self._entries.items()):
-            if other.kind != "camera" or other.source != spec.source:
+            if other.kind != "camera" or self._canonical_camera(other.source) != target:
                 continue
             if not claim or entry.refs > 0:
                 return other
-            entry.teardown()
             del self._entries[other]
+            if teardown_out is not None:
+                teardown_out.append(entry)
+            else:
+                entry.teardown()
         return spec
 
     def _note(self, message: str) -> None:
@@ -339,25 +356,40 @@ class SourcePool:
             pass
 
     def acquire(self, spec: CaptureSpec) -> Entry:
+        self.sweep()
+        to_teardown: list[Entry] = []
         with self._lock:
-            self.sweep()
-            spec = self._resolve(spec, claim=True)
+            spec = self._resolve(spec, claim=True, teardown_out=to_teardown)
             entry = self._entries.get(spec)
             if entry is not None and entry.error and entry.refs == 0:
                 # A capture that failed is never handed out again (a camera that
                 # errored must be reopened, not reused from the rebuild grace).
-                entry.teardown()
+                to_teardown.append(entry)
                 del self._entries[spec]
                 entry = None
+            if entry is not None:
+                if entry.refs == 0 and entry.idle_since:
+                    self._note(f"{spec.kind} capture reused after a rebuild ({entry.channel})")
+                elif entry.refs == 0 and entry.retained:
+                    self._note(f"capture reused after re-add ({entry.channel})")
+                entry.idle_since = 0.0
+                entry.retained = False
+                entry.refs += 1
+                result = entry
+            else:
+                result = None
+        for old in to_teardown:
+            old.teardown()
+        if result is not None:
+            return result
+        with self._lock:
+            spec = self._resolve(spec, claim=True)
+            entry = self._entries.get(spec)
             if entry is None:
                 entry = self._build(spec)
                 self._entries[spec] = entry
                 if self._started:
                     entry.pipeline.set_state(Gst.State.PLAYING)
-            elif entry.refs == 0 and entry.idle_since:
-                self._note(f"{spec.kind} capture reused after a rebuild ({entry.channel})")
-            elif entry.refs == 0 and entry.retained:
-                self._note(f"capture reused after re-add ({entry.channel})")
             entry.idle_since = 0.0
             entry.retained = False
             entry.refs += 1
@@ -383,6 +415,7 @@ class SourcePool:
         """Drop one reference.  ``linger`` (a canvas rebuild) keeps an unused
         camera running for a moment so the rebuilt canvas takes it over
         instead of closing and reopening the device."""
+        dropped: Entry | None = None
         with self._lock:
             spec = self._resolve(spec)
             entry = self._entries.get(spec)
@@ -408,8 +441,10 @@ class SourcePool:
                            f"({entry.channel})")
                 self._schedule_sweep(SCREEN_IDLE_GRACE_S + 0.1)
                 return
-            entry.teardown()
             del self._entries[spec]
+            dropped = entry
+        if dropped is not None:
+            dropped.teardown()
 
     def discard(self, spec: CaptureSpec) -> None:
         """Drop a released capture immediately (a removed layer's source).
@@ -418,18 +453,22 @@ class SourcePool:
         capture around for a layer that no longer exists.  A capture shared
         with another layer stays alive for its remaining references.
         """
+        dropped: Entry | None = None
         with self._lock:
             spec = self._resolve(spec)
             entry = self._entries.get(spec)
             if entry is None or entry.refs > 0 or entry.retained:
                 return
-            entry.teardown()
             del self._entries[spec]
+            dropped = entry
             self._note(f"capture released on removal ({entry.channel})")
+        if dropped is not None:
+            dropped.teardown()
 
     def sweep(self) -> None:
         """Tear down screen/retained captures whose grace window has expired."""
         now = time.monotonic()
+        expired: list[tuple[Entry, str]] = []
         with self._lock:
             for spec, entry in list(self._entries.items()):
                 if entry.refs > 0:
@@ -438,18 +477,18 @@ class SourcePool:
                     if (entry.spec.kind == "screen" or not entry.retained_since
                             or now - entry.retained_since < RETAIN_GRACE_S):
                         continue
-                    entry.teardown()
                     del self._entries[spec]
-                    self._note(
-                        f"removed capture released ({entry.channel})")
+                    expired.append((entry, f"removed capture released ({entry.channel})"))
                     continue
                 if not entry.idle_since:
                     continue
                 if now - entry.idle_since < SCREEN_IDLE_GRACE_S:
                     continue
-                entry.teardown()
                 del self._entries[spec]
-                self._note(f"idle {entry.spec.kind} capture released ({entry.channel})")
+                expired.append((entry, f"idle {entry.spec.kind} capture released ({entry.channel})"))
+        for entry, note in expired:
+            entry.teardown()
+            self._note(note)
 
     def probe_size(self, spec: CaptureSpec) -> tuple[int, int]:
         """The native frame size a capture for ``spec`` will have.
@@ -459,7 +498,8 @@ class SourcePool:
         computed from it, and the canvas-sized request is only right when the
         camera happens to deliver exactly that mode.
         """
-        entry = self._entries.get(self._resolve(spec))
+        with self._lock:
+            entry = self._entries.get(self._resolve(spec))
         if entry is not None:
             return entry.source_size
         fallback = spec.expected or (max(2, spec.width), max(2, spec.height))
@@ -483,13 +523,14 @@ class SourcePool:
         """Stable channel for a spec, even while its capture is released."""
         # Every camera spec on one device shares a channel, so a layer built
         # before another layer's capture existed still finds the shared feed.
-        key = (CaptureSpec("camera", spec.source) if spec.kind == "camera"
-               else spec)
-        channel = self._channels.get(key)
-        if channel is None:
-            channel = f"anycam-src-{next(self._counter)}"
-            self._channels[key] = channel
-        return channel
+        key = (CaptureSpec("camera", self._canonical_camera(spec.source))
+               if spec.kind == "camera" else spec)
+        with self._lock:
+            channel = self._channels.get(key)
+            if channel is None:
+                channel = f"anycam-src-{next(self._counter)}"
+                self._channels[key] = channel
+            return channel
 
     def start(self) -> None:
         with self._lock:
@@ -520,7 +561,9 @@ class SourcePool:
 
     def poll_errors(self) -> None:
         self.sweep()
-        for entry in list(self._entries.values()):
+        with self._lock:
+            entries = list(self._entries.values())
+        for entry in entries:
             bus = entry.pipeline.get_bus()
             if bus is None:
                 continue
@@ -612,15 +655,18 @@ class SourcePool:
                          name=f"anycam-reconnect-{entry.channel}").start()
 
     def errors(self) -> dict[str, str]:
-        return {entry.channel: entry.error
-                for entry in self._entries.values() if entry.error}
+        with self._lock:
+            entries = list(self._entries.values())
+        return {entry.channel: entry.error for entry in entries if entry.error}
 
     # ------------------------------------------------------------------ build
     @staticmethod
     def _add_audio_branch(pipeline: Gst.Pipeline, channel: str, *,
                           sync: bool = False) -> Gst.Element:
-        """convert -> resample -> 48 kHz stereo -> interaudiosink; returns the head."""
-        elements = [make("audioconvert"), make("audioresample"),
+        """queue -> convert -> resample -> 48 kHz stereo -> interaudiosink; returns the head."""
+        elements = [make("queue", max_size_buffers=0, max_size_bytes=0,
+                         max_size_time=2 * Gst.SECOND),
+                    make("audioconvert"), make("audioresample"),
                     caps_filter("audio/x-raw,format=F32LE,rate=48000,channels=2"),
                     make("interaudiosink", channel=channel, sync=sync)]
         for element in elements:
@@ -770,9 +816,11 @@ class SourcePool:
         elements: list[Gst.Element] = [
             make("filesrc", location=str(spec.source)),
             decode,
+            make("queue", max_size_buffers=0, max_size_bytes=0,
+                 max_size_time=2 * Gst.SECOND),
             make("videoconvert"),
             make("videoscale"),
-            make("videorate"),
+            make("videorate", skip_to_first=True),
             # Square pixels: without them videoscale meets a different-shaped
             # target by changing the pixel aspect ratio, which the compositor
             # ignores, so a 4:3 stream came out stretched to 16:9.  With

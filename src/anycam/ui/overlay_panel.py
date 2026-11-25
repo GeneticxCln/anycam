@@ -52,10 +52,9 @@ class OverlayPanel(QWidget):
         layout.addLayout(row)
         layout.addWidget(self.record_button)
         layout.addWidget(self.mute_button)
-        self.setStyleSheet("QWidget { background: #11161c; color: #e6edf2; }"
-                           "QPushButton { background: #1f2a33; border: 1px solid #2c3a45; "
-                           "border-radius: 6px; padding: 5px; }"
-                           "QPushButton:hover { background: #2a3a46; }")
+        from . import theme
+
+        self.setStyleSheet(theme.overlay_stylesheet(theme.current_personality()))
         self.refresh()
 
     # --------------------------------------------------------------- content
@@ -80,10 +79,17 @@ class OverlayPanel(QWidget):
         self.picture.setPixmap(round_pixmap)
 
     def refresh(self) -> None:
+        from .. import i18n
+
         window = self._window
-        self.record_button.setText("Stop recording" if window.recording else "Record")
-        self.mute_button.setText("Unmute" if window.project.audio.mic_muted else "Mute")
-        self.scene_label.setText(window.scene.name)
+        rec_text = i18n.translate("Stop recording" if window.recording else "Record")
+        mute_text = i18n.translate("Unmute" if window.project.audio.mic_muted else "Mute")
+        if self.record_button.text() != rec_text:
+            self.record_button.setText(rec_text)
+        if self.mute_button.text() != mute_text:
+            self.mute_button.setText(mute_text)
+        if self.scene_label.text() != window.scene.name:
+            self.scene_label.setText(window.scene.name)
 
     # ---------------------------------------------------------------- moving
     def mousePressEvent(self, event) -> None:  # noqa: N802

@@ -108,6 +108,43 @@ class PhoneMixin:
 
         return Pairing(config.state_dir() / "phones.json").name(device)
 
+    def paired_phones(self) -> dict[str, str]:
+        """``{device_id: display_name}`` for every currently paired phone."""
+        service = self._phone_service
+        if service is not None:
+            return service.pairing.devices()
+        from ..phone.auth import Pairing
+
+        return Pairing(config.state_dir() / "phones.json").devices()
+
+    def forget_phone(self, device: str) -> bool:
+        """Unpair ``device`` and disconnect its active stream, if any."""
+        if not device:
+            return False
+        service = self._phone_service
+        if service is not None:
+            existed = device in service.pairing.devices()
+            service.forget(device)
+            removed = existed
+        else:
+            from ..phone.auth import Pairing
+
+            removed = Pairing(config.state_dir() / "phones.json").forget(device)
+        if removed:
+            self.log_event(f"phone: unpaired {device}")
+            self._status(f"Removed paired phone ({device})")
+            if hasattr(self, "_refresh_paired_phones"):
+                self._refresh_paired_phones()
+        return removed
+
+    def forget_all_phones(self) -> int:
+        """Unpair every paired phone; returns how many were removed."""
+        devices = list(self.paired_phones())
+        removed = sum(1 for dev in devices if self.forget_phone(dev))
+        if removed:
+            self._status(f"Removed {removed} paired phone(s)")
+        return removed
+
     def _pair_phone(self) -> tuple[str, str] | None:
         """Show the QR code until a phone streams; its ``(device, name)``."""
         service = self._phone_link()
@@ -144,6 +181,8 @@ class PhoneMixin:
         if message:
             self.log_event(f"phone {device}: {message}")
             self._status(message)
+        if event == "paired" and hasattr(self, "_refresh_paired_phones"):
+            self._refresh_paired_phones()
 
     def toggle_multiview(self) -> None:
         if getattr(self, "_multiview", None) is not None:

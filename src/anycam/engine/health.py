@@ -91,10 +91,11 @@ class HealthMixin:
                 "frames": frames,
                 "last_frame_age_s": None if age is None else round(age, 2),
                 "fps": None if source_fps is None else round(source_fps, 2),
-                # Static damage-driven shares may also be low-rate: report
-                # what is measured without claiming the source is broken.
+                # Static damage-driven shares emit 0 fps when unchanged: flag
+                # them as static rather than falsely alarming with SLOW.
+                "static": (layer.kind == "screen" and frames > 0 and source_fps == 0.0),
                 "slow": (layer.kind == "screen" and source_fps is not None
-                         and source_fps < min(10.0, self.fps / 2)),
+                         and 0.0 < source_fps < min(10.0, self.fps / 2)),
             }
             if last is None:
                 if now - max(self._start_time, since) > self._stall_seconds:

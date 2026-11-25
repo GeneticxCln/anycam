@@ -44,7 +44,7 @@ PipeWire session and no working OpenGL canvas. "Gap" names what that leaves unpr
 | `.deb`, PKGBUILD, Flatpak, AppImage recipes | **partial** | `tests/test_phase9_packaging.py`: the `.deb` is built and its contents checked; the others are parsed and cross-checked | Not built in `makepkg`, `flatpak-builder` or `appimagetool` |
 | First-run checklist | **verified** | `tests/test_phase9_packaging.py` | Fixes are shown, not run |
 | Browser harness | **partial** | `scripts/compat-matrix.py` self-test with Chromium's test camera | Zoom, Teams, Meet, OBS, Firefox and the AnyCam device itself still need the loopback device |
-| Not built | **not implemented** | — | Web source (needs QtWebEngine), window capture, NDI, whiteboard region blur, GL pixel tests |
+| Remaining unbuilt | **not implemented** | — | Dedicated game/Vulkan window capture, NDI (proprietary SDK), 3D depth masks, hardware-gated GL/VA-API/real-phone runs (web source, PPTX/ODP slides, `.cube` LUTs, whiteboard region blur, Studio live second preview, GPU/CPU chroma spill, multi-vcam, AEC, phone audio, paired-phones UI, nftables, 4 filter slots, and live RTMP/mic-DSP swaps are now built and unit-tested in `tests/test_{hardening,performance,studio_capabilities,studio_upgrades,i18n_and_packaging}.py`) |
 
 ## 1. Video sources
 

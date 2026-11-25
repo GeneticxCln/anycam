@@ -266,41 +266,113 @@ class FirstRunDialog(QDialog):
     """Shown once: what is ready on this machine and how to fix what is not."""
 
     def __init__(self, results, parent=None) -> None:
-        from .. import firstrun
-
         super().__init__(parent)
         self.setWindowTitle("Welcome to AnyCam")
-        self.results = results
+        self.results = list(results)
+        self._action_job: dict | None = None
         layout = QVBoxLayout(self)
-        ok = firstrun.ready(results)
-        heading = QLabel("Everything AnyCam needs is here." if ok else
-                         "A few things need attention before AnyCam can run everything.")
-        heading.setWordWrap(True)
-        heading.setObjectName("title")
-        layout.addWidget(heading)
+        self._heading = QLabel("")
+        self._heading.setWordWrap(True)
+        self._heading.setObjectName("title")
+        layout.addWidget(self._heading)
         self.rows = QListWidget()
-        for check in results:
-            mark = "\u2713" if check.ok else ("\u2717" if check.required else "\u2022")
-            text = f"{mark}  {check.title} \u2014 {check.detail}"
-            if check.fix:
-                text += f"\n      {check.fix}"
-            self.rows.addItem(text)
         layout.addWidget(self.rows, 1)
+        self._action_status = QLabel("")
+        self._action_status.setObjectName("muted")
+        self._action_status.setWordWrap(True)
+        layout.addWidget(self._action_status)
         buttons = QHBoxLayout()
+        self.setup_vcam_button = QPushButton("Set up virtual camera…")
+        self.setup_vcam_button.clicked.connect(self.run_vcam_setup)
+        self.recheck_button = QPushButton("Re-check")
+        self.recheck_button.clicked.connect(self.recheck)
         copy = QPushButton("Copy report")
         copy.clicked.connect(self.copy_report)
         done = QPushButton("Start")
         done.setObjectName("primary")
         done.clicked.connect(self.accept)
+        buttons.addWidget(self.setup_vcam_button)
+        buttons.addWidget(self.recheck_button)
         buttons.addWidget(copy)
         buttons.addStretch(1)
         buttons.addWidget(done)
         layout.addLayout(buttons)
-        self.resize(640, 420)
+        self._populate(self.results)
+        self.resize(640, 440)
+
+    def _populate(self, results) -> None:
+        from .. import firstrun
+
+        self.results = list(results)
+        ok = firstrun.ready(self.results)
+        self._heading.setText(
+            "Everything AnyCam needs is here." if ok else
+            "A few things need attention before AnyCam can run everything.")
+        self.rows.clear()
+        has_vcam_action = False
+        for check in self.results:
+            mark = "\u2713" if check.ok else ("\u2717" if check.required else "\u2022")
+            text = f"{mark}  {check.title} \u2014 {check.detail}"
+            if check.fix:
+                text += f"\n      {check.fix}"
+            self.rows.addItem(text)
+            if not check.ok and getattr(check, "action", "") == "setup-vcam":
+                has_vcam_action = True
+        self.setup_vcam_button.setVisible(has_vcam_action)
+
+    def run_vcam_setup(self) -> None:
+        """Run one-time v4l2loopback setup off the UI thread, then re-check."""
+        import threading
+        from PySide6.QtCore import QTimer
+        from .. import config
+
+        if self._action_job is not None:
+            return
+        self.setup_vcam_button.setEnabled(False)
+        self._action_status.setText("Waiting for system password prompt…")
+        parent = self.parent()
+        if parent is not None and hasattr(parent, "_finish_vcam_output"):
+            parent._finish_vcam_output()
+        job: dict = {}
+        self._action_job = job
+
+        def work() -> None:
+            try:
+                job["error"] = config.setup_vcam_system(config.loopback_device())
+            except Exception as exc:  # noqa: BLE001
+                job["error"] = str(exc)
+            job["done"] = True
+
+        threading.Thread(target=work, name="anycam-firstrun-vcam", daemon=True).start()
+        timer = QTimer(self)
+        timer.setInterval(150)
+
+        def poll() -> None:
+            if not job.get("done"):
+                return
+            timer.stop()
+            self._action_job = None
+            self.setup_vcam_button.setEnabled(True)
+            err = str(job.get("error") or "")
+            if err:
+                self._action_status.setText(f"Virtual camera setup did not finish: {err}")
+            else:
+                self._action_status.setText("Virtual camera set up permanently.")
+                self.recheck()
+
+        timer.timeout.connect(poll)
+        timer.start()
+
+    def recheck(self) -> None:
+        from .. import firstrun
+
+        self._populate(firstrun.checks())
 
     def copy_report(self) -> None:
         from PySide6.QtGui import QGuiApplication
 
         from .. import firstrun
 
-        QGuiApplication.clipboard().setText(firstrun.summary_text(self.results))
+        clipboard = QGuiApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(firstrun.summary_text(self.results))

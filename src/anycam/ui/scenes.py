@@ -96,6 +96,7 @@ class SceneMixin:
         self.studio_check.toggled.connect(self._studio_toggled)
         self.next_scene_combo = QComboBox()
         self.next_scene_combo.setToolTip("The scene that goes live next")
+        self.next_scene_combo.currentIndexChanged.connect(self._refresh_studio_preview)
         self.cut_button = QPushButton("Cut")
         self.cut_button.clicked.connect(lambda: self.take_next_scene(cut=True))
         self.trans_button = QPushButton("Transition")
@@ -105,11 +106,164 @@ class SceneMixin:
             header.addWidget(widget)
         self._studio_toggled(False)
 
+    def _ensure_studio_preview_widget(self):
+        """Lazily build the secondary Studio PreviewWidget only when Studio mode is on."""
+        widget = getattr(self, "studio_preview", None)
+        if widget is not None:
+            return widget
+        layout = getattr(self, "_studio_preview_layout", None)
+        if layout is None:
+            return None
+        from PySide6.QtCore import QSize
+
+        widget = PreviewWidget()
+        widget.setMinimumSize(QSize(260, 146))
+        widget.set_selection_auto_hide(True)
+        layout.addWidget(widget, 1)
+        self.studio_preview = widget
+        return widget
+
+    def _destroy_studio_preview_widget(self) -> None:
+        widget = getattr(self, "studio_preview", None)
+        if widget is None:
+            return
+        self.studio_preview = None
+        layout = getattr(self, "_studio_preview_layout", None)
+        if layout is not None:
+            layout.removeWidget(widget)
+        widget.setParent(None)
+        widget.deleteLater()
+
     def _studio_toggled(self, on: bool) -> None:
         for widget in (self.next_scene_combo, self.cut_button, self.trans_button):
             widget.setVisible(bool(on))
+        panel = getattr(self, "studio_preview_panel", None)
         if on:
+            self._ensure_studio_preview_widget()
+            if panel is not None:
+                panel.setVisible(True)
             self._refresh_next_scene()
+            self._refresh_studio_preview()
+        else:
+            self._stop_studio_preview()
+            self._destroy_studio_preview_widget()
+            if panel is not None:
+                panel.setVisible(False)
+
+    def _staged_scene(self) -> Scene | None:
+        combo = getattr(self, "next_scene_combo", None)
+        if combo is None:
+            return None
+        scene_id = combo.currentData()
+        if not scene_id:
+            return None
+        return next((s for s in self.project.scenes if s.id == scene_id), None)
+
+    def _stop_studio_preview(self) -> None:
+        """Stop the secondary Studio preview engine cleanly."""
+        eng = getattr(self, "_studio_engine", None)
+        self._studio_engine = None
+        self._studio_pending_frame = None
+        if eng is not None:
+            try:
+                eng.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _on_studio_frame(self, sample) -> None:
+        buf = sample.get_buffer()
+        caps = sample.get_caps()
+        if buf is None or caps is None or caps.get_size() == 0:
+            return
+        st = caps.get_structure(0)
+        if not (st.has_field("width") and st.has_field("height")):
+            return
+        w = int(st.get_value("width"))
+        h = int(st.get_value("height"))
+        fmt = str(st.get_value("format")) if st.has_field("format") else "RGBA"
+        stride = w * (4 if fmt == "RGBA" else 3)
+        ok, info = buf.map(1)  # Gst.MapFlags.READ
+        if not ok:
+            return
+        try:
+            raw = bytes(info.data)[: stride * h]
+        finally:
+            buf.unmap(info)
+        if raw:
+            self._studio_pending_frame = (w, h, stride, raw, fmt)
+
+    def _refresh_studio_preview(self, *_args) -> None:
+        """Start or retarget the lightweight live Preview monitor for the staged scene."""
+        if not (hasattr(self, "studio_check") and self.studio_check.isChecked()):
+            self._stop_studio_preview()
+            return
+        preview_widget = getattr(self, "studio_preview", None)
+        if preview_widget is None:
+            return
+        staged = self._staged_scene()
+        label = getattr(self, "studio_preview_label", None)
+        if staged is None:
+            if label is not None:
+                label.setText("Preview (no other scene)")
+            preview_widget.set_scene(None)
+            self._stop_studio_preview()
+            return
+        if label is not None:
+            label.setText(f"Preview · {staged.name}")
+        preview_widget.set_scene(staged)
+        # Only run a live second GStreamer graph while the main engine is running
+        # (and never during headless/closing states unless an engine is live).
+        if self.engine is None or getattr(self, "_closing", False):
+            self._stop_studio_preview()
+            return
+        current = getattr(self, "_studio_engine", None)
+        if current is not None and getattr(current, "scene", None) is staged:
+            return
+        self._stop_studio_preview()
+        try:
+            from ..engine.controller import AnyCamEngine
+
+            studio_eng = AnyCamEngine(
+                self.project,
+                scene=staged,
+                preview=True,
+                audio=False,
+                vcam=False,
+                canvas="cpu",
+                canvas_w=640,
+                canvas_h=360,
+                fps=min(24, int(self.project.output.fps)),
+                preview_target=(640, 360),
+                pool=getattr(self, "_source_pool", None),
+                on_frame=self._on_studio_frame,
+            )
+            studio_eng.start()
+            self._studio_engine = studio_eng
+        except Exception as exc:  # noqa: BLE001 - secondary monitor never breaks program
+            self.log_event(f"studio preview: {exc}")
+            self._studio_engine = None
+
+    def _pump_studio_preview(self) -> None:
+        """Pump the Studio preview engine and paint its latest frame on the GUI thread."""
+        eng = getattr(self, "_studio_engine", None)
+        if eng is None:
+            return
+        try:
+            eng.pump(0)
+        except Exception:  # noqa: BLE001
+            self._stop_studio_preview()
+            return
+        frame = getattr(self, "_studio_pending_frame", None)
+        self._studio_pending_frame = None
+        if frame is None:
+            return
+        from PySide6.QtGui import QImage
+
+        w, h, stride, raw, fmt = frame
+        qfmt = QImage.Format.Format_RGB888 if fmt == "RGB" else QImage.Format.Format_RGBA8888
+        widget = getattr(self, "studio_preview", None)
+        if widget is not None:
+            widget.set_image(QImage(raw, w, h, stride, qfmt), owner=raw)
 
     def _refresh_next_scene(self) -> None:
         combo = getattr(self, "next_scene_combo", None)
@@ -126,6 +280,8 @@ class SceneMixin:
         combo.blockSignals(False)
         for button in (self.cut_button, self.trans_button):
             button.setEnabled(combo.count() > 0)
+        if hasattr(self, "studio_check") and self.studio_check.isChecked():
+            self._refresh_studio_preview()
 
     def take_next_scene(self, cut: bool = False) -> bool:
         """Put the staged scene live; ``cut`` ignores its transition."""
@@ -220,6 +376,8 @@ class SceneMixin:
         self._load_playlist_state()
         self._mark_dirty()
         self._show_scene_live()
+        if self.engine is not None and hasattr(self.engine, "set_blur_regions"):
+            self.engine.set_blur_regions(self.scene.blur_regions)
 
     def _scene_row_changed(self, row: int) -> None:
         if row < 0:
@@ -242,6 +400,8 @@ class SceneMixin:
         self._load_playlist_state()
         self._mark_dirty()
         self._show_scene_live()
+        if self.engine is not None and hasattr(self.engine, "set_blur_regions"):
+            self.engine.set_blur_regions(self.scene.blur_regions)
 
     def add_scene(self) -> None:
         scene = Scene(new_id("scene"), f"Scene {len(self.project.scenes) + 1}")
@@ -333,6 +493,8 @@ class SceneMixin:
         self._load_playlist_state()
         self._mark_dirty()
         self._show_scene_live()
+        if self.engine is not None and hasattr(self.engine, "set_blur_regions"):
+            self.engine.set_blur_regions(self.scene.blur_regions)
 
     def duplicate_scene(self, scene_id: str = "") -> Scene | None:
         """Copy a scene (layers get new ids) and switch to the copy."""

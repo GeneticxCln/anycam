@@ -22,6 +22,7 @@ class Check:
     detail: str
     fix: str = ""            # a command or an instruction; "" when nothing is needed
     required: bool = True
+    action: str = ""         # optional interactive fix id: "setup-vcam" | "video-group" | ""
 
 
 def install_hint(packages: dict[str, str], distro: str | None = None) -> str:
@@ -100,7 +101,8 @@ def checks(elements: dict | None = None, cameras: list[str] | None = None,
         ("a camera exists but you may not open it" if devices else "no camera found"),
         "" if usable else ("sudo usermod -aG video $USER   (then log out and in)" if devices
                            else "plug a camera in, or add a screen, image or video instead"),
-        required=False))
+        required=False,
+        action="" if usable or not devices else "video-group"))
 
     vcam_ok = bool(config.vcam_available(vcam)) if hasattr(config, "vcam_available") else False
     found.append(Check(
@@ -109,7 +111,8 @@ def checks(elements: dict | None = None, cameras: list[str] | None = None,
         "" if vcam_ok else (
             "sudo modprobe v4l2loopback exclusive_caps=1 card_label=AnyCam   "
             "(or enable-v4l2loopback / PipeWire camera backend)"),
-        required=False))
+        required=False,
+        action="" if vcam_ok else "setup-vcam"))
 
     pipewire = bool(env.get("XDG_RUNTIME_DIR")) and (Path(env["XDG_RUNTIME_DIR"]) / "pipewire-0").exists()
     found.append(Check(

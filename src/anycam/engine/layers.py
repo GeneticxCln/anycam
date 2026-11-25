@@ -347,7 +347,12 @@ class LayerMixin:
         health_target: list[str | None] = [layer.id]
         chain._health_target = health_target  # type: ignore[attr-defined]
 
-        retime = self.canvas_backend == "gpu" and layer.kind in LIVE_KINDS
+        _RETIME_KINDS = (
+            LIVE_KINDS
+            | {"video", "test", "animation", "particles", "gif",
+               "ticker", "lower_third", "clock", "timer", "drawing"}
+        )
+        retime = self.canvas_backend == "gpu" and layer.kind in _RETIME_KINDS
 
         def on_source_buffer(_pad, _info, target=health_target):
             # PipeWire's SPA header sequence is carried in buffer.offset.
@@ -694,6 +699,10 @@ class LayerMixin:
         self._specs.append(spec)
         self._layer_acquired.add(layer_id)
         self.layer_sources[layer_id] = entry.source_size
+        chain = self._layer_chains.get(layer_id)
+        if chain is not None and chain.framing is not None:
+            chain.framing.source_size = entry.source_size
+            self.set_layer_framing(layer_id)
         self._record_camera_mode(layer_id, entry)
         if entry.probe_error:
             self.report.camera_probe_error = entry.probe_error
@@ -731,9 +740,10 @@ class LayerMixin:
         self.set_layer_visible(layer_id, False)
         self._layer_specs.pop(layer_id, None)
         self._layer_acquired.discard(layer_id)
-        pad = self._layer_pads.pop(layer_id, None)
-        if pad is not None:
-            pad.set_property("alpha", 0.0)
+        with self._get_transition_lock():
+            pad = self._layer_pads.pop(layer_id, None)
+            if pad is not None:
+                pad.set_property("alpha", 0.0)
         self.drop_layer_audio(layer_id)
         removed = self._layer_chains.pop(layer_id, None)
         # A generated layer (animation, ticker, GIF, drawing) owns a feeder
@@ -944,6 +954,13 @@ class LayerMixin:
         try:
             self._add_layer(layer, zorder)
         except Exception as exc:  # noqa: BLE001 - the caller rebuilds on failure
+            if layer.kind == "screen":
+                leaked = self.screen_fds.pop(layer.id, -1)
+                if leaked >= 0:
+                    try:
+                        os.close(leaked)
+                    except OSError:
+                        pass
             safe_exc = config.redact_text(str(exc), layer.source)
             print(
                 f"[engine] could not attach {layer.name} live: {safe_exc}",

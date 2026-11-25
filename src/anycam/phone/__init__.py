@@ -20,3 +20,8 @@ PHONE_SIZE = (1920, 1080)
 def phone_channel(device_id: str) -> str:
     """The intervideo channel a paired phone's video is published on."""
     return "anycam-phone-" + re.sub(r"[^A-Za-z0-9_-]", "_", device_id or "none")
+
+
+def phone_audio_channel(device_id: str) -> str:
+    """The interaudio channel a paired phone's microphone is published on."""
+    return phone_channel(device_id) + "-audio"

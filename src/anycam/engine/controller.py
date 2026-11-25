@@ -65,6 +65,9 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         preview_target: tuple[int, int] | None = None,
         preview_gl_sink: Callable[[Gst.Element], bool] | None = None,
         canvas: str | None = None,
+        canvas_w: int | None = None,
+        canvas_h: int | None = None,
+        fps: int | None = None,
         skip_layers: set[str] | None = None,
         pool: SourcePool | None = None,
         on_frame: Callable | None = None,
@@ -118,9 +121,9 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         self.canvas_backend = ""
         # "gpu" (qml6glsink) or "image" (appsink -> QImage) once built.
         self.preview_backend = ""
-        self.canvas_w = int(project.output.canvas_w)
-        self.canvas_h = int(project.output.canvas_h)
-        self.fps = int(project.output.fps)
+        self.canvas_w = int(canvas_w if canvas_w is not None else project.output.canvas_w)
+        self.canvas_h = int(canvas_h if canvas_h is not None else project.output.canvas_h)
+        self.fps = int(fps if fps is not None else project.output.fps)
         self.recorder = recorder
         if recorder is not None:
             self.record_path = str(recorder.path)
@@ -343,6 +346,9 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
                 self._gl_tee, gl_queue, make("gldownload", "canvas_download")]
         self._add(*mixed, rate, canvas_caps, self.tee)
         self._link([*mixed, rate, canvas_caps, self.tee])
+        self._canvas_caps_element = canvas_caps
+        self._blur_probe = None
+        self.set_blur_regions(getattr(self.scene, "blur_regions", ()))
         # The compositor must never reach zero pads.  This one is live for the
         # whole canvas lifetime and sits behind every scene layer.
         self._build_background()
@@ -395,6 +401,8 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
                 self.report.rtmp_error = config.redact_text(
                     f"stream output could not start: {exc}",
                     self.rtmp, *self.rtmp_extra)
+        if str(getattr(self.project.output, "ndi_name", "") or "").strip():
+            self._build_ndi()
 
         if self._branch_count == 0:
             # Without a tee branch the compositor's output pad stays unlinked
@@ -670,6 +678,131 @@ drives ``pump`` from a timer; the CLI drives it from a small loop."""
         self._pending_sample = None
         self._frame_counter = None
         self._preview_gl_sink_element = None
+        self._gl_tee = None
+        self._audio_raw_tee = None
+        self._media_decode = None
+        self._media_sink = None
+        self._media_eos_pad = None
+        self._vcam_caps_filter = None
+        self._rtmp_bus = None
+        self._rtmp_video_elements = []
+        self._rtmp_video_tee_pad = None
+        self._rtmp_audio_elements = []
+        self._rtmp_audio_tee_pad = None
+        self._rtmp_audio_tee = None
+        self._mic_conv = None
+        self._mic_dsp_elements = []
+        self._remove_blur_probe()
+        self._canvas_caps_element = None
+        self._extra_vcam_outputs = []
+
+    def _build_ndi(self) -> None:
+        """Publish the composed canvas as an NDI output when ``ndisink`` is installed."""
+        from .. import ndi
+
+        ndi_name = str(getattr(self.project.output, "ndi_name", "") or "").strip()
+        if not ndi_name or self.tee is None or not ndi.sink_available():
+            return
+        try:
+            queue = make("queue", "queue_ndi", max_size_buffers=2, max_size_time=0, max_size_bytes=0)
+            queue.set_property("leaky", 2)
+            conv = make("videoconvert", "ndi_conv")
+            sink = make("ndisink", "ndi_sink", ndi_name=ndi_name, sync=False)
+            sink.set_property("async", False)
+            self._attach_tee_branch(self.tee, [queue, conv, sink], count_branch=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[ndi] output unavailable: {exc}", file=sys.stderr, flush=True)
+
+    def _remove_blur_probe(self) -> None:
+        info = getattr(self, "_blur_probe", None)
+        self._blur_probe = None
+        if info is not None:
+            pad, probe_id, _state = info
+            try:
+                pad.remove_probe(probe_id)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def set_blur_regions(self, regions) -> bool:
+        """Apply post-compositor Gaussian blur over normalized ``(x, y, w, h)`` rects.
+
+        Zero-overhead when ``regions`` is empty (the buffer probe is removed).
+        """
+        cleaned: list[tuple[float, float, float, float]] = []
+        for entry in regions or ():
+            if len(entry) != 4:
+                continue
+            x, y, w, h = (float(v) for v in entry)
+            x = max(0.0, min(1.0, x))
+            y = max(0.0, min(1.0, y))
+            w = max(0.0, min(1.0 - x, w))
+            h = max(0.0, min(1.0 - y, h))
+            if w > 0.002 and h > 0.002:
+                cleaned.append((x, y, w, h))
+        self._blur_regions = cleaned
+        if not cleaned:
+            self._remove_blur_probe()
+            return True
+        caps_el = getattr(self, "_canvas_caps_element", None)
+        if caps_el is None:
+            return False
+        pad = caps_el.get_static_pad("src")
+        if pad is None:
+            return False
+        existing = getattr(self, "_blur_probe", None)
+        if existing is not None:
+            existing[2]["regions"] = list(cleaned)
+            return True
+        state = {"regions": list(cleaned), "w": self.canvas_w, "h": self.canvas_h}
+
+        def on_buffer(_pad, info):
+            import numpy as np
+            from PIL import Image, ImageFilter
+
+            rects = state["regions"]
+            if not rects:
+                return Gst.PadProbeReturn.OK
+            buf = info.get_buffer()
+            if buf is None:
+                return Gst.PadProbeReturn.OK
+            ok, mapped = buf.map(Gst.MapFlags.READ)
+            if not ok:
+                return Gst.PadProbeReturn.OK
+            try:
+                w, h = state["w"], state["h"]
+                need = w * h * 4
+                if len(mapped.data) < need:
+                    return Gst.PadProbeReturn.OK
+                arr = np.frombuffer(mapped.data, dtype=np.uint8, count=need).reshape(h, w, 4).copy()
+            finally:
+                buf.unmap(mapped)
+            for rx, ry, rw, rh in rects:
+                x0 = max(0, min(w - 1, int(round(rx * w))))
+                y0 = max(0, min(h - 1, int(round(ry * h))))
+                x1 = max(x0 + 1, min(w, int(round((rx + rw) * w))))
+                y1 = max(y0 + 1, min(h, int(round((ry + rh) * h))))
+                patch = Image.fromarray(arr[y0:y1, x0:x1], "RGBA")
+                pw, ph = patch.size
+                small = patch.resize((max(1, pw // 4), max(1, ph // 4)), Image.BILINEAR)
+                blurred = small.filter(ImageFilter.GaussianBlur(radius=4)).resize(
+                    (pw, ph), Image.BILINEAR)
+                arr[y0:y1, x0:x1] = np.asarray(blurred, dtype=np.uint8)
+            payload = arr.tobytes()
+            if buf.mini_object.is_writable() and buf.is_all_memory_writable():
+                buf.fill(0, payload)
+            else:
+                setter = getattr(info, "set_buffer", None)
+                if setter is not None:
+                    out = buf.copy_deep()
+                    out.fill(0, payload)
+                    setter(out)
+            return Gst.PadProbeReturn.OK
+
+        probe_id = pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
+        if probe_id:
+            self._blur_probe = (pad, probe_id, state)
+            return True
+        return False
 
     def run(self, seconds: float, sample_cb: Callable[[dict], None] | None = None,
             tick_cb: Callable[[float], None] | None = None) -> dict:

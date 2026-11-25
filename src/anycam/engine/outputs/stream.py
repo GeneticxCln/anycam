@@ -107,8 +107,9 @@ class StreamMixin:
                         "rtmp2sink" if Gst.ElementFactory.find("rtmp2sink") else "rtmpsink")
         # FLV/RTMP carries H.264/AAC, not HEVC or AV1.  A saved H.265/AV1
         # recording preference therefore selects H.264 NVENC for this branch.
+        stream_w, stream_h, _stream_fps = self._output_format("rtmp")
         plan = encoder_plan(self._encoder_preference(), purpose="rtmp",
-                            width=self.canvas_w, height=self.canvas_h)
+                            width=stream_w, height=stream_h)
         missing = [name for name in (sink_factory, "mpegtsmux" if srt else "flvmux",
                                      plan.factory, plan.parser)
                    if Gst.ElementFactory.find(name) is None]
@@ -122,6 +123,7 @@ class StreamMixin:
                      max_size_time=200_000_000)
         # Downstream leak: the encoder can never push back into the compositor.
         queue.set_property("leaky", 2)
+        scale_path = self._output_scale_elements("rtmp", "rtmp")
         pixel_path = self._encoder_input(plan.hardware, "rtmp", plan.factory)
         enc = self._make_encoder(plan, "rtmp_encoder", purpose="rtmp")
         parse = self._make_parser(plan, "rtmp_parse")
@@ -130,7 +132,7 @@ class StreamMixin:
         video_sink = make("appsink", "rtmp_video_sink", emit_signals=True,
                           max_buffers=8, drop=False, sync=False)
         video_sink.set_property("async", False)
-        video_elements = [queue, *pixel_path, enc, parse, h264, video_sink]
+        video_elements = [queue, *scale_path, *pixel_path, enc, parse, h264, video_sink]
         self._on(video_sink, "new-sample", self._on_rtmp_video_sample)
         video_tee_pad = self._attach_tee_branch(self.tee, video_elements,
                                                 count_branch=True)
@@ -162,10 +164,20 @@ class StreamMixin:
         self._rtmp_sink_factory = sink_factory
         self._rtmp_with_audio = audio_sink is not None
         self._rtmp_encoder = enc
+        self._rtmp_video_elements = list(video_elements)
+        self._rtmp_video_tee_pad = video_tee_pad
+        self._rtmp_audio_elements = list(audio_elements)
+        self._rtmp_audio_tee_pad = audio_tee_pad
+        self._rtmp_audio_tee = tee
         try:
             publisher = self._make_publisher(url, "anycam-rtmp")
         except Exception:
             self._rtmp_encoder = None
+            self._rtmp_video_elements = []
+            self._rtmp_video_tee_pad = None
+            self._rtmp_audio_elements = []
+            self._rtmp_audio_tee_pad = None
+            self._rtmp_audio_tee = None
             self._cleanup_rtmp_canvas_branch(
                 video_elements, video_tee_pad, audio_elements, audio_tee_pad, tee)
             raise
@@ -176,6 +188,114 @@ class StreamMixin:
         for extra_url in self.rtmp_extra:
             self._add_extra_target(extra_url)
         self._publish_report()
+
+    def attach_rtmp(self, url: str, extra: list[str] | tuple[str, ...] = ()) -> bool:
+        """Start streaming from a running canvas without rebuilding it."""
+        if (self.pipeline is None or self.tee is None
+                or getattr(self, "_stopped", False) or not url):
+            return False
+        if getattr(self, "_rtmp_video_tee_pad", None) is not None or self._rtmp_pipeline is not None:
+            self.detach_rtmp()
+        self.rtmp = url
+        self.rtmp_extra = [u for u in extra if u and u != url]
+        self.report._rtmp_extra_urls = list(self.rtmp_extra)
+        self.report.rtmp_error = ""
+        self._rtmp_state = RtmpState()
+        self._rtmp_extras = []
+        try:
+            self._build_rtmp()
+        except Exception as exc:  # noqa: BLE001
+            self.report.rtmp_error = config.redact_text(
+                f"stream output could not start: {exc}", url, *self.rtmp_extra)
+            self.rtmp = ""
+            self.rtmp_extra = []
+            return False
+        publisher = getattr(self, "_rtmp_publisher", None)
+        if publisher is None:
+            self.rtmp = ""
+            self.rtmp_extra = []
+            return False
+        clock = self.pipeline.get_clock() or Gst.SystemClock.obtain()
+        if self._canvas_base is None:
+            self._canvas_base = self.pipeline.get_base_time()
+        publisher.feed.skipping = True
+        force_keyframe(self._rtmp_encoder)
+        self._apply_canvas_clock(publisher.pipeline, clock)
+        self._start_async(publisher)
+        with self._get_rtmp_lock():
+            extras = list(self._rtmp_extras)
+        for state in extras:
+            if state.publisher is not None:
+                state.publisher.feed.skipping = True
+                self._apply_canvas_clock(state.publisher.pipeline, clock)
+                self._start_async(state.publisher)
+        return True
+
+    @staticmethod
+    def _unlink_tee_pad_safely(pad: Gst.Pad | None) -> None:
+        """Unlink a tee src pad under a blocking probe so no buffer hits not-linked."""
+        if pad is None or not pad.is_linked():
+            return
+        parent = pad.get_parent_element()
+        playing = False
+        if parent is not None:
+            _ret, state, pending = parent.get_state(0)
+            playing = state == Gst.State.PLAYING or pending == Gst.State.PLAYING
+        if not playing:
+            peer = pad.get_peer()
+            if peer is not None:
+                pad.unlink(peer)
+            return
+        done = threading.Event()
+
+        def on_idle(target_pad, _info):
+            peer = target_pad.get_peer()
+            if peer is not None:
+                target_pad.unlink(peer)
+            done.set()
+            return Gst.PadProbeReturn.REMOVE
+
+        probe = pad.add_probe(Gst.PadProbeType.IDLE, on_idle)
+        if not done.wait(0.4):
+            if probe:
+                try:
+                    pad.remove_probe(probe)
+                except Exception:  # noqa: BLE001
+                    pass
+            peer = pad.get_peer()
+            if peer is not None:
+                pad.unlink(peer)
+
+    def detach_rtmp(self) -> bool:
+        """Stop streaming and remove the RTMP encoder branch without rebuilding the canvas."""
+        if self.pipeline is None:
+            return False
+        self._teardown_rtmp(everything=True)
+        video_elements = list(getattr(self, "_rtmp_video_elements", ()))
+        video_pad = getattr(self, "_rtmp_video_tee_pad", None)
+        audio_elements = list(getattr(self, "_rtmp_audio_elements", ()))
+        audio_pad = getattr(self, "_rtmp_audio_tee_pad", None)
+        audio_tee = getattr(self, "_rtmp_audio_tee", None)
+        self._rtmp_video_elements = []
+        self._rtmp_video_tee_pad = None
+        self._rtmp_audio_elements = []
+        self._rtmp_audio_tee_pad = None
+        self._rtmp_audio_tee = None
+        self._rtmp_encoder = None
+        self.rtmp = ""
+        self.rtmp_extra = []
+        self._rtmp_state = RtmpState()
+        self._rtmp_extras = []
+        self.report.rtmp_url = ""
+        self.report.rtmp_targets = []
+        self.report.rtmp_error = ""
+        self.report._rtmp_extra_urls = []
+        if video_pad is not None or audio_pad is not None:
+            self._unlink_tee_pad_safely(video_pad)
+            self._unlink_tee_pad_safely(audio_pad)
+            self._cleanup_rtmp_canvas_branch(
+                video_elements, video_pad, audio_elements, audio_pad, audio_tee)
+        return True
 
     def _cleanup_rtmp_canvas_branch(
         self,
@@ -303,26 +423,39 @@ class StreamMixin:
             pad.add_probe(Gst.PadProbeType.BUFFER | Gst.PadProbeType.BUFFER_LIST, on_data)
         return publisher
 
+    def _get_rtmp_lock(self) -> threading.RLock:
+        lock = getattr(self, "_rtmp_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._rtmp_lock = lock
+        return lock
+
     def _adopt_primary(self, publisher: "Publisher") -> None:
         """Expose the first target through the long-standing ``_rtmp_*`` attributes."""
-        self._rtmp_publisher = publisher
-        self._rtmp_pipeline = publisher.pipeline
-        self._rtmp_bus = publisher.bus
-        self._rtmp_appsrc = publisher.video_src
-        self._rtmp_audio_appsrc = publisher.audio_src
-        self._rtmp_feed = publisher.feed
-        self._rtmp_failed = False
-        self._rtmp_state.publisher = publisher
+        with self._get_rtmp_lock():
+            self._rtmp_publisher = publisher
+            self._rtmp_pipeline = publisher.pipeline
+            self._rtmp_bus = publisher.bus
+            self._rtmp_appsrc = publisher.video_src
+            self._rtmp_audio_appsrc = publisher.audio_src
+            self._rtmp_feed = publisher.feed
+            self._rtmp_failed = False
+            self._rtmp_state.publisher = publisher
 
     def _add_extra_target(self, url: str) -> None:
         state = RtmpState(url=url, state="connecting")
-        self._rtmp_extras.append(state)
+        with self._get_rtmp_lock():
+            self._rtmp_extras.append(state)
+            index = len(self._rtmp_extras)
         try:
-            state.publisher = self._make_publisher(
-                url, f"anycam-rtmp-{len(self._rtmp_extras)}", f"rtmpx{len(self._rtmp_extras)}")
+            publisher = self._make_publisher(
+                url, f"anycam-rtmp-{index}", f"rtmpx{index}")
+            with self._get_rtmp_lock():
+                state.publisher = publisher
         except Exception as exc:  # noqa: BLE001 - one bad target must not stop the rest
-            state.state = "failed"
-            state.error = config.redact_text(f"could not start: {exc}", url)
+            with self._get_rtmp_lock():
+                state.state = "failed"
+                state.error = config.redact_text(f"could not start: {exc}", url)
 
     def _apply_canvas_clock(self, pipeline: Gst.Pipeline, clock=None) -> None:
         if self._canvas_base is not None:
@@ -331,7 +464,9 @@ class StreamMixin:
             pipeline.set_base_time(self._canvas_base)
 
     def start_extra_targets(self, clock=None) -> None:
-        for state in self._rtmp_extras:
+        with self._get_rtmp_lock():
+            extras = list(self._rtmp_extras)
+        for state in extras:
             if state.publisher is not None:
                 self._apply_canvas_clock(state.publisher.pipeline, clock)
                 state.publisher.pipeline.set_state(Gst.State.PLAYING)
@@ -340,28 +475,33 @@ class StreamMixin:
         sample = sink.emit("pull-sample")
         if sample is None:
             return Gst.FlowReturn.OK
-        feed = self._rtmp_feed
-        publisher = self._rtmp_publisher
-        if feed is not None and not self._rtmp_failed:
+        with self._get_rtmp_lock():
+            primary = (self._rtmp_feed, self._rtmp_publisher) if not self._rtmp_failed else (None, None)
+            extras = [state.publisher for state in self._rtmp_extras
+                      if state.publisher is not None and not state.failed_flag]
+        feed, publisher = primary
+        if feed is not None:
             feed.push(without_encoder_offset(sample)
                       if publisher is not None and publisher.srt else sample)
-        for state in self._rtmp_extras:
-            if state.publisher is not None and not state.failed_flag:
-                state.publisher.feed.push(
-                    without_encoder_offset(sample) if state.publisher.srt else sample)
+        for extra_pub in extras:
+            extra_pub.feed.push(
+                without_encoder_offset(sample) if extra_pub.srt else sample)
         return Gst.FlowReturn.OK
 
     def _on_rtmp_audio_sample(self, sink):
         sample = sink.emit("pull-sample")
         if sample is None:
             return Gst.FlowReturn.OK
-        appsrc = self._rtmp_audio_appsrc
-        if appsrc is not None and not self._rtmp_failed:
+        with self._get_rtmp_lock():
+            appsrc = self._rtmp_audio_appsrc if not self._rtmp_failed else None
+            extra_srcs = [state.publisher.audio_src for state in self._rtmp_extras
+                          if state.publisher is not None
+                          and state.publisher.audio_src is not None
+                          and not state.failed_flag]
+        if appsrc is not None:
             appsrc.emit("push-sample", sample)
-        for state in self._rtmp_extras:
-            publisher = state.publisher
-            if publisher is not None and publisher.audio_src is not None and not state.failed_flag:
-                publisher.audio_src.emit("push-sample", sample)
+        for extra_src in extra_srcs:
+            extra_src.emit("push-sample", sample)
         return Gst.FlowReturn.OK
 
     def _poll_rtmp_bus(self) -> None:
@@ -520,27 +660,34 @@ class StreamMixin:
         ``everything`` also ends the extra destinations and cancels reconnects
         (the engine is going away); otherwise only the primary leg is dropped.
         """
-        if everything:
-            for state in self._rtmp_extras:
-                if state.publisher is not None:
-                    self._discard(state.publisher)
-                    state.publisher = None
-                state.restart_at = 0.0
-            self._rtmp_state.restart_at = 0.0
-        pipeline = self._rtmp_pipeline
-        publisher = getattr(self, "_rtmp_publisher", None)
+        with self._get_rtmp_lock():
+            if everything:
+                extras_to_drop = []
+                for state in self._rtmp_extras:
+                    if state.publisher is not None:
+                        extras_to_drop.append(state.publisher)
+                        state.publisher = None
+                    state.restart_at = 0.0
+                self._rtmp_state.restart_at = 0.0
+            else:
+                extras_to_drop = []
+            pipeline = self._rtmp_pipeline
+            publisher = getattr(self, "_rtmp_publisher", None)
+            if pipeline is not None:
+                self._rtmp_pipeline = None
+                self._rtmp_bus = None
+                self._rtmp_appsrc = None
+                self._rtmp_audio_appsrc = None
+                self._rtmp_feed = None
+                # Keep _rtmp_encoder: it lives in the canvas graph, and _restart_primary
+                # needs it for force_keyframe (audit item 6).  Clear publisher refs so
+                # a stale first_data cannot flip state back to "live" (item 5).
+                self._rtmp_publisher = None
+                self._rtmp_state.publisher = None
+        for extra_pub in extras_to_drop:
+            self._discard(extra_pub)
         if pipeline is None:
             return
-        self._rtmp_pipeline = None
-        self._rtmp_bus = None
-        self._rtmp_appsrc = None
-        self._rtmp_audio_appsrc = None
-        self._rtmp_feed = None
-        # Keep _rtmp_encoder: it lives in the canvas graph, and _restart_primary
-        # needs it for force_keyframe (audit item 6).  Clear publisher refs so
-        # a stale first_data cannot flip state back to "live" (item 5).
-        self._rtmp_publisher = None
-        self._rtmp_state.publisher = None
 
         def shutdown() -> None:
             lock = getattr(publisher, "lock", None)

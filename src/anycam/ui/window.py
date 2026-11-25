@@ -30,6 +30,7 @@ from .cameras import _CAMERA_LOSS  # noqa: F401
 from .ctl import CtlMixin  # noqa: E402
 from .effects_panel import EffectsPanelMixin  # noqa: E402
 from .general_panel import GeneralPanelMixin  # noqa: E402
+from .personality_panel import PersonalityPanelMixin  # noqa: E402
 from .draw_panel import DrawMixin  # noqa: E402
 from .backdrop_panel import BackdropMixin  # noqa: E402
 from .audio_panel import AudioPanelMixin  # noqa: E402
@@ -47,7 +48,7 @@ from .desktop import DesktopMixin  # noqa: E402
 from .phone import PhoneMixin  # noqa: E402
 
 
-class AnyCamWindow(CtlMixin, GeneralPanelMixin, EffectsPanelMixin, DrawMixin, BackdropMixin, AudioPanelMixin, PlaylistMixin, OutputPanelMixin, SceneMixin, LayersMixin, UndoMixin, CameraMixin, ScreenMixin, OutputsMixin, ProjectIOMixin, EngineMixin, DesktopMixin, PhoneMixin,
+class AnyCamWindow(CtlMixin, PersonalityPanelMixin, GeneralPanelMixin, EffectsPanelMixin, DrawMixin, BackdropMixin, AudioPanelMixin, PlaylistMixin, OutputPanelMixin, SceneMixin, LayersMixin, UndoMixin, CameraMixin, ScreenMixin, OutputsMixin, ProjectIOMixin, EngineMixin, DesktopMixin, PhoneMixin,
                   QMainWindow):
     """The standalone studio window."""
 
@@ -168,7 +169,7 @@ class AnyCamWindow(CtlMixin, GeneralPanelMixin, EffectsPanelMixin, DrawMixin, Ba
         self.screenshot_ok = False
         self.setWindowTitle("AnyCam")
         self.resize(1440, 900)
-        self.setStyleSheet(STYLE)
+        self.apply_personality()
         self._build_ui()
         self.preview.stroke_finished.connect(self._draw_stroke_finished)
         self._install_shortcuts()
@@ -453,7 +454,7 @@ class AnyCamWindow(CtlMixin, GeneralPanelMixin, EffectsPanelMixin, DrawMixin, Ba
     DRAW_COLOURS = ("#ff3b5c", "#facc15", "#5eead0", "#60a5fa", "#ffffff", "#111827")
 
     DRAW_TOOLS = (("pen", "Pen"), ("marker", "Marker"), ("arrow", "Arrow"),
-                  ("box", "Box"))
+                  ("box", "Box"), ("blur", "Blur"))
 
     def eventFilter(self, watched, event):
         grid = getattr(self, "effect_grid", None)

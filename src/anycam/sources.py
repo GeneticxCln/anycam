@@ -16,6 +16,7 @@ import itertools
 import os
 import re
 import sys
+import threading
 import time
 import weakref
 from dataclasses import dataclass, field
@@ -408,6 +409,13 @@ uniform float hue;
 uniform float red_gain;
 uniform float green_gain;
 uniform float blue_gain;
+uniform float chroma_enabled;
+uniform float chroma_key_r;
+uniform float chroma_key_g;
+uniform float chroma_key_b;
+uniform float chroma_similarity;
+uniform float chroma_smoothness;
+uniform float chroma_spill;
 void main () {
   vec4 c = texture2D(tex, v_texcoord);
   vec3 rgb = c.rgb * 255.0;
@@ -426,7 +434,23 @@ void main () {
   o.g = 1.16438*(y-16.0) - 0.391762*(u-128.0) - 0.812968*(v-128.0);
   o.b = 1.16438*(y-16.0) + 2.01723*(u-128.0);
   o *= vec3(red_gain, green_gain, blue_gain);
-  gl_FragColor = vec4(clamp(o / 255.0, 0.0, 1.0), c.a);
+  vec3 out_rgb = clamp(o / 255.0, 0.0, 1.0);
+  float out_a = c.a;
+  if (chroma_enabled > 0.5) {
+    float kcb = -0.148246*chroma_key_r - 0.29102*chroma_key_g + 0.439266*chroma_key_b + 128.0;
+    float kcr =  0.439271*chroma_key_r - 0.367833*chroma_key_g - 0.071438*chroma_key_b + 128.0;
+    float dist = length(vec2(u - kcb, v - kcr)) / 180.0;
+    float sim = clamp(chroma_similarity * 0.75, 0.0, 1.0);
+    float sm = max(0.005, chroma_smoothness * 0.35);
+    float matte = smoothstep(sim, sim + sm, dist);
+    out_a *= matte;
+    if (chroma_spill > 0.001) {
+      float spill_zone = 1.0 - smoothstep(sim, sim + sm + 0.20, dist);
+      float luma = dot(out_rgb, vec3(0.299, 0.587, 0.114));
+      out_rgb = mix(out_rgb, vec3(luma), clamp(spill_zone * chroma_spill, 0.0, 1.0));
+    }
+  }
+  gl_FragColor = vec4(out_rgb, out_a);
 }
 """
 
@@ -451,15 +475,25 @@ def gl_rack_elements(mirror_on_gpu: bool = True) -> dict[str, Gst.Element] | Non
 
 def _set_balance_uniforms(shader: Gst.Element, brightness: float, contrast: float,
                           saturation: float, hue: float,
-                          gains: tuple[float, float, float] = (1.0, 1.0, 1.0)) -> None:
+                          gains: tuple[float, float, float] = (1.0, 1.0, 1.0),
+                          chroma: tuple[bool, int, int, int, float, float, float] | None = None) -> None:
     from gi.repository import GObject
 
+    c_on, kr, kg, kb, c_sim, c_sm, c_spill = (
+        chroma if chroma is not None else (False, 0, 255, 0, 0.35, 0.10, 0.0))
     # glshader only takes float uniforms; doubles were ignored (all zero: black).
     uniforms = Gst.Structure.new_empty("uniforms")
     for key, value in (("brightness", brightness), ("contrast", contrast),
                        ("saturation", saturation), ("hue", hue),
                        ("red_gain", gains[0]), ("green_gain", gains[1]),
-                       ("blue_gain", gains[2])):
+                       ("blue_gain", gains[2]),
+                       ("chroma_enabled", 1.0 if c_on else 0.0),
+                       ("chroma_key_r", float(kr)),
+                       ("chroma_key_g", float(kg)),
+                       ("chroma_key_b", float(kb)),
+                       ("chroma_similarity", float(c_sim)),
+                       ("chroma_smoothness", float(c_sm)),
+                       ("chroma_spill", float(c_spill))):
         typed = GObject.Value(GObject.TYPE_FLOAT)
         typed.set_float(float(value))
         uniforms.set_value(key, typed)
@@ -473,14 +507,15 @@ def rgb_gains(fx) -> tuple[float, float, float]:
 
 
 def gpu_colour_is_equivalent(fx: Effects) -> bool:
-    """Whether the colour step can run after the upload without changing the
-    picture: nothing order-sensitive follows it in the CPU rack (a filter or
-    processor, a frame, a film style, the chroma key)."""
+    """Whether colour and chroma key can run after the upload without changing the
+    picture: nothing order-sensitive follows them in the CPU rack (a filter or
+    processor, a frame, a film style)."""
     return (str(getattr(fx, "filter", "none") or "none") == "none"
             and str(getattr(fx, "filter2", "none") or "none") == "none"
+            and str(getattr(fx, "filter3", "none") or "none") == "none"
+            and str(getattr(fx, "filter4", "none") or "none") == "none"
             and str(getattr(fx, "frame_style", "none") or "none") == "none"
-            and str(getattr(fx, "color_effect", "none") or "none") == "none"
-            and not bool(getattr(fx, "chroma_enabled", False)))
+            and str(getattr(fx, "color_effect", "none") or "none") == "none")
 
 
 _frame_shown: "weakref.WeakKeyDictionary[Gst.Element, tuple]" = weakref.WeakKeyDictionary()
@@ -588,17 +623,89 @@ def _apply_cpu_rgb_gains(elements: dict, gains: tuple[float, float, float]) -> N
         finally:
             buf.unmap(mapped)
         r_lut, g_lut, b_lut = state["luts"]
-        arr[:, 0] = r_lut[arr[:, 0]]
-        arr[:, 1] = g_lut[arr[:, 1]]
-        arr[:, 2] = b_lut[arr[:, 2]]
-        out = buf.copy_deep()
-        out.fill(0, arr.tobytes())
-        info.set_buffer(out)
+        np.take(r_lut, arr[:, 0], out=arr[:, 0])
+        np.take(g_lut, arr[:, 1], out=arr[:, 1])
+        np.take(b_lut, arr[:, 2], out=arr[:, 2])
+        payload = arr.tobytes()
+        if buf.mini_object.is_writable() and buf.is_all_memory_writable():
+            buf.fill(0, payload)
+        else:
+            setter = getattr(info, "set_buffer", None)
+            if setter is not None:
+                out = buf.copy_deep()
+                out.fill(0, payload)
+                setter(out)
         return Gst.PadProbeReturn.OK
 
     probe_id = pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
     if probe_id:
         elements["rgb_probe"] = (pad, probe_id, state)
+
+
+def _remove_cpu_spill_probe(elements: dict) -> None:
+    probe_info = elements.pop("spill_probe", None)
+    if probe_info is not None:
+        pad, probe_id, _state = probe_info
+        try:
+            pad.remove_probe(probe_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _apply_cpu_chroma_spill(elements: dict, enabled: bool,
+                            key_rgb: tuple[int, int, int], strength: float) -> None:
+    """Suppress chroma key colour spill on CPU frames (zero overhead when off)."""
+    if not enabled or strength <= 0.01:
+        _remove_cpu_spill_probe(elements)
+        return
+    pad = elements.get("rgb_pad")
+    if pad is None:
+        return
+    dominant = int(max(range(3), key=lambda idx: key_rgb[idx]))
+    others = [idx for idx in range(3) if idx != dominant]
+    existing = elements.get("spill_probe")
+    if existing is not None:
+        existing[2].update({"dom": dominant, "others": others, "strength": float(strength)})
+        return
+    state = {"dom": dominant, "others": others, "strength": float(strength)}
+
+    def on_buffer(_pad, info):
+        import numpy as np
+
+        buf = info.get_buffer()
+        if buf is None:
+            return Gst.PadProbeReturn.OK
+        ok, mapped = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.PadProbeReturn.OK
+        try:
+            raw = mapped.data
+            if len(raw) < 4 or len(raw) % 4 != 0:
+                return Gst.PadProbeReturn.OK
+            arr = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 4).copy()
+        finally:
+            buf.unmap(mapped)
+        dom = state["dom"]
+        o0, o1 = state["others"]
+        s = state["strength"]
+        ch = arr[:, dom].astype(np.float32)
+        limit = 0.5 * (arr[:, o0].astype(np.float32) + arr[:, o1].astype(np.float32))
+        excess = np.maximum(0.0, ch - limit)
+        arr[:, dom] = np.clip(ch - excess * s, 0, 255).astype(np.uint8)
+        payload = arr.tobytes()
+        if buf.mini_object.is_writable() and buf.is_all_memory_writable():
+            buf.fill(0, payload)
+        else:
+            setter = getattr(info, "set_buffer", None)
+            if setter is not None:
+                out = buf.copy_deep()
+                out.fill(0, payload)
+                setter(out)
+        return Gst.PadProbeReturn.OK
+
+    probe_id = pad.add_probe(Gst.PadProbeType.BUFFER, on_buffer)
+    if probe_id:
+        elements["spill_probe"] = (pad, probe_id, state)
 
 
 def apply_effects(elements: dict, fx: Effects) -> None:
@@ -618,11 +725,22 @@ def apply_effects(elements: dict, fx: Effects) -> None:
     # upload whenever that gives the same picture: a colour look on the CPU
     # cost ~13 ms per 1080p frame on the source thread.  Otherwise the CPU
     # elements do it, as on the CPU canvas.
+    chroma_on = bool(getattr(fx, "chroma_enabled", False))
+    kr, kg, kb = parse_chroma_color(
+        str(getattr(fx, "chroma_key", "#00ff00") or "#00ff00"))
+    c_sim = max(0.0, min(1.0, _effect_number(
+        getattr(fx, "chroma_similarity", 0.35), 0.35)))
+    c_sm = max(0.0, min(1.0, _effect_number(
+        getattr(fx, "chroma_smoothness", 0.10), 0.10)))
+    c_spill = max(0.0, min(1.0, _effect_number(
+        getattr(fx, "chroma_spill", 0.0), 0.0)))
     gpu = elements.get("gl_balance") is not None and gpu_colour_is_equivalent(fx)
     gl_balance = elements.get("gl_balance")
     if gl_balance is not None:
         if gpu:
-            _set_balance_uniforms(gl_balance, brightness, contrast, saturation, hue, gains)
+            _set_balance_uniforms(
+                gl_balance, brightness, contrast, saturation, hue, gains,
+                chroma=(chroma_on, kr, kg, kb, c_sim, c_sm, c_spill))
         else:
             _set_balance_uniforms(gl_balance, 0.0, 1.0, 1.0, 0.0, gains)
     _apply_cpu_rgb_gains(elements, gains)
@@ -641,7 +759,8 @@ def apply_effects(elements: dict, fx: Effects) -> None:
         balance.set_property("saturation", 1.0 if neutral else saturation)
         balance.set_property("hue", 0.0 if neutral else hue)
 
-    for slot_key, attr in (("slot", "filter"), ("slot2", "filter2")):
+    for slot_key, attr in (("slot", "filter"), ("slot2", "filter2"),
+                           ("slot3", "filter3"), ("slot4", "filter4")):
         slot = elements.get(slot_key)
         if slot is not None:
             slot.apply(getattr(fx, attr, "none"),
@@ -691,31 +810,22 @@ def apply_effects(elements: dict, fx: Effects) -> None:
 
     alpha = elements.get("alpha")
     if alpha is not None:
-        if bool(getattr(fx, "chroma_enabled", False)):
-            red, green, blue = parse_chroma_color(
-                str(getattr(fx, "chroma_key", "#00ff00") or "#00ff00"))
+        if chroma_on and not gpu:
             alpha.set_property("method", "custom")
-            alpha.set_property("target-r", red)
-            alpha.set_property("target-g", green)
-            alpha.set_property("target-b", blue)
-            # ``noise-level`` is 0..64, so map the UI's 0..1 tolerance onto
-            # that range.  Keeping the default sensitivity at ~100 is also
-            # essential: the old 13 made bright green count as "too bright to
-            # key", which is why the checkbox appeared to do nothing.
-            similarity = max(0.0, min(1.0, _effect_number(
-                getattr(fx, "chroma_similarity", 0.35), 0.35)))
-            smoothness = max(0.0, min(1.0, _effect_number(
-                getattr(fx, "chroma_smoothness", 0.10), 0.10)))
-            alpha.set_property("noise-level", similarity * 64.0)
-            sensitivity = max(1, min(128, int(round(128.0 - smoothness * 28.0))))
+            alpha.set_property("target-r", kr)
+            alpha.set_property("target-g", kg)
+            alpha.set_property("target-b", kb)
+            alpha.set_property("noise-level", c_sim * 64.0)
+            sensitivity = max(1, min(128, int(round(128.0 - c_sm * 28.0))))
             alpha.set_property("black-sensitivity", sensitivity)
             alpha.set_property("white-sensitivity", sensitivity)
         else:
             # Clear any previous key and restore opaque output.  Switching the
             # method live is supported by the element and avoids a graph
-            # rebuild when the checkbox is toggled.
+            # rebuild when the checkbox is toggled (or when GPU chroma runs).
             alpha.set_property("method", "set")
             alpha.set_property("alpha", 1.0)
+    _apply_cpu_chroma_spill(elements, chroma_on and not gpu, (kr, kg, kb), c_spill)
 
 
 def _add_effects(chain: SourceChain, layer) -> None:
@@ -792,7 +902,10 @@ def _add_rate(chain: SourceChain, live: bool, fps: int) -> None:
     # queue dropped the real frames, and a Distort filter showed 4 new
     # frames in 2 s (51 frames out, 47 of them copies).  The mixer repeats
     # a layer's last frame by itself; videorate only drops for a live one.
-    rate_element = make("videorate", drop_only=bool(live))
+    # skip-to-first prevents videorate from flooding T*fps duplicate copies of
+    # frame 1 when a layer is added live to a canvas that has been running for
+    # T seconds (e.g. emoji rain / animations added minutes into a session).
+    rate_element = make("videorate", drop_only=bool(live), skip_to_first=True)
     if live and fps > 0:
         # Drop-only cannot raise a slower source to a fixed higher rate
         # (30 fps into a 60/1 chain failed to link), so a live chain caps
@@ -860,22 +973,17 @@ def _finish_chain(chain: SourceChain, width: int, height: int, fps: int, *,
         # relative to the picture the viewer sees and costs no more than the
         # fitted size.  It is a pass-through until a filter is chosen.
         fx = getattr(layer, "effects", None) or Effects()
-        gate = SwapGate()    # the two slots must not swap at the same time
+        gate = SwapGate()    # filter slots must not swap at the same time
         live = getattr(layer, "kind", "") in LIVE_KINDS
-        slot = FilterSlot(getattr(fx, "filter", "none"),
-                          getattr(fx, "filter_amount", 0.5), chain.elements,
-                          size=(int(width), int(height)), fps=int(fps), gate=gate,
-                          live=live)
-        chain.add(slot.element)
-        chain.effects["slot"] = slot
-        chain.cleanup.append(slot.close)
-        slot2 = FilterSlot(getattr(fx, "filter2", "none"),
-                           getattr(fx, "filter2_amount", 0.5), chain.elements,
-                           size=(int(width), int(height)), fps=int(fps), gate=gate,
-                           live=live)
-        chain.add(slot2.element)
-        chain.effects["slot2"] = slot2
-        chain.cleanup.append(slot2.close)
+        for slot_key, attr in (("slot", "filter"), ("slot2", "filter2"),
+                               ("slot3", "filter3"), ("slot4", "filter4")):
+            slot = FilterSlot(getattr(fx, attr, "none"),
+                              getattr(fx, f"{attr}_amount", 0.5), chain.elements,
+                              size=(int(width), int(height)), fps=int(fps), gate=gate,
+                              live=live)
+            chain.add(slot.element)
+            chain.effects[slot_key] = slot
+            chain.cleanup.append(slot.close)
     if layer is not None and Gst.ElementFactory.find("gdkpixbufoverlay") is not None:
         frame = make("gdkpixbufoverlay", overlay_width=int(width),
                      overlay_height=int(height))
@@ -1390,8 +1498,9 @@ def animation_chain(preset: str, width: int, height: int, fps: int,
         key, f"backdrop_{key}_{_next_source_number():x}", width, height, fps)
     chain.add(source.appsrc)
     chain.cleanup.append(source.stop)
-    fitted = _fit_letterbox(chain, source.width, source.height, width, height, layer=layer)
-    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
+    fitted = _fit_letterbox(chain, source.width, source.height, width, height,
+                            live=True, fps=fps, layer=layer)
+    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer, pin_rate=False)
     chain.source_size = (source.width, source.height)
     return chain
 
@@ -1439,8 +1548,9 @@ def animated_chain(layer, width: int, height: int, fps: int) -> SourceChain:
     chain.add(source.appsrc)
     chain.cleanup.append(source.stop)
     chain.control = generator
-    fitted = _fit_letterbox(chain, size[0], size[1], width, height, layer=layer)
-    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer)
+    fitted = _fit_letterbox(chain, size[0], size[1], width, height,
+                            live=True, fps=fps, layer=layer)
+    _finish_chain(chain, fitted.w, fitted.h, fps, layer=layer, pin_rate=False)
     chain.source_size = size
     return chain
 
@@ -1518,12 +1628,79 @@ def background_chain(width: int, height: int, fps: int) -> SourceChain:
     return chain
 
 
+def web_chain(url: str, width: int, height: int, fps: int, layer=None) -> SourceChain:
+    """Live browser/web-page layer backed by :mod:`anycam.web_source`."""
+    from . import web_source
+
+    width = max(2, int(width) // 2 * 2)
+    height = max(2, int(height) // 2 * 2)
+    web_fps = max(1, min(30, int(fps or web_source.DEFAULT_WEB_FPS)))
+    custom_css = str(getattr(layer, "custom_css", "") or "")
+    gen = web_source.WebPageGenerator(url, width, height, fps=web_fps, custom_css=custom_css)
+    chain = SourceChain()
+    src = make("appsrc", format=Gst.Format.TIME, is_live=True, do_timestamp=True,
+               max_buffers=2, block=False, leaky_type=2)
+    src.set_property("caps", Gst.Caps.from_string(
+        f"video/x-raw,format=RGBA,width={width},height={height},framerate={web_fps}/1"))
+    stop_ev = threading.Event()
+    step_ns = Gst.SECOND // web_fps
+
+    def pump() -> None:
+        index = 0
+        interval = 1.0 / web_fps
+        while not stop_ev.is_set():
+            started = time.monotonic()
+            arr = gen.frame(started)
+            data = arr.tobytes()
+            buf = Gst.Buffer.new_wrapped(data)
+            buf.pts = index * step_ns
+            buf.duration = step_ns
+            index += 1
+            try:
+                ret = src.emit("push-buffer", buf)
+            except Exception:  # noqa: BLE001
+                break
+            if ret not in (Gst.FlowReturn.OK, Gst.FlowReturn.FLUSHING):
+                stop_ev.wait(0.1)
+                continue
+            elapsed = time.monotonic() - started
+            stop_ev.wait(max(0.005, interval - elapsed))
+
+    worker = threading.Thread(target=pump, name="anycam-web-source", daemon=True)
+    worker.start()
+
+    def cleanup() -> None:
+        stop_ev.set()
+        if worker.is_alive():
+            worker.join(timeout=1.0)
+        gen.close()
+
+    chain.cleanup.append(cleanup)
+    chain.effects["web_generator"] = gen
+    chain.add(src, make("videoconvert"))
+    if layer is not None:
+        _add_effects(chain, layer)
+    _finish_chain(chain, width, height, fps, layer=layer, pin_rate=True)
+    chain.source_size = (width, height)
+    return chain
+
+
 def build_chain(layer, width: int, height: int, fps: int, screen_node: int | None = None,
                 screen_fd: int | None = None, canvas: tuple[int, int] | None = None,
                 screen_size: tuple[int, int] | None = None,
                 screen_flip: str | None = None) -> SourceChain:
     kind = layer.kind
     canvas_w, canvas_h = canvas or (width, height)
+    if kind == "web":
+        return web_chain(layer.source, width, height, fps, layer)
+    if kind == "game":
+        from . import game_capture
+
+        return game_capture.build_game_chain(layer.source, width, height, fps, layer)
+    if kind == "ndi":
+        from . import ndi
+
+        return ndi.build_ndi_chain(layer.source, width, height, fps, layer)
     if kind == "camera":
         # The capture mode follows the canvas, not the layer box.
         capture = camera_capture_request(layer, canvas_w, canvas_h, fps)

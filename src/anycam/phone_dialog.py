@@ -198,12 +198,20 @@ class PhonePairDialog(QDialog):
         if self.firewall_backend == "firewalld":
             self._allow_with_firewalld(retried)
             return
-        command = firewall.allow_command(self.port)
+        command = (firewall.nftables_allow_command(self.port)
+                   if self.firewall_backend == "nftables"
+                   else firewall.allow_command(self.port))
         if command is None or self._firewall_process is not None:
             return
         self.firewall_button.setEnabled(False)
         self.firewall_text.setText("Enter your password in the system prompt…")
         process = QProcess(self)
+        from PySide6.QtCore import QProcessEnvironment
+        from . import privileged
+
+        env = QProcessEnvironment.systemEnvironment()
+        env.insert("PATH", privileged._TRUSTED_PATH)
+        process.setProcessEnvironment(env)
         process.finished.connect(
             lambda code, _status: self._firewall_done(code, retried))
         process.errorOccurred.connect(self._firewall_error)
@@ -231,8 +239,15 @@ class PhonePairDialog(QDialog):
         self.log(f"firewall: pkexec exit {code}: {output or 'no output'}")
         if self._closed:
             return
-        if code == 0 and (not firewall.ufw_blocks(self.port)
-                          or not firewall.ufw_rules_readable()):
+        if self.firewall_backend == "nftables" and code == 0:
+            firewall.remember_allowed(self.port, backend_name="nftables")
+            self.firewall_bar.setVisible(False)
+            self.status.setText("Phones are allowed through nftables for this session. "
+                                "Scan the code now.")
+            return
+        rules_file = "user6.rules" if ":" in self.host else "user.rules"
+        if code == 0 and (not firewall.ufw_blocks(self.port, host=self.host)
+                          or not firewall.ufw_rules_readable(rules_file=rules_file)):
             # ufw allow succeeded.  Where its rules cannot be read (Debian,
             # Ubuntu) the check cannot confirm it, so remember it instead.
             firewall.remember_allowed(self.port)

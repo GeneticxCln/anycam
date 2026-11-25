@@ -343,12 +343,20 @@ class ProjectIOMixin:
                 return False
             path = chosen
         path = Path(path)
+        payload = scene.to_dict()
+        # Scrub inline credentials from shareable scene presets so an exported
+        # RTSP/HTTP network layer never leaks passwords or keyring references.
+        for item in payload.get("layers", ()):
+            if isinstance(item, dict) and item.get("kind") == "network":
+                source = str(item.get("source") or "")
+                if source:
+                    item["source"] = config.redact_text(source, source)
         temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(scene.to_dict(), indent=2) + "\n")
+                handle.write(json.dumps(payload, indent=2) + "\n")
             os.chmod(temp, 0o600)
             os.replace(temp, path)
             written = path
@@ -406,7 +414,7 @@ class ProjectIOMixin:
         quietly(self.stream_key_edit, lambda w: w.setText(
             key if preset != "custom" and not credentials.has_reference(key) else ""))
         self.extra_list.clear()
-        self.extra_list.addItems(out.rtmp_extra_urls)
+        self.extra_list.addItems([config.redact_url(u) for u in out.rtmp_extra_urls])
         quietly(self.record_dir_edit, lambda w: w.setText(out.record_dir))
         quietly(self.record_bitrate, lambda w: w.setValue(out.record_bitrate_kbps))
         quietly(self.record_min_free, lambda w: w.setValue(out.record_min_free_mb))

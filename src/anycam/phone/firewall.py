@@ -62,13 +62,20 @@ def _allowed_path() -> Path:
     return config.state_dir() / "firewall-allowed.json"
 
 
-def remember_allowed(port: int, *, state_file: Path | None = None) -> None:
-    """Note that this app opened ``port`` in ufw (rules unreadable afterwards)."""
+def remember_allowed(port: int, *, state_file: Path | None = None,
+                     backend_name: str = "ufw") -> None:
+    """Note that this app opened ``port`` in ``backend_name`` (rules unreadable afterwards)."""
     port_num = _validate_port(port)
     path = state_file or _allowed_path()
-    ports = _allowed_ports(path)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        data = raw if isinstance(raw, dict) else {}
+    except (OSError, ValueError):
+        data = {}
+    ports = [int(p) for p in data.get(backend_name, []) if isinstance(p, (int, str)) and str(p).isdigit()]
     if port_num not in ports:
         ports.append(port_num)
+        data[backend_name] = ports
         tmp = path.with_suffix(".tmp")
         fd = -1
         try:
@@ -77,7 +84,7 @@ def remember_allowed(port: int, *, state_file: Path | None = None) -> None:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 fd = -1
-                json.dump({"ufw": ports}, handle)
+                json.dump(data, handle)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, path)
@@ -93,10 +100,10 @@ def remember_allowed(port: int, *, state_file: Path | None = None) -> None:
                 pass
 
 
-def _allowed_ports(path: Path) -> list[int]:
+def _allowed_ports(path: Path, backend_name: str = "ufw") -> list[int]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return [int(p) for p in data.get("ufw", [])]
+        return [int(p) for p in data.get(backend_name, [])]
     except (OSError, ValueError, TypeError, AttributeError):
         return []
 
@@ -332,13 +339,62 @@ def auth_missing(reason: str) -> bool:
             or "not authorized" in text)
 
 
+# --------------------------------------------------------------- nftables
+NFTABLES_CONF = Path("/etc/nftables.conf")
+
+
+def _nftables_active(*, conf: Path = NFTABLES_CONF) -> bool:
+    """True when plain nftables appears configured with a restrictive input policy."""
+    if shutil.which("nft") is None:
+        return False
+    text = _read(conf)
+    if not text:
+        return False
+    return bool(re.search(r"hook\s+input\b[^}]*policy\s+(drop|reject)", text, re.S | re.I))
+
+
+def nftables_blocks(port: int, *, conf: Path = NFTABLES_CONF,
+                    state_file: Path | None = None) -> bool:
+    """True when ``/etc/nftables.conf`` drops input and does not accept ``port``/tcp."""
+    port_num = _validate_port(port)
+    if not _nftables_active(conf=conf):
+        return False
+    if port_num in _allowed_ports(state_file or _allowed_path(), "nftables"):
+        return False
+    text = _read(conf)
+    if re.search(rf"\btcp\s+dport\s+(?:\{{[^}}]*\b)?{port_num}\b[^;\n]*\baccept\b", text):
+        return False
+    return True
+
+
+def nftables_allow_command(port: int) -> list[str] | None:
+    """Command (via pkexec) to accept ``port``/tcp in active nftables input filter chains."""
+    port_num = _validate_port(port)
+    pkexec, nft = shutil.which("pkexec"), shutil.which("nft")
+    if pkexec is None or nft is None:
+        return None
+    script = (
+        f"nft list chains | awk '"
+        f"/^table / {{ fam=$2; tbl=$3 }} "
+        f"/^\\tchain / {{ ch=$2 }} "
+        f"/type filter hook input/ {{ print fam, tbl, ch }}' | "
+        f"while read -r fam tbl ch; do "
+        f"nft list chain \"$fam\" \"$tbl\" \"$ch\" | grep -q \"tcp dport {port_num} .*accept\" || "
+        f"nft insert rule \"$fam\" \"$tbl\" \"$ch\" tcp dport {port_num} accept comment \\\"{COMMENT}\\\"; "
+        f"done"
+    )
+    return [pkexec, "/bin/sh", "-c", script]
+
+
 # --------------------------------------------------------------- dispatch
 def backend() -> str:
-    """"firewalld", "ufw" or "" (nothing AnyCam knows how to open)."""
+    """"firewalld", "ufw", "nftables" or "" (nothing AnyCam knows how to open)."""
     if firewalld_running():
         return "firewalld"
     if shutil.which("ufw") is not None or (UFW_DIR / "ufw.conf").exists():
         return "ufw"
+    if _nftables_active():
+        return "nftables"
     return ""
 
 
@@ -349,6 +405,8 @@ def blocks(port: int, host: str = "") -> bool:
         return firewalld_blocks(port, host)
     if kind == "ufw":
         return ufw_blocks(port, host=host) and allow_command(port) is not None
+    if kind == "nftables":
+        return nftables_blocks(port) and nftables_allow_command(port) is not None
     return False
 
 

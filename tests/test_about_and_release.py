@@ -78,7 +78,9 @@ def test_settings_has_an_about_tab_showing_version_one(window):
 def test_about_does_not_disturb_the_other_settings_tabs(window):
     win, _app = window
     names = [win.settings_tabs.tabText(i) for i in range(win.settings_tabs.count())]
-    assert names[:6] == ["Sources", "Audio", "Media", "Output", "Stream", "Diagnostics"]
+    assert names[:5] == ["Sources", "Audio", "Media", "Output", "Stream"]
+    assert {"AI", "Personality", "Shortcuts", "General", "Diagnostics"}.issubset(set(names))
+    assert names[-1] == "About"
 
 
 def test_copy_version_details_puts_the_release_on_the_clipboard(window):

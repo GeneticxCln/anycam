@@ -217,6 +217,34 @@ FILTERS: dict[str, FilterSpec] = {
 FILTER_CATEGORIES: tuple[str, ...] = (
     "Distort", "Retro TV", "Touch-up", "Portrait", "Face", "Masks", "Framing", "Packs")
 _PACK_SPECS: dict[str, FilterSpec] = {}
+_LUT_SPECS: dict[str, FilterSpec] = {}
+_FILTERS_LOCK = threading.RLock()
+
+
+def reload_luts(folder=None) -> int:
+    """Discover user ``.cube`` 3D LUTs and register them as live filters."""
+    import re
+    from . import luts
+
+    found = luts.discover_luts(folder)
+    with _FILTERS_LOCK:
+        for key in list(_LUT_SPECS):
+            FILTERS.pop(key, None)
+        _LUT_SPECS.clear()
+        for path in found:
+            slug = re.sub(r"[^a-z0-9_-]+", "-", path.stem.lower()).strip("-") or "lut"
+            key = f"lut-{slug}"
+            if key in FILTERS:
+                continue
+            spec = FilterSpec(
+                key, path.stem, "Packs", "",
+                f"3D .cube LUT ({path.name})",
+                "", "amount", 0.0, 1.0, False, 1.0, (),
+                f"lut:{path}",
+            )
+            FILTERS[spec.key] = spec
+            _LUT_SPECS[spec.key] = spec
+    return len(_LUT_SPECS)
 
 
 def reload_packs(root=None) -> list[str]:
@@ -226,18 +254,20 @@ def reload_packs(root=None) -> list[str]:
     from . import packs
 
     packs.set_custom_root(Path(root) if root is not None and Path(root).is_dir() else None)
-    for key in list(_PACK_SPECS):
-        FILTERS.pop(key, None)
-    _PACK_SPECS.clear()
     found, problems = packs.discover(root)
-    for effect in found:
-        if effect.filter_key in FILTERS:
-            continue
-        spec = FilterSpec(effect.filter_key, effect.label, packs.CATEGORY, "",
-                          effect.description or f"{effect.label} (pack {effect.pack})",
-                          "", "amount", 0.0, 1.0, False, effect.default, (), effect.processor)
-        FILTERS[spec.key] = spec
-        _PACK_SPECS[spec.key] = spec
+    with _FILTERS_LOCK:
+        for key in list(_PACK_SPECS):
+            FILTERS.pop(key, None)
+        _PACK_SPECS.clear()
+        for effect in found:
+            if effect.filter_key in FILTERS:
+                continue
+            spec = FilterSpec(effect.filter_key, effect.label, packs.CATEGORY, "",
+                              effect.description or f"{effect.label} (pack {effect.pack})",
+                              "", "amount", 0.0, 1.0, False, effect.default, (), effect.processor)
+            FILTERS[spec.key] = spec
+            _PACK_SPECS[spec.key] = spec
+    reload_luts()
     return problems
 
 
@@ -257,7 +287,8 @@ def favourites() -> list[str]:
     except (OSError, ValueError):
         return []
     keys = [key for key in data if isinstance(key, str)] if isinstance(data, list) else []
-    return [key for key in dict.fromkeys(keys) if key in FILTERS]
+    with _FILTERS_LOCK:
+        return [key for key in dict.fromkeys(keys) if key in FILTERS]
 
 
 def set_favourite(key: str, starred: bool) -> list[str]:
@@ -267,13 +298,23 @@ def set_favourite(key: str, starred: bool) -> list[str]:
     import tempfile
 
     keys = [k for k in favourites() if k != key]
-    if starred and key in FILTERS:
+    with _FILTERS_LOCK:
+        known = key in FILTERS
+    if starred and known:
         keys.append(key)
     path = _favourites_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=".fav-")
-    with os.fdopen(handle, "w", encoding="utf-8") as stream:
-        json.dump(keys, stream)
-    os.replace(temporary, path)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(keys, stream)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
     return keys
 
 
@@ -619,7 +660,12 @@ class FilterSlot:
                     self.idle.set()
                 elif ok:
                     if old_runner is not None:
-                        old_runner.stop()
+                        if finish:
+                            threading.Thread(
+                                target=old_runner.stop, daemon=True,
+                                name="anycam-filter-stop").start()
+                        else:
+                            old_runner.stop()
                 else:
                     if new_runner is not None:
                         new_runner.stop()
@@ -628,7 +674,8 @@ class FilterSlot:
                     self._finish()
             return ok and not closed_during
 
-        if parent.get_state(0)[1] != Gst.State.PLAYING:
+        _res, state, pending = parent.get_state(0)
+        if state != Gst.State.PLAYING and pending != Gst.State.PLAYING:
             ok = relink(finish=False)
             self._busy = False
             self.idle.set()

@@ -3,9 +3,10 @@ from __future__ import annotations
 
 
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QGridLayout, QGroupBox, QLabel, QLineEdit, QListWidget,
+    QCheckBox, QComboBox, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QPushButton, QSpinBox,
     QVBoxLayout, QWidget,
 )
@@ -29,9 +30,23 @@ class OutputPanelMixin:
         grid = QGridLayout(box)
         self.rtmp_edit = QLineEdit(self.project.output.rtmp_url)
         self.rtmp_edit.setPlaceholderText("rtmp://host/live/stream-key")
+        self.rtmp_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.rtmp_edit.textChanged.connect(lambda *_: self._mark_dirty())
+        self.rtmp_show_button = QPushButton("Show")
+        self.rtmp_show_button.setCheckable(True)
+        self.rtmp_show_button.setToolTip("Show or hide the stream address and key")
+        self.rtmp_show_button.toggled.connect(
+            lambda on: (
+                self.rtmp_edit.setEchoMode(
+                    QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password),
+                self.rtmp_show_button.setText("Hide" if on else "Show"),
+            ))
+        url_row = QHBoxLayout()
+        url_row.setContentsMargins(0, 0, 0, 0)
+        url_row.addWidget(self.rtmp_edit, 1)
+        url_row.addWidget(self.rtmp_show_button)
         grid.addWidget(QLabel("RTMP URL"), 0, 0)
-        grid.addWidget(self.rtmp_edit, 0, 1, 1, 2)
+        grid.addLayout(url_row, 0, 1, 1, 2)
         self.stream_preset = QComboBox()
         for key, (label, _base) in streaming.PRESETS.items():
             self.stream_preset.addItem(label, key)
@@ -60,7 +75,7 @@ class OutputPanelMixin:
         grid.addWidget(QLabel("Also publish to"), 3, 0)
         self.extra_list = QListWidget()
         self.extra_list.setMaximumHeight(70)
-        self.extra_list.addItems(self.project.output.rtmp_extra_urls)
+        self.extra_list.addItems([config.redact_url(u) for u in self.project.output.rtmp_extra_urls])
         grid.addWidget(self.extra_list, 3, 1, 1, 2)
         self.extra_edit = QLineEdit()
         self.extra_edit.setPlaceholderText("another rtmp:// or rtmps:// address")
@@ -183,7 +198,7 @@ class OutputPanelMixin:
             self._status(problem)
             return problem
         self.project.output.rtmp_extra_urls.append(url)
-        self.extra_list.addItem(url)
+        self.extra_list.addItem(config.redact_url(url))
         self._mark_dirty()
         if self.live and self.engine is not None:
             self.restart_engine()
@@ -218,64 +233,12 @@ class OutputPanelMixin:
             if row["error"] and row["state"] != "live":
                 text += f"\n    {row['error'][:140]}"
             lines.append(text)
-        label.setText("\n".join(lines))
+        joined = "\n".join(lines)
+        if label.text() != joined:
+            label.setText(joined)
 
-    def _output_tab(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        box = QGroupBox("Canvas")
-        grid = QGridLayout(box)
-        self.width_spin = QSpinBox(); self.width_spin.setRange(320, 7680); self.width_spin.setValue(self.project.output.canvas_w)
-        self.height_spin = QSpinBox(); self.height_spin.setRange(240, 4320); self.height_spin.setValue(self.project.output.canvas_h)
-        self.fps_spin = QSpinBox(); self.fps_spin.setRange(1, 120); self.fps_spin.setValue(self.project.output.fps)
-        # H.264 needs even dimensions: snap instead of letting x264 fail later.
-        for spin in (self.width_spin, self.height_spin):
-            spin.setSingleStep(2)
-            spin.valueChanged.connect(
-                lambda value, field=spin: field.setValue(value - value % 2)
-                if value % 2 else None)
-        # A size or rate edit takes effect while the preview runs: after a short
-        # pause (so typing "1280" does not rebuild at 1, 12, 128 ...) the canvas
-        # is rebuilt with the new format; nothing happens when it is stopped.
-        self._canvas_apply_timer = QTimer(self)
-        self._canvas_apply_timer.setSingleShot(True)
-        self._canvas_apply_timer.setInterval(800)
-        self._canvas_apply_timer.timeout.connect(self._apply_canvas_edit)
-        for spin in (self.width_spin, self.height_spin, self.fps_spin):
-            spin.valueChanged.connect(lambda *_: self._mark_dirty())
-            spin.valueChanged.connect(lambda *_: self._canvas_apply_timer.start())
-        grid.addWidget(QLabel("Width"), 0, 0); grid.addWidget(self.width_spin, 0, 1)
-        grid.addWidget(QLabel("Height"), 1, 0); grid.addWidget(self.height_spin, 1, 1)
-        grid.addWidget(QLabel("FPS"), 2, 0); grid.addWidget(self.fps_spin, 2, 1)
-        canvas_hint = QLabel("A new size or rate restarts the running preview; the virtual "
-                             "camera keeps the mode it opened with.")
-        canvas_hint.setObjectName("muted")
-        canvas_hint.setWordWrap(True)
-        grid.addWidget(canvas_hint, 3, 0, 1, 2)
-        layout.addWidget(box)
-
-        encoder_box = QGroupBox("Video encoder")
-        encoder_grid = QGridLayout(encoder_box)
-        self.encoder_combo = QComboBox()
-        self._populate_encoders(str(self.project.output.encoder or "auto").lower())
-        self.encoder_combo.currentIndexChanged.connect(self._encoder_changed)
-        encoder_grid.addWidget(QLabel("Encoder"), 0, 0)
-        encoder_grid.addWidget(self.encoder_combo, 0, 1)
-        encoder_note = QLabel(self._encoder_summary())
-        encoder_note.setObjectName("muted")
-        encoder_note.setWordWrap(True)
-        self.encoder_note = encoder_note
-        encoder_grid.addWidget(encoder_note, 1, 0, 1, 2)
-        self.encoder_retest = QPushButton("Test encoders again")
-        self.encoder_retest.setToolTip(
-            "Encodes a few frames with every encoder in a separate process; one that crashes "
-            "cannot take AnyCam down")
-        self.encoder_retest.clicked.connect(self._retest_encoders)
-        encoder_grid.addWidget(self.encoder_retest, 2, 0, 1, 2)
-        layout.addWidget(encoder_box)
-
-        layout.addWidget(self._recording_group())
-
+    def _ai_effects_group(self) -> QGroupBox:
+        """Compute device, person cut-out model, worker isolation and effect packs."""
         effects_box = QGroupBox("AI effects")
         effects_grid = QGridLayout(effects_box)
         self.effects_device_combo = QComboBox()
@@ -324,12 +287,189 @@ class OutputPanelMixin:
         self.packs_note.setObjectName("muted")
         self.packs_note.setWordWrap(True)
         effects_grid.addWidget(self.packs_note, 5, 0, 1, 3)
+
+        packs_row = QHBoxLayout()
+        open_packs = QPushButton("Open packs folder")
+        open_packs.clicked.connect(self._open_packs_folder)
+        reload_packs = QPushButton("Reload packs")
+        reload_packs.clicked.connect(self._reload_packs)
+        packs_row.addWidget(open_packs)
+        packs_row.addWidget(reload_packs)
+        packs_row.addStretch(1)
+        effects_grid.addLayout(packs_row, 6, 0, 1, 3)
+
         self._model_download: dict | None = None
         self._model_download_timer = QTimer(self)
         self._model_download_timer.setInterval(150)
         self._model_download_timer.timeout.connect(self._poll_model_download)
         self._update_segmentation_note()
-        layout.addWidget(effects_box)
+        return effects_box
+
+    def _open_packs_folder(self) -> None:
+        folder = packs.packs_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+    def _reload_packs(self) -> None:
+        self.pack_problems = effect_library.reload_packs()
+        if hasattr(self, "packs_note"):
+            self.packs_note.setText(self._packs_summary())
+        if hasattr(self, "_populate_effect_grid"):
+            self._populate_effect_grid()
+        self._status(self._packs_summary())
+
+    def _ai_tab(self) -> QWidget:
+        """Dedicated AI settings tab: models, acceleration, isolation, packs and motion."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 14, 16, 16)
+        layout.setSpacing(12)
+        layout.addWidget(self._ai_effects_group())
+        if hasattr(self, "_motion_group"):
+            layout.addWidget(self._motion_group())
+        layout.addStretch(1)
+        return page
+
+    def _shortcuts_reference_group(self) -> QGroupBox:
+        box4 = QGroupBox("Shortcut reference")
+        grid4 = QGridLayout(box4)
+        keys = [("Ctrl+P", "start / stop preview"), ("Ctrl+R", "record"),
+                ("Ctrl+Shift+V", "virtual camera"), ("F5", "snapshot"),
+                ("Ctrl+M", "mute microphone"), ("Ctrl+1…9", "switch scene"),
+                ("← ↑ → ↓", "nudge selected layer (Shift = 10×)"),
+                ("Ctrl+Alt+←↑→↓", "align selected layers to canvas edges"),
+                ("Ctrl+Alt+H / V", "centre selected layers"),
+                ("Ctrl+D", "duplicate selected layers"),
+                ("Ctrl+Z", "undo layer edit"), ("Ctrl+Shift+Z", "redo layer edit")]
+        for row, (key, what) in enumerate(keys):
+            chip = QLabel(key)
+            chip.setObjectName("accent")
+            grid4.addWidget(chip, row, 0)
+            grid4.addWidget(QLabel(what), row, 1)
+        self.global_shortcuts_label = QLabel()
+        self.global_shortcuts_label.setObjectName("muted")
+        self.global_shortcuts_label.setWordWrap(True)
+        grid4.addWidget(self.global_shortcuts_label, len(keys), 0, 1, 2)
+        self._update_global_shortcuts_label()
+        return box4
+
+    def _output_tab(
+        self,
+        *,
+        include_ai: bool = True,
+        include_shortcuts: bool = True,
+        include_project_actions: bool = True,
+    ) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        box = QGroupBox("Canvas")
+        grid = QGridLayout(box)
+        self.width_spin = QSpinBox(); self.width_spin.setRange(320, 7680); self.width_spin.setValue(self.project.output.canvas_w)
+        self.height_spin = QSpinBox(); self.height_spin.setRange(240, 4320); self.height_spin.setValue(self.project.output.canvas_h)
+        self.fps_spin = QSpinBox(); self.fps_spin.setRange(1, 120); self.fps_spin.setValue(self.project.output.fps)
+        # H.264 needs even dimensions: snap instead of letting x264 fail later.
+        for spin in (self.width_spin, self.height_spin):
+            spin.setSingleStep(2)
+            spin.valueChanged.connect(
+                lambda value, field=spin: field.setValue(value - value % 2)
+                if value % 2 else None)
+        # A size or rate edit takes effect while the preview runs: after a short
+        # pause (so typing "1280" does not rebuild at 1, 12, 128 ...) the canvas
+        # is rebuilt with the new format; nothing happens when it is stopped.
+        self._canvas_apply_timer = QTimer(self)
+        self._canvas_apply_timer.setSingleShot(True)
+        self._canvas_apply_timer.setInterval(800)
+        self._canvas_apply_timer.timeout.connect(self._apply_canvas_edit)
+        for spin in (self.width_spin, self.height_spin, self.fps_spin):
+            spin.valueChanged.connect(lambda *_: self._mark_dirty())
+            spin.valueChanged.connect(lambda *_: self._canvas_apply_timer.start())
+        grid.addWidget(QLabel("Width"), 0, 0); grid.addWidget(self.width_spin, 0, 1)
+        grid.addWidget(QLabel("Height"), 1, 0); grid.addWidget(self.height_spin, 1, 1)
+        grid.addWidget(QLabel("FPS"), 2, 0); grid.addWidget(self.fps_spin, 2, 1)
+        self.canvas_combo = QComboBox()
+        self.canvas_combo.addItem("Automatic (GPU when it works)", "auto")
+        self.canvas_combo.addItem("CPU", "cpu")
+        index = self.canvas_combo.findData(self.project.output.canvas_backend)
+        self.canvas_combo.setCurrentIndex(max(0, index))
+        self.canvas_combo.currentIndexChanged.connect(self._canvas_backend_changed)
+        grid.addWidget(QLabel("Mix layers on"), 3, 0)
+        grid.addWidget(self.canvas_combo, 3, 1)
+        self.canvas_note = QLabel()
+        self.canvas_note.setObjectName("muted")
+        self.canvas_note.setWordWrap(True)
+        grid.addWidget(self.canvas_note, 4, 0, 1, 2)
+        self._update_canvas_note()
+        canvas_hint = QLabel("A new size or rate restarts the running preview; the virtual "
+                             "camera keeps the mode it opened with.")
+        canvas_hint.setObjectName("muted")
+        canvas_hint.setWordWrap(True)
+        grid.addWidget(canvas_hint, 5, 0, 1, 2)
+        layout.addWidget(box)
+
+        box2 = QGroupBox("Video output (virtual camera)")
+        grid2 = QGridLayout(box2)
+        self.vcam_edit = QLineEdit(self.project.output.vcam_device)
+        self.vcam_edit.textChanged.connect(lambda *_: self._mark_dirty())
+        grid2.addWidget(QLabel("Device"), 0, 0)
+        grid2.addWidget(self.vcam_edit, 0, 1)
+        self.vcam_backend_combo = QComboBox()
+        for label, value in (
+            ("Loopback device: every app (default)", "v4l2"),
+            ("PipeWire camera: no driver, PipeWire-aware apps only", "pipewire"),
+            ("Both", "both"),
+        ):
+            self.vcam_backend_combo.addItem(label, value)
+        if not pipewire_available():
+            for row in (1, 2):
+                item = self.vcam_backend_combo.model().item(row)
+                if item is not None:
+                    item.setEnabled(False)
+        backend_index = self.vcam_backend_combo.findData(self._vcam_backend())
+        self.vcam_backend_combo.setCurrentIndex(max(0, backend_index))
+        self.vcam_backend_combo.currentIndexChanged.connect(
+            self._vcam_backend_changed)
+        grid2.addWidget(QLabel("Publish as"), 1, 0)
+        grid2.addWidget(self.vcam_backend_combo, 1, 1)
+        self.vcam_extra_edit = QLineEdit(", ".join(getattr(self.project.output, "vcam_extra_devices", [])))
+        self.vcam_extra_edit.setPlaceholderText("/dev/video11, /dev/video12 (optional extra loopback nodes)")
+        self.vcam_extra_edit.editingFinished.connect(self._vcam_extra_changed)
+        grid2.addWidget(QLabel("Extra devices"), 2, 0)
+        grid2.addWidget(self.vcam_extra_edit, 2, 1)
+        self.vcam_pw_count = QSpinBox()
+        self.vcam_pw_count.setRange(1, 4)
+        self.vcam_pw_count.setValue(int(getattr(self.project.output, "vcam_pipewire_count", 1)))
+        self.vcam_pw_count.setToolTip("Number of PipeWire virtual camera nodes to publish simultaneously")
+        self.vcam_pw_count.valueChanged.connect(self._vcam_extra_changed)
+        grid2.addWidget(QLabel("PipeWire cameras"), 3, 0)
+        grid2.addWidget(self.vcam_pw_count, 3, 1)
+        self.vcam_note = QLabel()
+        self.vcam_note.setObjectName("muted")
+        self.vcam_note.setWordWrap(True)
+        grid2.addWidget(self.vcam_note, 4, 0, 1, 2)
+        self._update_vcam_note()
+        layout.addWidget(box2)
+
+        encoder_box = QGroupBox("Video encoder")
+        encoder_grid = QGridLayout(encoder_box)
+        self.encoder_combo = QComboBox()
+        self._populate_encoders(str(self.project.output.encoder or "auto").lower())
+        self.encoder_combo.currentIndexChanged.connect(self._encoder_changed)
+        encoder_grid.addWidget(QLabel("Encoder"), 0, 0)
+        encoder_grid.addWidget(self.encoder_combo, 0, 1)
+        encoder_note = QLabel(self._encoder_summary())
+        encoder_note.setObjectName("muted")
+        encoder_note.setWordWrap(True)
+        self.encoder_note = encoder_note
+        encoder_grid.addWidget(encoder_note, 1, 0, 1, 2)
+        self.encoder_retest = QPushButton("Test encoders again")
+        self.encoder_retest.setToolTip(
+            "Encodes a few frames with every encoder in a separate process; one that crashes "
+            "cannot take AnyCam down")
+        self.encoder_retest.clicked.connect(self._retest_encoders)
+        encoder_grid.addWidget(self.encoder_retest, 2, 0, 1, 2)
+        layout.addWidget(encoder_box)
+
+        layout.addWidget(self._recording_group())
 
         screen_box = QGroupBox("Screen capture")
         screen_grid = QGridLayout(screen_box)
@@ -364,82 +504,17 @@ class OutputPanelMixin:
         screen_grid.addWidget(screen_note, 1, 0, 1, 3)
         layout.addWidget(screen_box)
 
-        box2 = QGroupBox("Video output (virtual camera)")
-        grid2 = QGridLayout(box2)
-        self.vcam_edit = QLineEdit(self.project.output.vcam_device)
-        self.vcam_edit.textChanged.connect(lambda *_: self._mark_dirty())
-        grid2.addWidget(QLabel("Device"), 0, 0)
-        grid2.addWidget(self.vcam_edit, 0, 1)
-        self.vcam_backend_combo = QComboBox()
-        for label, value in (
-            ("Loopback device: every app (default)", "v4l2"),
-            ("PipeWire camera: no driver, PipeWire-aware apps only", "pipewire"),
-            ("Both", "both"),
-        ):
-            self.vcam_backend_combo.addItem(label, value)
-        if not pipewire_available():
-            for row in (1, 2):
-                item = self.vcam_backend_combo.model().item(row)
-                if item is not None:
-                    item.setEnabled(False)
-        backend_index = self.vcam_backend_combo.findData(self._vcam_backend())
-        self.vcam_backend_combo.setCurrentIndex(max(0, backend_index))
-        self.vcam_backend_combo.currentIndexChanged.connect(
-            self._vcam_backend_changed)
-        grid2.addWidget(QLabel("Publish as"), 1, 0)
-        grid2.addWidget(self.vcam_backend_combo, 1, 1)
-        self.vcam_note = QLabel()
-        self.vcam_note.setObjectName("muted")
-        self.vcam_note.setWordWrap(True)
-        grid2.addWidget(self.vcam_note, 2, 0, 1, 2)
-        self._update_vcam_note()
-        layout.addWidget(box2)
-
-        perf_box = QGroupBox("Canvas")
-        perf_grid = QGridLayout(perf_box)
-        self.canvas_combo = QComboBox()
-        self.canvas_combo.addItem("Automatic (GPU when it works)", "auto")
-        self.canvas_combo.addItem("CPU", "cpu")
-        index = self.canvas_combo.findData(self.project.output.canvas_backend)
-        self.canvas_combo.setCurrentIndex(max(0, index))
-        self.canvas_combo.currentIndexChanged.connect(self._canvas_backend_changed)
-        perf_grid.addWidget(QLabel("Mix layers on"), 0, 0)
-        perf_grid.addWidget(self.canvas_combo, 0, 1)
-        self.canvas_note = QLabel()
-        self.canvas_note.setObjectName("muted")
-        self.canvas_note.setWordWrap(True)
-        perf_grid.addWidget(self.canvas_note, 1, 0, 1, 2)
-        self._update_canvas_note()
-        layout.addWidget(perf_box)
-
-        box4 = QGroupBox("Shortcuts")
-        grid4 = QGridLayout(box4)
-        keys = [("Ctrl+P", "start / stop preview"), ("Ctrl+R", "record"),
-                ("Ctrl+Shift+V", "virtual camera"), ("F5", "snapshot"),
-                ("Ctrl+M", "mute microphone"), ("Ctrl+1…9", "switch scene"),
-                ("← ↑ → ↓", "nudge selected layer (Shift = 10×)"),
-                ("Ctrl+Alt+←↑→↓", "align selected layers to canvas edges"),
-                ("Ctrl+Alt+H / V", "centre selected layers"),
-                ("Ctrl+D", "duplicate selected layers"),
-                ("Ctrl+Z", "undo layer edit"), ("Ctrl+Shift+Z", "redo layer edit")]
-        for row, (key, what) in enumerate(keys):
-            chip = QLabel(key)
-            chip.setObjectName("accent")
-            grid4.addWidget(chip, row, 0)
-            grid4.addWidget(QLabel(what), row, 1)
-        self.global_shortcuts_label = QLabel()
-        self.global_shortcuts_label.setObjectName("muted")
-        self.global_shortcuts_label.setWordWrap(True)
-        grid4.addWidget(self.global_shortcuts_label, len(keys), 0, 1, 2)
-        self._update_global_shortcuts_label()
-        layout.addWidget(box4)
-
-        save = QPushButton("Save project")
-        save.clicked.connect(self.save_project)
-        layout.addWidget(save)
-        reload_button = QPushButton("Reload saved project")
-        reload_button.clicked.connect(self.reload_project)
-        layout.addWidget(reload_button)
+        if include_ai:
+            layout.addWidget(self._ai_effects_group())
+        if include_shortcuts:
+            layout.addWidget(self._shortcuts_reference_group())
+        if include_project_actions:
+            save = QPushButton("Save project")
+            save.clicked.connect(self.save_project)
+            layout.addWidget(save)
+            reload_button = QPushButton("Reload saved project")
+            reload_button.clicked.connect(self.reload_project)
+            layout.addWidget(reload_button)
         layout.addStretch(1)
         return page
 

@@ -41,6 +41,9 @@ class CtlMixin:
             return {"ok": False, "error": "a request is a JSON object"}
         action = str(request.get("action", "")).strip()
         argument = str(request.get("argument", "") or "")
+        if action not in ("list", "state") and (
+                getattr(self, "_ui_blocked", 0) or getattr(self, "_closing", False)):
+            return {"ok": False, "error": "busy"}
         try:
             if action == "list":
                 return {"ok": True, "actions": self.ctl_action_names()}

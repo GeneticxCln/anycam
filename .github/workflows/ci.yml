@@ -60,6 +60,14 @@ jobs:
       - name: Lint
         run: /usr/bin/python3 -m ruff check src tests scripts
 
+      - name: Shellcheck scripts
+        run: shellcheck -S error scripts/*.sh packaging/deb/build.sh
+
+      - name: Smoke-build .deb package
+        run: |
+          packaging/deb/build.sh /tmp/deb-ci
+          dpkg-deb --info /tmp/deb-ci/*.deb
+
       - name: Run tests
         # addopts in pyproject.toml is "-q", which cancels out -v and would
         # hide the name of the test that is running.  --timeout turns a stuck

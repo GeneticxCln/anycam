@@ -96,6 +96,18 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+_DEFAULT_URLOPEN = urllib.request.urlopen
+
+
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse downgrade redirects from HTTPS to HTTP/FTP/file schemes."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not str(newurl or "").lower().startswith("https://"):
+            raise ValueError(f"refused non-HTTPS redirect: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def download(key: str, progress: ProgressHandler | None = None,
              timeout: float = 30.0) -> Path:
     """Fetch model ``key``, verify it, and return its path.
@@ -106,7 +118,13 @@ def download(key: str, progress: ProgressHandler | None = None,
     """
     info = CATALOG[key]
     final = models_dir() / info.filename
+    for orphan in final.parent.glob(f".{info.filename}.*.part"):
+        orphan.unlink(missing_ok=True)
     request = urllib.request.Request(info.url, headers={"User-Agent": "AnyCam"})
+    if urllib.request.urlopen is _DEFAULT_URLOPEN:
+        open_fn = urllib.request.build_opener(_HttpsOnlyRedirectHandler).open
+    else:
+        open_fn = urllib.request.urlopen
     received = 0
     partial: Path | None = None
     try:
@@ -115,7 +133,7 @@ def download(key: str, progress: ProgressHandler | None = None,
             suffix=".part", delete=False,
         ) as handle:
             partial = Path(handle.name)
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with open_fn(request, timeout=timeout) as response:
                 while True:
                     chunk = response.read(1 << 16)
                     if not chunk:

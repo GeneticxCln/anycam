@@ -16,10 +16,15 @@ and what you saw. There is no bounty; fixes are released as patch versions and c
   - the certificate is self-signed and remade when the LAN address changes; the fingerprint is shown in the
     pairing dialog so you can compare it;
   - concurrent connections are capped.
-- Streaming (RTMP) credentials live in the project file, which is written owner-only (`0600`); error texts
-  and reports mask stream keys and camera passwords.
+- Streaming (RTMP/SRT) and network-camera credentials are stored in the desktop keyring
+  when available (gnome-keyring, KWallet, KeePassXC), falling back to the project file
+  written owner-only (`0600`); UI fields, error texts, scene exports, and reports mask
+  stream keys and camera passwords.
+- `yt-dlp` stream resolution validates both input and resolved URLs against loopback,
+  link-local, metadata, and private IP ranges (including DNS resolution).
 
 ## Privileged actions
 
-Only two, both through `pkexec` and the normal password prompt: loading `v4l2loopback` (virtual camera setup)
-and, if you click **Allow phones**, one ufw or firewalld rule for TCP 8443.
+Only explicit user-triggered actions through `pkexec` and the normal password prompt:
+loading `v4l2loopback` (virtual camera setup), opening TCP 8443 in ufw/firewalld/nftables
+when you click **Allow phones**, and an explicit USB camera reset if requested.

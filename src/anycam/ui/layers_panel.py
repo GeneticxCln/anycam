@@ -217,7 +217,8 @@ class LayersMixin:
                    ("Network URL", "network"),
                    ("Ticker", "ticker"), ("Lower third", "lower_third"),
                    ("Clock", "clock"), ("Timer", "timer"),
-                   ("Animated GIF", "gif"))
+                   ("Animated GIF", "gif"), ("Web page", "web"),
+                   ("Window / Game", "game"), ("NDI stream", "ndi"))
         for index, (label, kind) in enumerate(sources):
             button = QPushButton(f"+ {label}")
             button.clicked.connect(lambda _=False, k=kind: self.add_layer(k))
@@ -439,6 +440,70 @@ class LayersMixin:
                     return existing
             layer = Layer(new_id("layer"), "phone", name, source=source,
                           box=box or (0.0, 0.0, 1.0, 1.0), z=0)
+        elif kind == "game":
+            from .. import game_capture
+
+            if not source:
+                nodes = game_capture.list_pipewire_game_nodes()
+                choices = [f"{n['name']} (PipeWire #{n['node_id']})" for n in nodes]
+                choices.append("Choose window via desktop portal…")
+                picked, ok = QInputDialog.getItem(
+                    self, "Window / Game capture",
+                    "Select a game capture stream (obs-vkcapture / PipeWire) or portal window:",
+                    choices, 0, False,
+                )
+                if not ok or not picked:
+                    return None
+                if picked == choices[-1]:
+                    # Portal window-only picker (types=2)
+                    return self.add_layer("screen", box=box)
+                node = nodes[choices.index(picked)]
+                source = f"pw:{node['node_id']}"
+                name = node["name"]
+            else:
+                name = "Game capture"
+            layer = Layer(new_id("layer"), "game", name, source=source,
+                          box=box or (0.0, 0.0, 1.0, 1.0), z=0)
+        elif kind == "ndi":
+            from .. import ndi
+
+            if not ndi.src_available():
+                self._status("NDI requires gst-plugin-ndi (ndisrc) and the NDI runtime")
+                return None
+            if not source:
+                found = ndi.discover_sources(timeout_s=1.0)
+                if found:
+                    picked, ok = QInputDialog.getItem(
+                        self, "NDI stream", "Discovered NDI sources:", found, 0, True)
+                else:
+                    picked, ok = QInputDialog.getText(
+                        self, "NDI stream", "NDI source name (e.g. STUDIO (Camera 1)):")
+                if not ok or not picked.strip():
+                    return None
+                source = picked.strip()
+            layer = Layer(new_id("layer"), "ndi", source, source=source,
+                          box=box or (0.0, 0.0, 1.0, 1.0), z=0)
+        elif kind == "web":
+            from .. import web_source
+
+            if not source:
+                if not web_source.available():
+                    self._status(
+                        "Web page sources need QtWebEngine (install PySide6-Addons)")
+                    return None
+                source, ok = QInputDialog.getText(
+                    self, "Web page source",
+                    "HTTP/HTTPS URL (HTML overlay, alert widget, local dashboard):")
+                if not ok or not source.strip():
+                    return None
+            url = source.strip()
+            problem = web_source.validate_web_url(url)
+            if problem:
+                self._status(problem)
+                return None
+            host = urlparse(url).hostname or "Web page"
+            layer = Layer(new_id("layer"), "web", host, source=url,
+                          box=box or (0.0, 0.0, 1.0, 1.0), z=0)
         elif kind == "network":
             if not source:
                 source, ok = QInputDialog.getText(
@@ -451,7 +516,7 @@ class LayersMixin:
             if content.needs_resolving(uri):
                 # A video-site page is not a stream: ask yt-dlp for the real address.
                 self._status("Looking up the stream\u2026")
-                res = self._run_with_ui(lambda: content.resolve_stream(uri))
+                res = self._run_with_ui(lambda: content.resolve_stream(uri), timeout=50.0)
                 if res is None:
                     self._status("Stream lookup timed out")
                     return None
@@ -804,7 +869,7 @@ class LayersMixin:
 
     def _layer_volume_changed(self, _value=None) -> None:
         layer = self.preview.selected_layer()
-        if layer is None or layer.kind != "video":
+        if layer is None or layer.kind not in ("video", "phone"):
             return
         layer.volume = self.layer_volume_slider.value() / 100.0
         layer.muted = self.layer_mute_check.isChecked()
@@ -814,12 +879,12 @@ class LayersMixin:
             self.engine.set_layer_volume(layer.id, layer.volume, layer.muted)
 
     def _sync_layer_volume(self, layer: Layer | None) -> None:
-        is_video = layer is not None and layer.kind == "video"
+        has_audio = layer is not None and layer.kind in ("video", "phone")
         for widget in (self.layer_volume_slider, self.layer_mute_check):
             widget.blockSignals(True)
-            widget.setEnabled(is_video)
-        self.layer_volume_slider.setValue(int(round((layer.volume if is_video else 1.0) * 100)))
-        self.layer_mute_check.setChecked(bool(layer.muted) if is_video else False)
+            widget.setEnabled(has_audio)
+        self.layer_volume_slider.setValue(int(round((layer.volume if has_audio else 1.0) * 100)))
+        self.layer_mute_check.setChecked(bool(layer.muted) if has_audio else False)
         self.layer_volume_label.setText(f"{self.layer_volume_slider.value()}%")
         for widget in (self.layer_volume_slider, self.layer_mute_check):
             widget.blockSignals(False)

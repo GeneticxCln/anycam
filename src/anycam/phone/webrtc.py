@@ -21,7 +21,7 @@ gi.require_version("GstSdp", "1.0")
 gi.require_version("GstWebRTC", "1.0")
 from gi.repository import Gst, GstSdp, GstWebRTC  # noqa: E402
 
-from . import PHONE_SIZE, phone_channel  # noqa: E402
+from . import PHONE_SIZE, phone_audio_channel, phone_channel  # noqa: E402
 
 Gst.init(None)
 
@@ -52,6 +52,7 @@ class PhoneReceiver:
                  on_closed: Callable[[], None] | None = None) -> None:
         self.device = device_id
         self.channel = phone_channel(device_id)
+        self.audio_channel = phone_audio_channel(device_id)
         self.on_event = on_event
         self.on_closed = on_closed
         self.pipeline: Gst.Pipeline | None = None
@@ -61,6 +62,7 @@ class PhoneReceiver:
         self.error = ""
         self.closed = False
         self._video_linked = False
+        self._audio_linked = False
         self._gathered = threading.Event()
         self._lock = threading.Lock()
         self._handlers: list[tuple[Gst.Object, int]] = []
@@ -269,8 +271,14 @@ class PhoneReceiver:
                 return
             pipeline = self.pipeline
             route_video = name.startswith("video/") and not self._video_linked
+            route_audio = name.startswith("audio/") and not self._audio_linked
             if route_video:
                 self._video_linked = True
+            elif route_audio:
+                self._audio_linked = True
+        if route_audio:
+            self._link_audio_pad(pipeline, pad)
+            return
         if not route_video:
             self._link_fakesink(pipeline, pad)
             return
@@ -333,6 +341,45 @@ class PhoneReceiver:
             self.error = "could not link decoded phone video"
             print(f"[phone] {self.device}: {self.error}", file=sys.stderr, flush=True)
             self._emit("failed", self.error)
+            self._link_fakesink(pipeline, pad)
+
+    def _link_audio_pad(self, pipeline: Gst.Pipeline, pad: Gst.Pad) -> None:
+        """Route incoming phone microphone audio onto ``self.audio_channel``."""
+        factories = ("queue", "audioconvert", "audioresample", "capsfilter", "interaudiosink")
+        elements = [Gst.ElementFactory.make(factory) for factory in factories]
+        if any(element is None for element in elements):
+            with self._lock:
+                self._audio_linked = False
+            self._link_fakesink(pipeline, pad)
+            return
+        queue, _conv, _res, caps_filter, sink = elements
+        queue.set_property("leaky", 2)
+        queue.set_property("max-size-buffers", 4)
+        queue.set_property("max-size-bytes", 0)
+        queue.set_property("max-size-time", 0)
+        caps_filter.set_property("caps", Gst.Caps.from_string(
+            "audio/x-raw,format=F32LE,rate=48000,channels=2"))
+        sink.set_property("channel", self.audio_channel)
+        sink.set_property("sync", False)
+        for element in elements:
+            pipeline.add(element)
+        linked = True
+        for upstream, downstream in zip(elements, elements[1:]):
+            if not upstream.link(downstream):
+                linked = False
+                break
+        if linked:
+            for element in elements:
+                element.sync_state_with_parent()
+            queue_sink = queue.get_static_pad("sink")
+            if queue_sink is None or pad.link(queue_sink) != Gst.PadLinkReturn.OK:
+                linked = False
+        if not linked:
+            for element in elements:
+                element.set_state(Gst.State.NULL)
+                pipeline.remove(element)
+            with self._lock:
+                self._audio_linked = False
             self._link_fakesink(pipeline, pad)
 
     def _on_frame(self, _pad, _info):

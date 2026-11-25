@@ -44,12 +44,15 @@ def model_path() -> Path:
 
 
 def chosen_model() -> str:
-    return _chosen
+    with _lock:
+        return _chosen
 
 
 def active_model() -> str:
     """The model in use: RVM only once it has been downloaded."""
-    if _chosen == "rvm":
+    with _lock:
+        chosen = _chosen
+    if chosen == "rvm":
         from . import models
 
         if models.model_path("rvm") is not None:
@@ -59,23 +62,19 @@ def active_model() -> str:
 
 def generation() -> int:
     """Changes whenever the model or the device changes (rebuild segmenters)."""
-    return _generation
+    with _lock:
+        return _generation
 
 
 def set_model(name: str) -> bool:
     """Choose ``mediapipe`` or ``rvm``; True when it changed."""
     global _chosen
     name = name if name in MODELS else "mediapipe"
-    if name == _chosen:
-        return False
-    _chosen = name
+    with _lock:
+        if name == _chosen:
+            return False
+        _chosen = name
     reset()
-    try:
-        from . import effect_worker
-
-        effect_worker.notify_runtime_settings(model=_chosen)
-    except Exception:  # noqa: BLE001
-        pass
     return True
 
 
@@ -85,6 +84,13 @@ def reset() -> None:
     with _lock:
         _state.clear()
         _generation += 1
+        chosen = _chosen
+    try:
+        from . import effect_worker
+
+        effect_worker.notify_runtime_settings(model=chosen)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 inference.on_change(reset)

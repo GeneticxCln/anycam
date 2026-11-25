@@ -8,8 +8,8 @@ import threading
 import numpy as np
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QGridLayout, QGroupBox,
-                               QHBoxLayout, QHeaderView, QKeySequenceEdit, QLabel, QPushButton,
-                               QSlider, QTableWidget, QVBoxLayout, QWidget)
+                               QHBoxLayout, QHeaderView, QKeySequenceEdit, QLabel, QListWidget,
+                               QPushButton, QSlider, QTableWidget, QVBoxLayout, QWidget)
 from PySide6.QtCore import Qt, QTimer
 
 from .. import a11y, hotkeys, i18n
@@ -21,9 +21,17 @@ class GeneralPanelMixin:
 
     _motion_monitor = None
 
-    def _general_tab(self) -> QWidget:
+    def _general_tab(
+        self,
+        *,
+        include_motion: bool = True,
+        include_shortcuts: bool = True,
+        include_project_save: bool = False,
+    ) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 14, 16, 16)
+        layout.setSpacing(12)
 
         language_box = QGroupBox("Language")
         language_layout = QHBoxLayout(language_box)
@@ -35,25 +43,34 @@ class GeneralPanelMixin:
         self.language_combo.currentIndexChanged.connect(
             lambda _i: self.set_language(str(self.language_combo.currentData())))
         language_layout.addWidget(self.language_combo, 1)
-        layout.addWidget(language_box)
-
         check_button = QPushButton("Check this computer\u2026")
         check_button.setToolTip("Is the camera, virtual camera, sound and screen capture ready?")
         check_button.clicked.connect(lambda: self.show_first_run_check(force=True))
         language_layout.addWidget(check_button)
+        layout.addWidget(language_box)
 
         files = QGroupBox("Project")
-        files_layout = QHBoxLayout(files)
-        for label, handler in (("Open…", lambda: self.open_project()),
-                               ("Save as…", lambda: self.save_project_as()),
-                               ("Import scene…", lambda: self.import_scene()),
-                               ("Export scene…", lambda: self.export_scene())):
+        files_grid = QGridLayout(files)
+        project_actions = []
+        if include_project_save:
+            project_actions.extend([
+                ("Save project", lambda: self.save_project()),
+                ("Reload saved project", lambda: self.reload_project()),
+            ])
+        project_actions.extend([
+            ("Open…", lambda: self.open_project()),
+            ("Save as…", lambda: self.save_project_as()),
+            ("Import scene…", lambda: self.import_scene()),
+            ("Export scene…", lambda: self.export_scene()),
+        ])
+        for idx, (label, handler) in enumerate(project_actions):
             button = QPushButton(label)
             button.clicked.connect(lambda _checked=False, h=handler: h())
-            files_layout.addWidget(button)
+            files_grid.addWidget(button, idx // 2, idx % 2)
         layout.addWidget(files)
 
-        layout.addWidget(self._motion_group())
+        if include_motion:
+            layout.addWidget(self._motion_group())
 
         remote_box = QGroupBox("Phone remote")
         remote_layout = QVBoxLayout(remote_box)
@@ -69,6 +86,25 @@ class GeneralPanelMixin:
         remote_layout.addWidget(remote_note)
         layout.addWidget(remote_box)
 
+        phones_box = QGroupBox("Paired phones")
+        phones_layout = QVBoxLayout(phones_box)
+        self.paired_phones_list = QListWidget()
+        self.paired_phones_list.setMaximumHeight(96)
+        self.paired_phones_list.setAccessibleName("Paired phones")
+        phones_layout.addWidget(self.paired_phones_list)
+        phone_actions = QHBoxLayout()
+        self.forget_phone_button = QPushButton("Remove phone")
+        self.forget_phone_button.setObjectName("danger")
+        self.forget_phone_button.clicked.connect(self._forget_selected_phone)
+        self.forget_all_phones_button = QPushButton("Remove all")
+        self.forget_all_phones_button.clicked.connect(self._forget_all_phones)
+        phone_actions.addWidget(self.forget_phone_button)
+        phone_actions.addWidget(self.forget_all_phones_button)
+        phone_actions.addStretch(1)
+        phones_layout.addLayout(phone_actions)
+        layout.addWidget(phones_box)
+        self._refresh_paired_phones()
+
         panel_box = QGroupBox("Floating panel")
         panel_layout = QVBoxLayout(panel_box)
         self.panel_check = QCheckBox("Show a small always-on-top panel (round preview, record, mute, scenes)")
@@ -81,6 +117,48 @@ class GeneralPanelMixin:
         panel_layout.addWidget(panel_note)
         layout.addWidget(panel_box)
 
+        if include_shortcuts:
+            layout.addWidget(self._shortcuts_editor_group(), 1)
+        else:
+            layout.addStretch(1)
+        return page
+
+    def _refresh_paired_phones(self) -> None:
+        widget = getattr(self, "paired_phones_list", None)
+        if widget is None:
+            return
+        from PySide6.QtWidgets import QListWidgetItem
+
+        widget.clear()
+        devices = self.paired_phones() if hasattr(self, "paired_phones") else {}
+        for device_id, name in devices.items():
+            item = QListWidgetItem(f"{name}  ({device_id})")
+            item.setData(Qt.ItemDataRole.UserRole, device_id)
+            widget.addItem(item)
+        has_any = bool(devices)
+        if hasattr(self, "forget_phone_button"):
+            self.forget_phone_button.setEnabled(has_any)
+        if hasattr(self, "forget_all_phones_button"):
+            self.forget_all_phones_button.setEnabled(has_any)
+        if has_any and widget.currentRow() < 0:
+            widget.setCurrentRow(0)
+
+    def _forget_selected_phone(self) -> None:
+        widget = getattr(self, "paired_phones_list", None)
+        if widget is None:
+            return
+        item = widget.currentItem()
+        if item is None:
+            return
+        device_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        if device_id and hasattr(self, "forget_phone"):
+            self.forget_phone(device_id)
+
+    def _forget_all_phones(self) -> None:
+        if hasattr(self, "forget_all_phones"):
+            self.forget_all_phones()
+
+    def _shortcuts_editor_group(self) -> QGroupBox:
         keys_box = QGroupBox("Keyboard shortcuts")
         keys_layout = QVBoxLayout(keys_box)
         self.hotkey_table = QTableWidget(len(hotkeys.ACTIONS), 2)
@@ -89,6 +167,7 @@ class GeneralPanelMixin:
         self.hotkey_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.Stretch)
         self.hotkey_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.hotkey_table.setMinimumHeight(240)
         self._hotkey_edits: dict[str, QKeySequenceEdit] = {}
         current = hotkeys.current()
         for row, (action, label, _default) in enumerate(hotkeys.ACTIONS):
@@ -108,7 +187,18 @@ class GeneralPanelMixin:
         reset = QPushButton("Reset shortcuts to defaults")
         reset.clicked.connect(self.reset_hotkeys)
         keys_layout.addWidget(reset)
-        layout.addWidget(keys_box, 1)
+        return keys_box
+
+    def _shortcuts_tab(self) -> QWidget:
+        """Dedicated Shortcuts tab: customisable hotkeys plus quick reference."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 14, 16, 16)
+        layout.setSpacing(12)
+        layout.addWidget(self._shortcuts_editor_group())
+        if hasattr(self, "_shortcuts_reference_group"):
+            layout.addWidget(self._shortcuts_reference_group())
+        layout.addStretch(1)
         return page
 
     # ------------------------------------------------------------- shortcuts
@@ -150,6 +240,9 @@ class GeneralPanelMixin:
         for target in targets:
             changed += i18n.apply(target, catalog)
             a11y.apply(target)
+        tabs = getattr(self, "settings_tabs", None)
+        if tabs is not None and hasattr(tabs, "sync_header"):
+            tabs.sync_header()
         return changed
 
 

@@ -187,7 +187,8 @@ class PreviewWidget(QWidget):
         points into alive for as long as the image is shown."""
         self.image = image
         self._image_owner = owner
-        self.update()
+        if not self.gpu_live:
+            self.update()
 
     def display_size(self) -> tuple[int, int]:
         """Device pixels the canvas occupies inside the widget (letterboxed)."""
@@ -249,7 +250,7 @@ class PreviewWidget(QWidget):
         x, y = self.point_norm(pos)
         x, y = max(0.0, min(1.0, x)), max(0.0, min(1.0, y))
         points = self._stroke["points"]
-        if self._stroke["tool"] in ("arrow", "box"):
+        if self._stroke["tool"] in ("arrow", "box", "blur"):
             points[:] = [points[0], [x, y]]        # a shape: start and current end
         elif abs(x - points[-1][0]) + abs(y - points[-1][1]) > 0.0015:
             points.append([x, y])
@@ -260,7 +261,7 @@ class PreviewWidget(QWidget):
         self.update()
         if stroke is None:
             return
-        if stroke["tool"] in ("arrow", "box") and len(stroke["points"]) < 2:
+        if stroke["tool"] in ("arrow", "box", "blur") and len(stroke["points"]) < 2:
             return                                  # a click, not a shape
         self.stroke_finished.emit(stroke)
 
@@ -282,6 +283,12 @@ class PreviewWidget(QWidget):
         pen = QPen(colour, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
                    Qt.PenJoinStyle.RoundJoin)
         painter.setPen(pen)
+        if tool == "blur" and len(points) >= 2:
+            rect = QRectF(points[0], points[-1]).normalized()
+            painter.setPen(QPen(QColor("#5eead4"), 2.0, Qt.PenStyle.DashLine))
+            painter.setBrush(QColor(94, 234, 212, 48))
+            painter.drawRect(rect)
+            return
         if tool == "box" and len(points) >= 2:
             painter.drawRect(QRectF(points[0], points[-1]).normalized())
         elif len(points) == 1:

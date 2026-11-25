@@ -54,9 +54,9 @@ Priority: optional
 Architecture: all
 Maintainer: AnyCam contributors <anycam@users.noreply.github.com>
 Installed-Size: $size
-Depends: python3 (>= 3.11), python3-numpy, python3-pil, python3-psutil, python3-gi, python3-gi-cairo, gir1.2-gstreamer-1.0, gir1.2-gst-plugins-base-1.0, gir1.2-gdkpixbuf-2.0, gir1.2-gst-plugins-bad-1.0, gstreamer1.0-plugins-base, gstreamer1.0-x, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-nice, gstreamer1.0-libav, ffmpeg, v4l-utils, python3-pyside6.qtwidgets | python3-pyside6
-Recommends: gstreamer1.0-plugins-ugly, gstreamer1.0-pipewire, v4l2loopback-dkms
-Suggests: python3-onnxruntime, python3-cryptography, python3-segno, poppler-utils, yt-dlp
+Depends: python3 (>= 3.11), python3-numpy, python3-pil, python3-psutil, python3-gi, python3-gi-cairo, gir1.2-gstreamer-1.0, gir1.2-gst-plugins-base-1.0, gir1.2-gdkpixbuf-2.0, gir1.2-gst-plugins-bad-1.0, gstreamer1.0-plugins-base, gstreamer1.0-x, gstreamer1.0-plugins-good, gstreamer1.0-plugins-bad, gstreamer1.0-nice, gstreamer1.0-libav, ffmpeg, v4l-utils, python3-pyside6.qtwidgets | python3-pyside6, python3-pyside6.qtnetwork | python3-pyside6
+Recommends: gstreamer1.0-plugins-ugly, gstreamer1.0-pipewire, gstreamer1.0-qt6, gir1.2-secret-1, v4l2loopback-dkms
+Suggests: python3-onnxruntime, python3-cryptography, python3-segno, qrencode, openssl, poppler-utils, yt-dlp, libreoffice-impress
 Homepage: https://github.com/GeneticxCln/anycam
 Description: Linux-native virtual camera studio
  AnyCam mixes cameras, screens, images and overlays into scenes and publishes

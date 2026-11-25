@@ -247,7 +247,29 @@ class ManyCamWindow(AnyCamWindow):
         self.stage_add_buttons: list[QPushButton] = []
         self._stage_slots: list[tuple[QPushButton, tuple]] = []
         self._stage_canvas: tuple | None = None
-        preview_layout.addWidget(self.preview, 1)
+
+        # Studio Mode live second monitor (Preview / staged next scene), created
+        # lazily only while Studio mode is checked so normal mode keeps a single
+        # PreviewWidget and full monitor width.
+        self.studio_preview_panel = QFrame()
+        self.studio_preview_panel.setObjectName("panel")
+        self._studio_preview_layout = QVBoxLayout(self.studio_preview_panel)
+        self._studio_preview_layout.setContentsMargins(4, 4, 4, 4)
+        self._studio_preview_layout.setSpacing(4)
+        self.studio_preview_label = QLabel("Preview (next)")
+        self.studio_preview_label.setObjectName("muted")
+        self._studio_preview_layout.addWidget(self.studio_preview_label)
+        self.studio_preview: PreviewWidget | None = None
+        self.studio_preview_panel.hide()
+        self._studio_engine = None
+        self._studio_pending_frame = None
+
+        monitors_row = QHBoxLayout()
+        monitors_row.setContentsMargins(0, 0, 0, 0)
+        monitors_row.setSpacing(6)
+        monitors_row.addWidget(self.studio_preview_panel, 1)
+        monitors_row.addWidget(self.preview, 1)
+        preview_layout.addLayout(monitors_row, 1)
         self.draw_bar = self._build_draw_bar()
         preview_layout.addWidget(self.draw_bar)
 
@@ -337,46 +359,105 @@ class ManyCamWindow(AnyCamWindow):
 
     # --------------------------------------------------------------- settings
     def _build_settings(self) -> QDialog:
+        from .ui.settings_view import SideTabWidget
+
         dialog = QDialog(self)
         dialog.setWindowTitle("AnyCam settings")
-        dialog.resize(520, 680)
-        tabs = QTabWidget(dialog)
+        dialog.resize(820, 620)
+        tabs = SideTabWidget(dialog)
 
         def scrolled(page: QWidget) -> QScrollArea:
             # Each page scrolls instead of forcing the dialog taller than a
-            # small screen (the Output page alone wants ~1170 px).
+            # small screen.
             area = QScrollArea()
             area.setWidgetResizable(True)
             area.setFrameShape(QFrame.Shape.NoFrame)
             area.setWidget(page)
             return area
 
-        tabs.addTab(scrolled(self._layers_tab()), "Sources")
-        tabs.addTab(scrolled(self._audio_tab()), "Audio")
-        tabs.addTab(scrolled(self._playlist_tab()), "Media")
-        tabs.addTab(scrolled(self._output_tab()), "Output")
-        tabs.addTab(scrolled(self._stream_tab()), "Stream")
-        tabs.addTab(scrolled(self._diagnostics_tab()), "Diagnostics")
-        tabs.addTab(scrolled(self._general_tab()), "General")
-        tabs.addTab(scrolled(self._about_tab()), "About")
+        tabs.addTab(
+            scrolled(self._layers_tab()), "Sources",
+            section="Studio",
+            subtitle="Layers, framing, opacity, video volume and layer order.",
+        )
+        tabs.addTab(
+            scrolled(self._audio_tab()), "Audio",
+            section="Studio",
+            subtitle="Microphone, voice processing, mixer meters, sync and outputs.",
+        )
+        tabs.addTab(
+            scrolled(self._playlist_tab()), "Media",
+            section="Studio",
+            subtitle="Playlists, PDF slides, desktop audio and background music.",
+        )
+        tabs.addTab(
+            scrolled(self._output_tab(
+                include_ai=False, include_shortcuts=False, include_project_actions=False)),
+            "Output",
+            section="Studio",
+            subtitle="Canvas format, virtual camera, video encoder, recording and screen capture.",
+        )
+        tabs.addTab(
+            scrolled(self._stream_tab()), "Stream",
+            section="Studio",
+            subtitle="RTMP, RTMPS and SRT destinations, bitrate and live status.",
+        )
+        tabs.addTab(
+            scrolled(self._ai_tab()), "AI",
+            section="Intelligence",
+            subtitle="Compute device, person cut-out models, worker isolation, packs and motion.",
+        )
+        tabs.addTab(
+            scrolled(self._personality_tab()), "Personality",
+            section="Appearance",
+            subtitle="Pick a design bubble — each bubble gives AnyCam its own visual personality.",
+        )
+        tabs.addTab(
+            scrolled(self._shortcuts_tab()), "Shortcuts",
+            section="System",
+            subtitle="Customise keyboard shortcuts and review global portal hotkeys.",
+        )
+        tabs.addTab(
+            scrolled(self._general_tab(
+                include_motion=False, include_shortcuts=False, include_project_save=True)),
+            "General",
+            section="System",
+            subtitle="Language, system check, project files, phone remote and floating panel.",
+        )
+        self._diag_tab_index = tabs.addTab(
+            scrolled(self._diagnostics_tab()), "Diagnostics",
+            section="System",
+            subtitle="Live pipeline status, virtual camera checks and session log.",
+        )
+        tabs.addTab(
+            scrolled(self._about_tab()), "About",
+            section="System",
+            subtitle="Version, licence, runtime environment and credits.",
+        )
+        tabs.currentChanged.connect(self._maybe_refresh_diagnostics)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(tabs)
         self.settings_tabs = tabs
+        self.apply_personality(getattr(self, "_personality", None))
+        dialog.setStyleSheet(self.styleSheet())
         self.apply_interface_polish(dialog)
         return dialog
 
     def _about_tab(self) -> QWidget:
         """Version, licence, runtime versions and credits."""
         from . import about
+        from .ui import theme
 
+        active = getattr(self, "_personality", None) or theme.current_personality()
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(8)
         title = QLabel(about.headline())
         title.setObjectName("aboutTitle")
-        title.setStyleSheet("font-size: 30px; font-weight: 700; color: #5eead0;")
+        title.setStyleSheet(f"font-size: 30px; font-weight: 700; color: {active.accent};")
+        self._about_title = title
         layout.addWidget(title)
         release = QLabel(about.release_line())
         release.setObjectName("aboutRelease")
@@ -393,9 +474,10 @@ class ManyCamWindow(AnyCamWindow):
                       f"{about.LICENSE_NAME} licence")
         link.setOpenExternalLinks(True)
         palette = link.palette()
-        palette.setColor(palette.ColorRole.Link, QColor("#5eead0"))   # readable on the dark theme
+        palette.setColor(palette.ColorRole.Link, QColor(active.accent))
         link.setPalette(palette)
         link.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self._about_link = link
         layout.addWidget(link)
 
         runtime = QGroupBox("This installation")
@@ -451,6 +533,13 @@ class ManyCamWindow(AnyCamWindow):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+        if hasattr(self, "_refresh_paired_phones"):
+            self._refresh_paired_phones()
+        self._maybe_refresh_diagnostics(self.settings_tabs.currentIndex())
+
+    def _maybe_refresh_diagnostics(self, index: int) -> None:
+        if self.settings_tabs.tabText(index) != "Diagnostics" and index != getattr(self, "_diag_tab_index", -1):
+            return
         self._refresh_diag_state()
         if not self._diag_result and (
                 self._diag_thread is None or not self._diag_thread.is_alive()):
@@ -528,7 +617,9 @@ class ManyCamWindow(AnyCamWindow):
     def _copy_log(self) -> None:
         from . import applog
 
-        QApplication.clipboard().setText(applog.tail(400))
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(applog.tail(400))
         self._status("The last 400 log lines are on the clipboard.")
 
     def _build_diagnostics_log(self, layout) -> None:

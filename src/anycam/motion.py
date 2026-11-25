@@ -94,3 +94,6 @@ class MotionMonitor:
     def reset(self) -> None:
         self._previous = None
         self._since = None
+        self._quiet_until = 0.0
+        self.level = 0.0
+        self.region = None

@@ -200,27 +200,28 @@ class EffectsPanelMixin:
         colour_row.addWidget(self.chroma_color, 1)
         colour_row.addWidget(pick)
         chroma_layout.addLayout(colour_row, 1, 1)
-        for key, label, value in (
+        for row_idx, (key, label, value) in enumerate((
             ("chroma_similarity", "Tolerance", int(round(fx.chroma_similarity * 100))),
             ("chroma_smoothness", "Edge softness", int(round(fx.chroma_smoothness * 100))),
-        ):
+            ("chroma_spill", "Spill suppression", int(round(fx.chroma_spill * 100))),
+        ), start=2):
             holder, slider, _label = _slider_row(
                 label, 0, 100, value,
                 lambda v, a=key: self._set_effect(a, v / 100.0))
             self._effect_sliders[key] = slider
-            chroma_layout.addWidget(holder, 2 if key == "chroma_similarity" else 3,
-                                    0, 1, 2)
+            chroma_layout.addWidget(holder, row_idx, 0, 1, 2)
         chroma_note = QLabel(
             "Pick the backdrop colour. Tolerance widens the key; edge softness "
-            "blends the boundary instead of leaving a hard cutout.")
+            "blends the boundary; spill suppression removes colour bounce on edges.")
         chroma_note.setObjectName("muted")
         chroma_note.setWordWrap(True)
-        chroma_layout.addWidget(chroma_note, 4, 0, 1, 2)
+        chroma_layout.addWidget(chroma_note, 5, 0, 1, 2)
         layout.addWidget(chroma)
         self._effect_controls.append(chroma)
         self._chroma_controls.extend((self.chroma_color, pick,
                                       self._effect_sliders["chroma_similarity"],
-                                      self._effect_sliders["chroma_smoothness"]))
+                                      self._effect_sliders["chroma_smoothness"],
+                                      self._effect_sliders["chroma_spill"]))
         self._update_frame_controls()
 
         layout.addStretch(1)
@@ -258,9 +259,11 @@ class EffectsPanelMixin:
         self.filter_slot = QComboBox()
         self.filter_slot.addItem("Filter 1", 1)
         self.filter_slot.addItem("Filter 2", 2)
+        self.filter_slot.addItem("Filter 3", 3)
+        self.filter_slot.addItem("Filter 4", 4)
         self.filter_slot.setToolTip(
-            "A layer has two filter slots, so two filters can be on at once "
-            "(for example a portrait effect and a distortion).")
+            "A layer has four filter slots, so up to four filters can be on "
+            "at once (for example background blur, touch-up, and a distortion).")
         self.filter_slot.currentIndexChanged.connect(self._filter_slot_changed)
         row.addWidget(self.filter_slot)
         self.thumb_refresh = QPushButton("Use picture")
@@ -290,14 +293,6 @@ class EffectsPanelMixin:
 
         self.effect_grid = QListWidget()
         self.effect_grid.setObjectName("effectGrid")
-        # The app-wide item padding breaks icon-mode sizing (tiles were clipped
-        # to a strip), so the grid carries its own rules.
-        self.effect_grid.setStyleSheet(
-            "QListWidget#effectGrid::item { padding: 0px; margin: 1px; "
-            "border: 2px solid transparent; border-radius: 7px; color: #9fb0bb; }"
-            "QListWidget#effectGrid::item:selected { border: 2px solid #5eead0; "
-            "background: #12302d; color: #5eead0; }"
-            "QListWidget#effectGrid::item:hover { background: #16222a; }")
         self.effect_grid.setViewMode(QListWidget.ViewMode.IconMode)
         self.effect_grid.setIconSize(QSize(112, 63))
         self.effect_grid.setGridSize(QSize(126, 96))
@@ -463,9 +458,10 @@ class EffectsPanelMixin:
         check.blockSignals(False)
 
     def _slot_attr(self) -> str:
-        """The Effects field of the chosen filter slot: ``filter`` or ``filter2``."""
+        """The Effects field of the chosen filter slot: ``filter``..``filter4``."""
         combo = getattr(self, "filter_slot", None)
-        return "filter2" if combo is not None and combo.currentData() == 2 else "filter"
+        slot = combo.currentData() if combo is not None else 1
+        return {1: "filter", 2: "filter2", 3: "filter3", 4: "filter4"}.get(slot, "filter")
 
     def _filter_slot_changed(self, *_args) -> None:
         self._sync_effects_controls()
@@ -761,7 +757,7 @@ class EffectsPanelMixin:
             setattr(fx, attr, max(0.0, min(2.0, float(value) / 100.0)))
         elif attr == "hue":
             fx.hue = max(-1.0, min(1.0, float(value) / 180.0))
-        elif attr in ("chroma_similarity", "chroma_smoothness"):
+        elif attr in ("chroma_similarity", "chroma_smoothness", "chroma_spill"):
             setattr(fx, attr, max(0.0, min(1.0, float(value))))
         elif attr == "chroma_key":
             fx.chroma_key = str(value).strip() or "#00ff00"
@@ -785,7 +781,7 @@ class EffectsPanelMixin:
             fx.frame_color = str(value).strip() or "#5eead0"
         elif attr == "frame_matte":
             fx.frame_matte = str(value).strip() or "#0b0d10"
-        elif attr in ("filter_amount", "filter2_amount"):
+        elif attr in ("filter_amount", "filter2_amount", "filter3_amount", "filter4_amount"):
             setattr(fx, attr, max(0.0, min(1.0, float(value))))
         elif attr == "frame_width":
             fx.frame_width = max(1, min(48, int(value)))
@@ -932,6 +928,9 @@ class EffectsPanelMixin:
                 int(round(fx.chroma_similarity * 100)))
             self._effect_sliders["chroma_smoothness"].setValue(
                 int(round(fx.chroma_smoothness * 100)))
+            if "chroma_spill" in self._effect_sliders:
+                self._effect_sliders["chroma_spill"].setValue(
+                    int(round(fx.chroma_spill * 100)))
             self.chroma_enabled.setChecked(bool(fx.chroma_enabled))
             self.chroma_color.setText(fx.chroma_key or "#00ff00")
             self._update_chroma_controls()

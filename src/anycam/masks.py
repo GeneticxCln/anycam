@@ -10,6 +10,7 @@ line, blinking LED eyes) drawn on top of the cached base a dozen times a second.
 from __future__ import annotations
 
 from collections import OrderedDict
+import functools
 import math
 import threading
 from typing import Callable
@@ -123,7 +124,6 @@ def _eye_holes(a: Art, rx=0.30, ry=0.2):
 
 def _paint_face(a: Art, colour: Color, feather=0.08, cy=0.4, rx=1.06, ry=1.55):
     layer = Image.new("RGBA", a.size, colour)
-    a.clip_to(a.face_mask(0, cy, rx, ry, feather))     # nothing yet: make area mask
     shape = a.face_mask(0, cy, rx, ry, feather)
     layer.putalpha(ImageChops.multiply(layer.getchannel("A"), shape))
     a.img.alpha_composite(layer)
@@ -319,7 +319,6 @@ def paint_zombie(a: Art):
 def paint_vampire(a: Art):
     _paint_face(a, _c("#ece3ee", 150), 0.07, 0.4, 1.06, 1.6)
     for sx in (-0.5, 0.5):
-        a.ellipse(sx, 0.0, 0.3, 0.22, fill=(180, 20, 40, 0))
         a.ellipse(sx, 0.0, 0.13, 0.13, fill=_c("#d40f2c"), outline=_c("#6a0010"), width=0.02)
         a.ellipse(sx, 0.0, 0.03, 0.13, fill=_c("#1a0004"))
         a.line([(sx - 0.34, -0.3 - 0.03 * (1 if sx > 0 else -1)), (sx + 0.34, -0.45 + 0.1 * (1 if sx > 0 else -1))],
@@ -698,12 +697,36 @@ def _affine(points_img, scale_px: float):
     return m                                              # shape (3, 2)
 
 
+def _perspective_coeffs(dst_pts: list[tuple[float, float]],
+                        src_pts: list[tuple[float, float]]) -> tuple[float, ...] | None:
+    """Solve Pillow's 8-element PERSPECTIVE transform mapping ``dst -> src``."""
+    matrix = []
+    rhs = []
+    for (xd, yd), (xs, ys) in zip(dst_pts, src_pts, strict=True):
+        matrix.append([xd, yd, 1.0, 0.0, 0.0, 0.0, -xs * xd, -xs * yd])
+        rhs.append(xs)
+        matrix.append([0.0, 0.0, 0.0, xd, yd, 1.0, -ys * xd, -ys * yd])
+        rhs.append(ys)
+    try:
+        sol = np.linalg.solve(np.asarray(matrix, dtype=np.float64),
+                              np.asarray(rhs, dtype=np.float64))
+    except np.linalg.LinAlgError:
+        return None
+    return tuple(float(v) for v in sol)
+
+
 def place(canvas: Image.Image, key: str, t: float, left_eye, right_eye, mouth,
-          opacity: float = 1.0) -> None:
-    """Warp the mask onto one face and composite it onto ``canvas`` (RGBA)."""
+          opacity: float = 1.0, nose=None, mouth_open: float = 0.0) -> None:
+    """Warp the mask onto one face (with 3D perspective when ``nose`` is given) and composite."""
     tpl = template(key, t)
     scale = tpl.width / (X1 - X0)
-    m = _affine([left_eye, right_eye, mouth], scale)
+    # Subtle mouth-open stretch along the lower face when expression is detected.
+    mouth_eff = mouth
+    if mouth_open > 0.05:
+        ex, ey = 0.5 * (left_eye[0] + right_eye[0]), 0.5 * (left_eye[1] + right_eye[1])
+        stretch = 1.0 + 0.14 * min(1.0, float(mouth_open))
+        mouth_eff = (ex + (mouth[0] - ex) * stretch, ey + (mouth[1] - ey) * stretch)
+    m = _affine([left_eye, right_eye, mouth_eff], scale)
     if m is None:
         return
     a_mat = np.array([[m[0, 0], m[1, 0], m[2, 0]], [m[0, 1], m[1, 1], m[2, 1]], [0.0, 0.0, 1.0]])
@@ -714,15 +737,57 @@ def place(canvas: Image.Image, key: str, t: float, left_eye, right_eye, mouth,
     corners = np.array([[0, 0, 1], [tpl.width, 0, 1], [0, tpl.height, 1],
                         [tpl.width, tpl.height, 1]], dtype=float).T
     mapped = inverse @ corners
+
+    # 3D perspective foreshortening when 5-point landmarks provide nose position.
+    use_perspective = False
+    if nose is not None:
+        from . import face as face_mod
+
+        pose = face_mod.estimate_head_pose(
+            (left_eye, right_eye, nose, mouth_eff, mouth_eff))
+        if abs(pose.yaw) > 0.04 or abs(pose.pitch) > 0.04:
+            cx_img = float(mapped[0].mean())
+            cy_img = float(mapped[1].mean())
+            # Project each corner with depth z from yaw (left/right) & pitch (top/bottom).
+            # Corner order: TL, TR, BL, BR.
+            signs_x = (-1.0, 1.0, -1.0, 1.0)
+            signs_y = (-1.0, -1.0, 1.0, 1.0)
+            proj = mapped.copy()
+            for idx in range(4):
+                z = signs_x[idx] * math.sin(pose.yaw) * 0.22 + signs_y[idx] * math.sin(pose.pitch) * 0.16
+                persp = 1.0 / max(0.65, 1.0 - z)
+                proj[0, idx] = cx_img + (mapped[0, idx] - cx_img) * persp
+                proj[1, idx] = cy_img + (mapped[1, idx] - cy_img) * persp
+            mapped = proj
+            use_perspective = True
+
     x0 = max(0, int(math.floor(mapped[0].min())))
     y0 = max(0, int(math.floor(mapped[1].min())))
     x1 = min(canvas.width, int(math.ceil(mapped[0].max())))
     y1 = min(canvas.height, int(math.ceil(mapped[1].max())))
     if x1 - x0 < 4 or y1 - y0 < 4:
         return
-    data = (a_mat[0, 0], a_mat[0, 1], a_mat[0, 0] * x0 + a_mat[0, 1] * y0 + a_mat[0, 2],
-            a_mat[1, 0], a_mat[1, 1], a_mat[1, 0] * x0 + a_mat[1, 1] * y0 + a_mat[1, 2])
-    warped = tpl.transform((x1 - x0, y1 - y0), Image.AFFINE, data, resample=Image.BILINEAR)
+    if use_perspective:
+        dst_quad = [(float(mapped[0, i] - x0), float(mapped[1, i] - y0)) for i in (0, 1, 3, 2)]
+        src_quad = [(0.0, 0.0), (float(tpl.width), 0.0),
+                    (float(tpl.width), float(tpl.height)), (0.0, float(tpl.height))]
+        coeffs = _perspective_coeffs(dst_quad, src_quad)
+        if coeffs is not None:
+            warped = tpl.transform((x1 - x0, y1 - y0), Image.PERSPECTIVE, coeffs,
+                                   resample=Image.BILINEAR)
+        else:
+            use_perspective = False
+    if not use_perspective:
+        data = (a_mat[0, 0], a_mat[0, 1], a_mat[0, 0] * x0 + a_mat[0, 1] * y0 + a_mat[0, 2],
+                a_mat[1, 0], a_mat[1, 1], a_mat[1, 0] * x0 + a_mat[1, 1] * y0 + a_mat[1, 2])
+        warped = tpl.transform((x1 - x0, y1 - y0), Image.AFFINE, data, resample=Image.BILINEAR)
     if opacity < 1.0:
-        warped.putalpha(warped.getchannel("A").point(lambda v: int(v * opacity)))
+        lut = _opacity_lut(round(max(0.0, min(1.0, opacity)) * 255))
+        warped.putalpha(warped.getchannel("A").point(lut))
     canvas.alpha_composite(warped, (x0, y0))
+
+
+@functools.lru_cache(maxsize=64)
+def _opacity_lut(level_255: int) -> list[int]:
+    factor = level_255 / 255.0
+    return [int(v * factor) for v in range(256)]

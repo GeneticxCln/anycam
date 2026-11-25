@@ -9,29 +9,34 @@ no Wine.
 
 ## What it does
 
-- **Scenes and layers.** Cameras, screen shares, images, video, network streams, text,
-  tickers, lower thirds, clocks, timers, GIFs, drawings and PDF slides, each a layer you can
-  drag, resize, crop, rotate, flip, zoom, fit (contain, cover or stretch), lock, reorder and
-  undo. Scenes switch live without rebuilding the picture, with a cut, fade, slide or wipe,
-  and **Studio mode** lets you stage the next scene and take it with Cut or Transition.
-- **Effects.** About 90 filters and effects (colour looks, RGB levels, distortions, retro
-  TV, touch-up, background blur and replace, spotlight, auto-frame, rounded corners), 22 face
+- **Scenes and layers.** Cameras, screen shares, images, video, network streams, web pages
+  (optional QtWebEngine), text, tickers, lower thirds, clocks, timers, GIFs, drawings (with
+  post-compositor region blur), and PDF/PPTX/ODP slides, each a layer you can drag, resize,
+  crop, rotate, flip, zoom, fit (contain, cover or stretch), lock, reorder and undo. Scenes
+  switch live without rebuilding the picture, with a cut, fade, slide or wipe, and **Studio
+  mode** shows a live Preview monitor for the staged next scene alongside Program, with Cut
+  and Transition.
+- **Effects.** About 90 filters and effects (colour looks, RGB levels on GPU and CPU,
+  distortions, retro TV, touch-up, background blur and replace, spotlight, auto-frame,
+  rounded corners, GPU/CPU chroma key with spill suppression, and `.cube` 3D LUTs), 22 face
   masks, 32 themed frames, 42 animations, emoji, virtual backgrounds and 36 stage
-  backgrounds. A thumbnail browser applies them live, two filters stack per layer, and you can
-  star favourites and install third-party [effect packs](docs/EFFECT_PACKS.md).
+  backgrounds. A thumbnail browser applies them live, up to four filters stack per layer, and
+  you can star favourites and install third-party [effect packs](docs/EFFECT_PACKS.md).
 - **AI.** Person cut-out, face tracking and masks run on ONNX Runtime, on the CPU or an
   NVIDIA GPU. MediaPipe segmentation is bundled; Robust Video Matting is a verified,
   one-click download. See [docs/EFFECT_MODELS.md](docs/EFFECT_MODELS.md).
-- **Audio.** A mixer with a meter for every input and the output: microphone with noise
-  suppression, gate, compressor and EQ presets; desktop audio; background music with loop,
-  shuffle and a playlist; the sound of video layers; a sync offset per source; a monitor
-  output; and a virtual microphone that other apps can record.
-- **Outputs.** A V4L2 virtual camera (optionally also a PipeWire camera node), MP4
+- **Audio.** A mixer with a meter for every input and the output: microphone with live-swappable
+  noise suppression, optional echo cancellation, automatic gain, gate, compressor and EQ presets;
+  desktop audio; background music with loop, shuffle and a playlist; the sound of video and phone
+  layers; a sync offset per source; a monitor output; and a virtual microphone that other apps can
+  record.
+- **Outputs.** One or more V4L2 virtual cameras (and/or PipeWire camera nodes), MP4
   recording, and live streaming to several RTMP, RTMPS or SRT destinations at once from one
-  encode, each with its own status and automatic reconnect. Encoder: NVENC, VA-API or x264,
-  chosen by a real test encode.
-- **Phone as a camera and a remote.** Scan a QR code and the phone streams into a scene over
-  WebRTC; a paired phone can also switch scenes, mute and record from `/remote`.
+  encode (attaching/detaching live without rebuilding the canvas), each with its own status
+  and automatic reconnect. Encoder: NVENC, VA-API or x264, chosen by a real test encode.
+- **Phone as a camera and a remote.** Scan a QR code and the phone streams camera (plus optional
+  microphone audio) into a scene over WebRTC; manage/forget paired phones in **Settings →
+  General → Paired phones**; a paired phone can also switch scenes, mute and record from `/remote`.
 - **Desktop.** A tray icon, global shortcuts through the desktop portal, remappable
   keyboard shortcuts, a floating always-on-top panel with a round preview, motion detection
   that can switch scene and notify you, German and English, and accessible names on every
@@ -40,7 +45,7 @@ no Wine.
 ## Quick start
 
 ```bash
-pip install anycam-1.5.1.tar.gz     # from the GitHub release, or from a checkout:
+pip install anycam-1.6.0.tar.gz     # from the GitHub release, or from a checkout:
 ./scripts/setup.sh                  # creates .venv with system site-packages
 ./scripts/anycam-gui                # the studio (or: python -m anycam gui)
 ./scripts/install-desktop.sh        # optional: add it to the app menu
@@ -76,7 +81,7 @@ sources and the offscreen GUI; raw measurements are in [docs/EVIDENCE.md](docs/E
 
 ```bash
 sudo pacman -S --needed python pyside6 python-gobject gst-plugins-{base,good,bad,ugly} \
-  gst-libav gst-plugin-opengl gst-plugin-qml6 ffmpeg v4l-utils pipewire-pulse \
+  gst-libav gst-plugin-qml6 ffmpeg v4l-utils pipewire-pulse \
   xdg-desktop-portal python-numpy python-pillow python-psutil
 ```
 
@@ -89,7 +94,8 @@ when it is in use; `ANYCAM_PREVIEW=image` forces the CPU preview.
 `glvideomixer` when a test frame through upload, mix and download comes back right;
 otherwise, or with **CPU**, the `compositor` element does it. If a GPU canvas fails to
 start, AnyCam switches to the CPU for the rest of the session. `ANYCAM_CANVAS=cpu|gpu`
-overrides the setting. RGB levels run only on the GPU canvas.
+overrides the setting. RGB levels and chroma key spill suppression work on both GPU and CPU
+canvases.
 
 ## Virtual camera
 
@@ -189,62 +195,47 @@ Effect packs are third-party code and always run in a separate worker process.
 
 ## Known limitations
 
-- **Not built:** a web page source (needs QtWebEngine), window capture for games, NDI,
-  whiteboard region blur, several virtual cameras at once, and removing paired phones from
-  the UI (delete `~/.local/state/anycam/phones.json`).
-- **Tested without the hardware:** the virtual microphone and monitor output are checked as
-  graphs and properties, not recorded by another app; RTMP and SRT are tested against local
-  `ffmpeg` receivers, not against real platforms or `rtmps://` TLS; the GPU canvas could not
-  be started in the test environment, so RGB levels and GPU pixel output are untested; the
-  CUDA path is covered with a simulated provider only; VA-API with simulated hardware.
-  [PARITY.md](PARITY.md) lists each claim with its evidence and gap.
-- **Packaging:** the `.deb` is built and inspected by the tests. The PKGBUILD was built with
-  `makepkg` on 2026-11-14 (the package installs the wheel, desktop file and metainfo) and has a CI
-  job that is not yet seen green on GitHub. The Flatpak manifest and AppImage script are in
-  `packaging/unsupported/`: parsed and cross-checked, never built.
-- **Effects:** every effect fits a 1080p60 frame on the reference machine, but they still
-  use CPU on worker threads as well as per frame. AI effects run in-process by default
-  because the worker costs about 21–27 ms per 1080p frame; **Settings → Output → AI effects** can
-  isolate them. Masks are 2D, built from five face landmarks: no depth and no expression
-  tracking. Robust Video Matting is GPL-3.0, so it is a download, not bundled.
-- **Microphone:** noise suppression removes steady noise (fans, hum, hiss), not keyboard
-  clicks or voices, and there is no echo cancelling. Changing it restarts the canvas.
-- **Canvas:** one canvas size and FPS for all layers, two filter slots per layer, and one
-  virtual camera. Most scene and layer changes reposition pads without rebuilding the graph;
-  structural changes rebuild it and start a new recording segment. Studio mode stages a
-  scene by name, not with a second preview.
-- **Virtual camera:** with `exclusive_caps=1`, Chromium apps list AnyCam only while AnyCam is
-  running. An app that was already open when AnyCam started may need its camera list
-  reopened. The setup will not reload the driver while another app's v4l2loopback camera
-  (OBS, for example) exists, or while an app has the camera open.
-- **Phone camera:** video only (no phone audio). The phone shows a certificate warning the
-  first time, and again whenever its browser forgets the exception: the certificate is
-  self-signed because a LAN address cannot get a public one. Same Wi-Fi only, no internet
-  relay. Tested on one Android phone (Pixel 10) in Chrome. With plain nftables or another
-  firewall, allow TCP 8443 yourself.
-- **Devices:** a camera that returns under a different `/dev/video*` name must be
-  re-selected. Screen share asks the portal chooser each launch, and a static share can show
-  `SLOW`.
+- **Optional runtime dependencies:** Web page sources require `PySide6-Addons`
+  (`QtWebEngineWidgets`), PPTX/ODP slides require LibreOffice (`soffice`), NDI input/output
+  requires `gst-plugin-ndi` + the NDI runtime, and Robust Video Matting is a one-click
+  download in **Settings → AI** (GPL-3.0).
+- **Platform / browser behavior:**
+  - With `exclusive_caps=1`, Chromium/Discord list AnyCam only while AnyCam is running (an
+    already-open app may need its camera list reopened), and the one-time driver reload cannot
+    run while another app holds `v4l2loopback` open.
+  - Phone camera works on your local Wi-Fi (no internet relay) and shows a one-time
+    self-signed certificate prompt on the phone.
+  - Wayland compositors control portal screen-share restore tokens and may ignore
+    "always on top" on the floating mini-panel.
+- **Packaging:** `.deb` is built and checked in CI and tests; `PKGBUILD` is tested with
+  `makepkg`; Flatpak and AppImage recipes in `packaging/unsupported/` are validated but not
+  published to Flathub.
+- **Hardware-specific verification:** Real-platform `rtmps://` TLS, Intel/AMD VA-API, and
+  two-phone Android audio/remote tests require those external services/devices (see
+  [PARITY.md](PARITY.md)).
 - NVIDIA Broadcast and the Maxine SDK are not used (Windows-only app; restrictive SDK
-  licence). The AI effects run through onnxruntime instead.
+  licence). AI effects run through ONNX Runtime (with slim downscaled worker IPC when
+  isolation is enabled) and face masks use 3D perspective head-pose + expression tracking.
 
 ## Releases
 
-**v1.5.0** is the current version; **Settings → About** shows the version and what it runs
+**v1.6.0** is the current version; **Settings → About** shows the version and what it runs
 on. Pushing a `vX.Y.Z` tag runs `.github/workflows/release.yml`: it builds the tarball and
 wheel, checks the bundled assets, smoke-tests a clean install, builds the `.deb` and the Arch
-package, and publishes a GitHub Release with all of them and `SHA256SUMS`. To attach packages to
-an existing tag, run the workflow from the Actions tab with that tag. To release, bump `version` in `pyproject.toml` and `VERSION` in
-`src/anycam/config.py`, commit, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
-See [CHANGELOG.md](CHANGELOG.md).
+package, and publishes a GitHub Release with all of them and `SHA256SUMS`. To attach packages
+to an existing tag, run the workflow from the Actions tab with that tag. To release, bump
+`version` in `pyproject.toml`, `VERSION` in `src/anycam/config.py`, `pkgver` in
+`packaging/arch/PKGBUILD`, and add a `<release>` entry to
+`packaging/metainfo/io.github.geneticxcln.AnyCam.metainfo.xml`, commit, then
+`git tag vX.Y.Z && git push origin vX.Y.Z`. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Develop
 
 ```bash
 scripts/setup.sh                    # venv, packages, checks the GStreamer elements
-scripts/test.sh                     # the whole suite (1251 tests), Qt offscreen
+scripts/test.sh                     # the whole suite (1350+ tests), Qt offscreen
 scripts/test.sh --no-hardware       # hides cameras, loopback, audio server and portal, like CI
-ruff check src                      # defect rules only
+ruff check src tests scripts        # defect rules only
 python scripts/bench_canvas.py      # CPU per frame of each layer kind, relative to a baseline
 python scripts/compat-matrix.py     # which browsers see and open the AnyCam camera
 ```

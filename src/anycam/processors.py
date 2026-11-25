@@ -150,7 +150,7 @@ class FaceTrack:
                 self._merge(*done)
         if now - self._last >= self.interval:
             stale = now - self._result_at > self.hold
-            if self._job is None or stale:
+            if self._job is None or (stale and not self._job.busy):
                 self._last = now
                 self._detect(image, now)
             elif not self._job.busy:
@@ -170,6 +170,22 @@ class FaceTrack:
 
     @staticmethod
     def _find(sample: Image.Image) -> list | None:
+        from . import effect_worker
+
+        if effect_worker.slim_isolation_active():
+            rgb = np.asarray(sample.convert("RGB"), dtype=np.uint8)
+            raw = effect_worker.shared_inference_worker().detect_faces(rgb)
+            if raw is not None:
+                return [
+                    face_module.Face(
+                        x=float(d["x"]), y=float(d["y"]),
+                        w=float(d["w"]), h=float(d["h"]),
+                        score=float(d.get("score", 1.0)),
+                        landmarks=tuple((float(p[0]), float(p[1])) for p in d["landmarks"])
+                        if d.get("landmarks") else None,
+                    )
+                    for d in raw
+                ]
         detector = face_module.shared_detector()
         if detector is None:
             return None
@@ -177,9 +193,9 @@ class FaceTrack:
                                score_threshold=0.6, top_k=4)
 
     def _merge(self, found, size: tuple[int, int], now: float) -> None:
+        self._result_at = max(self._result_at, now)
         if found is None:
             return
-        self._result_at = max(self._result_at, now)
         width, height = size
         previous = list(self.faces)
         updated: list[TrackedFace] = []
@@ -294,7 +310,16 @@ class PersonMask:
         return weight * alpha + (1.0 - weight) * previous
 
     def _work(self, seg: segment.Segmenter, sample: Image.Image, previous, size, stamp):
-        alpha = seg.alpha(sample)
+        from . import effect_worker
+
+        alpha = None
+        if effect_worker.slim_isolation_active():
+            rgb = np.asarray(sample.convert("RGB"), dtype=np.uint8)
+            matte = effect_worker.shared_inference_worker().segment(rgb)
+            if matte is not None:
+                alpha = matte.astype(np.float32) * (1.0 / 255.0)
+        if alpha is None:
+            alpha = seg.alpha(sample)
         if alpha is None:
             raise RuntimeError("segmentation failed")
         small = self._smoothed(alpha, previous, seg.sharpen)
@@ -807,10 +832,13 @@ class FaceMask(Processor):
             return image
         out = image.convert("RGBA") if image.mode != "RGBA" else image.copy()
         opacity = 0.35 + 0.65 * self.amount
+        frame_rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
         for tracked in faces:
-            left, right, _nose, mouth_a, mouth_b = tracked.points[:5]
+            left, right, nose, mouth_a, mouth_b = tracked.points[:5]
             mouth = ((mouth_a[0] + mouth_b[0]) / 2, (mouth_a[1] + mouth_b[1]) / 2)
-            masks.place(out, self.key, now, left, right, mouth, opacity)
+            mouth_open, _smile = face_module.estimate_expression(frame_rgb, tracked.points[:5])
+            masks.place(out, self.key, now, left, right, mouth, opacity,
+                        nose=nose, mouth_open=mouth_open)
         return out
 
     def close(self) -> None:
@@ -846,7 +874,7 @@ class FacePrivacy(Processor):
                                       Image.BILINEAR)
                 region = small.resize(region.size, Image.NEAREST)
             else:
-                region = region.filter(ImageFilter.GaussianBlur(region.width / 10 * (0.6 + self.amount)))
+                region = _blurred(region, region.width / 10 * (0.6 + self.amount))
             out.paste(region, box)
         return out
 
@@ -888,6 +916,10 @@ class TouchUp(Processor):
             rgba.putalpha(image.getchannel("A"))
         return rgba
 
+    def set_amount(self, amount: float) -> None:
+        super().set_amount(amount)
+        self._glow = None
+
     def _bloom(self, rgb: Image.Image, now: float) -> Image.Image:
         """Add a blurred, dimmed copy with ``screen``; the copy is reused ~80 ms."""
         if (self._glow is None or self._glow[0] != rgb.size
@@ -898,15 +930,18 @@ class TouchUp(Processor):
         return ImageChops.screen(rgb, self._glow[1])
 
     def _feather_mask(self, size: tuple[int, int]) -> Image.Image:
-        """A soft-edged ellipse the size of a face crop (cached per size)."""
-        if size not in self._feather:
-            width, height = size
-            mask = Image.new("L", (width, height), 0)
-            ImageDraw.Draw(mask).ellipse([width * 0.04, height * 0.02, width * 0.96, height * 0.98], fill=255)
-            self._feather[size] = mask.filter(ImageFilter.GaussianBlur(max(1.5, width / 14)))
+        """A soft-edged ellipse the size of a face crop (cached at 8 px granularity)."""
+        width, height = size
+        qsize = (max(8, ((width + 4) // 8) * 8), max(8, ((height + 4) // 8) * 8))
+        if qsize not in self._feather:
+            qw, qh = qsize
+            mask = Image.new("L", qsize, 0)
+            ImageDraw.Draw(mask).ellipse([qw * 0.04, qh * 0.02, qw * 0.96, qh * 0.98], fill=255)
+            self._feather[qsize] = mask.filter(ImageFilter.GaussianBlur(max(1.5, qw / 14)))
             if len(self._feather) > 12:
                 self._feather.pop(next(iter(self._feather)))
-        return self._feather[size]
+        cached = self._feather[qsize]
+        return cached if cached.size == size else cached.resize(size, Image.BILINEAR)
 
     def _smooth(self, image: Image.Image, now: float) -> Image.Image:
         faces = self.faces.update(image, now)
@@ -1026,7 +1061,9 @@ class RoundCorners(Processor):
             big = Image.new("L", (width * ss, height * ss), 0)
             ImageDraw.Draw(big).rounded_rectangle(
                 (0, 0, width * ss - 1, height * ss - 1), radius=radius * ss, fill=255)
-            self._mask = np.asarray(big.resize((width, height), Image.LANCZOS))
+            pil_mask = big.resize((width, height), Image.LANCZOS)
+            self._pil_mask = pil_mask
+            self._mask = np.asarray(pil_mask)
             self._key = key
         return self._mask
 
@@ -1034,15 +1071,43 @@ class RoundCorners(Processor):
         mask = self.mask(*image.size)
         if mask is None:
             return image
-        pixels = np.array(image.convert("RGBA"))
-        np.minimum(pixels[..., 3], mask, out=pixels[..., 3])
-        return Image.fromarray(pixels, "RGBA")
+        rgba = image.copy() if image.mode == "RGBA" else image.convert("RGBA")
+        rgba.putalpha(ImageChops.darker(rgba.getchannel("A"), self._pil_mask))
+        return rgba
+
+
+class LutProcessor(Processor):
+    """Apply an Adobe/Iridas 3D ``.cube`` LUT to RGBA frames with live strength."""
+
+    def __init__(self, path: str, amount: float = 1.0) -> None:
+        super().__init__(amount)
+        self.path = str(path)
+        self._lut = None
+
+    def process(self, image: Image.Image, now: float) -> Image.Image:
+        from . import luts
+
+        if self.amount <= 1e-4:
+            return image
+        if self._lut is None:
+            try:
+                self._lut = luts.load_cube(self.path)
+            except Exception:  # noqa: BLE001 - unreadable LUT passes through
+                return image
+        rgba = np.asarray(image.convert("RGBA"), dtype=np.uint8)
+        out_rgb = luts.apply_cube_lut(rgba[..., :3], self._lut, self.amount)
+        out = np.empty_like(rgba)
+        out[..., :3] = out_rgb
+        out[..., 3] = rgba[..., 3]
+        return Image.fromarray(out, "RGBA")
 
 
 # ------------------------------------------------------------------ registry
 def make_processor(name: str, amount: float) -> Processor:
     """Build the processor registered under ``name`` (see ``effects``)."""
     kind, _, variant = name.partition(":")
+    if kind == "lut":
+        return LutProcessor(variant, amount)
     if kind == "background":
         if variant in ("blur", "dim", "mono"):
             return Background(variant, amount)
@@ -1265,13 +1330,14 @@ class NativeAutoFrame:
         if self._latest is not None:
             faces = self.faces.update(self._latest, now)
             if faces:
-                scale = width / self._latest.width
+                scale_x = width / max(1, self._latest.width)
+                scale_y = height / max(1, self._latest.height)
                 main = max(faces, key=lambda f: f.box[2] * f.box[3])
-                face_h = main.box[3] * scale
+                face_h = main.box[3] * scale_y
                 wanted = 0.30 + 0.20 * self.amount      # face height / frame height
                 target_zoom = max(1.0, min(3.0, wanted * height / max(1.0, face_h)))
                 cx, cy = main.centre
-                target = (cx * scale, cy * scale + face_h * 0.25)
+                target = (cx * scale_x, cy * scale_y + face_h * 0.25)
         if self._centre is None:
             self._centre = target
         self._centre = (self._centre[0] * 0.9 + target[0] * 0.1,
@@ -1375,11 +1441,14 @@ def build_processor_bin(name: str, amount: float, bin_name: str, width: int,
     if safemode.active() and kind in effect_worker.ISOLATED_KINDS:
         processor = Processor(amount)    # safe mode: AI effects pass the picture through
     else:
-        isolated = effect_worker.wants_isolation(name)
-        if kind in NATIVE_FRAMING and not isolated:
+        # Third-party packs always use full-frame worker isolation; built-in AI
+        # effects route downscaled inference through slim InferenceWorker (~1-2 ms)
+        # when isolation is enabled instead of shipping full 1080p RGBA frames.
+        full_isolated = kind == "pack" and effect_worker.wants_isolation(name)
+        if kind in NATIVE_FRAMING and not effect_worker.wants_isolation(name):
             return build_framing_bin(name, amount, bin_name, width, height, fps)
         processor = (effect_worker.RemoteProcessor(name, amount)
-                     if isolated else make_processor(name, amount))
+                     if full_isolated else make_processor(name, amount))
 
     def make(factory, element_name=None):
         element = Gst.ElementFactory.make(factory, element_name)

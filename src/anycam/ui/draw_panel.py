@@ -118,6 +118,20 @@ class DrawMixin:
         return max(drawings, key=lambda layer: layer.z) if drawings else None
 
     def _draw_stroke_finished(self, stroke: dict) -> None:
+        if stroke.get("tool") == "blur":
+            pts = stroke.get("points") or []
+            if len(pts) >= 2:
+                x0, y0 = float(pts[0][0]), float(pts[0][1])
+                x1, y1 = float(pts[-1][0]), float(pts[-1][1])
+                rx, ry = min(x0, x1), min(y0, y1)
+                rw, rh = abs(x1 - x0), abs(y1 - y0)
+                if rw > 0.005 and rh > 0.005:
+                    self.scene.blur_regions.append((rx, ry, rw, rh))
+                    self._mark_dirty()
+                    if self.engine is not None and hasattr(self.engine, "set_blur_regions"):
+                        self.engine.set_blur_regions(self.scene.blur_regions)
+                    self._status(f"Blur region added ({len(self.scene.blur_regions)} active)")
+            return
         layer = self._drawing_layer()
         if layer is None:
             layer = Layer(new_id("layer"), "drawing", "Drawing",
@@ -137,16 +151,40 @@ class DrawMixin:
             self.restart_engine()
 
     def _draw_undo(self) -> None:
+        if (getattr(self.preview, "draw_tool", "") == "blur"
+                and getattr(self.scene, "blur_regions", None)):
+            self.scene.blur_regions.pop()
+            self._mark_dirty()
+            if self.engine is not None and hasattr(self.engine, "set_blur_regions"):
+                self.engine.set_blur_regions(self.scene.blur_regions)
+            self._status("Removed last blur region")
+            return
         layer = self._drawing_layer()
         strokes = animated.parse_strokes(layer.source) if layer is not None else []
         if not strokes:
+            if getattr(self.scene, "blur_regions", None):
+                self.scene.blur_regions.pop()
+                self._mark_dirty()
+                if self.engine is not None and hasattr(self.engine, "set_blur_regions"):
+                    self.engine.set_blur_regions(self.scene.blur_regions)
+                self._status("Removed last blur region")
+                return
             self._status("Nothing to undo")
             return
         strokes.pop()
         self._apply_strokes(layer, strokes)
 
     def _draw_clear(self) -> None:
+        cleared = False
+        if getattr(self.scene, "blur_regions", None):
+            self.scene.blur_regions.clear()
+            self._mark_dirty()
+            if self.engine is not None and hasattr(self.engine, "set_blur_regions"):
+                self.engine.set_blur_regions([])
+            cleared = True
         layer = self._drawing_layer()
         if layer is not None and animated.parse_strokes(layer.source):
             self._apply_strokes(layer, [])
+            cleared = True
+        if cleared:
             self._status("Drawing cleared")

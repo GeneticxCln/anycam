@@ -2,6 +2,20 @@
 
 All notable changes. Versions follow `pyproject.toml`; each `vX.Y.Z` tag publishes a GitHub Release.
 
+## 1.6.0 - 2026-11-25
+
+- **Major studio features:**
+  - **Studio Mode live second Preview monitor:** Side-by-side live Preview for the staged next scene sharing `SourcePool` with Cut and Transition (lazily created while Studio mode is active).
+  - **4 stackable live filter slots** per layer (expanded from 2), **GPU smoothstep chroma key + spill suppression** in `BALANCE_SHADER` (plus CPU spill suppression), **3D perspective head-pose & expression-aware face masks**, and **3D `.cube` LUT** support.
+  - **New sources:** Web page source (`+ Web page`, optional `QtWebEngineWidgets` with transparent background & custom CSS), Window / Game capture (`+ Window / Game` for `obs-vkcapture`/PipeWire nodes, X11, and portal windows), feature-detected **NDI** input & output (`ndisrc`/`ndisink`), LibreOffice **PPTX/ODP slides**, and post-compositor **whiteboard region blur** (`Blur` tool in the Draw bar).
+  - **Pro audio & outputs:** Live-swappable microphone DSP (`engine.reconfigure_mic()`), acoustic **echo cancellation** (`webrtcechoprobe` + `webrtcdsp`), real-time **transient & keyboard click suppressor**, optional **phone camera microphone audio**, **multiple virtual cameras** (extra loopback devices + multi-node PipeWire cameras), **per-output resolution & FPS overrides** (record, stream, vcam), and **live RTMP attach/detach** without canvas rebuild.
+  - **Settings & Personality:** Reorganised Settings sidebar with live **Design Bubble** themes (8 built-in personalities including light theme `Paper Daylight`), **Paired phones** management UI (list, forget selected, forget all), actionable **first-run checklist**, and plain **nftables** firewall support.
+- **Performance, security & hardening:**
+  - Slim downscaled `InferenceWorker` IPC (~1–2 ms vs 21–27 ms full-frame) for isolated built-in AI effects, shared single-pass YuNet face detection across all 42 face/mask thumbnails, fast Pillow/numpy processor optimisations, and lazy Diagnostics cost measurement.
+  - Audio-mix persistence across record/restart, fixed recording dialog Close handling, GPU-canvas stall fallback, masked RTMP URL input & scrubbed scene exports, DNS SSRF blocking in `content.py`, HTTPS-only model download redirects, IPv6 phone TLS/firewall support, stable camera `by-id`/`by-path` matching with UVC backoff & explicit USB reset, and PyGObject-safe writable `Gst.Buffer` probes.
+- **i18n, packaging & CI:**
+  - Expanded German translation (`de.json` + `QComboBox`, `QTableWidget`, spinbox, and `OverlayPanel` live translations), updated `.deb` / `PKGBUILD` / Flatpak recipes, added `shellcheck` + `.deb` smoke build in CI, and validated `workflow_dispatch` tags in `release.yml`.
+
 ## 1.5.1 - 2026-11-20
 
 - **Security hardening:** Replaced pickle IPC across the untrusted effect-pack worker boundary with bounded

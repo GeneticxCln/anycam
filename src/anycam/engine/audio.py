@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import random
+import threading
 import time
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from .. import config  # noqa: E402
 from ..sources import (caps_filter, make)
 from ..engine.encoders import (ENCODER_FACTORIES, ENCODER_PARSERS, ENCODER_BITRATES, ENCODER_LABELS, encoder_bitrate, nvenc_available, _probe_nvenc, _va_encodes, va_factory, va_present, EncoderPlan, _requested_codec, _wants_va, encoder_plan, recording_codec, EncodedFeed, force_keyframe)  # noqa: E402,F401
 from ..engine.report import (EngineReport)  # noqa: E402,F401
-from ..engine.audio_helpers import (MIC_DENOISE_LEVELS, mic_dsp_wanted, describe_mic_dsp, mic_dsp_elements, voice_elements, delay_element, describe_voice_fx, audio_server_socket, virtual_mic_properties, VIRTUAL_MIC_NAME)  # noqa: E402,F401
+from ..engine.audio_helpers import (MIC_DENOISE_LEVELS, mic_dsp_wanted, echo_cancel_available, describe_mic_dsp, mic_dsp_elements, voice_elements, delay_element, describe_voice_fx, audio_server_socket, virtual_mic_properties, VIRTUAL_MIC_NAME)  # noqa: E402,F401
 from ..engine.source_pool import audio_channel  # noqa: E402  # noqa: E402,F401
 from ..engine.canvas_helpers import (GL_MIXER_LATENCY_NS, canvas_requested, gl_canvas_problem, _empty_drawing)  # noqa: E402,F401
 
@@ -110,7 +111,11 @@ class AudioMixin:
                 self.project.audio.mic_muted, meter=True,
                 delay_ms=self.project.audio.mic_delay_ms)
             self._add(src)
-            dsp = [*mic_dsp_elements(self.project.audio),
+            echo_probe = ""
+            if (getattr(self.project.audio, "mic_echo_cancel", False)
+                    and echo_cancel_available()):
+                echo_probe = self._build_echo_probe()
+            dsp = [*mic_dsp_elements(self.project.audio, echo_probe_name=echo_probe),
                    *voice_elements(self.project.audio)]
             if dsp:
                 self._add(*dsp)
@@ -127,6 +132,8 @@ class AudioMixin:
                     part for part in (self.report.mic_processing, fx) if part)
             self.mic_source = src
             self.mic_volume = vol
+            self._mic_conv = conv
+            self._mic_dsp_elements = list(dsp)
             self._audio_eos_pads.append(src.get_static_pad("src"))
             self.report.audio_inputs.append(f"mic:{mic_name}")
 
@@ -164,24 +171,119 @@ class AudioMixin:
                 except Exception:  # noqa: BLE001
                     pass
 
+    def reconfigure_mic(self) -> bool:
+        """Swap microphone DSP/EQ/dynamics live without rebuilding the canvas."""
+        if (self.pipeline is None or getattr(self, "_stopped", False)
+                or self.mic_source is None
+                or getattr(self, "_mic_conv", None) is None):
+            return False
+        src = self.mic_source
+        conv = self._mic_conv
+        src_pad = src.get_static_pad("src")
+        conv_sink = conv.get_static_pad("sink")
+        if src_pad is None or conv_sink is None:
+            return False
+        old_dsp = list(getattr(self, "_mic_dsp_elements", ()))
+        new_dsp = [*mic_dsp_elements(self.project.audio),
+                   *voice_elements(self.project.audio)]
+        result = {"ok": False}
+
+        def do_swap() -> None:
+            try:
+                peer = src_pad.get_peer()
+                if peer is not None:
+                    src_pad.unlink(peer)
+                conv_peer = conv_sink.get_peer()
+                if conv_peer is not None:
+                    conv_peer.unlink(conv_sink)
+                for element in reversed(old_dsp):
+                    element.set_state(Gst.State.NULL)
+                    if element.get_parent() is self.pipeline:
+                        self.pipeline.remove(element)
+                if new_dsp:
+                    self._add(*new_dsp, sync=False)
+                    self._link([src, *new_dsp, conv])
+                    for element in reversed(new_dsp):
+                        element.sync_state_with_parent()
+                else:
+                    self._link([src, conv])
+                self._mic_dsp_elements = list(new_dsp)
+                if new_dsp:
+                    desc = describe_mic_dsp(self.project.audio)
+                elif mic_dsp_wanted(self.project.audio):
+                    desc = "unavailable: GStreamer webrtcdsp is not installed"
+                else:
+                    desc = ""
+                fx = describe_voice_fx(self.project.audio)
+                if fx:
+                    desc = ", ".join(part for part in (desc, fx) if part)
+                self.report.mic_processing = desc
+                result["ok"] = True
+            except Exception:  # noqa: BLE001
+                for element in reversed(new_dsp):
+                    element.set_state(Gst.State.NULL)
+                    if self.pipeline is not None and element.get_parent() is self.pipeline:
+                        self.pipeline.remove(element)
+                try:
+                    if not src_pad.is_linked() and not conv_sink.is_linked():
+                        src.link(conv)
+                    self._mic_dsp_elements = []
+                except Exception:  # noqa: BLE001
+                    pass
+                result["ok"] = False
+
+        _ret, state, pending = self.pipeline.get_state(0)
+        if state == Gst.State.PLAYING or pending == Gst.State.PLAYING:
+            done = threading.Event()
+            lock = threading.Lock()
+            ran = {"done": False}
+
+            def on_block(_pad, _info):
+                with lock:
+                    if not ran["done"]:
+                        ran["done"] = True
+                        do_swap()
+                done.set()
+                return Gst.PadProbeReturn.REMOVE
+
+            probe = src_pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, on_block)
+            if not done.wait(0.5):
+                if probe:
+                    try:
+                        src_pad.remove_probe(probe)
+                    except Exception:  # noqa: BLE001
+                        pass
+                with lock:
+                    if not ran["done"]:
+                        ran["done"] = True
+                        do_swap()
+        else:
+            do_swap()
+        return result["ok"]
+
     # ------------------------------------------------------ video-layer sound
     def ensure_layer_audio(self, layer) -> bool:
-        """Mix a video layer's sound into the canvas audio (idempotent).
+        """Mix a video or phone layer's sound into the canvas audio (idempotent).
 
-        Only file videos carry sound; the capture pipeline publishes it on an
-        ``interaudiosink`` channel and this reads it through ``interaudiosrc``,
-        so the clip's sound loops with its picture and several layers on one
-        file share one decode.  Returns True when the layer has an audio input.
+        File videos publish sound on an ``interaudiosink`` channel managed by
+        ``SourcePool``; paired phones publish optional microphone audio directly
+        on ``phone_audio_channel(device_id)``.  Returns True when attached.
         """
-        if (self.audio_mixer is None or getattr(layer, "kind", "") != "video"
+        kind = getattr(layer, "kind", "")
+        if (self.audio_mixer is None or kind not in ("video", "phone")
                 or not layer.source or Gst.ElementFactory.find("interaudiosrc") is None):
             return False
         if layer.id in self._layer_audio:
             return True
-        spec = self._layer_specs.get(layer.id)
-        if spec is None:
-            return False
-        channel = audio_channel(self.pool.channel_for(spec))
+        if kind == "phone":
+            from ..phone import phone_audio_channel
+
+            channel = phone_audio_channel(layer.source)
+        else:
+            spec = self._layer_specs.get(layer.id)
+            if spec is None:
+                return False
+            channel = audio_channel(self.pool.channel_for(spec))
         name = f"layeraudio_{layer.id}"
         src = make("interaudiosrc", f"{name}_src", channel=channel)
         conv, vol, _level = self._mixer_input(
@@ -421,6 +523,31 @@ class AudioMixin:
         if len(sinks) == 1:
             return sinks[0].name
         return ""
+
+    def _build_echo_probe(self) -> str:
+        """Attach a ``webrtcechoprobe`` fed by the default speaker monitor for AEC."""
+        if not echo_cancel_available() or not audio_server_socket("pulse"):
+            return ""
+        sink_name = self._default_audio_sink()
+        if not sink_name:
+            return ""
+        monitor_src = f"{sink_name}.monitor"
+        try:
+            src = make("pulsesrc", "echo_ref_src", device=monitor_src)
+            conv = make("audioconvert", "echo_ref_conv")
+            res = make("audioresample", "echo_ref_resample")
+            caps = caps_filter(
+                "audio/x-raw,format=S16LE,layout=interleaved,rate=48000,channels=1",
+                "echo_ref_caps")
+            probe = make("webrtcechoprobe", "mic_echo_probe")
+            sink = make("fakesink", "echo_ref_sink", sync=False)
+            sink.set_property("async", False)
+            elements = [src, conv, res, caps, probe, sink]
+            self._add(*elements)
+            self._link(elements)
+            return "mic_echo_probe"
+        except Exception:  # noqa: BLE001
+            return ""
 
     def _audio_branch(self, raw: Gst.Element, name: str, sink: Gst.Element) -> bool:
         """raw tee -> queue -> convert -> resample -> ``sink``; False when it cannot link."""

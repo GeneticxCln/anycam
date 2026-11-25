@@ -16,7 +16,14 @@ MIC_DENOISE_LEVELS = ("low", "moderate", "high", "very-high")
 
 def mic_dsp_wanted(audio) -> bool:
     return (str(getattr(audio, "mic_denoise", "off")) in MIC_DENOISE_LEVELS
-            or bool(getattr(audio, "mic_auto_gain", False)))
+            or bool(getattr(audio, "mic_auto_gain", False))
+            or bool(getattr(audio, "mic_echo_cancel", False)))
+
+
+def echo_cancel_available() -> bool:
+    """True when both ``webrtcdsp`` and ``webrtcechoprobe`` are installed."""
+    return (Gst.ElementFactory.find("webrtcdsp") is not None
+            and Gst.ElementFactory.find("webrtcechoprobe") is not None)
 
 
 def describe_mic_dsp(audio) -> str:
@@ -26,27 +33,33 @@ def describe_mic_dsp(audio) -> str:
         parts.append(f"noise suppression {level}")
     if getattr(audio, "mic_auto_gain", False):
         parts.append("auto gain")
+    if getattr(audio, "mic_echo_cancel", False):
+        parts.append("echo cancel" if echo_cancel_available() else "echo cancel (unavailable)")
     return ", ".join(parts)
 
 
-def mic_dsp_elements(audio, prefix: str = "mic_dsp") -> list[Gst.Element]:
+def mic_dsp_elements(audio, prefix: str = "mic_dsp",
+                     *, echo_probe_name: str = "") -> list[Gst.Element]:
     """Voice processing between the microphone and the mixer, or [].
 
-    ``webrtcdsp`` only accepts interleaved S16 at 8/16/32/48 kHz, and reads
-    its settings when it starts (a change needs a rebuild).  Echo cancelling
-    is off: it needs a ``webrtcechoprobe`` on the playback side, which AnyCam
-    does not own.  Mono is enough for a voice and halves the work; the mixer
-    input spreads it to both channels.
+    ``webrtcdsp`` only accepts interleaved S16 at 8/16/32/48 kHz.  When
+    ``mic_echo_cancel`` is enabled and ``webrtcechoprobe`` is wired on the
+    playback side (named ``echo_probe_name``), acoustic echo cancellation runs
+    in the same WebRTC DSP block.  Mono is enough for a voice and halves the
+    work; the mixer input spreads it to both channels.
     """
     if not mic_dsp_wanted(audio):
         return []
     if Gst.ElementFactory.find("webrtcdsp") is None:
         return []
     level = str(getattr(audio, "mic_denoise", "off"))
-    dsp = make("webrtcdsp", prefix, echo_cancel=False,
+    want_aec = bool(getattr(audio, "mic_echo_cancel", False)) and bool(echo_probe_name) and echo_cancel_available()
+    dsp = make("webrtcdsp", prefix, echo_cancel=want_aec,
                gain_control=bool(getattr(audio, "mic_auto_gain", False)),
                noise_suppression=level in MIC_DENOISE_LEVELS,
                high_pass_filter=True)
+    if want_aec:
+        dsp.set_property("probe", echo_probe_name)
     if level in MIC_DENOISE_LEVELS:
         # GstWebrtcNoiseSuppressionLevel: low=0 moderate=1 high=2 very-high=3.
         dsp.set_property("noise-suppression-level", MIC_DENOISE_LEVELS.index(level))
@@ -102,8 +115,12 @@ def delay_ms(value) -> int:
 
 
 def voice_elements(audio, prefix: str = "mic_fx") -> list[Gst.Element]:
-    """Gate/compressor and equaliser for the microphone, in that order, or []."""
+    """Transient suppressor, gate/compressor and equaliser for the mic, or []."""
     elements: list[Gst.Element] = []
+    if bool(getattr(audio, "mic_neural_denoise", False)):
+        from .. import audio_denoise
+
+        elements.extend(audio_denoise.denoise_elements(f"{prefix}_transient"))
     dynamics = preset_name(getattr(audio, "mic_dynamics", "off"), DYNAMICS_PRESETS, "off")
     if Gst.ElementFactory.find("audiodynamic") is not None:
         for index, (mode, knee, threshold, ratio) in enumerate(DYNAMICS_PRESETS[dynamics]):
@@ -133,6 +150,8 @@ def delay_element(milliseconds, name: str):
 
 def describe_voice_fx(audio) -> str:
     parts = []
+    if getattr(audio, "mic_neural_denoise", False):
+        parts.append("transient click suppressor")
     dynamics = preset_name(getattr(audio, "mic_dynamics", "off"), DYNAMICS_PRESETS, "off")
     if dynamics != "off":
         parts.append(DYNAMICS_LABELS[dynamics].lower())

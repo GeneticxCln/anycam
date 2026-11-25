@@ -50,6 +50,51 @@ def default_sample(size: tuple[int, int] = THUMB_SIZE) -> Image.Image:
         return Image.new("RGB", size, (60, 90, 140))
 
 
+def _is_pure_processor(effects: Effects) -> str | None:
+    """Return processor name when ``effects`` is a single processor filter with no other active FX."""
+    if (effects.filter == "none" or effects.filter2 != "none"
+            or getattr(effects, "filter3", "none") != "none"
+            or getattr(effects, "filter4", "none") != "none"
+            or effects.frame_style != "none" or effects.color_effect != "none"
+            or effects.chroma_enabled or effects.mirror
+            or abs(effects.brightness) > 1e-4 or abs(effects.contrast - 1.0) > 1e-4
+            or abs(effects.saturation - 1.0) > 1e-4 or abs(effects.hue) > 1e-4
+            or abs(effects.red_gain - 1.0) > 1e-4 or abs(effects.green_gain - 1.0) > 1e-4
+            or abs(effects.blue_gain - 1.0) > 1e-4):
+        return None
+    spec = effect_library.FILTERS.get(effects.filter)
+    if spec is None or not spec.processor or spec.processor.startswith("pack:"):
+        return None
+    if spec.processor.startswith("autoframe"):
+        return None
+    return spec.processor
+
+
+_SAMPLE_FACE_CACHE: dict[tuple[int, int, int], list] = {}
+
+
+def _detect_sample_faces(picture: Image.Image):
+    """Detect faces once per thumbnail sample image (shared across all 42 face/mask tiles)."""
+    import hashlib
+    import numpy as np
+
+    from . import face as face_mod
+
+    rgb = picture.convert("RGB")
+    digest = hash(hashlib.blake2b(rgb.tobytes(), digest_size=8).digest())
+    key = (rgb.width, rgb.height, digest)
+    if key in _SAMPLE_FACE_CACHE:
+        return _SAMPLE_FACE_CACHE[key]
+    detector = face_mod.shared_detector()
+    if detector is None:
+        return None
+    found = detector.detect(np.asarray(rgb), score_threshold=0.6, top_k=4)
+    if len(_SAMPLE_FACE_CACHE) > 8:
+        _SAMPLE_FACE_CACHE.clear()
+    _SAMPLE_FACE_CACHE[key] = found
+    return found
+
+
 def render_thumbnail(effects: Effects, sample: Image.Image,
                      size: tuple[int, int] = THUMB_SIZE) -> Image.Image | None:
     """``sample`` with ``effects`` applied, or ``None`` if the chain failed."""
@@ -57,13 +102,45 @@ def render_thumbnail(effects: Effects, sample: Image.Image,
 
     width, height = size
     picture = sample.convert("RGBA").resize((width, height), Image.BILINEAR)
-    if str(effects.filter).startswith("pack-") or str(effects.filter2).startswith("pack-"):
+    if any(str(getattr(effects, attr, "none")).startswith("pack-")
+           for attr in ("filter", "filter2", "filter3", "filter4")):
         # A pack's code only ever runs in the worker process; a tile is not worth starting one.
         import dataclasses
 
         effects = dataclasses.replace(
-            effects, filter="none" if str(effects.filter).startswith("pack-") else effects.filter,
-            filter2="none" if str(effects.filter2).startswith("pack-") else effects.filter2)
+            effects,
+            **{attr: "none" if str(getattr(effects, attr, "none")).startswith("pack-")
+               else getattr(effects, attr, "none")
+               for attr in ("filter", "filter2", "filter3", "filter4")})
+    proc_name = _is_pure_processor(effects)
+    if proc_name is not None:
+        from . import processors
+
+        proc = None
+        try:
+            with effect_worker.in_process():
+                proc = processors.make_processor(proc_name, effects.filter_amount)
+            faces_helper = getattr(proc, "faces", None)
+            if faces_helper is not None:
+                # Synchronous + cached detection: avoids 42 redundant YuNet runs & 42 GStreamer pipelines.
+                faces_helper._job = None
+                cached = _detect_sample_faces(picture)
+                if cached is not None:
+                    faces_helper._merge(cached, picture.size, 0.0)
+                    faces_helper._last = 0.0
+            mask_helper = getattr(proc, "mask", None)
+            if mask_helper is not None:
+                mask_helper._job = None
+            out = proc.process(picture, 0.1)
+            return out.convert("RGB") if out is not None else None
+        except Exception:  # noqa: BLE001 - fall back to pipeline render
+            pass
+        finally:
+            if proc is not None:
+                try:
+                    proc.close()
+                except Exception:  # noqa: BLE001
+                    pass
     layer = Layer("thumb", "test", "thumb", effects=effects)
     chain = None
     pipeline = None
@@ -233,6 +310,7 @@ class TileRenderer:
             max_workers=1, thread_name_prefix="anycam-thumbs")
         self.future = None
         self.token = None
+        self._generation = 0
 
     @property
     def busy(self) -> bool:
@@ -242,14 +320,19 @@ class TileRenderer:
                sample_is_default: bool) -> None:
         import time
 
+        gen = self._generation
+
         def job():
+            if gen != self._generation:
+                return None
             try:
                 return tile_picture(category, entry, sample, sample_is_default)
             except Exception:  # noqa: BLE001 - a tile without a preview is fine
                 return None
             finally:
-                # Leave the GIL to the live effect threads between tiles.
-                time.sleep(TILE_PAUSE_S)
+                if gen == self._generation:
+                    # Leave the GIL to the live effect threads between tiles.
+                    time.sleep(TILE_PAUSE_S)
 
         self.token = token
         self.future = self._pool.submit(job)
@@ -267,6 +350,9 @@ class TileRenderer:
 
     def forget(self) -> None:
         """Drop the tile in flight (its grid was repopulated)."""
+        self._generation += 1
+        if self.future is not None:
+            self.future.cancel()
         self.future = self.token = None
 
     def stop(self) -> None:

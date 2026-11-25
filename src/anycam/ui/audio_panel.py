@@ -84,6 +84,21 @@ class AudioPanelMixin:
         self.auto_gain_check.setChecked(self.project.audio.mic_auto_gain)
         self.auto_gain_check.toggled.connect(self._mic_processing_changed)
         grid.addWidget(self.auto_gain_check, 6, 0, 1, 2)
+        self.echo_cancel_check = QCheckBox("Echo cancellation (remove speaker playback from mic)")
+        self.echo_cancel_check.setChecked(bool(getattr(self.project.audio, "mic_echo_cancel", False)))
+        self.echo_cancel_check.setEnabled(audio_helpers.echo_cancel_available())
+        self.echo_cancel_check.setToolTip(
+            "Uses WebRTC acoustic echo cancellation to suppress speaker output picked up by the microphone.")
+        self.echo_cancel_check.toggled.connect(self._mic_processing_changed)
+        grid.addWidget(self.echo_cancel_check, 7, 0, 1, 2)
+        self.transient_denoise_check = QCheckBox("Transient & keyboard click suppression")
+        self.transient_denoise_check.setChecked(
+            bool(getattr(self.project.audio, "mic_neural_denoise", False)))
+        self.transient_denoise_check.setToolTip(
+            "Suppresses sharp impulsive noises (keyboard clicks, mouse clicks, desk taps) "
+            "using real-time spectral + transient filtering.")
+        self.transient_denoise_check.toggled.connect(self._mic_processing_changed)
+        grid.addWidget(self.transient_denoise_check, 8, 0, 1, 2)
         layout.addWidget(box)
         layout.addWidget(self._mixer_group())
         layout.addWidget(self._sync_group())
@@ -179,7 +194,9 @@ class AudioPanelMixin:
         self.project.audio.mic_eq = str(self.eq_combo.currentData() or "flat")
         self._mark_dirty()
         if self.engine is not None and self.project.audio.mic_enabled:
-            self.restart_engine()
+            reconfigure = getattr(self.engine, "reconfigure_mic", None)
+            if not (callable(reconfigure) and reconfigure()):
+                self.restart_engine()
 
     def _audio_delay_changed(self, field: str, value: int) -> None:
         setattr(self.project.audio, field, audio_helpers.delay_ms(value))
@@ -212,7 +229,9 @@ class AudioPanelMixin:
                 f"Virtual microphone: {report.virtual_mic}" if report.virtual_mic else "",
                 f"Virtual microphone unavailable: {report.virtual_mic_error}"
                 if report.virtual_mic_error else "") if text]
-            self.audio_output_note.setText("  ·  ".join(notes))
+            text = "  ·  ".join(notes)
+            if self.audio_output_note.text() != text:
+                self.audio_output_note.setText(text)
 
     def _refresh_mics(self) -> None:
         current = self.mic_combo.currentData() or self.project.audio.mic_device
@@ -239,13 +258,28 @@ class AudioPanelMixin:
     def _mic_processing_changed(self, *_args) -> None:
         self.project.audio.mic_denoise = self.denoise_combo.currentData() or "off"
         self.project.audio.mic_auto_gain = self.auto_gain_check.isChecked()
+        echo_check = getattr(self, "echo_cancel_check", None)
+        echo_changed = False
+        if echo_check is not None:
+            new_echo = bool(echo_check.isChecked())
+            echo_changed = new_echo != bool(getattr(self.project.audio, "mic_echo_cancel", False))
+            self.project.audio.mic_echo_cancel = new_echo
+        trans_check = getattr(self, "transient_denoise_check", None)
+        if trans_check is not None:
+            self.project.audio.mic_neural_denoise = bool(trans_check.isChecked())
         self._mark_dirty()
-        # webrtcdsp reads its settings when it starts: rebuild to apply.
         if self.engine is not None and self.project.audio.mic_enabled:
-            self.restart_engine()
+            reconfigure = getattr(self.engine, "reconfigure_mic", None)
+            if echo_changed or not (callable(reconfigure) and reconfigure()):
+                self.restart_engine()
         level = self.denoise_combo.currentText()
+        extras = []
+        if self.project.audio.mic_auto_gain:
+            extras.append("automatic gain")
+        if getattr(self.project.audio, "mic_echo_cancel", False):
+            extras.append("echo cancel")
         self._status(f"Noise suppression: {level}"
-                     + (" · automatic gain" if self.project.audio.mic_auto_gain else ""))
+                     + (" · " + " · ".join(extras) if extras else ""))
 
     def _toggle_audio(self, enabled: bool) -> None:
         self.audio_on = enabled

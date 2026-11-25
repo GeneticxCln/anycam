@@ -165,6 +165,23 @@ class VcamTapMixin:
         if setter is not None:
             setter(attached)
 
+    def attach_extra_vcams(self, outputs: list[VcamOutput]) -> None:
+        """Feed additional virtual camera outputs from the existing canvas tap."""
+        self._extra_vcam_outputs = [out for out in outputs if out is not None and out.active]
+        for out in self._extra_vcam_outputs:
+            setter = getattr(out, "set_canvas_attached", None)
+            if callable(setter):
+                setter(self._vcam_valve is not None)
+
+    def detach_extra_vcams(self) -> None:
+        """Stop pushing canvas samples to extra virtual camera outputs."""
+        extras = list(getattr(self, "_extra_vcam_outputs", ()))
+        self._extra_vcam_outputs = []
+        for out in extras:
+            setter = getattr(out, "set_canvas_attached", None)
+            if callable(setter):
+                setter(False)
+
     def _on_vcam_sample(self, sink):
         sample = sink.emit("pull-sample")
         if sample is not None:
@@ -179,6 +196,9 @@ class VcamTapMixin:
             elif self._vcam_appsrc is not None:
                 # Buffers are refcounted; handing the sample to appsrc is zero-copy.
                 self._vcam_appsrc.emit("push-sample", sample)
+            for extra in tuple(getattr(self, "_extra_vcam_outputs", ())):
+                if extra.active:
+                    extra.push_sample(sample)
         return Gst.FlowReturn.OK
 
     def resume_vcam(self) -> None:

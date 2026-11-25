@@ -73,10 +73,33 @@ class RecordTapMixin:
             return make(plan.parser, name)
         return make(plan.parser, name, config_interval=-1)
 
+    def _output_format(self, purpose: str) -> tuple[int, int, int]:
+        """Target ``(width, height, fps)`` for ``record`` or ``stream`` (0 = follow canvas)."""
+        out = self.project.output
+        prefix = "stream" if purpose == "rtmp" else "record"
+        w = int(getattr(out, f"{prefix}_w", 0) or 0) or self.canvas_w
+        h = int(getattr(out, f"{prefix}_h", 0) or 0) or self.canvas_h
+        fps = int(getattr(out, f"{prefix}_fps", 0) or 0) or self.fps
+        return max(2, w // 2 * 2), max(2, h // 2 * 2), max(1, fps)
+
+    def _output_scale_elements(self, purpose: str, prefix: str) -> list[Gst.Element]:
+        """Insert videoscale/videorate when an output overrides canvas size or FPS."""
+        w, h, fps = self._output_format(purpose)
+        if (w, h, fps) == (self.canvas_w, self.canvas_h, self.fps):
+            return []
+        from ...sources import caps_string
+
+        return [
+            make("videoscale", f"{prefix}_out_scale", method=2),
+            make("videorate", f"{prefix}_out_rate"),
+            caps_filter(caps_string(w, h, fps, "RGBA"), f"{prefix}_out_caps"),
+        ]
+
     def _make_record_encoder(self) -> tuple[Gst.Element, bool]:
         """Return the recording encoder and whether its input is GPU memory."""
+        rec_w, rec_h, _rec_fps = self._output_format("record")
         plan = encoder_plan(self._encoder_preference(),
-                            width=self.canvas_w, height=self.canvas_h)
+                            width=rec_w, height=rec_h)
         self._record_plan = plan
         self.report.encoder = plan.factory
         self.report.video_codec = plan.codec
@@ -124,9 +147,11 @@ class RecordTapMixin:
         queue.set_property("leaky", 2)
         valve = make("valve", "record_valve", drop=False)
         enc, hardware = self._make_record_encoder()
+        rec_w, rec_h, _rec_fps = self._output_format("record")
         plan = self._record_plan or encoder_plan(
             self._encoder_preference(),
-            width=self.canvas_w, height=self.canvas_h)
+            width=rec_w, height=rec_h)
+        scale_path = self._output_scale_elements("record", "record")
         pixel_path = self._encoder_input(hardware, "record", plan.factory)
         parse = self._make_parser(plan, "record_parse_tap")
         # Encoded frames are never dropped here (the leaky queue in front of
@@ -136,21 +161,26 @@ class RecordTapMixin:
         sink.set_property("async", False)
         self._on(sink, "new-sample", self._on_record_sample)
         self._attach_tee_branch(
-            self.tee, [queue, valve, *pixel_path, enc, parse, sink],
+            self.tee, [queue, valve, *scale_path, *pixel_path, enc, parse, sink],
             count_branch=True)
         self._recorder_valve = valve
         self._record_encoder = enc
 
         tee = self._audio_tee()
         if tee is not None:
-            audio_queue = make("queue", "record_audio_queue",
-                               max_size_buffers=8, max_size_time=1 * Gst.SECOND)
-            audio_queue.set_property("leaky", 2)
-            audio_sink = make("appsink", "record_audio_sink", emit_signals=True,
-                              max_buffers=4, drop=True, sync=False)
-            audio_sink.set_property("async", False)
-            self._on(audio_sink, "new-sample", self._on_record_audio_sample)
-            self._attach_tee_branch(tee, [audio_queue, audio_sink])
+            self._attach_record_audio_tap(tee)
+
+    def _attach_record_audio_tap(self, tee: Gst.Element) -> None:
+        if self.pipeline is None or self.pipeline.get_by_name("record_audio_sink") is not None:
+            return
+        audio_queue = make("queue", "record_audio_queue",
+                           max_size_buffers=8, max_size_time=1 * Gst.SECOND)
+        audio_queue.set_property("leaky", 2)
+        audio_sink = make("appsink", "record_audio_sink", emit_signals=True,
+                          max_buffers=4, drop=True, sync=False)
+        audio_sink.set_property("async", False)
+        self._on(audio_sink, "new-sample", self._on_record_audio_sample)
+        self._attach_tee_branch(tee, [audio_queue, audio_sink])
 
     def attach_recorder(self, recorder: Recorder) -> bool:
         """Start feeding the existing canvas into ``recorder`` without a rebuild."""
@@ -171,6 +201,11 @@ class RecordTapMixin:
         if self._recorder_valve is None:
             self._build_recorder_tap()
         else:
+            if (getattr(recorder, "has_audio", False)
+                    and self.pipeline.get_by_name("record_audio_sink") is None):
+                tee = self._audio_tee()
+                if tee is not None:
+                    self._attach_record_audio_tap(tee)
             self._recorder_valve.set_property("drop", False)
             # The encoder kept its state while the valve was shut, so its next
             # frame is a delta frame that refers to pictures a new file does

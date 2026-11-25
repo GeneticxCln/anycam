@@ -89,7 +89,15 @@ Legend: `[ ]` open · `[~]` in progress · `[x]` done. Bug IDs (`B12`) are the
 - [x] **Unresponsive RTSP/network source**: canvas keeps ≥99% of its frames and `stop()` returns in under 1 s (B10/B11). Passed 2026-10-31 with a local RTSP server that accepts and never answers: ≥99% of 30 fps over a 2 s window, `stop()` 0.32 s.
 - [x] **Refused output does not poison the session** (B11): preview, recording and vcam keep running, and the recording flag does not stay on. Passed 2026-10-31 with a missing RTMP sink and with a forced rebuild failure.
 - [ ] **Physical camera unplug/replug** on real hardware with `scripts/verify-camera-reconnect.py`. Needs the user and a cable; the app now resolves the by-id path.
-- [ ] **UVC wedge recovery**: after repeated open failures, offer a USB reset (pkexec) instead of requiring a reboot.
+- [x] **UVC wedge recovery**: `reset_wedged_camera_usb(device)` (explicit `pkexec` USB reset) + backoff retained until reattached camera proves healthy (`>= 25` frames).
+- [x] **Chroma shader with smoothness and spill removal; live effect changes, no Apply button.** GPU `BALANCE_SHADER` YCbCr smoothstep keying + spill suppression, plus CPU spill suppression probe (`tests/test_studio_upgrades.py`).
+- [x] **Studio Mode live second Preview monitor.** Lightweight 640×360 CPU preview engine sharing `SourcePool` alongside Program (`tests/test_studio_upgrades.py`).
+- [x] **Web source with custom CSS through QtWebEngine (offscreen).** Feature-detected `src/anycam/web_source.py` + `sources.web_chain()` + `+ Web page` (`tests/test_studio_upgrades.py`).
+- [x] **PowerPoint/ODP slides through LibreOffice** (`content.presentation_pages()`) and **3D `.cube` LUT import** (`src/anycam/luts.py` + `LutProcessor`).
+- [x] **Whiteboard region blur** (post-compositor Gaussian blur over normalized rects on `Scene.blur_regions`, zero-overhead when empty).
+- [x] **Multiple virtual cameras** (`vcam_extra_devices` + multi-node PipeWire `vcam_pipewire_count`).
+- [x] **Acoustic echo cancellation** (`webrtcechoprobe` + `webrtcdsp echo-cancel=true`) and **live mic DSP reconfiguration** (`engine.reconfigure_mic()`).
+- [x] **Live RTMP attach/detach** (`engine.attach_rtmp()` / `detach_rtmp()`), **4 live filter slots**, **paired phones UI**, **phone camera audio**, **plain nftables firewall**, **actionable first-run checklist**, and **full German i18n pass**.
 
 ## 1. M1 engine split and source/output correctness
 

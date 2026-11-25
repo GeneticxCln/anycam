@@ -906,7 +906,8 @@ def test_sidebar_is_layouts_effects_scenes_and_settings_is_a_window(app):
         tabs = [window.settings_tabs.tabText(index)
                 for index in range(window.settings_tabs.count())]
         assert tabs == ["Sources", "Audio", "Media", "Output", "Stream",
-                        "Diagnostics", "General", "About"]
+                        "AI", "Personality", "Shortcuts", "General",
+                        "Diagnostics", "About"]
         assert not hasattr(window, "slot_grid")
     finally:
         _close(window, app)

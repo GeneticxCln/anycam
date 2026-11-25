@@ -146,11 +146,22 @@ class CameraMixin:
         if not cameras:
             return {}
         text = message.lower()
-        # Match the device as a whole name: "/dev/video1" is a substring of
-        # "/dev/video10" (the virtual camera), which swapped a healthy camera
-        # for a placeholder whenever the vcam reported an error.
-        explicit = {layer_id: device for layer_id, device in cameras.items()
-                    if re.search(re.escape(device.lower()) + r"(?![\w.-])", text)}
+        import os
+
+        # Match both the stored stable path (/dev/v4l/by-id/...) and its
+        # resolved /dev/videoN node so a multi-camera error blames only the
+        # failing device instead of quarantining every camera.
+        explicit: dict[str, str] = {}
+        for layer_id, device in cameras.items():
+            names = {device.lower()}
+            try:
+                resolved = os.path.realpath(device).lower()
+                if resolved:
+                    names.add(resolved)
+            except OSError:
+                pass
+            if any(re.search(re.escape(name) + r"(?![\w.-])", text) for name in names):
+                explicit[layer_id] = device
         if explicit:
             return explicit
         # Pool errors name their capture channel; blame only the cameras that
@@ -323,7 +334,14 @@ class CameraMixin:
             if self._lost_cameras:
                 self._camera_watch.start(self._camera_retry_ms)
             else:
-                self._camera_retry_ms = 2000
+                # Keep the backoff until the reattached camera proves healthy
+                # (stops wedged UVC cameras from spinning in a 2 s reopen loop).
+                report = getattr(self.engine, "report", None)
+                health = getattr(report, "source_health", {}) or {}
+                self._camera_reattached_at = {
+                    lid: int(health.get(lid, {}).get("frames", 0))
+                    for lid in restored
+                }
                 self._camera_watch.stop()
             return
         self._quiet_engine_errors = True
@@ -360,8 +378,69 @@ class CameraMixin:
     def _forget_lost_cameras(self) -> None:
         """Drop reconnect state when the scene or the preview changes."""
         self._lost_cameras.clear()
+        self._camera_reattached_at = {}
         self._camera_retry_ms = 2000
         self._camera_watch.stop()
+
+    def _check_reattached_camera_health(self) -> None:
+        """Reset camera reconnect backoff once reattached devices deliver healthy frames."""
+        pending = getattr(self, "_camera_reattached_at", None)
+        if not pending or self.engine is None:
+            return
+        report = getattr(self.engine, "report", None)
+        health = getattr(report, "source_health", {}) or {}
+        healthy_frames = 25
+        remaining = {}
+        for lid, start_frames in pending.items():
+            if lid in self._lost_cameras:
+                continue
+            current = int(health.get(lid, {}).get("frames", 0))
+            if current - start_frames < healthy_frames:
+                remaining[lid] = start_frames
+        self._camera_reattached_at = remaining
+        if not remaining and not self._lost_cameras:
+            self._camera_retry_ms = 2000
+
+    @staticmethod
+    def reset_wedged_camera_usb(device: str) -> str:
+        """Reset the USB parent of a wedged V4L2 camera via pkexec (explicit action).
+
+        Returns "" on success or an error message.
+        """
+        import os
+        from .. import privileged
+
+        if not device:
+            return "no camera device specified"
+        try:
+            real = os.path.realpath(device)
+        except OSError as exc:
+            return str(exc)
+        node = Path(real).name
+        if not re.fullmatch(r"video\d+", node):
+            return f"not a V4L2 video node: {device}"
+        sys_dev = Path(f"/sys/class/video4linux/{node}/device")
+        try:
+            cur = sys_dev.resolve()
+        except OSError:
+            return f"could not locate USB device for {node}"
+        usb_dir = None
+        for candidate in (cur, *cur.parents):
+            if (candidate / "authorized").exists() and (candidate / "idVendor").exists():
+                usb_dir = candidate
+                break
+        if usb_dir is None:
+            return f"{node} does not appear to be a resettable USB camera"
+        auth_file = str(usb_dir / "authorized")
+        if not re.fullmatch(r"/sys/devices/[A-Za-z0-9._:/-]+/authorized", auth_file):
+            return f"unexpected sysfs path: {auth_file}"
+        cmd = [
+            "sh", "-c",
+            'printf 0 > "$1" && sleep 0.5 && printf 1 > "$1"',
+            "anycam-usb-reset", auth_file,
+        ]
+        code, out = privileged.run_privileged(cmd, timeout=30.0)
+        return "" if code == 0 else (out.strip() or f"USB reset exited with {code}")
 
     def _choose_camera_device(self) -> str:
         # A UVC replug renumbers the node (for example video0 -> video3).

@@ -48,9 +48,11 @@ Deviations from the plan below, and why:
 - The offer's `urn:3gpp:video-orientation` extension is removed, so Android
   rotates the pixels itself instead of tagging frames the receiver ignores.
 
-Not built yet: phone audio, a devices manager to forget a paired phone from
-the UI (`PhoneService.forget` exists), and the hardware pass on real Android
-phones (M8.5).
+Built: optional phone microphone audio (`phone_audio_channel` → `interaudiosink` → canvas
+audio mixer with per-layer volume/mute), a paired-phones manager in **Settings → General →
+Paired phones** (list, forget selected, forget all), IPv6 TLS/firewall support, and plain
+`nftables` firewall support alongside `ufw` and `firewalld`. Remaining hardware gate: live
+end-to-end validation on two real Android phones (M8.5).
 
 ## 1. Without pairing: a camera app's URL
 

@@ -7,11 +7,12 @@ const $ = (id) => document.getElementById(id);
 const ui = {
   intro: $("intro"), introText: $("intro-text"), stage: $("stage"), bar: $("bar"),
   status: $("status"), text: $("status-text"), video: $("preview"),
-  toggle: $("toggle"), flip: $("flip"), quality: $("quality"),
+  toggle: $("toggle"), flip: $("flip"), mic: $("mic"), quality: $("quality"),
 };
 
 let creds = loadCreds();
 let facing = read("facing") || "environment";
+let micEnabled = read("mic") === "1";
 ui.quality.value = read("quality") === "1080" ? "1080" : "720";
 let stream = null;
 let pc = null;
@@ -52,6 +53,10 @@ function showIntro(message) {
 function updateButtons() {
   ui.toggle.textContent = wanted ? "Stop" : "Start";
   ui.toggle.className = wanted ? "" : "primary";
+  if (ui.mic) {
+    ui.mic.textContent = micEnabled ? "Mic: on" : "Mic: off";
+    ui.mic.setAttribute("aria-pressed", micEnabled ? "true" : "false");
+  }
   ui.video.style.transform = facing === "user" ? "scaleX(-1)" : "";
 }
 
@@ -95,15 +100,25 @@ async function openCamera(myGen) {
   stopCamera();
   const height = Number(ui.quality.value);
   const width = height === 1080 ? 1920 : 1280;
+  const videoConstraints = {
+    facingMode: { ideal: facing },
+    width: { ideal: width }, height: { ideal: height },
+    frameRate: { ideal: 30, max: 30 },
+  };
   setStatus("Opening the camera…");
-  const opened = await navigator.mediaDevices.getUserMedia({
-    audio: false,
-    video: {
-      facingMode: { ideal: facing },
-      width: { ideal: width }, height: { ideal: height },
-      frameRate: { ideal: 30, max: 30 },
-    },
-  });
+  let opened;
+  try {
+    opened = await navigator.mediaDevices.getUserMedia({
+      audio: micEnabled ? { echoCancellation: true, noiseSuppression: true } : false,
+      video: videoConstraints,
+    });
+  } catch (err) {
+    if (!micEnabled) throw err;
+    micEnabled = false;
+    write("mic", "0");
+    updateButtons();
+    opened = await navigator.mediaDevices.getUserMedia({ audio: false, video: videoConstraints });
+  }
   if (myGen !== gen || !wanted) {
     opened.getTracks().forEach((track) => track.stop());
     return false;
@@ -182,6 +197,10 @@ async function connect(myGen) {
   const track = stream.getVideoTracks()[0];
   const transceiver = peer.addTransceiver(track, { direction: "sendonly", streams: [stream] });
   preferCodecs(transceiver);
+  const audioTrack = stream.getAudioTracks()[0];
+  if (audioTrack) {
+    peer.addTransceiver(audioTrack, { direction: "sendonly", streams: [stream] });
+  }
   peer.addEventListener("connectionstatechange", () => onPeerState(peer));
   await peer.setLocalDescription(await peer.createOffer());
   await iceGathered(peer);
@@ -291,7 +310,7 @@ async function reopenCamera() {
   try {
     if (!(await openCamera(myGen))) return;
     if (myGen !== gen || !wanted) return;
-    const sender = pc && pc.getSenders()[0];
+    const sender = pc && pc.getSenders().find((s) => s.track && s.track.kind === "video");
     if (sender && pc.connectionState === "connected") {
       await sender.replaceTrack(stream.getVideoTracks()[0]);
       if (myGen === gen && wanted) await limitBitrate(sender);
@@ -324,6 +343,22 @@ ui.flip.addEventListener("click", () => {
   updateButtons();
   reopenCamera();
 });
+if (ui.mic) {
+  ui.mic.addEventListener("click", async () => {
+    micEnabled = !micEnabled;
+    write("mic", micEnabled ? "1" : "0");
+    updateButtons();
+    if (!wanted) return;
+    const myGen = ++gen;
+    try {
+      if (!(await openCamera(myGen))) return;
+      if (myGen !== gen || !wanted) return;
+      await connect(myGen);
+    } catch (error) {
+      if (myGen === gen && wanted) failed(error);
+    }
+  });
+}
 ui.quality.addEventListener("change", () => {
   write("quality", ui.quality.value);
   reopenCamera();

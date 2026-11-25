@@ -97,9 +97,7 @@ class EngineMixin:
                 preview=True,
                 # A recording that has an audio track keeps it fed (silence if
                 # the microphone is off) so its muxer never waits on a dead pad.
-                audio=(self.audio_on or bool(self.project.audio.media_file)
-                       or bool(self.project.audio.desktop_device)
-                       or (recorder is not None and recorder.has_audio)),
+                audio=self._project_needs_audio(recorder),
                 # Only an explicit Go Live publishes; a saved URL is inert.
                 rtmp=self.project.output.rtmp_url if self.live else None,
                 rtmp_extra=self.project.output.rtmp_extra_urls if self.live else None,
@@ -201,6 +199,8 @@ class EngineMixin:
         # image is capped at 960x540 (~2.1 MB per copy), which fits the frame
         # budget; a 33 ms tick capped the whole preview at 30 fps.
         self.timer.start(16)
+        if hasattr(self, "studio_check") and self.studio_check.isChecked():
+            self._refresh_studio_preview()
         if self.engine.report.vcam_error:
             self._status(self.engine.report.vcam_error)
         elif self.engine.report.media_errors:
@@ -219,6 +219,8 @@ class EngineMixin:
 
     def stop_engine(self, *, clear_preview: bool = True) -> None:
         self.timer.stop()
+        if hasattr(self, "_stop_studio_preview"):
+            self._stop_studio_preview()
         if self.engine is not None:
             # Finalising takes up to a few seconds (end-of-stream through the
             # muxers).  It runs on a worker while the window keeps painting;
@@ -317,14 +319,15 @@ class EngineMixin:
             ("timers", self._stop_all_timers),
             ("pending edits", self.preview.cancel_pending_edits),
             ("auxiliary windows", self._close_auxiliary_windows),
+            ("studio preview", lambda: self._stop_studio_preview() if hasattr(self, "_stop_studio_preview") else None),
             ("engine", lambda: self.stop_engine() if self.engine is not None else None),
             ("recorder", self._finish_recorder),
             ("virtual camera", self._finish_vcam_output),
             ("phone link", self._stop_phone_link),
             ("desktop integration", self._stop_desktop_integration),
-            ("source pool", self._source_pool.stop),
+            ("source pool", lambda: self._run_with_ui(self._source_pool.stop, allow_closing=True)),
             ("project save", self._save_if_needed),
-            ("screen sessions", self._close_screen_sessions),
+            ("screen sessions", lambda: self._run_with_ui(self._close_screen_sessions, allow_closing=True)),
         )
         # _closing is set only after the engine step: setting it first made
         # _run_with_ui inline engine.stop() on the GUI thread, which blocked
@@ -349,9 +352,10 @@ class EngineMixin:
         self._teardown()
         event.accept()
 
-    def _run_with_ui(self, function):
+    def _run_with_ui(self, function, *, timeout: float = 25.0,
+                     on_timeout=None, allow_closing: bool = False):
         """Run a blocking call on a thread while Qt keeps handling events."""
-        if self.headless or getattr(self, "_closing", False):
+        if self.headless or (getattr(self, "_closing", False) and not allow_closing):
             return function()
         result: dict = {}
 
@@ -369,7 +373,8 @@ class EngineMixin:
         # switch in the middle of a privileged operation).  Portal shortcuts
         # check ``_ui_blocked`` for the same reason.
         self._ui_blocked = getattr(self, "_ui_blocked", 0) + 1
-        deadline = time.monotonic() + 25.0
+        deadline = time.monotonic() + max(0.5, float(timeout))
+        timed_out = False
         try:
             thread.start()
             while thread.is_alive() and time.monotonic() < deadline:
@@ -378,6 +383,7 @@ class EngineMixin:
                         QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
                 thread.join(0.02)
             if thread.is_alive():
+                timed_out = True
                 # A stop that waits on the GPU/driver must not freeze the
                 # window for ever.  The worker is a daemon and the engine is
                 # already forgotten, so the session can rebuild.
@@ -385,6 +391,8 @@ class EngineMixin:
                       file=sys.stderr, flush=True)
         finally:
             self._ui_blocked -= 1
+        if timed_out:
+            return on_timeout
         if "error" in result:
             raise result["error"]
         return result.get("value")
@@ -593,12 +601,18 @@ class EngineMixin:
         stopped", and stopping a layer later can block on the same context.
         One restart with the image preview keeps the studio usable.
         """
-        if self.engine is None or getattr(self.engine, "preview_backend", "") != "gpu":
+        if self.engine is None or (
+                getattr(self.engine, "preview_backend", "") != "gpu"
+                and getattr(self.engine, "canvas_backend", "") != "gpu"):
             self._gpu_stalled_since = 0.0
             return False
         report = self.engine.report
         delivering = any(entry.get("frames") for entry in report.source_health.values())
-        if rec.get("instant_fps", 0) > 0 or not delivering or report.stalled_sources:
+        non_screen_stalled = [
+            lid for lid in report.stalled_sources
+            if getattr(self.scene.layer(lid), "kind", "") != "screen"
+        ]
+        if rec.get("instant_fps", 0) > 0 or not delivering or non_screen_stalled:
             self._gpu_stalled_since = 0.0
             return False
         now = time.monotonic()
@@ -609,11 +623,16 @@ class EngineMixin:
         if now - since < 3.0:
             return False
         self._gpu_stalled_since = 0.0
-        self.log_event("preview: GPU canvas produced no frames; using the image preview")
+        was_gpu_canvas = getattr(self.engine, "canvas_backend", "") == "gpu"
+        was_gpu_preview = getattr(self.engine, "preview_backend", "") == "gpu"
+        if was_gpu_canvas:
+            self._gpu_canvas_failed = True
+        self.log_event("preview: GPU canvas produced no frames; falling back to CPU/image preview")
         # Stop the running engine first so qml6glsink finishes tearing down
         # before disable_gpu() destroys the QQuickWidget / GstGLQt6VideoItem.
         self.stop_engine(clear_preview=False)
-        self.preview.disable_gpu()
+        if was_gpu_preview:
+            self.preview.disable_gpu()
         self.start_engine()
         return True
 
@@ -643,6 +662,8 @@ class EngineMixin:
         self.engine.pump(0)
         if self._pending_frame is not None:
             self._update_preview()
+        if hasattr(self, "_pump_studio_preview"):
+            self._pump_studio_preview()
         mv = getattr(self, "_multiview", None)
         if mv is not None:
             try:
@@ -662,6 +683,8 @@ class EngineMixin:
             if self._recover_stalled_gpu_canvas(rec):
                 return
             self._update_source_status()
+            if hasattr(self, "_check_reattached_camera_health"):
+                self._check_reattached_camera_health()
             stats = (f"{rec['instant_fps']:5.1f} fps · {rec['frames']} frames · "
                      f"CPU {rec['cpu_pct']}% · RSS {rec['rss_mib']} MiB")
             source_fps = self._screen_source_fps()

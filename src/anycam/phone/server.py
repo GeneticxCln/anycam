@@ -85,6 +85,9 @@ class _TLSServer(http.server.ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address, handler, context: ssl.SSLContext, service):
+        self.address_family = (
+            socket.AF_INET6 if ":" in str(address[0]) else socket.AF_INET
+        )
         self.context = context
         self.service = service
         # One thread per connection, and the page is reachable by anything on

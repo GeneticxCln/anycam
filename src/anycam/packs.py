@@ -122,7 +122,11 @@ def _read_manifest(folder: Path, data) -> tuple[list[PackEffect], list[str]]:
         if not relative or folder.resolve() not in path.parents or path.suffix != ".py":
             problems.append(f"{key}: the file must be a .py inside the pack")
             continue
-        if not path.is_file() or path.stat().st_size > MAX_FILE_BYTES:
+        try:
+            is_valid = path.is_file() and path.stat().st_size <= MAX_FILE_BYTES
+        except OSError:
+            is_valid = False
+        if not is_valid:
             problems.append(f"{key}: {relative} is missing or larger than 1 MB")
             continue
         try:
@@ -173,13 +177,20 @@ def load_effect(variant: str, amount: float, root: Path | None = None):
     found = find(pack, key, root)
     if found is None:
         raise KeyError(f"no effect pack entry {variant!r}")
-    module_name = f"anycam_pack_{pack}_{key}".replace("-", "_").replace(".", "_")
+    import hashlib
+
+    digest = hashlib.sha256(f"{pack}\0{key}".encode("utf-8")).hexdigest()[:12]
+    module_name = f"anycam_pack_{pack}_{key}_{digest}".replace("-", "_").replace(".", "_")
     spec = importlib.util.spec_from_file_location(module_name, found.path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load {found.path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(module_name, None)
+        raise
     cls = getattr(module, "Effect", None)
     if cls is None:
         raise ImportError(f"{found.path.name} defines no class Effect")

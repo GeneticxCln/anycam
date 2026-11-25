@@ -35,6 +35,8 @@ jobs:
           python-version: "3.12"
 
       - name: Verify version metadata consistency
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           python - <<'PY'
           import os
@@ -63,7 +65,12 @@ jobs:
           if not meta_versions or meta_versions[0] != pyproject:
               errors.append(f"metainfo latest release={meta_versions[:1]!r} != {pyproject!r}")
           ref = os.environ.get("GITHUB_REF", "")
-          if ref.startswith("refs/tags/v"):
+          dispatch_tag = os.environ.get("INPUT_TAG", "").strip()
+          if dispatch_tag:
+              tag = dispatch_tag.removeprefix("v")
+              if tag != pyproject:
+                  errors.append(f"workflow_dispatch tag {dispatch_tag} != pyproject.toml version {pyproject}")
+          elif ref.startswith("refs/tags/v"):
               tag = ref.removeprefix("refs/tags/v")
               if tag != pyproject:
                   errors.append(f"tag v{tag} != pyproject.toml version {pyproject}")
